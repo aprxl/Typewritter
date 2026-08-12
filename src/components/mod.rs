@@ -17,6 +17,7 @@
 
 pub mod backdrop;
 pub mod breadcrumb;
+pub mod context_menu;
 pub mod dialog;
 pub mod editor;
 pub mod file_finder;
@@ -32,6 +33,7 @@ pub mod topics;
 
 pub use backdrop::Backdrop;
 pub use breadcrumb::Breadcrumb;
+pub use context_menu::ContextMenu;
 pub use dialog::Dialog;
 pub use editor::Editor;
 pub use file_finder::FileFinder;

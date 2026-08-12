@@ -37,6 +37,10 @@ pub struct Mouse {
     pub position: (f32, f32),
     /// Did the left button go down this frame?
     pub left_pressed: bool,
+    /// Did the right button go down this frame? Components that own a
+    /// context menu need it; the shell handles its own right-clicks
+    /// straight off `Input`.
+    pub right_pressed: bool,
     /// Whether the cursor is over the window at all.
     pub in_window: bool,
 }
@@ -46,6 +50,7 @@ impl Default for Mouse {
         Self {
             position: (0.0, 0.0),
             left_pressed: false,
+            right_pressed: false,
             in_window: false,
         }
     }
@@ -115,6 +120,13 @@ impl Context {
     /// component is allowed to act on it.
     pub fn click_position(&self) -> Option<(f32, f32)> {
         (self.mouse.left_pressed && self.mouse.in_window && !self.overlay_open)
+            .then_some(self.mouse.position)
+    }
+
+    /// Where the right button went down this frame, if it did and if this
+    /// component is allowed to act on it.
+    pub fn right_click_position(&self) -> Option<(f32, f32)> {
+        (self.mouse.right_pressed && self.mouse.in_window && !self.overlay_open)
             .then_some(self.mouse.position)
     }
 }

@@ -7,7 +7,7 @@ edition = "2024"
 # Vendored Atomos platform (src/renderer, src/input.rs, src/frame.rs,
 # src/animation.rs) — see docs/atomos/. Versions track Atomos; wgpu is
 # pinned to glyphon's, upgrade the two together.
-#
+
 # The OS clipboard. Pure Rust on every platform we target — x11rb and
 # wl-clipboard-rs on Linux, no GTK — which matters because this app draws
 # all of its own chrome and links no other UI toolkit.

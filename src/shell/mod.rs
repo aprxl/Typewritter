@@ -27,7 +27,7 @@ mod input;
 mod panel;
 mod stepped;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,7 @@ use crate::components::sidenotes::Note;
 use crate::components::tab_strip::TabView;
 use crate::components::topics::Entry;
 use crate::components::{
-    Backdrop, Breadcrumb, Dialog, Editor, FileFinder, FileTree, Onboarding, Palette,
+    Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileFinder, FileTree, Onboarding, Palette,
     SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics, breadcrumb, editor,
     file_tree, sidenotes, status_line, tab_strip, title_bar, topics,
 };
@@ -87,6 +87,15 @@ struct SlashMenuState {
     /// the menu stays open (the underlying document caret doesn't move
     /// while the user is filtering, since the query lives here, not in the
     /// document).
+    anchor: (f32, f32),
+}
+
+/// The open context menu's rows and selection, if it's open. The rows are
+/// resolved commands rather than ids so running one cannot re-look-up a
+/// different entry than the one that was drawn.
+struct ContextMenuState {
+    items: Vec<&'static commands::Command>,
+    selected: usize,
     anchor: (f32, f32),
 }
 
@@ -163,6 +172,9 @@ pub struct Shell {
     finder: Option<FileFinderState>,
     /// The open slash menu's query, selection, and anchor point, if it's open.
     slash_menu: Option<SlashMenuState>,
+    /// The open context menu's rows, selection, and anchor point, if open.
+    context_menu: Option<ContextMenuState>,
+    tree_menu_request: file_tree::MenuRequest,
     /// Indices into `regions` of the regions the shell rebuilds.
     title_region: usize,
     tree_region: usize,
@@ -176,6 +188,7 @@ pub struct Shell {
     finder_region: usize,
     #[allow(dead_code)] // wired up in a later task
     slash_region: usize,
+    menu_region: usize,
     /// Blinks the caret in the editor and the name prompt.
     caret: Stepped,
     /// Fades the writing indicator.
@@ -247,6 +260,7 @@ impl Shell {
             .and_then(|config| Vault::open(&config.vault))
             .map(|vault| Rc::new(RefCell::new(vault)));
         let docs = Rc::new(RefCell::new(Tabs::new()));
+        let tree_menu_request = Rc::new(Cell::new(None));
 
         let mut layout = Layout::new(Style::default());
         let title = layout.add_child(Layout::ROOT, Style::fixed(title_bar::HEIGHT));
@@ -291,7 +305,11 @@ impl Shell {
             region(
                 renderer,
                 tree,
-                Box::new(FileTree::new(vault.clone(), docs.clone())),
+                Box::new(FileTree::new(
+                    vault.clone(),
+                    docs.clone(),
+                    tree_menu_request.clone(),
+                )),
             ),
             region(renderer, text_column, Box::new(Editor::placeholder())),
         ];
@@ -370,6 +388,11 @@ impl Shell {
             Box::new(FileFinder::closed()),
         ));
         let finder_region = regions.len() - 1;
+        regions.push(Region::detached(
+            Layout::ROOT,
+            Box::new(ContextMenu::closed()),
+        ));
+        let menu_region = regions.len() - 1;
 
         Self {
             layout,
@@ -388,6 +411,8 @@ impl Shell {
             palette: None,
             finder: None,
             slash_menu: None,
+            context_menu: None,
+            tree_menu_request,
             title_region,
             tree_region,
             onboard_region,
@@ -399,6 +424,7 @@ impl Shell {
             palette_region,
             finder_region,
             slash_region,
+            menu_region,
             // Two steps, because a caret is on or off: every frame between
             // two flips repaints the same pixels. The writing indicator is
             // a fade, but `Topics` already rounds it to sixteenths, so
@@ -498,6 +524,7 @@ impl Shell {
             mouse: Mouse {
                 position: input.mouse_position(),
                 left_pressed: input.is_mouse_pressed(MouseButton::Left),
+                right_pressed: input.is_mouse_pressed(MouseButton::Right),
                 in_window: input.is_cursor_in_window(),
             },
             scroll_y: input.scroll_delta().1,
@@ -508,6 +535,7 @@ impl Shell {
                 || self.onboarding
                 || self.palette.is_some()
                 || self.slash_menu.is_some()
+                || self.context_menu.is_some()
                 || self.finder.is_some(),
         };
         for region in &mut self.regions {
@@ -596,6 +624,7 @@ impl Shell {
             (self.palette_region, self.palette.is_some()),
             (self.slash_region, self.slash_menu.is_some()),
             (self.finder_region, self.finder.is_some()),
+            (self.menu_region, self.context_menu.is_some()),
         ];
         for (index, open) in overlays {
             match (open, self.regions[index].is_attached()) {

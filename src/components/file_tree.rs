@@ -5,7 +5,7 @@
 //! Clicks open files: a single click previews (a transient tab, replaced by
 //! the next open), a double-click pins the file in a full tab.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -18,6 +18,18 @@ use crate::ui::{Component, Context, Dirty, Hover};
 use crate::vault::Vault;
 
 pub const WIDTH: f32 = 250.0;
+
+/// What a right-click in the file tree landed on: a row, or the empty space
+/// below the rows. The tree owns the row hit-test, so it is the only thing
+/// that can tell them apart; the shell holds the other end of this and
+/// clears it the frame it acts on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuTarget {
+    Row,
+    Empty,
+}
+
+pub type MenuRequest = Rc<Cell<Option<((f32, f32), MenuTarget)>>>;
 
 /// One row's height. Names are drawn at their baseline, so a row's visual
 /// extent is `[y - ROW_HALF, y - ROW_HALF + ROW_HEIGHT)` and the hit-test
@@ -36,6 +48,7 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(300);
 pub struct FileTree {
     vault: Option<Rc<RefCell<Vault>>>,
     docs: Rc<RefCell<Tabs>>,
+    menu_request: MenuRequest,
     /// The row currently receiving the hover surface. Kept during fade-out.
     hovered: Option<PathBuf>,
     hover: Hover,
@@ -49,10 +62,15 @@ pub struct FileTree {
 }
 
 impl FileTree {
-    pub fn new(vault: Option<Rc<RefCell<Vault>>>, docs: Rc<RefCell<Tabs>>) -> Self {
+    pub fn new(
+        vault: Option<Rc<RefCell<Vault>>>,
+        docs: Rc<RefCell<Tabs>>,
+        menu_request: MenuRequest,
+    ) -> Self {
         Self {
             vault,
             docs,
+            menu_request,
             hovered: None,
             hover: Hover::new(),
             scroll: 0.0,
@@ -169,6 +187,27 @@ impl Component for FileTree {
             // Expanding can change how much there is to scroll.
             let max = (self.content_height() - rect.height).max(0.0);
             self.scroll = self.scroll.clamp(0.0, max);
+        }
+
+        if let Some(position) = context.right_click_position()
+            && rect.contains(position)
+        {
+            let path = self.row_path(rect, position);
+            match path {
+                Some(path) => {
+                    // Menu commands act on `tree_selected`, so right-click must target
+                    // this row before the menu opens or New note would use another row.
+                    self.docs.borrow_mut().tree_selected = Some(path);
+                    self.menu_request.set(Some((position, MenuTarget::Row)));
+                }
+                None => {
+                    // With nothing selected, New note creates at the vault root, which is
+                    // what right-clicking the empty part of the panel should mean.
+                    self.docs.borrow_mut().tree_selected = None;
+                    self.menu_request.set(Some((position, MenuTarget::Empty)));
+                }
+            }
+            self.dirty.set();
         }
 
         self.dirty
@@ -323,7 +362,11 @@ mod tests {
     /// the highlight has to land on the row that highlight belongs to.
     #[test]
     fn rows_hit_the_band_they_are_drawn_in() {
-        let tree = FileTree::new(None, Rc::new(RefCell::new(Tabs::new())));
+        let tree = FileTree::new(
+            None,
+            Rc::new(RefCell::new(Tabs::new())),
+            Rc::new(Cell::new(None::<((f32, f32), MenuTarget)>)),
+        );
         let rect = Rect::new(0.0, 0.0, WIDTH, 600.0);
         let baseline_of = |row: usize| CONTENT_TOP + row as f32 * ROW_HEIGHT;
 
@@ -354,7 +397,11 @@ mod tests {
     /// Scrolling moves the bands with the content, not just the drawing.
     #[test]
     fn a_scrolled_tree_hits_the_row_under_the_pointer() {
-        let mut tree = FileTree::new(None, Rc::new(RefCell::new(Tabs::new())));
+        let mut tree = FileTree::new(
+            None,
+            Rc::new(RefCell::new(Tabs::new())),
+            Rc::new(Cell::new(None::<((f32, f32), MenuTarget)>)),
+        );
         let rect = Rect::new(0.0, 0.0, WIDTH, 600.0);
         let baseline = CONTENT_TOP + 5.0 * ROW_HEIGHT;
         assert_eq!(tree.row_index(rect, (10.0, baseline)), Some(5));

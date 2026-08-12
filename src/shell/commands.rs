@@ -392,6 +392,39 @@ pub fn editor_entries() -> Vec<palette::Entry> {
         .collect()
 }
 
+/// The editor's context menu, in the order it is drawn. Ids rather than a
+/// second table: a menu row and its chord then cannot describe different
+/// behaviour from the palette entry with the same name.
+pub const EDITOR_MENU: &[&str] = &["edit.cut", "edit.copy", "edit.paste"];
+
+/// The file tree's context menu.
+pub const TREE_MENU: &[&str] = &["file.new", "folder.new", "file.delete"];
+
+/// The file tree's context menu over empty space, where there is no file to
+/// act on — only the two ways to add one. Deleting is deliberately absent
+/// rather than shown greyed out: a row that can never do anything is noise.
+pub const TREE_ROOT_MENU: &[&str] = &["file.new", "folder.new"];
+
+/// The commands `ids` name, in the order given. An id with no command is
+/// skipped rather than panicking — a menu is a view of the table, and a
+/// renamed command must not take the app down with it.
+pub fn menu(ids: &[&str]) -> Vec<&'static Command> {
+    ids.iter()
+        .filter_map(|id| COMMANDS.iter().find(|command| command.id == *id))
+        .collect()
+}
+
+pub fn menu_entries(ids: &[&str]) -> Vec<palette::Entry> {
+    menu(ids)
+        .iter()
+        .map(|command| palette::Entry {
+            title: command.title.to_string(),
+            group: command.group.to_string(),
+            hint: command.chord.map(|c| c.label()).unwrap_or_default(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +490,12 @@ mod tests {
         let editor_titles: Vec<String> = editor_entries().iter().map(|e| e.title.clone()).collect();
         let expected: Vec<String> = in_table.iter().map(|c| c.title.to_string()).collect();
         assert_eq!(editor_titles, expected);
+    }
+
+    #[test]
+    fn every_menu_id_names_a_real_command() {
+        assert_eq!(menu(EDITOR_MENU).len(), EDITOR_MENU.len());
+        assert_eq!(menu(TREE_MENU).len(), TREE_MENU.len());
+        assert_eq!(menu(TREE_ROOT_MENU).len(), TREE_ROOT_MENU.len());
     }
 }

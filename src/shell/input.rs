@@ -15,8 +15,8 @@ use super::commands;
 use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
-    Dialog, FileFinder, FileTree, Onboarding, Palette, SlashMenu, file_finder, onboarding,
-    title_bar,
+    ContextMenu, Dialog, FileFinder, FileTree, Onboarding, Palette, SlashMenu, context_menu,
+    file_finder, file_tree, onboarding, title_bar,
 };
 use crate::config::Config;
 use crate::document::{FlatPos, FlatRange, Style};
@@ -32,7 +32,7 @@ use crate::vim::{
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{PaletteState, Shell, SlashMenuState};
+use super::{ContextMenuState, PaletteState, Shell, SlashMenuState};
 
 impl Shell {
     /// Choosing a vault is a shell job: the picker persists the config and
@@ -55,6 +55,11 @@ impl Shell {
         // The slash menu swallows everything else while it's open.
         if self.slash_menu.is_some() {
             self.handle_slash_menu_input(input);
+            return;
+        }
+        // The context menu swallows input while it is open.
+        if self.context_menu.is_some() {
+            self.handle_context_menu_input(input, viewport);
             return;
         }
         // A dialog swallows everything else until it resolves.
@@ -88,6 +93,32 @@ impl Shell {
         {
             self.open_finder();
             return;
+        }
+
+        // The tree owns its row hit-test. Consume its request first so a
+        // right-click cannot also be interpreted as an editor menu request.
+        if let Some((at, target)) = self.tree_menu_request.take() {
+            let ids = match target {
+                file_tree::MenuTarget::Row => commands::TREE_MENU,
+                file_tree::MenuTarget::Empty => commands::TREE_ROOT_MENU,
+            };
+            self.open_context_menu(ids, at);
+            return;
+        }
+        if input.is_mouse_pressed(MouseButton::Right)
+            && input.is_cursor_in_window()
+            && self
+                .layout
+                .rect(self.text_column)
+                .contains(input.mouse_position())
+        {
+            // Right-click deliberately leaves the caret where it is: Cut and
+            // Copy use the selection, or the caret's line when there is none.
+            let has_file = self.docs.borrow().active().is_some();
+            if has_file {
+                self.open_context_menu(commands::EDITOR_MENU, input.mouse_position());
+                return;
+            }
         }
 
         if let Some(command) = commands::matching(input) {
@@ -1143,6 +1174,111 @@ impl Shell {
         self.regions[self.slash_region].set_component(Box::new(menu));
     }
 
+    // ---- context menu ----------------------------------------------------
+
+    fn open_context_menu(&mut self, ids: &[&str], anchor: (f32, f32)) {
+        let items = commands::menu(ids);
+        if items.is_empty() {
+            return;
+        }
+        self.context_menu = Some(ContextMenuState {
+            items,
+            selected: 0,
+            anchor,
+        });
+        self.refresh_context_menu();
+    }
+
+    fn refresh_context_menu(&mut self) {
+        let menu = match &self.context_menu {
+            Some(state) => {
+                let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
+                ContextMenu::new(commands::menu_entries(&ids), state.selected, state.anchor)
+            }
+            None => ContextMenu::closed(),
+        };
+        self.regions[self.menu_region].set_component(Box::new(menu));
+    }
+
+    fn close_context_menu(&mut self) {
+        self.context_menu = None;
+        self.refresh_context_menu();
+    }
+
+    fn handle_context_menu_input(&mut self, input: &Input, viewport: Rect) {
+        if input.is_key_pressed(KeyCode::Escape) {
+            self.close_context_menu();
+            return;
+        }
+        if input.is_key_typed(KeyCode::ArrowDown) {
+            let changed = if let Some(state) = &mut self.context_menu {
+                let next = (state.selected + 1).min(state.items.len() - 1);
+                let changed = next != state.selected;
+                state.selected = next;
+                changed
+            } else {
+                false
+            };
+            if changed {
+                self.refresh_context_menu();
+            }
+        }
+        if input.is_key_typed(KeyCode::ArrowUp) {
+            let changed = if let Some(state) = &mut self.context_menu {
+                let next = state.selected.saturating_sub(1);
+                let changed = next != state.selected;
+                state.selected = next;
+                changed
+            } else {
+                false
+            };
+            if changed {
+                self.refresh_context_menu();
+            }
+        }
+        if input.is_key_pressed(KeyCode::Enter) {
+            self.run_selected_menu_command();
+            return;
+        }
+
+        let Some(state) = &self.context_menu else {
+            return;
+        };
+        let card = context_menu::card_anchored(viewport, state.anchor, state.items.len());
+        let point = input.mouse_position();
+        if input.is_cursor_in_window() {
+            if let Some(row) = context_menu::row_at(card, state.items.len(), point) {
+                let changed = self
+                    .context_menu
+                    .as_ref()
+                    .is_some_and(|state| state.selected != row);
+                if changed {
+                    if let Some(state) = &mut self.context_menu {
+                        state.selected = row;
+                    }
+                    self.refresh_context_menu();
+                }
+                if input.is_mouse_pressed(MouseButton::Left) {
+                    self.run_selected_menu_command();
+                }
+            } else if input.is_mouse_pressed(MouseButton::Left) && !card.contains(point) {
+                self.close_context_menu();
+            }
+        }
+    }
+
+    fn run_selected_menu_command(&mut self) {
+        let command = self
+            .context_menu
+            .as_ref()
+            .and_then(|state| state.items.get(state.selected))
+            .copied();
+        self.close_context_menu();
+        if let Some(command) = command {
+            (command.run)(self);
+        }
+    }
+
     fn handle_slash_menu_input(&mut self, input: &Input) {
         if input.is_key_pressed(KeyCode::Escape) {
             self.close_slash_menu();
@@ -1494,8 +1630,11 @@ impl Shell {
         self.config = Some(config);
         self.onboarding = false;
         self.vault = vault.clone();
-        self.regions[self.tree_region]
-            .set_component(Box::new(FileTree::new(vault, self.docs.clone())));
+        self.regions[self.tree_region].set_component(Box::new(FileTree::new(
+            vault,
+            self.docs.clone(),
+            self.tree_menu_request.clone(),
+        )));
         self.regions[self.onboard_region].set_component(Box::new(Onboarding::new(false)));
         self.rebuild_views();
     }
