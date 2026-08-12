@@ -54,6 +54,8 @@ fn key_label(key: KeyCode) -> &'static str {
         KeyCode::KeyD => "D",
         KeyCode::KeyO => "O",
         KeyCode::KeyC => "C",
+        KeyCode::KeyX => "X",
+        KeyCode::KeyV => "V",
         KeyCode::Digit1 => "1",
         KeyCode::Digit2 => "2",
         KeyCode::Digit3 => "3",
@@ -147,6 +149,36 @@ pub const COMMANDS: &[Command] = &[
             key: KeyCode::KeyD,
         }),
         run: |shell| shell.ask_delete_selected(),
+    },
+    Command {
+        id: "edit.copy",
+        title: "Copy",
+        group: "Edit",
+        chord: Some(Chord {
+            mods: CTRL,
+            key: KeyCode::KeyC,
+        }),
+        run: |shell| shell.copy_selection(false),
+    },
+    Command {
+        id: "edit.cut",
+        title: "Cut",
+        group: "Edit",
+        chord: Some(Chord {
+            mods: CTRL,
+            key: KeyCode::KeyX,
+        }),
+        run: |shell| shell.copy_selection(true),
+    },
+    Command {
+        id: "edit.paste",
+        title: "Paste",
+        group: "Edit",
+        chord: Some(Chord {
+            mods: CTRL,
+            key: KeyCode::KeyV,
+        }),
+        run: |shell| shell.paste_clipboard(),
     },
     Command {
         id: "vault.open",

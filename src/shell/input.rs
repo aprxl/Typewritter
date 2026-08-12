@@ -414,6 +414,7 @@ impl Shell {
             }
             ExtendedAction::Paste { before, count } => {
                 self.repeat = Some(super::RepeatOp::Paste { before, count });
+                self.import_yank();
                 self.docs.borrow_mut().paste(before, count);
                 self.goal_x = None;
             }
@@ -741,6 +742,75 @@ impl Shell {
         Some(FlatRange::new(start, end))
     }
 
+    /// Publishes the yank register to the OS clipboard when it has changed.
+    /// One call site covers every path that yanks — present and future —
+    /// because it compares state instead of hooking each of them.
+    pub(super) fn export_yank(&mut self) {
+        let yank = self.docs.borrow().yank().unwrap_or_default().to_string();
+        if !yank.is_empty() && yank != self.exported_yank {
+            crate::clipboard::set(&yank);
+            self.exported_yank = yank;
+        }
+    }
+
+    /// Pulls the OS clipboard into the yank register, so `p` and Ctrl+V
+    /// paste what was copied in another application. Text this app itself
+    /// published is skipped — re-importing it would be a no-op that only
+    /// risks losing the register to a clipboard read that failed.
+    pub(super) fn import_yank(&mut self) {
+        if let Some(text) = crate::clipboard::get()
+            && !text.is_empty()
+            && text != self.exported_yank
+        {
+            self.docs.borrow_mut().set_yank(text);
+        }
+    }
+
+    /// Copies the selection, or the caret's whole line when there is none —
+    /// the same "no selection means this line" rule the vim operators use.
+    /// `cut` deletes what it copied.
+    pub(super) fn copy_selection(&mut self, cut: bool) {
+        let visual_active = self.vim.visual_mode().is_some();
+        // Both reads are resolved into locals first: a `Ref` held in an
+        // `if let` scrutinee is still alive inside the branch, and the
+        // `borrow_mut()` below would panic against it.
+        let line = self.docs.borrow().active().map(|tab| {
+            let block = tab.document.caret.block;
+            (block, tab.document.line_range(block, block))
+        });
+        if let Some(range) = self.current_selection() {
+            if cut {
+                self.docs.borrow_mut().delete_range(range);
+            } else {
+                self.docs.borrow_mut().yank_range(range);
+            }
+        } else if let Some((block, range)) = line {
+            // `delete_line` does not write the yank register; `delete_lines`
+            // does, and cutting has to copy what it removed.
+            if cut {
+                self.docs.borrow_mut().delete_lines(block, block);
+            } else {
+                self.docs.borrow_mut().yank_range(range);
+            }
+        }
+        if visual_active {
+            self.exit_visual();
+        }
+    }
+
+    /// Pastes the OS clipboard at the caret.
+    pub(super) fn paste_clipboard(&mut self) {
+        self.import_yank();
+        self.docs.borrow_mut().paste(false, 1);
+    }
+
+    fn exit_visual(&mut self) {
+        self.vim.set_mode(Mode::Normal);
+        self.visual_anchor = None;
+        self.visual_override = None;
+        self.visual_line_mode = false;
+    }
+
     fn repeat(&mut self) {
         let Some(operation) = self.repeat.clone() else {
             return;
@@ -823,7 +893,10 @@ impl Shell {
                 self.apply_edit(Edit::DeleteChar, count);
                 self.start_insert();
             }
-            super::RepeatOp::Paste { before, count } => self.docs.borrow_mut().paste(before, count),
+            super::RepeatOp::Paste { before, count } => {
+                self.import_yank();
+                self.docs.borrow_mut().paste(before, count);
+            }
             super::RepeatOp::Insert(events) => {
                 self.docs.borrow_mut().transaction(|docs| {
                     for event in events {
@@ -1158,10 +1231,7 @@ impl Shell {
                         .borrow_mut()
                         .touch(|doc| doc.set_flat_position(caret));
                 }
-                self.vim.set_mode(Mode::Normal);
-                self.visual_anchor = None;
-                self.visual_override = None;
-                self.visual_line_mode = false;
+                self.exit_visual();
             }
         }
     }

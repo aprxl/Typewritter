@@ -10,6 +10,7 @@ pub mod input;
 pub mod renderer;
 
 // Typewritter's own.
+pub mod clipboard;
 pub mod components;
 pub mod config;
 pub mod document;

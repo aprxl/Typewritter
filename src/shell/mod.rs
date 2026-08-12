@@ -148,6 +148,11 @@ pub struct Shell {
     vault: Option<Rc<RefCell<Vault>>>,
     /// The open tabs — shared with the tree and the tab strip.
     docs: Rc<RefCell<Tabs>>,
+    /// The last text this app published to the OS clipboard. Compared each
+    /// frame against the live yank register so a yank — from any of the
+    /// vim paths, the operators, or the chords — is exported exactly once,
+    /// from one place, instead of at every site that writes the register.
+    exported_yank: String,
     /// First run: show the onboarding splash instead of the vault.
     onboarding: bool,
     /// Vim mode and pending state, driving the editor.
@@ -377,6 +382,7 @@ impl Shell {
             config,
             vault,
             docs,
+            exported_yank: String::new(),
             onboarding,
             vim: Vim::new(),
             palette: None,
@@ -449,6 +455,7 @@ impl Shell {
         renderer: &mut Renderer,
     ) -> bool {
         self.handle_input(input, viewport);
+        self.export_yank();
         self.sync_overlay_layers(renderer);
 
         // Every animation, every frame, accumulated with `|=` — `||` would

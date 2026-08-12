@@ -354,6 +354,14 @@ impl Tabs {
         self.active().map(|tab| tab.yank.as_str())
     }
 
+    /// Replaces the yank register. The shell uses this to feed in text that
+    /// was copied outside the app; `Tabs` itself never looks at the OS.
+    pub fn set_yank(&mut self, text: String) {
+        if let Some(tab) = self.active_mut() {
+            tab.yank = text;
+        }
+    }
+
     pub fn paste(&mut self, before: bool, count: usize) {
         let text = self
             .active()
