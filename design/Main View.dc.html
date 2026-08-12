@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet><template id="__bundler_thumbnail"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#F8EDD0"/><rect x="30" y="30" width="40" height="40" fill="#C24F1A"/><text x="50" y="63" font-family="Georgia,serif" font-size="30" font-weight="700" fill="#F8EDD0" text-anchor="middle">T</text></svg></template><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/iosevka@5/latin-400.css"><style>body{margin:0;background:#e7dcc0}@keyframes twcaret{0%,48%{opacity:1}52%,100%{opacity:0}}@keyframes twpulse{0%,100%{opacity:1}50%{opacity:.35}}a{color:#0D6678}a:hover{color:#C24F1A}</style></helmet>
+<div data-screen-label="Main view — Insert, in a fraction" style="position:relative;width:1440px;height:900px;background:#F8EDD0;color:#3C3836;font-family:Georgia,'Times New Roman',serif;display:flex;flex-direction:column;overflow:hidden;user-select:none">
+
+<div style="flex:none;height:46px;background:#F0E3BE;border-bottom:2px solid #DDD0A0;display:flex;align-items:center;padding:0 18px;gap:12px">
+<div style="flex:none;width:24px;height:24px;background:#C24F1A;color:#F8EDD0;display:flex;align-items:center;justify-content:center;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:14px;font-weight:700">T</div>
+<div style="display:flex;align-items:baseline;gap:9px"><span style="font-size:17px;letter-spacing:.01em">Typewritter</span><span style="width:1px;height:12px;background:#DDD0A0;align-self:center"></span><span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:9.5px;letter-spacing:.2em;color:#928374">LECTURE CAPTURE</span></div>
+<div style="margin-left:auto;display:flex;align-items:center;gap:8px;padding:4px 9px;border:1px solid #DDD0A0;color:#928374">
+<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="8"></circle><path d="M21 21l-4.3-4.3"></path></svg>
+<span style="font-size:12.5px">search the vault</span>
+<span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;letter-spacing:.1em;color:#A09183">⌘ /</span>
+</div>
+</div>
+
+<div style="flex:none;height:38px;background:#FAF1DB;border-bottom:1px solid #DDD0A0;display:flex;align-items:stretch">
+<div style="position:relative;display:flex;align-items:center;gap:8px;padding:0 18px;background:#F8EDD0;font-size:14px;color:#3C3836">
+<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#C24F1A" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"></path><polyline points="14 2 14 8 20 8"></polyline><path d="M16 13H8M16 17H8"></path></svg>
+<span>opamps</span><div style="position:absolute;left:0;bottom:-1px;width:100%;height:2px;background:#C24F1A"></div></div>
+<div style="display:flex;align-items:center;gap:8px;padding:0 18px;font-size:14px;font-style:italic;color:#928374">
+<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
+<span>lecture-04</span></div>
+<div style="display:flex;align-items:center;padding:0 14px;color:#A09183">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M5 12h14M12 5v14"></path></svg>
+</div>
+</div>
+
+<div style="flex:none;height:30px;background:#FAF1DB;border-bottom:2px solid #DDD0A0;display:flex;align-items:center;padding:0 18px;gap:7px;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:11.5px;color:#7C6F64">
+<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#A09183" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"></path></svg>
+<span>vault</span><span style="color:#C4B79E">›</span><span>analog</span><span style="color:#C4B79E">›</span><span>opamps</span><span style="color:#C4B79E">›</span><span style="color:#3C3836">Non-inverting amp</span>
+</div>
+
+<div style="flex:1;min-height:0;display:flex;align-items:stretch">
+
+<sc-if value="{{ showTree }}" hint-placeholder-val="{{ true }}">
+<div style="flex:none;width:250px;background:#F0E3BE;border-right:1px solid #DDD0A0;padding:24px 0 0;display:flex;flex-direction:column;gap:24px">
+<div style="display:flex;flex-direction:column">
+<div style="display:flex;align-items:center;gap:7px;padding:0 18px 10px;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;letter-spacing:.18em;color:#928374">
+<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>ANALOG</div>
+<div style="display:flex;align-items:center;gap:8px;padding:6px 18px 6px 28px;background:#E8D08C;font-size:14.5px;color:#3C3836"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#C24F1A" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>opamps<span style="margin-left:auto;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;color:#7C6F64">08-09</span></div>
+<div style="display:flex;align-items:center;gap:8px;padding:6px 18px 6px 28px;font-size:14.5px;color:#7C6F64"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#C4B79E" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>filters<span style="margin-left:auto;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;color:#A09183">08-07</span></div>
+<div style="display:flex;align-items:center;gap:8px;padding:6px 18px 6px 28px;font-size:14.5px;color:#7C6F64"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#C4B79E" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>bias-notes<span style="margin-left:auto;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;color:#A09183">08-04</span></div>
+</div>
+<div style="display:flex;flex-direction:column">
+<div style="display:flex;align-items:center;gap:7px;padding:0 18px 10px;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;letter-spacing:.18em;color:#928374">
+<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>DAILY</div>
+<div style="display:flex;align-items:center;gap:8px;padding:6px 18px 6px 28px;font-size:14.5px;color:#7C6F64"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#C4B79E" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18"></rect><path d="M16 2v4M8 2v4M3 10h18"></path></svg>2026-08-09<span style="margin-left:auto;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;color:#A09183">today</span></div>
+</div>
+<div style="margin-top:auto;border-top:1px solid #DDD0A0;padding:12px 18px;display:flex;align-items:center;gap:7px;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:9.5px;letter-spacing:.16em;color:#A09183">
+<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5h10M11 12h10M11 19h10M3 8l3-3 3 3M6 5v14"></path></svg>NEWEST FIRST</div>
+</div>
+</sc-if>
+
+<div style="flex:1;min-width:0;display:flex;align-items:stretch;background:#F8EDD0">
+
+<div style="flex:none;width:706px;box-sizing:border-box;padding:46px 0 0 72px">
+<div style="width:634px">
+
+<div style="font-size:34px;line-height:1.15;letter-spacing:-.01em">Non-inverting amplifier</div>
+<div style="height:2px;background:#DDD0A0;margin:16px 0 11px"></div>
+<div style="display:flex;align-items:center;gap:16px;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10.5px;letter-spacing:.14em;color:#928374">
+<span style="display:flex;align-items:center;gap:6px"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>2026-08-09</span>
+<span>LECTURE 04</span>
+<span style="display:flex;align-items:center;gap:6px;color:#A09183"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>4 PAGES</span>
+</div>
+
+<div style="margin-top:34px;display:flex;align-items:baseline;gap:14px"><span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:15px;color:#C24F1A">1</span><span style="font-size:21px;font-weight:700">Topology</span></div>
+<div style="margin-top:10px;font-size:17.5px;line-height:1.72;text-wrap:pretty">Feedback taken from the output to the inverting input, signal driven straight into the <strong style="font-weight:700">non-inverting</strong> terminal <span style="display:inline-flex;align-items:center;height:16px;padding:1px 5px 0;border:1px solid #A84C00;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:9px;line-height:1;letter-spacing:.1em;color:#A84C00;vertical-align:baseline;position:relative;top:-2px">IDEAL</span>. The divider sets how much of the output comes back, and that fraction is the whole story.</div>
+
+<div style="margin-top:16px;font-size:17.5px;line-height:1.72;color:#7C6F64"><span style="display:inline-flex;align-items:center;gap:4px;height:16px;padding:1px 5px 0;margin-right:5px;border:1px solid #B07B18;background:#EFE0A8;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:9px;line-height:1;letter-spacing:.1em;color:#B07B18;vertical-align:baseline;position:relative;top:-2px"><svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M12 8v5M12 17h.01"></path></svg>TODO</span> he wrote the bias current spec on the board — copy it from Ana.</div>
+
+<div style="margin-top:22px;display:flex;align-items:center;gap:12px;padding:9px 0;border-top:1px solid #DDD0A0;border-bottom:1px solid #DDD0A0;color:#7C6F64">
+<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#C24F1A" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+<span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:13px;color:#928374">1.1</span><span style="font-size:16px">Open-loop response</span><span style="margin-left:auto;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:9.5px;letter-spacing:.14em;color:#A09183">4 BLOCKS FOLDED</span></div>
+
+<div style="margin-top:30px;display:flex;align-items:baseline;gap:14px"><span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:15px;color:#C24F1A">2</span><span style="font-size:21px;font-weight:700">Gain</span></div>
+<div style="margin-top:14px;display:flex;align-items:baseline;gap:12px"><span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:12.5px;color:#928374">2.1</span><span style="font-size:17px;font-weight:700">Closed-loop</span></div>
+<div style="margin-top:8px;font-size:17.5px;line-height:1.72">Closed-loop gain:</div>
+
+<div style="margin-top:22px;display:flex;align-items:center;gap:16px">
+<div style="flex:1;display:flex;justify-content:center;align-items:center;gap:10px;font-family:Iosevka,'PragmataPro Mono',ui-monospace,monospace;font-size:21px;color:#3C3836">
+<span>A</span><span style="color:#7C6F64">=</span><span>1</span><span style="color:#7C6F64">+</span>
+<span style="display:inline-flex;flex-direction:column;align-items:center;gap:5px">
+<span style="padding:1px 7px">R<span style="font-size:13px;vertical-align:-4px">2</span></span>
+<span style="width:100%;min-width:58px;height:2px;background:#3C3836"></span>
+<span style="display:inline-flex;align-items:center;padding:1px 7px;background:#EFE0A8;box-shadow:inset 0 0 0 1px #DDD0A0">R<span style="display:inline-block;width:11px;height:13px;margin-left:1px;vertical-align:-4px;box-shadow:inset 0 0 0 1px #C4B79E"></span><span style="display:inline-block;width:2px;height:22px;margin-left:2px;background:#C24F1A;animation:twcaret 1.05s step-end infinite"></span></span>
+</span>
+</div>
+<div style="flex:none;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:13px;color:#928374">(2)</div>
+</div>
+
+<div style="margin-top:26px;font-size:17.5px;line-height:1.72">With <span style="font-family:Iosevka,'PragmataPro Mono',ui-monospace,monospace;font-size:16px;background:#F3E5C1;box-shadow:inset 0 0 0 1px #EFE0A8;padding:1px 5px">R<span style="font-size:11px;vertical-align:-3px">2</span></span> = 10k the ideal gain is 11<span style="font-size:11px;vertical-align:6px;color:#C24F1A">1</span>, and the measured figure sits just under<span style="font-size:11px;vertical-align:6px;color:#C24F1A">2</span></div>
+
+<div style="margin-top:16px;font-size:17.5px;line-height:1.72;color:#7C6F64"><span style="display:inline-flex;align-items:center;height:16px;padding:1px 5px 0;margin-right:5px;border:1px solid #0D6678;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:9px;line-height:1;letter-spacing:.1em;color:#0D6678;vertical-align:baseline;position:relative;top:-2px">PS</span> the same divider shows up in the Sallen–Key next week.</div>
+
+</div>
+</div>
+
+<sc-if value="{{ showSidenotes }}" hint-placeholder-val="{{ true }}">
+<div style="flex: none; width: 150px; padding: 46px 18px 0 0; border-left: 1px solid #E8D08C; position: relative; padding-left: 5px; padding-right: 50px; left: 60px">
+<div style="position:absolute;left:0;top:644px;width:14px;height:1px;background:#DDD0A0"></div>
+<div style="position:absolute;left:20px;top:634px;width:164px;font-size:13.5px;line-height:1.55;color:#7C6F64"><span style="font-size:10px;vertical-align:5px;color:#C24F1A">1</span> ideal case — <span style="font-family:Iosevka,'PragmataPro Mono',ui-monospace,monospace;font-size:12.5px">A → ∞</span>, input impedance taken as infinite</div>
+<div style="position:absolute;left:20px;top:696px;width:164px;font-size:13.5px;line-height:1.55;color:#7C6F64"><span style="font-size:10px;vertical-align:5px;color:#C24F1A">2</span> measured 10.94 at 1 kHz, bench rig B</div>
+</div>
+</sc-if>
+<div style="flex:1;min-width:0"></div>
+
+</div>
+
+<sc-if value="{{ showTopics }}" hint-placeholder-val="{{ true }}">
+<div style="flex:none;width:214px;background:#F0E3BE;border-left:1px solid #DDD0A0;padding:24px 0 0">
+<div style="display:flex;align-items:center;gap:7px;padding:0 18px 13px;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;letter-spacing:.18em;color:#928374">
+<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 9h16M4 15h16M10 3L8 21M16 3l-2 18"></path></svg>TOPICS</div>
+<div style="display:flex;align-items:baseline;gap:9px;padding:5px 18px;font-size:14.5px;color:#7C6F64"><span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:11px;color:#A09183">1</span>Topology</div>
+<div style="display:flex;align-items:baseline;gap:9px;padding:4px 18px 4px 32px;font-size:13px;color:#928374"><span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;color:#928374">1.1</span>Ideal</div>
+<div style="display:flex;align-items:baseline;gap:9px;padding:4px 18px 4px 32px;font-size:13px;color:#928374"><span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;color:#928374">1.2</span>Bias</div>
+<div style="display:flex;align-items:baseline;gap:9px;padding:5px 18px;margin-top:8px;font-size:14.5px;color:#3C3836"><span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:11px;color:#C24F1A">2</span>Gain</div>
+<div style="display:flex;align-items:baseline;gap:9px;padding:4px 18px 4px 32px;background:#E8D08C;font-size:13px;color:#3C3836"><span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;color:#7C6F64">2.1</span>Closed-loop</div>
+<div style="display:flex;align-items:baseline;gap:9px;padding:4px 18px 4px 32px;font-size:13px;color:#928374"><span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;color:#928374">2.2</span>Open-loop</div>
+<div style="margin:20px 18px 0;height:1px;background:#DDD0A0"></div>
+<div style="display:flex;align-items:center;gap:7px;padding:13px 18px 0;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:9.5px;letter-spacing:.16em;color:#A09183"><span style="width:6px;height:6px;background:#3E7D59;animation:twpulse 2.4s ease-in-out infinite"></span>WRITING NOW</div>
+</div>
+</sc-if>
+
+</div>
+
+<div style="flex:none;height:36px;background:#F0E3BE;border-top:2px solid #DDD0A0;display:flex;align-items:center;gap:12px;padding:0 18px;font-size:13.5px;color:#7C6F64">
+<span style="padding:3px 10px;background:#C24F1A;color:#F8EDD0;font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:10px;letter-spacing:.18em">INSERT</span>
+<span style="color:#3C3836">opamps</span>
+<span style="color:#C4B79E">·</span>
+<span style="display:flex;align-items:center;gap:7px"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#A84C00" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M18 7V4H6l6 8-6 8h12v-3"></path></svg>you're inside a fraction, filling in the <span style="color:#A84C00">denominator</span></span>
+<span style="margin-left:auto;display:flex;align-items:center;gap:7px"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#3E7D59" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg>saved a moment ago</span>
+<span style="color:#C4B79E">·</span>
+<span>1,204 words so far</span>
+<sc-if value="{{ showStats }}" hint-placeholder-val="{{ false }}">
+<span style="color:#C4B79E">·</span>
+<span style="font-family:'PragmataPro Mono','PragmataPro',ui-monospace,monospace;font-size:11px;color:#A09183">redrew 1/9 · 0.41ms</span>
+</sc-if>
+</div>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1440,&quot;height&quot;:900},&quot;showTree&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Regions&quot;},&quot;showSidenotes&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Regions&quot;},&quot;showTopics&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Regions&quot;},&quot;showStats&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Statusline&quot;,&quot;label&quot;:&quot;Show render stats&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      showTree: this.props.showTree ?? true,
+      showSidenotes: this.props.showSidenotes ?? true,
+      showTopics: this.props.showTopics ?? true,
+      showStats: this.props.showStats ?? false,
+    };
+  }
+}
+</script>
+</body>
+</html>

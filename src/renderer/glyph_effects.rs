@@ -1,0 +1,431 @@
+//! Custom glyph rasterization for text effects that cosmic-text's built-in
+//! pipeline doesn't support: continuous faux-bold and faux-condense on any
+//! static font (no variable-font axis required), via swash's `embolden`
+//! and `transform` applied directly during rasterization.
+//!
+//! Shaping and layout (BiDi, kerning, line-breaking) still come from
+//! cosmic-text's `Buffer`/`layout_runs` — only the rasterization step is
+//! replaced, through glyphon's `custom_glyph` extension point. cosmic-text's
+//! own built-in `SwashCache` never calls `embolden`/`transform` for regular
+//! text (verified against its source), so getting either effect means
+//! driving swash ourselves, the same way cosmic-text's own (private)
+//! `swash.rs` module does internally, just with those two calls added.
+
+use std::collections::HashMap;
+
+use glyphon::{
+    Buffer, Color, ContentType, CustomGlyph, CustomGlyphId, FontSystem, LayoutGlyph,
+    RasterizeCustomGlyphRequest, RasterizedCustomGlyph, fontdb,
+};
+use swash::scale::{Render, ScaleContext, Source, StrikeWith, image::Content, image::Image};
+use swash::zeno::{Format, Transform};
+
+/// The synthetic per-glyph effect parameters carried by
+/// [`super::FontParameters`], in the form the placement/measurement code
+/// consumes: one value per *span* (or per whole buffer, for `draw_text`),
+/// applied to each of that span's glyphs.
+#[derive(Clone, Copy, Debug)]
+pub struct GlyphEffect {
+    /// Faux-bold outline dilation in pixels; `0.0` = none.
+    pub embolden: f32,
+    /// Faux condense/expand ratio; `1.0` = none.
+    pub condense: f32,
+    /// Tracking in EM units, mirroring `FontParameters::tracking` (and
+    /// cosmic-text's `letter_spacing`, which is where it's actually
+    /// applied). Carried here because glyph *placement* needs to know it —
+    /// see the tracking-recentering note in
+    /// [`EffectGlyphs::layout_to_custom_glyphs_with`].
+    pub tracking: f32,
+    /// Faux-italic shear factor (mirrors `FontParameters::slant`); `0.0` =
+    /// none.
+    pub slant: f32,
+}
+
+impl GlyphEffect {
+    pub const NEUTRAL: Self = Self {
+        embolden: 0.0,
+        condense: 1.0,
+        tracking: 0.0,
+        slant: 0.0,
+    };
+}
+
+impl From<&super::FontParameters> for GlyphEffect {
+    fn from(parameters: &super::FontParameters) -> Self {
+        Self {
+            embolden: parameters.weight,
+            condense: parameters.width,
+            tracking: parameters.tracking,
+            slant: parameters.slant,
+        }
+    }
+}
+
+/// Identifies one distinct (font, glyph, size, weight, condense, slant)
+/// combination. Floats are stored as bits so the key can derive `Eq`/`Hash`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct EffectGlyphKey {
+    font_id: fontdb::ID,
+    glyph_id: u16,
+    size_bits: u32,
+    embolden_bits: u32,
+    condense_bits: u32,
+    slant_bits: u32,
+}
+
+/// Rasterizes text through swash directly instead of cosmic-text's built-in
+/// `SwashCache`, so `embolden` (faux bold) and `transform` (faux condense,
+/// faux italic) can be applied on any font. A simple map keyed by [`EffectGlyphKey`] is
+/// the honest scale for a Phase 0 spike (a handful of demo lines) — no
+/// eviction; real documents with thousands of glyphs are a later problem.
+pub struct EffectGlyphs {
+    scale_context: ScaleContext,
+    cache: HashMap<EffectGlyphKey, Image>,
+    ids: HashMap<EffectGlyphKey, CustomGlyphId>,
+    keys_by_id: HashMap<CustomGlyphId, EffectGlyphKey>,
+    next_id: u16,
+}
+
+impl Default for EffectGlyphs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EffectGlyphs {
+    pub fn new() -> Self {
+        Self {
+            scale_context: ScaleContext::new(),
+            cache: HashMap::new(),
+            ids: HashMap::new(),
+            keys_by_id: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    /// Convert a shaped `Buffer`'s glyphs into `CustomGlyph` entries, with
+    /// `embolden`/`condense`/`slant` applied uniformly to every glyph.
+    /// `left`/`top` place the buffer's own origin on screen, matching how a
+    /// normal `TextArea` positions text.
+    ///
+    /// Rasterizes any not-yet-seen (font, glyph, size, weight, condense)
+    /// combination immediately, rather than lazily inside the rasterize
+    /// callback — glyphon requires a `CustomGlyph`'s exact pixel width/height
+    /// to be declared up front, before it asks for the bitmap, and that size
+    /// isn't known until swash has actually rendered the glyph.
+    pub fn layout_to_custom_glyphs(
+        &mut self,
+        font_system: &mut FontSystem,
+        buffer: &Buffer,
+        position: (f32, f32),
+        effect: GlyphEffect,
+        color: [u8; 4],
+    ) -> Vec<CustomGlyph> {
+        let uniform_color = Color::rgba(color[0], color[1], color[2], color[3]);
+        self.layout_to_custom_glyphs_with(font_system, buffer, position, |_glyph| {
+            (effect, uniform_color)
+        })
+    }
+
+    /// Per-span variant, for `Layer::draw_styled_text`: every span in a
+    /// call is shaped together as one cosmic-text rich-text buffer (see
+    /// `TextStack::shape_spans`), so unlike [`Self::layout_to_custom_glyphs`]
+    /// there's no single effect/color for the whole buffer — each glyph
+    /// recovers its own span's `(weight, width)` via `glyph.metadata`, an
+    /// index into `span_effects` (cosmic-text has no native per-span
+    /// concept for this synthetic effect, so it rides through shaping via
+    /// the generic `metadata` field `shape_spans` tags every span with).
+    /// Color, unlike weight/width, *is* native to cosmic-text — it comes
+    /// back already resolved per glyph via `glyph.color_opt`.
+    pub fn layout_to_custom_glyphs_spans(
+        &mut self,
+        font_system: &mut FontSystem,
+        buffer: &Buffer,
+        position: (f32, f32),
+        span_effects: &[GlyphEffect],
+    ) -> Vec<CustomGlyph> {
+        self.layout_to_custom_glyphs_with(font_system, buffer, position, |glyph| {
+            let effect = span_effects
+                .get(glyph.metadata)
+                .copied()
+                .unwrap_or(GlyphEffect::NEUTRAL);
+            let color = glyph
+                .color_opt
+                .unwrap_or(Color::rgba(0xFF, 0xFF, 0xFF, 0xFF));
+            (effect, color)
+        })
+    }
+
+    /// Shared core of [`Self::layout_to_custom_glyphs`]/
+    /// [`Self::layout_to_custom_glyphs_spans`]: walks every glyph in
+    /// `buffer`, asking `effect_and_color` for that glyph's
+    /// `(embolden, condense, slant)`/color, then rasterizes (cached by
+    /// `EffectGlyphKey`) and emits a `CustomGlyph`.
+    fn layout_to_custom_glyphs_with(
+        &mut self,
+        font_system: &mut FontSystem,
+        buffer: &Buffer,
+        position: (f32, f32),
+        mut effect_and_color: impl FnMut(&LayoutGlyph) -> (GlyphEffect, Color),
+    ) -> Vec<CustomGlyph> {
+        let (left, top) = position;
+        let mut glyphs = Vec::new();
+        for run in buffer.layout_runs() {
+            // `weight`/`width` are rasterization-time effects cosmic-text's
+            // shaper never sees, so it reserves each glyph only its
+            // *unmodified* advance. The pen corrections here mirror what
+            // FreeType documents for its own faux bold
+            // (`FT_Outline_Embolden`): dilation pushes ink outward by
+            // `embolden` px on *every* side, so each emboldened glyph is
+            // offset right by `embolden` (re-centering the ink in its
+            // slot) and its advance grows by `2 * embolden`; faux-condense
+            // scales ink toward the glyph origin by `condense`, so its
+            // advance scales by `condense` too (a compensating-only-one-
+            // side `+embolden` was tried first: bold still clipped its
+            // left neighbor, and condensed spans still gapped).
+            // `pen_delta` accumulates corrected-minus-natural advances —
+            // pure per-glyph arithmetic from the shaped `glyph.w`, never
+            // inference from rasterized bitmap edges (also tried: normal
+            // antialiased glyphs routinely overhang their advance, which
+            // compounded into runaway gaps on plain text). Measurement
+            // applies these same deltas — see
+            // `text_stack::measure_shaped_buffer_with`. Reset per run,
+            // since each run is an independent visual line.
+            let mut pen_delta: f32 = 0.0;
+            for glyph in run.glyphs {
+                let (effect, color) = effect_and_color(glyph);
+                let embolden = effect.embolden.max(0.0);
+                let condense = effect.condense;
+                let slant = effect.slant;
+                let physical = glyph.physical((left, top + run.line_y), 1.0);
+                // cosmic-text applies letter-spacing CSS-style: the whole
+                // track is appended *after* each glyph's advance (see its
+                // shape.rs), which makes a tracked span cram flush against
+                // whatever precedes it while leaving a full orphan track
+                // dangling after its last glyph. Shifting every tracked
+                // glyph right by half a track recenters it: interior gaps
+                // are untouched (all glyphs shift equally), and each span
+                // boundary ends up with half a track instead of
+                // zero-then-full — how professional layout engines treat
+                // tracking (space *between* letters, not after them).
+                // Scaled by `condense` because the track rides inside
+                // `glyph.w`, which `pen_delta` condenses along with
+                // everything else.
+                let track_shift = 0.5 * effect.tracking * glyph.font_size * condense;
+                // Updated before the whitespace `continue`s below — a
+                // space inside a condensed/bold span adjusts the pen the
+                // same way an inked glyph does.
+                let render_x = physical.x as f32 + pen_delta + embolden + track_shift;
+                pen_delta += effect_advance_delta(embolden, condense, glyph.w);
+
+                let key = EffectGlyphKey {
+                    font_id: physical.cache_key.font_id,
+                    glyph_id: physical.cache_key.glyph_id,
+                    size_bits: physical.cache_key.font_size_bits,
+                    embolden_bits: embolden.to_bits(),
+                    condense_bits: condense.to_bits(),
+                    slant_bits: slant.to_bits(),
+                };
+
+                if !self.cache.contains_key(&key)
+                    && let Some(image) = rasterize_glyph(
+                        &mut self.scale_context,
+                        font_system,
+                        key,
+                        physical.cache_key.font_weight,
+                        embolden,
+                        condense,
+                        slant,
+                    )
+                {
+                    self.cache.insert(key, image);
+                }
+                let Some(image) = self.cache.get(&key) else {
+                    continue; // no outline for this glyph (e.g. whitespace)
+                };
+                if image.placement.width == 0 || image.placement.height == 0 {
+                    continue;
+                }
+
+                let id = if let Some(&id) = self.ids.get(&key) {
+                    id
+                } else {
+                    let id: CustomGlyphId = self.next_id;
+                    self.next_id += 1;
+                    self.ids.insert(key, id);
+                    self.keys_by_id.insert(id, key);
+                    id
+                };
+
+                // A color glyph (bitmap or COLR emoji) already carries its
+                // own full RGBA — glyphon's shader ignores `CustomGlyph`'s
+                // `color` entirely for `ContentType::Color` content (see
+                // `rasterize`'s doc), so `None` here just documents that
+                // rather than changing behavior.
+                let glyph_color = if image.content == Content::Color {
+                    None
+                } else {
+                    Some(color)
+                };
+
+                glyphs.push(CustomGlyph {
+                    id,
+                    left: render_x + image.placement.left as f32,
+                    top: physical.y as f32 - image.placement.top as f32,
+                    width: image.placement.width as f32,
+                    height: image.placement.height as f32,
+                    color: glyph_color,
+                    snap_to_physical_pixel: true,
+                    metadata: 0,
+                });
+            }
+        }
+        glyphs
+    }
+
+    /// The `rasterize_custom_glyph` callback for
+    /// `TextRenderer::prepare_with_custom`. Looks up the image already
+    /// rendered by [`Self::layout_to_custom_glyphs`] — no swash work happens
+    /// here, only a cache read.
+    pub fn rasterize(&self, request: RasterizeCustomGlyphRequest) -> Option<RasterizedCustomGlyph> {
+        let key = *self.keys_by_id.get(&request.id)?;
+        let image = self.cache.get(&key)?;
+        // `Content::Color` (bitmap/COLR emoji) carries full RGBA and is
+        // drawn as-is; `Mask`/`SubpixelMask` (plain outline glyphs — always
+        // `Mask` here, since rasterization always requests `Format::Alpha`)
+        // carry single-channel coverage, tinted by the text's own color —
+        // see glyphon's `shader.wgsl` `fs_main` for exactly how each
+        // `content_type` is interpreted.
+        let content_type = match image.content {
+            Content::Color => ContentType::Color,
+            Content::Mask | Content::SubpixelMask => ContentType::Mask,
+        };
+        Some(RasterizedCustomGlyph {
+            data: image.data.clone(),
+            content_type,
+        })
+    }
+}
+
+/// How much wider (or narrower, for condense) a glyph's advance becomes
+/// once its synthetic effects are applied, relative to the `natural_advance`
+/// cosmic-text shaped it with: `2 * embolden` for faux bold (ink dilates by
+/// `embolden` px on each side — FreeType's documented advance correction
+/// for its equivalent `FT_Outline_Embolden`), and the advance scales by
+/// `condense` for faux condense/expand, exactly as the ink does. Used by
+/// both glyph placement ([`EffectGlyphs::layout_to_custom_glyphs_with`]'s
+/// `pen_delta`) and text measurement
+/// (`text_stack::measure_shaped_buffer_with`) so rendered and measured
+/// widths always agree. `embolden` is expected pre-clamped to `>= 0.0`.
+pub fn effect_advance_delta(embolden: f32, condense: f32, natural_advance: f32) -> f32 {
+    (condense - 1.0) * natural_advance + 2.0 * embolden
+}
+
+/// The swash [`Transform`] combining faux-condense (horizontal scale) with
+/// faux-italic (horizontal shear): `x' = condense * x + slant * y; y' = y`
+/// (font outlines are y-up with baseline at 0, so +y shears right — the
+/// italic direction). `None` when both effects are neutral, keeping the
+/// untouched outlines on swash's fast path.
+fn effect_transform(condense: f32, slant: f32) -> Option<Transform> {
+    (condense != 1.0 || slant != 0.0).then(|| Transform::new(condense, 0.0, slant, 1.0, 0.0, 0.0))
+}
+
+/// Rasterize one glyph via swash directly, applying `embolden` (continuous
+/// faux-bold outline expansion) and, if `condense != 1.0` or `slant != 0.0`,
+/// a single composed `transform` (faux condense/expand + faux italic shear).
+/// Mirrors the recipe cosmic-text's own private `swash.rs` uses internally,
+/// minus the two calls it never makes.
+fn rasterize_glyph(
+    scale_context: &mut ScaleContext,
+    font_system: &mut FontSystem,
+    key: EffectGlyphKey,
+    weight: fontdb::Weight,
+    embolden: f32,
+    condense: f32,
+    slant: f32,
+) -> Option<Image> {
+    let font = font_system.get_font(key.font_id, weight)?;
+    let size = f32::from_bits(key.size_bits);
+    let mut scaler = scale_context
+        .builder(font.as_swash())
+        .size(size)
+        .hint(true)
+        .build();
+    // Color sources first (embedded-bitmap emoji, then COLR layered-outline
+    // emoji), falling back to the plain monochrome outline every other
+    // glyph uses. Each source is a no-op fallthrough when the font doesn't
+    // have it (`has_color_bitmaps`/`has_color_outlines`/`has_outlines`,
+    // checked internally by swash's `render_into`) — so this is exactly
+    // the previous behavior for every non-emoji glyph. `embolden`/
+    // `transform` only apply where swash's own `render_into` applies them
+    // (`Outline` unconditionally, `ColorOutline` for `transform` only) —
+    // harmlessly ignored for the embedded-bitmap source, which has no
+    // outline to dilate/skew in the first place.
+    Render::new(&[
+        Source::ColorBitmap(StrikeWith::BestFit),
+        Source::ColorOutline(0),
+        Source::Outline,
+    ])
+    .format(Format::Alpha)
+    .embolden(embolden)
+    .transform(effect_transform(condense, slant))
+    .render(&mut scaler, key.glyph_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    use glyphon::fontdb;
+    use swash::zeno::Point;
+
+    use super::{EffectGlyphKey, effect_transform};
+
+    fn key(slant: f32) -> EffectGlyphKey {
+        EffectGlyphKey {
+            font_id: fontdb::ID::dummy(),
+            glyph_id: 42,
+            size_bits: 17.5_f32.to_bits(),
+            embolden_bits: 0.0_f32.to_bits(),
+            condense_bits: 1.0_f32.to_bits(),
+            slant_bits: slant.to_bits(),
+        }
+    }
+
+    fn hash_of(key: &EffectGlyphKey) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn slant_participates_in_raster_cache_key() {
+        let roman = key(0.0);
+        let italic = key(0.25);
+        assert_ne!(
+            roman, italic,
+            "differently-slanted glyphs must not share a cache entry"
+        );
+        assert_ne!(hash_of(&roman), hash_of(&italic));
+    }
+
+    #[test]
+    fn effect_transform_shears_italics_without_touching_y() {
+        // x' = condense * x + slant * y ; y' = y
+        let t = effect_transform(1.0, 0.25).expect("slant must produce a transform");
+        let p = t.transform_point(Point { x: 10.0, y: 20.0 });
+        assert_eq!(p.x, 15.0);
+        assert_eq!(p.y, 20.0);
+        // Condense alone keeps the vertical axis: x' = condense * x.
+        let c = effect_transform(0.8, 0.0).expect("condense must produce a transform");
+        let p = c.transform_point(Point { x: 10.0, y: 20.0 });
+        assert_eq!(p.x, 8.0);
+        assert_eq!(p.y, 20.0);
+    }
+
+    #[test]
+    fn neutral_effects_omit_the_transform() {
+        assert!(effect_transform(1.0, 0.0).is_none());
+    }
+}

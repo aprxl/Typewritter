@@ -1,0 +1,22 @@
+[package]
+name = "typewritter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Vendored Atomos platform (src/renderer, src/input.rs, src/frame.rs,
+# src/animation.rs) — see docs/atomos/. Versions track Atomos; wgpu is
+# pinned to glyphon's, upgrade the two together.
+bytemuck = { version = "1.18", features = ["derive"] }
+glyphon = "0.11.0"
+fuzzy-matcher = "0.3.7"
+image = { version = "0.25", default-features = false, features = ["png"] }
+lyon = "1.0.19"
+lyon_extra = "1.1"
+pollster = "0.4"
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "pollster"] }
+serde = { version = "1.0.229", features = ["derive"] }
+swash = "0.2.9"
+toml = "1.1.4"
+wgpu = "29.0.4"
+winit = "0.30.13"
