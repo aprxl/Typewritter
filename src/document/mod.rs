@@ -22,6 +22,12 @@ pub struct Document {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Block {
     Paragraph(Vec<Inline>),
+    /// A horizontal rule. It holds a single empty run so it satisfies the
+    /// "every block has a run" invariant and the caret can rest on it like
+    /// any other empty line; typing there turns it back into a paragraph
+    /// (see `prune_runs`). The rule itself is drawn by the editor — this
+    /// block has no content of its own.
+    Divider(Vec<Inline>),
     Heading {
         level: u8,
         content: Vec<Inline>,
@@ -133,6 +139,7 @@ impl Block {
     pub fn inlines(&self) -> &[Inline] {
         match self {
             Block::Paragraph(inlines)
+            | Block::Divider(inlines)
             | Block::Heading {
                 content: inlines, ..
             } => inlines,
@@ -143,6 +150,7 @@ impl Block {
     pub fn inlines_mut(&mut self) -> &mut Vec<Inline> {
         match self {
             Block::Paragraph(inlines)
+            | Block::Divider(inlines)
             | Block::Heading {
                 content: inlines, ..
             } => inlines,
@@ -152,6 +160,10 @@ impl Block {
 
     pub fn is_heading(&self) -> bool {
         matches!(self, Block::Heading { .. })
+    }
+
+    pub fn is_divider(&self) -> bool {
+        matches!(self, Block::Divider(_))
     }
 
     pub fn is_code(&self) -> bool {
@@ -198,6 +210,14 @@ fn style_matches(style: Style, mask: Style) -> bool {
 /// The block the caret's placeholder-empty state lives in.
 fn empty_block() -> Block {
     Block::Paragraph(vec![Inline::Text(Text {
+        text: String::new(),
+        style: Style::PLAIN,
+    })])
+}
+
+/// A rule block, holding the one empty run every block must have.
+fn divider_block() -> Block {
+    Block::Divider(vec![Inline::Text(Text {
         text: String::new(),
         style: Style::PLAIN,
     })])
@@ -528,6 +548,7 @@ impl Document {
         }
         match block {
             Block::Paragraph(_) => Block::Paragraph(runs),
+            Block::Divider(_) => Block::Divider(runs),
             Block::Heading { level, .. } => Block::Heading {
                 level: *level,
                 content: runs,
@@ -825,6 +846,12 @@ impl Document {
     fn prune_runs(&mut self) {
         for block in &mut self.blocks {
             block.inlines_mut().retain(|r| !r.text().is_empty());
+            // A rule holds no text. Typing on one turns it into prose —
+            // enforced centrally here, so every edit path gets it without
+            // a special case of its own.
+            if block.is_divider() && block.inlines().iter().any(|r| !r.text().is_empty()) {
+                *block = Block::Paragraph(std::mem::take(block.inlines_mut()));
+            }
             if block.inlines().is_empty() {
                 *block = match block {
                     Block::Heading { level, .. } => Block::Heading {
@@ -845,6 +872,7 @@ impl Document {
                         first: *first,
                         lang: lang.clone(),
                     },
+                    Block::Divider(_) => divider_block(),
                     Block::Paragraph(_) => empty_block(),
                 };
             }
@@ -1358,6 +1386,27 @@ impl Document {
         self.enforce();
     }
 
+    /// Puts a rule below the caret's block and leaves the caret on a fresh
+    /// empty paragraph after it — a rule is a separator you keep writing
+    /// past, never a place to land. An empty block is replaced rather than
+    /// pushed down, so a rule on a blank line does not leave a gap above
+    /// itself.
+    pub fn insert_divider(&mut self) {
+        self.clamp_caret();
+        let b = self.caret.block;
+        let at = if self.block_len(b) == 0 {
+            self.blocks[b] = divider_block();
+            b
+        } else {
+            self.blocks.insert(b + 1, divider_block());
+            b + 1
+        };
+        self.blocks.insert(at + 1, empty_block());
+        self.set_caret(at + 1, 0, 0);
+        self.dirty = true;
+        self.enforce();
+    }
+
     /// After a deletion the context is the style of the char now before the
     /// caret (PLAIN at block start).
     fn refresh_context(&mut self) {
@@ -1504,6 +1553,7 @@ mod tests {
             }
             .is_heading()
         );
+        assert!(Block::Divider(vec![]).is_divider());
     }
 
     #[test]
@@ -1859,6 +1909,44 @@ mod tests {
         d.set_heading(None);
         assert!(!d.blocks[0].is_heading());
         assert_eq!(runs(&d.blocks[0]), vec![("hello".into(), Style::PLAIN)]);
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn a_divider_inserted_on_a_blank_line_replaces_it() {
+        let mut d = doc();
+        d.insert_divider();
+        assert_eq!(d.blocks.len(), 2);
+        assert!(d.blocks[0].is_divider());
+        assert_eq!(runs(&d.blocks[0]), vec![(String::new(), Style::PLAIN)]);
+        assert_eq!(text_of_block(&d, 1), "");
+        assert_eq!(d.caret.block, 1);
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn a_divider_after_text_keeps_the_text() {
+        let mut d = doc();
+        d.insert_text("text");
+        d.insert_divider();
+        assert_eq!(d.blocks.len(), 3);
+        assert_eq!(text_of_block(&d, 0), "text");
+        assert!(d.blocks[1].is_divider());
+        assert_eq!(text_of_block(&d, 2), "");
+        assert_eq!(d.caret.block, 2);
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn typing_on_a_rule_turns_it_back_into_a_paragraph() {
+        let mut d = doc();
+        d.insert_divider();
+        d.set_caret(0, 0, 0);
+        d.insert_text("typed");
+        assert!(matches!(d.blocks[0], Block::Paragraph(_)));
+        assert_eq!(text_of_block(&d, 0), "typed");
+        assert_eq!(d.blocks.len(), 2);
+        assert_eq!(d.caret.block, 0);
         assert_invariants(&d);
     }
 

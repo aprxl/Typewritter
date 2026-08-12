@@ -20,12 +20,18 @@ pub const LINE_H1: f32 = 42.0;
 pub const LINE_H2: f32 = 36.0;
 pub const LINE_H3: f32 = 32.0;
 pub const LINE_H4: f32 = 30.0;
+/// The band a rule occupies. Deliberately shorter than a body line: a rule
+/// separates, and a big hole around it disrupts reading more than the
+/// separation it buys is worth.
+pub const LINE_DIVIDER: f32 = 20.0;
 /// Space below a paragraph.
 pub const GAP_PARAGRAPH: f32 = 14.0;
 /// Space *above* a heading (the first block gets none).
 pub const GAP_HEADING: f32 = 26.0;
 /// Space below a heading.
 pub const GAP_AFTER_HEADING: f32 = 8.0;
+/// Space below a rule — tighter than a paragraph's, for the same reason.
+pub const GAP_DIVIDER: f32 = 8.0;
 
 /// A run of a visual line that came from one source run, covering exactly
 /// `[start, start + len)` chars of it. Ranges on a line are contiguous and
@@ -91,7 +97,7 @@ pub fn text_style(kind: &Block, style: Style) -> TextStyle {
             theme::INK,
         )
         .bold(),
-        Block::Paragraph(_) => TextStyle::serif(17.5, theme::INK),
+        Block::Paragraph(_) | Block::Divider(_) => TextStyle::serif(17.5, theme::INK),
         Block::CodeLine { .. } => TextStyle::mono(17.5, theme::INK),
     };
     if style.bold {
@@ -256,6 +262,7 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
             Block::Heading { level: 2, .. } => LINE_H2,
             Block::Heading { level: 3, .. } => LINE_H3,
             Block::Heading { level: 4, .. } => LINE_H4,
+            Block::Divider(_) => LINE_DIVIDER,
             Block::Heading { .. } | Block::Paragraph(_) | Block::CodeLine { .. } => LINE_BODY,
         };
 
@@ -285,6 +292,8 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
             0.0
         } else if block.is_heading() {
             GAP_AFTER_HEADING
+        } else if block.is_divider() {
+            GAP_DIVIDER
         } else {
             GAP_PARAGRAPH
         };
@@ -855,6 +864,24 @@ mod tests {
         assert_eq!(hit.block, 0);
         assert_eq!(hit.offset, 0);
         assert_eq!(hit.style, Style::PLAIN);
+    }
+
+    #[test]
+    fn a_rule_costs_less_vertical_space_than_a_blank_line() {
+        let d = doc_with(vec![
+            para("a"),
+            Block::Divider(vec![Inline::Text(Text {
+                text: String::new(),
+                style: Style::PLAIN,
+            })]),
+        ]);
+        let laid = layout(&d, 200.0, &fake_measure);
+        assert_eq!(laid.blocks[1].height, LINE_DIVIDER);
+        assert_eq!(laid.blocks[1].lines.len(), 1);
+        assert!(laid.blocks[1].lines[0].segments.is_empty());
+
+        let blank = doc_with(vec![para("a"), para("")]);
+        assert!(laid.height < layout(&blank, 200.0, &fake_measure).height);
     }
 
     #[test]

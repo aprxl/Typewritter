@@ -286,6 +286,13 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.docs.borrow_mut().set_code(true),
     },
     Command {
+        id: "format.divider",
+        title: "Divider",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().insert_divider(),
+    },
+    Command {
         id: "format.inline_code",
         title: "Inline code",
         group: "Format",

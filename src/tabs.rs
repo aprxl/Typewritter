@@ -408,6 +408,10 @@ impl Tabs {
         self.edit(|doc| doc.set_heading(level));
     }
 
+    pub fn insert_divider(&mut self) {
+        self.edit(|doc| doc.insert_divider());
+    }
+
     /// Flip bold/italic on the pending context. Caret-only — never promotes
     /// a preview tab (a bold/italic toggle doesn't touch content).
     pub fn toggle_bold(&mut self) {

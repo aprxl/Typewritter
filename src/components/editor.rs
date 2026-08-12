@@ -283,6 +283,20 @@ impl Component for Editor {
         let mut pieces: Vec<Painted> = Vec::new();
         for (bi, block) in self.layout.blocks.iter().enumerate() {
             let kind = &self.layout.source[bi];
+            // A rule has no runs to paint, so it is drawn here rather than
+            // in the text pass below: a hairline centred in its own short
+            // band, spanning the text column and nothing more.
+            if kind.is_divider() {
+                if let Some(line) = block.lines.first() {
+                    let top = content + line.y - self.scroll;
+                    if top + line.height >= rect.y && top <= rect.bottom() {
+                        // Whole pixel: a 1px rule on a fraction smears.
+                        let y = (top + line.height * 0.5).round();
+                        theme::rule(layer, (x, y), Self::content_width(rect), 1.0, theme::BORDER);
+                    }
+                }
+                continue;
+            }
             for line in &block.lines {
                 let top = content + line.y - self.scroll;
                 if top + line.height < rect.y || top > rect.bottom() {

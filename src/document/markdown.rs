@@ -231,6 +231,14 @@ fn empty_paragraph() -> Block {
     })])
 }
 
+/// A thematic break: three or more `-` alone on a line. Only `-` is
+/// accepted — `***` and `___` mean the same thing in CommonMark, but this
+/// app writes `---`, and accepting one spelling keeps the round trip exact.
+fn is_divider_line(line: &str) -> bool {
+    let line = line.trim();
+    line.len() >= 3 && line.chars().all(|c| c == '-')
+}
+
 /// Parse a line as a heading `#{1,4}\s+...`. Returns `(level, content)`.
 fn parse_heading(line: &str) -> Option<(u8, &str)> {
     let bytes = line.as_bytes();
@@ -315,6 +323,14 @@ pub fn parse(path: &Path, text: &str) -> Document {
             };
             in_fence = true;
             fence_had_lines = false;
+            continue;
+        }
+        if is_divider_line(line) {
+            flush_para(&mut blocks, &mut para);
+            blocks.push(Block::Divider(vec![Inline::Text(Text {
+                text: String::new(),
+                style: Style::PLAIN,
+            })]));
             continue;
         }
         if let Some((level, content)) = parse_heading(line) {
@@ -504,11 +520,20 @@ pub fn serialize(doc: &Document) -> String {
                 out.push_str(&serialize_runs(content));
                 i += 1;
             }
+            Block::Divider(_) => {
+                out.push_str("---");
+                i += 1;
+            }
             Block::Paragraph(runs) => {
                 let mut line = serialize_runs(runs);
                 // Guard a paragraph that would otherwise re-read as a
                 // heading (e.g. text `# foo`).
                 if line.starts_with('#') {
+                    line.insert(0, '\\');
+                }
+                // Guard a paragraph that would otherwise re-read as a
+                // divider (e.g. text `---`).
+                if is_divider_line(&line) {
                     line.insert(0, '\\');
                 }
                 out.push_str(&line);
@@ -663,6 +688,22 @@ mod tests {
             let ast = serialize(&parse(Path::new("x"), s));
             assert_eq!(once, ast, "canonical stability failed for {s:?}");
         }
+    }
+
+    #[test]
+    fn a_rule_round_trips() {
+        let d = parse(Path::new("x"), "before\n\n---\n\nafter\n");
+        assert!(d.blocks[1].is_divider());
+        assert_eq!(serialize(&d), "before\n\n---\n\nafter\n");
+        assert_eq!(parse(Path::new("x"), &serialize(&d)).blocks, d.blocks);
+    }
+
+    #[test]
+    fn a_paragraph_of_dashes_is_not_a_rule() {
+        let d = parse(Path::new("x"), "\\---\n");
+        assert!(matches!(d.blocks[0], Block::Paragraph(_)));
+        assert_eq!(text_of_block(&d, 0), "---");
+        assert_eq!(serialize(&d), "\\---\n");
     }
 
     #[test]
