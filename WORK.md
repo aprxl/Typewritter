@@ -1,10 +1,8 @@
 # Work log
 
 State at handoff: `cargo fmt --check` clean, `cargo clippy --all-targets -D
-warnings` clean, 185 tests passing, `timeout 6 ./target/release/typewritter`
-exits 124 with no panic or wgpu error. Nothing is committed yet — the repo has
-no commits at all, and `git commit` is blocked until a git identity is set
-(`git config --global user.name`/`user.email`).
+warnings` clean, 205 tests passing, and the tree committed as `d5caaa1`
+(`Initial commit: Typewritter, plus today's bug-fix wave`).
 
 ---
 
@@ -152,3 +150,62 @@ call); pausing the pulse when nothing is live would take idle CPU near zero, but
 that is a product decision. The larger renderer-side items — rect-sized layer
 textures, the measure-only shape cache, `EffectGlyphs` eviction — are Atomos's
 and are ranked in `~/.dev/Atomos/FEEDBACK.md`.
+
+---
+
+## Session log — bug fixes from classroom testing
+
+**`src/vault.rs`, `src/components/dialog.rs`, `src/shell/commands.rs`,
+`src/shell/input.rs`** — folders. There was no way to create one and no way to
+put a note inside one: `create_note` refused any name containing `/` and always
+wrote to the vault root. Now `Ctrl+Shift+N` opens a `Prompt::NewFolder`, a new
+note lands in whatever folder is selected in the tree (the parent folder when a
+file is selected, the vault root when nothing is), and a typed name may be a
+relative path such as `math/lecture 3` whose parents are created on the way.
+Absolute paths and `..` are refused in `resolve_new_path`. `Vault::refresh` used
+to re-read only the top level and throw away every expanded folder, so a file
+created inside one was invisible; it now merges the fresh listing with the old
+expansion state, and the new `Vault::reveal` expands every ancestor of whatever
+was just created.
+
+**`src/components/editor.rs`** — the current-line band was drawn inside
+`if self.caret_on`, so the whole line highlight blinked along with the caret.
+The band is the line indicator and is now drawn every frame; only the caret bar
+stays blink-gated.
+
+**`src/components/editor.rs`, `src/shell/mod.rs`** — the editor could not
+scroll past the end of the file, which left the last line stuck against the
+bottom edge of the window. New `editor::max_scroll` adds `OVERSCROLL` (half the
+visible height) of empty space past the last line, and `Shell::editor_max_scroll`
+calls it.
+
+**`src/main.rs`** — random black flashes lasting one to three frames. A
+compositor can report a zero-sized window mid-resize; solving the layout against
+it collapses every region's rect, and `Region::update` then clears every layer
+without drawing into it, leaving the renderer's clear colour on screen.
+`App::frame` now returns early on a degenerate viewport, keeping the last good
+frame.
+
+**`src/main.rs`, `src/input.rs`** — dead keys and system input methods produced
+nothing on macOS. winit only sends `WindowEvent::Ime` when IME is allowed and it
+is off by default; its own documentation notes that on macOS IME must be enabled
+for dead-key sequences to combine at all. The window now calls
+`set_ime_allowed(true)` and `Ime::Commit` folds into the same per-frame `text()`
+buffer. winit delivers no `KeyboardInput` during a preedit, so a commit cannot
+double up with typed text. Not yet drawn: the preedit itself, so a sequence in
+flight is invisible until it commits.
+
+**`src/shell/mod.rs`, `src/shell/input.rs`** — only the file tree could be
+drag-resized. `Shell::divider()` became `dividers()`/`divider_at()` over a new
+`Divider` enum, and `dragging` went from `bool` to `Option<Divider>`. The topics
+outline and the sidenote margin are measured from their own right edge
+(`dragged_width`), since they grow leftwards, while the tree still grows
+rightwards. `divider_hot` still means the tree's divider specifically, because
+that is what the file tree draws its accent rule from.
+
+Every change is covered by `cargo test` (205 passing), and the folder creation,
+the non-blinking band and the IME path were additionally verified against the
+running app by injecting real key events through `/dev/uinput` and reading the
+saved Markdown back off disk — but the two mouse-driven paths (wheel overscroll
+and divider dragging) rest on unit tests only, because pointer injection could
+not be made to reach the app under this compositor.
