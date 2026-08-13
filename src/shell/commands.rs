@@ -325,6 +325,21 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.docs.borrow_mut().insert_divider(),
     },
     Command {
+        // SPEC §6.1: <leader>m once a leader-binding mechanism exists.
+        id: "format.math",
+        title: "Math",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().insert_inline_math(),
+    },
+    Command {
+        id: "format.math_block",
+        title: "Math block",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().insert_math_block(),
+    },
+    Command {
         id: "format.inline_code",
         title: "Inline code",
         group: "Format",
@@ -490,6 +505,12 @@ mod tests {
         let editor_titles: Vec<String> = editor_entries().iter().map(|e| e.title.clone()).collect();
         let expected: Vec<String> = in_table.iter().map(|c| c.title.to_string()).collect();
         assert_eq!(editor_titles, expected);
+        assert!(editor.iter().any(|command| command.id == "format.math"));
+        assert!(
+            editor
+                .iter()
+                .any(|command| command.id == "format.math_block")
+        );
     }
 
     #[test]

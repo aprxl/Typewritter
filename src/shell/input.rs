@@ -142,6 +142,7 @@ impl Shell {
         let mouse = input.mouse_position();
         let over_editor = input.is_cursor_in_window() && rect.contains(mouse);
         let has_tab = self.docs.borrow().active().is_some();
+        let in_math = self.docs.borrow().in_math();
 
         if has_tab && over_editor && input.scroll_delta().1 != 0.0 {
             let max = self.editor_max_scroll();
@@ -151,7 +152,7 @@ impl Shell {
             self.docs.borrow_mut().set_editor_scroll(next);
         }
 
-        if has_tab && !self.vim.command_active() {
+        if has_tab && !in_math && !self.vim.command_active() {
             self.arrow_keys(input);
         }
 
@@ -257,6 +258,17 @@ impl Shell {
     /// Insert: today's typing, plus Escape popping one level back (style
     /// context first, then mode). Formatting lives in the slash menu.
     fn edit_frame_insert(&mut self, input: &Input) {
+        // Inside an expression, math owns every key: `/` builds a fraction
+        // rather than opening the slash menu, Tab walks slots, and Esc pops
+        // one level of structure before it pops the mode. Vim must not see
+        // these keys; math has no Vim state to advance, and feeding it
+        // characters would desynchronise that state.
+        let in_math = self.docs.borrow().in_math();
+        if in_math {
+            self.edit_frame_math(input);
+            return;
+        }
+
         // Bare / opens the slash menu — before the docs borrow so we can
         // call refresh_slash_menu (which needs &mut self) without a conflict.
         let text = input.text();
@@ -322,6 +334,49 @@ impl Shell {
                 self.apply(action);
             }
             self.goal_x = None;
+        }
+    }
+
+    fn edit_frame_math(&mut self, input: &Input) {
+        for c in input.text().chars() {
+            if c == '/' {
+                self.docs.borrow_mut().math_fraction();
+            } else {
+                self.docs.borrow_mut().math_type(c);
+            }
+        }
+        if input.is_key_typed(KeyCode::Backspace) {
+            self.docs.borrow_mut().math_backspace();
+        }
+        if input.is_key_typed(KeyCode::Tab) {
+            if input.shift() {
+                self.docs.borrow_mut().math_slot_prev();
+            } else {
+                self.docs.borrow_mut().math_slot_next();
+            }
+        }
+        if input.is_key_typed(KeyCode::ArrowLeft) {
+            let moved = self.docs.borrow_mut().math_left();
+            if !moved {
+                self.docs.borrow_mut().math_exit();
+                self.docs.borrow_mut().move_left();
+            }
+        }
+        if input.is_key_typed(KeyCode::ArrowRight) {
+            let moved = self.docs.borrow_mut().math_right();
+            if !moved {
+                self.docs.borrow_mut().math_exit();
+            }
+        }
+        if input.is_key_pressed(KeyCode::Escape) {
+            let popped = self.docs.borrow_mut().math_pop();
+            if !popped {
+                self.docs.borrow_mut().math_exit();
+            }
+        }
+        if input.is_key_typed(KeyCode::Enter) {
+            self.docs.borrow_mut().math_exit();
+            self.docs.borrow_mut().newline();
         }
     }
 

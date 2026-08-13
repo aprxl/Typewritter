@@ -21,6 +21,7 @@ pub struct StatusLine {
     note: String,
     saved: String,
     words: String,
+    math_path: String,
     command: String,
     show_stats: bool,
     frametime: Duration,
@@ -45,6 +46,7 @@ impl StatusLine {
             note,
             saved,
             words,
+            math_path: String::new(),
             command,
             show_stats,
             frametime: Duration::ZERO,
@@ -52,6 +54,11 @@ impl StatusLine {
             redraws: (0, 0),
             dirty: Dirty::new(),
         }
+    }
+
+    pub fn with_math_path(mut self, math_path: String) -> Self {
+        self.math_path = math_path;
+        self
     }
 
     fn stats(&self) -> String {
@@ -76,8 +83,14 @@ impl Component for StatusLine {
         } else {
             &self.command
         };
+        let math_width = if self.math_path.is_empty() {
+            0.0
+        } else {
+            theme::width(layer, &self.math_path, &body) + 32.0
+        };
         let left = theme::width(layer, &self.mode, &TextStyle::mono(10.0, theme::BACKGROUND))
             + theme::width(layer, note, &body)
+            + math_width
             + 90.0;
         let right = theme::width(layer, &self.saved, &body)
             + theme::width(layer, &self.words, &body)
@@ -181,7 +194,8 @@ impl Component for StatusLine {
         } else {
             &self.command
         };
-        if x + theme::width(layer, note, &body) < right {
+        let note_width = theme::width(layer, note, &body);
+        if x + note_width < right {
             theme::draw(
                 layer,
                 note,
@@ -189,6 +203,27 @@ impl Component for StatusLine {
                 &body.clone().color(theme::INK),
                 theme::LEFT,
             );
+            if !self.math_path.is_empty() {
+                let path_x = x + note_width + 12.0;
+                let path_width = theme::width(layer, &self.math_path, &body);
+                if path_x + 20.0 + path_width < right {
+                    theme::icon(
+                        layer,
+                        icons::NEXT_SLOT,
+                        (path_x, middle - 6.5),
+                        13.0,
+                        theme::NON_TEXT,
+                        1.9,
+                    );
+                    theme::draw(
+                        layer,
+                        &self.math_path,
+                        (path_x + 20.0, middle),
+                        &body,
+                        theme::LEFT,
+                    );
+                }
+            }
         }
     }
 }

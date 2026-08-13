@@ -922,12 +922,21 @@ impl Shell {
             let width = Editor::content_width(self.layout.rect(self.text_column));
             let layout = self.current_layout(width);
             let scroll = self.docs.borrow().editor_scroll;
-            let docs = self.docs.borrow();
-            match docs.active() {
+            let mut docs = self.docs.borrow_mut();
+            match docs.active_mut() {
                 Some(tab) => {
                     let caret = tab.document.caret;
+                    let math_path = if tab.document.math.is_some() {
+                        let mut path = vec!["math"];
+                        path.extend(tab.document.math_path_names());
+                        path.join(" › ")
+                    } else {
+                        String::new()
+                    };
+                    let math = tab.document.math.clone();
                     (
                         Editor::new(layout, caret, scroll, block_caret, caret.style)
+                            .with_math(math)
                             .with_selection(selection, line_selection),
                         StatusLine::new(
                             mode_label,
@@ -941,7 +950,8 @@ impl Shell {
                             format!("{} words", tab.document.word_count()),
                             self.show_stats,
                             command.clone(),
-                        ),
+                        )
+                        .with_math_path(math_path),
                     )
                 }
                 None => (

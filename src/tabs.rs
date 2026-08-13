@@ -420,6 +420,70 @@ impl Tabs {
         self.edit(|doc| doc.insert_divider());
     }
 
+    pub fn insert_inline_math(&mut self) {
+        self.edit(Document::insert_inline_math);
+    }
+
+    pub fn insert_math_block(&mut self) {
+        self.edit(Document::insert_math_block);
+    }
+
+    pub fn math_type(&mut self, c: char) {
+        self.edit(|doc| doc.math_insert_char(c));
+    }
+
+    pub fn math_fraction(&mut self) {
+        self.edit(Document::math_insert_fraction);
+    }
+
+    pub fn math_backspace(&mut self) {
+        self.edit(|doc| {
+            doc.math_backspace();
+        });
+    }
+
+    // Math movement changes caret state, not content, so it touches rather than edits.
+    pub fn math_left(&mut self) -> bool {
+        let mut moved = false;
+        self.touch(|doc| moved = doc.math_move_left());
+        moved
+    }
+
+    pub fn math_right(&mut self) -> bool {
+        let mut moved = false;
+        self.touch(|doc| moved = doc.math_move_right());
+        moved
+    }
+
+    pub fn math_slot_next(&mut self) -> bool {
+        let mut moved = false;
+        self.touch(|doc| moved = doc.math_slot_next());
+        moved
+    }
+
+    pub fn math_slot_prev(&mut self) -> bool {
+        let mut moved = false;
+        self.touch(|doc| moved = doc.math_slot_prev());
+        moved
+    }
+
+    pub fn math_pop(&mut self) -> bool {
+        let mut popped = false;
+        self.touch(|doc| popped = doc.math_pop());
+        popped
+    }
+
+    pub fn math_exit(&mut self) {
+        self.touch(Document::math_exit);
+    }
+
+    /// Whether the caret is inside a math expression — the shell routes
+    /// keys on this, so it must come from the document rather than from
+    /// any state the shell keeps of its own.
+    pub fn in_math(&self) -> bool {
+        self.active().is_some_and(|tab| tab.document.math.is_some())
+    }
+
     /// Flip bold/italic on the pending context. Caret-only — never promotes
     /// a preview tab (a bold/italic toggle doesn't touch content).
     pub fn toggle_bold(&mut self) {
@@ -577,6 +641,22 @@ mod tests {
             !tabs.active().unwrap().preview,
             "an actual edit still promotes it"
         );
+    }
+
+    #[test]
+    fn math_edits_promote_a_preview_tab_but_moves_do_not() {
+        let edit_path = temp_file("math-edit-preview", "a");
+        let mut tabs = Tabs::new();
+        tabs.open_preview(&edit_path);
+        tabs.insert_inline_math();
+        tabs.math_type('x');
+        assert!(!tabs.active().unwrap().preview);
+
+        let move_path = temp_file("math-move-preview", "b");
+        tabs.open_preview(&move_path);
+        tabs.active_mut().unwrap().document.insert_inline_math();
+        tabs.math_left();
+        assert!(tabs.active().unwrap().preview);
     }
 
     #[test]
