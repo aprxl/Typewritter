@@ -1,11 +1,11 @@
 //! Recursive box layout for math expressions, reducing the TeX model to what
 //! fractions need. Every node measures to `(width, ascent, descent)` around a
-//! shared baseline, lists concatenate boxes, and fractions stack operands
+//! shared anchor line, lists concatenate boxes, and fractions stack operands
 //! around the math axis. A nested fraction is simply a tall child whose
 //! ancestors grow to hold it. Layout is pure and measured through a closure,
 //! so every rule remains testable without a renderer.
 //!
-//! Box origins are baseline-left. Every child tuple stores `(x, y, box)` with
+//! Box origins are anchor-left. Every child tuple stores `(x, y, box)` with
 //! `y` positive upward; a denominator therefore has a negative y offset.
 
 use crate::document::math::{MathCursor, MathList, MathNode, Slot, Step};
@@ -17,9 +17,6 @@ pub const BASE_SIZE: f32 = 17.5;
 /// Font scale per script level: full, script, scriptscript. Clamped at level
 /// 2 because deeper TeX scripts do not shrink further.
 pub const LEVEL_SCALE: [f32; 3] = [1.0, 0.78, 0.62];
-/// The math axis: the height of the fraction bar above the baseline, roughly
-/// half an x-height as a fraction of the current size.
-pub const AXIS_RISE: f32 = 0.25;
 /// Vertical clearance between the bar and each operand, as a fraction of the
 /// current size.
 pub const FRAC_GAP: f32 = 0.12;
@@ -33,18 +30,16 @@ pub const SLOT_H: f32 = 16.0;
 /// The fraction bar's thickness.
 pub const BAR: f32 = 1.0;
 
-// Font metrics are not plumbed into this pure layout yet; nominal proportions
-// keep geometry deterministic until the renderer can provide them.
-const ASCENT_RATIO: f32 = 0.72;
-const DESCENT_RATIO: f32 = 0.28;
+// The renderer centers glyphs vertically, so the anchor line is a center line.
+// Symmetric boxes make equal clearance above and below the line exact.
 
 /// A laid-out node and its positioned children.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MathBox {
     pub width: f32,
-    /// Height above this box's baseline.
+    /// Height above this box's anchor line.
     pub ascent: f32,
-    /// Depth below this box's baseline.
+    /// Depth below this box's anchor line.
     pub descent: f32,
     pub kind: BoxKind,
 }
@@ -62,7 +57,7 @@ pub enum BoxKind {
     Slot {
         size: f32,
     },
-    /// Child y offsets are baseline-relative and positive upward.
+    /// Child y offsets are anchor-relative and positive upward.
     Row {
         children: Vec<(f32, f32, MathBox)>,
     },
@@ -97,10 +92,11 @@ fn size(level: usize) -> f32 {
 fn glyph(ch: char, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
     let size = size(level);
     let text = ch.to_string();
+    let half = size * 0.5;
     MathBox {
         width: measure(&text, &TextStyle::math(size, theme::INK)),
-        ascent: size * ASCENT_RATIO,
-        descent: size * DESCENT_RATIO,
+        ascent: half,
+        descent: half,
         kind: BoxKind::Glyph { text, size },
     }
 }
@@ -108,10 +104,11 @@ fn glyph(ch: char, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> M
 fn slot_box(level: usize) -> MathBox {
     let scale = scale(level);
     let height = SLOT_H * scale;
+    let half = height * 0.5;
     MathBox {
         width: SLOT_W * scale,
-        ascent: height * ASCENT_RATIO,
-        descent: height * DESCENT_RATIO,
+        ascent: half,
+        descent: half,
         kind: BoxKind::Slot { size: height },
     }
 }
@@ -137,7 +134,6 @@ fn fraction(
     let numerator = layout(num, operand_level, measure);
     let denominator = layout(den, operand_level, measure);
     let current_size = size(level);
-    let axis = current_size * AXIS_RISE;
     let gap = current_size * FRAC_GAP;
     let pad = FRAC_PAD * scale(level);
     let width = numerator.width.max(denominator.width) + pad * 2.0;
@@ -148,9 +144,15 @@ fn fraction(
         descent: BAR * 0.5,
         kind: BoxKind::Bar { thickness: BAR },
     };
-    let bar_y = axis;
-    let numerator_y = bar_y + bar.ascent + gap + numerator.descent;
-    let denominator_y = bar_y - bar.descent - gap - denominator.ascent;
+    // Anchor line is the inline prose middle, so placing the bar at zero
+    // aligns it with the math axis instead of lifting the whole fraction.
+    let bar_y = 0.0;
+    let numerator_half = (numerator.ascent + numerator.descent) * 0.5;
+    let denominator_half = (denominator.ascent + denominator.descent) * 0.5;
+    let numerator_offset = BAR * 0.5 + gap + numerator_half;
+    let denominator_offset = BAR * 0.5 + gap + denominator_half;
+    let numerator_y = numerator_offset;
+    let denominator_y = -denominator_offset;
     let children = vec![
         ((width - numerator.width) * 0.5, numerator_y, numerator),
         (0.0, bar_y, bar),
@@ -184,10 +186,10 @@ fn row_box(children: Vec<(f32, f32, MathBox)>) -> MathBox {
     }
 }
 
-/// Resolve cursor to `(x, baseline_offset, height)`.
+/// Resolve cursor to `(x, anchor_offset, height)`.
 ///
-/// `baseline_offset` uses box coordinates: numerator baselines are positive,
-/// denominator baselines are negative. Cursor height follows its current
+/// `anchor_offset` uses box coordinates: numerator anchors are positive,
+/// denominator anchors are negative. Cursor height follows its current
 /// list level rather than the total height of an enclosing fraction.
 pub fn cursor_pos(
     list: &MathList,
@@ -540,8 +542,51 @@ mod tests {
         let num = &fraction[0];
         let bar = &fraction[1];
         let den = &fraction[2];
-        assert!(num.1 - num.2.descent > bar.1 + bar.2.ascent);
-        assert!(bar.1 - bar.2.descent > den.1 + den.2.ascent);
+        let numerator_gap = num.1 - num.2.descent - (bar.1 + bar.2.ascent);
+        let denominator_gap = bar.1 - bar.2.descent - (den.1 + den.2.ascent);
+        assert!(numerator_gap > 0.0);
+        assert!(denominator_gap > 0.0);
+    }
+
+    #[test]
+    fn a_fraction_puts_its_operands_the_same_distance_from_the_bar() {
+        let list = vec![fraction(
+            symbols("x"),
+            vec![fraction(symbols("yz"), symbols("w"))],
+        )];
+        let box_ = layout(&list, 0, &fake_measure);
+        let BoxKind::Row { children } = box_.kind else {
+            panic!("fraction must produce row");
+        };
+        let BoxKind::Row { children: fraction } = &children[0].2.kind else {
+            panic!("fraction must produce row");
+        };
+        let numerator = &fraction[0];
+        let bar = &fraction[1];
+        let denominator = &fraction[2];
+        let numerator_gap = numerator.1 - numerator.2.descent - (bar.1 + bar.2.ascent);
+        let denominator_gap = bar.1 - bar.2.descent - (denominator.1 + denominator.2.ascent);
+        assert!((numerator_gap - denominator_gap).abs() < 0.0001);
+    }
+
+    #[test]
+    fn a_fraction_is_centred_on_its_own_anchor_line() {
+        let one_level = layout(
+            &vec![fraction(symbols("x"), symbols("y"))],
+            0,
+            &fake_measure,
+        );
+        assert_eq!(one_level.ascent, one_level.descent);
+
+        let two_deep = layout(
+            &vec![fraction(
+                vec![fraction(symbols("x"), symbols("y"))],
+                vec![fraction(symbols("z"), symbols("w"))],
+            )],
+            0,
+            &fake_measure,
+        );
+        assert_eq!(two_deep.ascent, two_deep.descent);
     }
 
     #[test]
@@ -556,7 +601,10 @@ mod tests {
         };
         let (x, y, _) = cursor_pos(&list, &cursor, 0, &fake_measure);
         assert_eq!(x, FRAC_PAD + BASE_SIZE * LEVEL_SCALE[1] * 0.5);
-        assert!(y < 0.0);
+        assert_eq!(
+            y,
+            -(BAR * 0.5 + BASE_SIZE * FRAC_GAP + BASE_SIZE * LEVEL_SCALE[1] * 0.5)
+        );
 
         let (root_x, root_y, _) = cursor_pos(&list, &MathCursor::default(), 0, &fake_measure);
         assert_eq!(root_x, 0.0);
