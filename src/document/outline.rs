@@ -51,6 +51,8 @@ pub fn outline(blocks: &[Block]) -> Vec<Node> {
             .iter()
             .map(|run| match run {
                 Inline::Text(text) => text.text.as_str(),
+                // Math is opaque and contributes no heading prose.
+                Inline::Math(_) => "",
             })
             .collect();
 

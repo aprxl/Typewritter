@@ -5,7 +5,7 @@
 use std::rc::Rc;
 
 use crate::document::layout::{self, DocLayout};
-use crate::document::{Block, Caret, FlatRange, Inline, Style};
+use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style};
 use crate::layout::Rect;
 use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
@@ -323,8 +323,10 @@ impl Component for Editor {
                 let baseline = top + line.height * 0.5;
                 let mut cursor = x;
                 pieces.clear();
+                let mut atom_pieces = Vec::new();
                 for segment in &line.segments {
                     let run = &kind.inlines()[segment.inline];
+                    let is_math = matches!(run, Inline::Math(_));
                     let text: String = match run {
                         Inline::Text(t) => t
                             .text
@@ -332,6 +334,7 @@ impl Component for Editor {
                             .skip(segment.start)
                             .take(segment.len.min(VIEW_CAP))
                             .collect(),
+                        Inline::Math(_) => ATOM.to_string(),
                     };
                     let width =
                         theme::width(layer, &text, &layout::text_style(kind, segment.style));
@@ -342,6 +345,20 @@ impl Component for Editor {
                         cursor += theme::BADGE_PAD;
                     }
                     pieces.push((text, segment.style, cursor, width));
+                    atom_pieces.push(is_math);
+                    if is_math {
+                        // Placeholder only; the math renderer will replace this box.
+                        theme::outline(
+                            layer,
+                            Rect {
+                                x: cursor,
+                                y: baseline - line.height * 0.5 + 2.0,
+                                width,
+                                height: line.height - 4.0,
+                            },
+                            theme::NON_TEXT,
+                        );
+                    }
                     cursor += width;
                     if segment.style.badge {
                         cursor += theme::BADGE_PAD;
@@ -390,7 +407,10 @@ impl Component for Editor {
                         );
                     }
                 }
-                for (text, style, at, _) in &pieces {
+                for ((text, style, at, _), is_math) in pieces.iter().zip(&atom_pieces) {
+                    if *is_math {
+                        continue;
+                    }
                     let style = layout::text_style(kind, *style);
                     theme::draw(layer, text, (*at, baseline), &style, theme::LEFT);
                 }
@@ -420,6 +440,7 @@ impl Component for Editor {
             .and_then(|b| b.inlines().get(self.caret.inline))
             .and_then(|run| match run {
                 Inline::Text(t) => t.text.chars().nth(self.caret.offset),
+                Inline::Math(_) => Some(ATOM),
             });
         let screen_x = x + caret_x;
         let screen_y = content + caret_baseline - self.scroll;
@@ -551,6 +572,7 @@ impl Editor {
                     .skip(segment.start)
                     .take(segment.len)
                     .collect(),
+                Inline::Math(_) => ATOM.to_string(),
             };
             if flat >= cursor + segment.len {
                 x += layout::advance(&text, block, segment.style, &|text, style| {

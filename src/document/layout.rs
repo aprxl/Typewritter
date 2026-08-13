@@ -77,6 +77,10 @@ pub struct DocLayout {
 /// The font a run renders with. Body is serif 17.5; headings are serif at
 /// 24/21/18.5 and always bold; a run's `bold`/`italic` stack on top.
 pub fn text_style(kind: &Block, style: Style) -> TextStyle {
+    if kind.is_math() {
+        // Placeholder only; the math layout task will replace body prose here.
+        return TextStyle::serif(17.5, theme::INK);
+    }
     if style.code {
         return TextStyle::mono(17.5, theme::INK);
     }
@@ -97,7 +101,9 @@ pub fn text_style(kind: &Block, style: Style) -> TextStyle {
             theme::INK,
         )
         .bold(),
-        Block::Paragraph(_) | Block::Divider(_) => TextStyle::serif(17.5, theme::INK),
+        Block::Paragraph(_) | Block::Divider(_) | Block::Math(_) => {
+            TextStyle::serif(17.5, theme::INK)
+        }
         Block::CodeLine { .. } => TextStyle::mono(17.5, theme::INK),
     };
     if style.bold {
@@ -263,6 +269,8 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
             Block::Heading { level: 3, .. } => LINE_H3,
             Block::Heading { level: 4, .. } => LINE_H4,
             Block::Divider(_) => LINE_DIVIDER,
+            // Placeholder only; display math gets real sizing later.
+            Block::Math(_) => LINE_BODY,
             Block::Heading { .. } | Block::Paragraph(_) | Block::CodeLine { .. } => LINE_BODY,
         };
 
@@ -310,12 +318,14 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
 fn run_text(run: &Inline) -> &str {
     match run {
         Inline::Text(t) => &t.text,
+        Inline::Math(_) => "\u{FFFC}",
     }
 }
 
 fn run_style(run: &Inline) -> Style {
     match run {
         Inline::Text(t) => t.style,
+        Inline::Math(_) => Style::PLAIN,
     }
 }
 

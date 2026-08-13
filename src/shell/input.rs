@@ -504,6 +504,7 @@ impl Shell {
                         .iter()
                         .map(|run| match run {
                             crate::document::Inline::Text(text) => text.text.as_str(),
+                            crate::document::Inline::Math(_) => "\u{FFFC}",
                         })
                         .collect::<String>()
                         .chars()
@@ -697,11 +698,11 @@ impl Shell {
             .map(|tab| tab.document.caret_position());
         let Some(original) = original else { return };
         let range = match target {
-            OperatorTarget::TextObject(object) => self
-                .docs
-                .borrow()
-                .active()
-                .and_then(|tab| tab.document.text_object_range(object)),
+            OperatorTarget::TextObject(object) => {
+                let docs = self.docs.borrow();
+                docs.active()
+                    .and_then(|tab| tab.document.text_object_range(object))
+            }
             OperatorTarget::Motion(motion) => {
                 if matches!(motion, Motion::Up) {
                     self.vertical_motion(true, count);
@@ -720,7 +721,8 @@ impl Shell {
                 else {
                     return;
                 };
-                self.docs.borrow().active().map(|tab| {
+                let docs = self.docs.borrow();
+                docs.active().map(|tab| {
                     crate::vim::Vim::operator_range(&tab.document, original, motion, current)
                 })
             }
@@ -871,14 +873,16 @@ impl Shell {
                     .map(|tab| tab.document.caret_position());
                 let Some(current) = current else { return };
                 let range = if line {
-                    self.docs.borrow().active().map(|tab| {
+                    let docs = self.docs.borrow();
+                    docs.active().map(|tab| {
                         tab.document.line_range(
                             current.block,
                             current.block + shape.end.block - shape.start.block,
                         )
                     })
                 } else {
-                    self.docs.borrow().active().map(|tab| {
+                    let docs = self.docs.borrow();
+                    docs.active().map(|tab| {
                         let block_delta = shape.end.block - shape.start.block;
                         let end = if block_delta == 0 {
                             tab.document.position(

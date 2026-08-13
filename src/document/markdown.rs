@@ -21,6 +21,7 @@
 use std::io;
 use std::path::Path;
 
+use super::math_notation;
 use super::{Block, Caret, Document, Inline, Style, Text};
 
 /// Scan for the next unescaped occurrence of `marker` at or after `start`.
@@ -38,6 +39,20 @@ fn find_closer(chars: &[char], marker: &[char], start: usize) -> Option<usize> {
             return Some(i);
         }
         i += 1;
+    }
+    None
+}
+
+fn find_dollar_closer(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += if i + 1 < chars.len() { 2 } else { 1 };
+        } else if chars[i] == '$' {
+            return Some(i);
+        } else {
+            i += 1;
+        }
     }
     None
 }
@@ -84,6 +99,17 @@ fn parse_inline(s: &str) -> Vec<Inline> {
                     i += 2;
                 } else {
                     text_buf.push('\\');
+                    i += 1;
+                }
+            }
+            '$' => {
+                if let Some(cl) = find_dollar_closer(&chars, i + 1) {
+                    push_plain(&mut runs, &mut text_buf);
+                    let inner: String = chars[i + 1..cl].iter().collect();
+                    runs.push(Inline::Math(math_notation::parse(&inner)));
+                    i = cl + 1;
+                } else {
+                    text_buf.push('$');
                     i += 1;
                 }
             }
@@ -175,9 +201,13 @@ fn parse_inline(s: &str) -> Vec<Inline> {
                         // inside it rather than being literal.
                         let inner: String = chars[after..cl].iter().collect();
                         for run in parse_inline(&inner) {
-                            let Inline::Text(mut t) = run;
-                            t.style.highlight = !t.style.is_boxed();
-                            runs.push(Inline::Text(t));
+                            match run {
+                                Inline::Text(mut t) => {
+                                    t.style.highlight = !t.style.is_boxed();
+                                    runs.push(Inline::Text(t));
+                                }
+                                Inline::Math(list) => runs.push(Inline::Math(list)),
+                            }
                         }
                         i = cl + 2;
                     }
@@ -264,6 +294,8 @@ pub fn parse(path: &Path, text: &str) -> Document {
     let mut in_fence = false;
     let mut fence_had_lines = false;
     let mut fence_lang: Option<String> = None;
+    let mut fence_math = false;
+    let mut math_body = String::new();
 
     let flush_para = |blocks: &mut Vec<Block>, para: &mut Vec<String>| {
         if !para.is_empty() {
@@ -277,7 +309,12 @@ pub fn parse(path: &Path, text: &str) -> Document {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         if in_fence {
             if line.trim() == "```" {
-                if !fence_had_lines {
+                if fence_math {
+                    blocks.push(Block::Math(vec![Inline::Math(math_notation::parse(
+                        &math_body,
+                    ))]));
+                    math_body.clear();
+                } else if !fence_had_lines {
                     let empty = Inline::Text(Text {
                         text: String::new(),
                         style: Style {
@@ -294,28 +331,36 @@ pub fn parse(path: &Path, text: &str) -> Document {
                 in_fence = false;
                 fence_had_lines = false;
                 fence_lang = None;
+                fence_math = false;
             } else {
-                let run = Inline::Text(Text {
-                    text: line.to_string(),
-                    style: Style {
-                        code: true,
-                        ..Style::PLAIN
-                    },
-                });
-                let first = !fence_had_lines;
-                let lang = if first { fence_lang.clone() } else { None };
-                blocks.push(Block::CodeLine {
-                    content: vec![run],
-                    first,
-                    lang,
-                });
-                fence_had_lines = true;
+                if fence_math {
+                    math_body.push_str(line);
+                } else {
+                    let run = Inline::Text(Text {
+                        text: line.to_string(),
+                        style: Style {
+                            code: true,
+                            ..Style::PLAIN
+                        },
+                    });
+                    let first = !fence_had_lines;
+                    let lang = if first { fence_lang.clone() } else { None };
+                    blocks.push(Block::CodeLine {
+                        content: vec![run],
+                        first,
+                        lang,
+                    });
+                    fence_had_lines = true;
+                }
             }
             continue;
         }
         if line.trim().starts_with("```") {
             flush_para(&mut blocks, &mut para);
             let info = line.trim()[3..].trim();
+            // Unknown tw-math versions remain code so newer files always open.
+            fence_math = info == "tw-math v1";
+            math_body.clear();
             fence_lang = if info.is_empty() {
                 None
             } else {
@@ -358,8 +403,12 @@ pub fn parse(path: &Path, text: &str) -> Document {
     flush_para(&mut blocks, &mut para);
 
     if in_fence {
-        // Unterminated fence: everything after opener is already code lines.
-        // The closing fence block is implicit at EOF; nothing extra to do.
+        // Unterminated fences still produce their content; the file must open.
+        if fence_math {
+            blocks.push(Block::Math(vec![Inline::Math(math_notation::parse(
+                &math_body,
+            ))]));
+        }
     }
 
     if blocks.is_empty() {
@@ -382,6 +431,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
             offset: 0,
             style: Style::PLAIN,
         },
+        math: None,
     }
 }
 
@@ -395,6 +445,7 @@ fn escape_run_text(t: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '*' => out.push_str("\\*"),
             '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
             // Only the doubled forms are markers, so only those need
             // escaping — prose is full of lone `=` and `[`, and escaping
             // every one of them would make the file unreadable on disk.
@@ -435,19 +486,21 @@ fn wrap_run(style: Style, escaped: &str) -> String {
 fn serialize_runs(runs: &[Inline]) -> String {
     // A boxed run's text is verbatim on the way in, so it must be verbatim
     // on the way out too.
-    let one = |style: Style, text: &str| {
-        if style.is_boxed() {
-            wrap_run(style, text)
-        } else {
-            wrap_run(style, &escape_run_text(text))
+    let one = |run: &Inline, style: Style| match run {
+        Inline::Text(t) => {
+            if style.is_boxed() {
+                wrap_run(style, &t.text)
+            } else {
+                wrap_run(style, &escape_run_text(&t.text))
+            }
         }
+        Inline::Math(list) => format!("${}$", math_notation::print(list)),
     };
     let mut out = String::new();
     let mut i = 0;
     while i < runs.len() {
-        let Inline::Text(t) = &runs[i];
-        if !t.style.highlight {
-            out.push_str(&one(t.style, &t.text));
+        if !runs[i].style().highlight {
+            out.push_str(&one(&runs[i], runs[i].style()));
             i += 1;
             continue;
         }
@@ -457,13 +510,12 @@ fn serialize_runs(runs: &[Inline]) -> String {
         }
         out.push_str("==");
         for run in &runs[i..=end] {
-            let Inline::Text(t) = run;
             out.push_str(&one(
+                run,
                 Style {
                     highlight: false,
-                    ..t.style
+                    ..run.style()
                 },
-                &t.text,
             ));
         }
         out.push_str("==");
@@ -522,6 +574,16 @@ pub fn serialize(doc: &Document) -> String {
             }
             Block::Divider(_) => {
                 out.push_str("---");
+                i += 1;
+            }
+            Block::Math(runs) => {
+                let list = match runs.as_slice() {
+                    [Inline::Math(list)] => list,
+                    _ => unreachable!("enforced math block invariant"),
+                };
+                out.push_str("```tw-math v1\n");
+                out.push_str(&math_notation::print(list));
+                out.push_str("\n```");
                 i += 1;
             }
             Block::Paragraph(runs) => {
@@ -628,6 +690,10 @@ mod tests {
         )
     }
 
+    fn math(t: &str) -> Inline {
+        Inline::Math(math_notation::parse(t))
+    }
+
     fn para(runs: Vec<Inline>) -> Block {
         Block::Paragraph(runs)
     }
@@ -696,6 +762,39 @@ mod tests {
         assert!(d.blocks[1].is_divider());
         assert_eq!(serialize(&d), "before\n\n---\n\nafter\n");
         assert_eq!(parse(Path::new("x"), &serialize(&d)).blocks, d.blocks);
+    }
+
+    #[test]
+    fn a_math_block_round_trips_through_its_fence() {
+        let d = doc_with(vec![Block::Math(vec![math("1/2")])]);
+        assert_eq!(serialize(&d), "```tw-math v1\n1/2\n```\n");
+        assert_eq!(parse(Path::new("x"), &serialize(&d)).blocks, d.blocks);
+    }
+
+    #[test]
+    fn inline_math_round_trips_through_dollars() {
+        let d = doc_with(vec![para(vec![
+            plain("before "),
+            math("a/b"),
+            plain(" after"),
+        ])]);
+        let text = serialize(&d);
+        assert_eq!(text, "before $a/b$ after\n");
+        assert_eq!(parse(Path::new("x"), &text).blocks, d.blocks);
+    }
+
+    #[test]
+    fn a_prose_dollar_is_escaped_not_parsed() {
+        let d = doc_with(vec![para(vec![plain("price $5")])]);
+        assert_eq!(serialize(&d), "price \\$5\n");
+        assert_eq!(parse(Path::new("x"), &serialize(&d)).blocks, d.blocks);
+    }
+
+    #[test]
+    fn an_unknown_tw_math_version_stays_a_code_block() {
+        let d = parse(Path::new("x"), "```tw-math v2\nx\n```\n");
+        assert!(d.blocks[0].is_code());
+        assert_eq!(serialize(&d), "```tw-math v2\nx\n```\n");
     }
 
     #[test]

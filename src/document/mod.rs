@@ -13,6 +13,9 @@ pub mod math_layout;
 pub mod math_notation;
 pub mod outline;
 
+/// Flat-text stand-in for one opaque math atom.
+pub const ATOM: char = '\u{FFFC}';
+
 /// A document: an ordered list of blocks with a caret.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Document {
@@ -21,6 +24,8 @@ pub struct Document {
     pub name: String,
     dirty: bool,
     pub caret: Caret,
+    /// Cursor inside the math atom named by `caret`, or prose focus when None.
+    pub math: Option<math::MathCursor>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -32,6 +37,8 @@ pub enum Block {
     /// (see `prune_runs`). The rule itself is drawn by the editor — this
     /// block has no content of its own.
     Divider(Vec<Inline>),
+    /// A display math block: exactly one opaque math atom until math rendering lands.
+    Math(Vec<Inline>),
     Heading {
         level: u8,
         content: Vec<Inline>,
@@ -46,6 +53,8 @@ pub enum Block {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Inline {
     Text(Text),
+    /// One opaque math expression; flat prose coordinates count it as one.
+    Math(math::MathList),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -144,6 +153,7 @@ impl Block {
         match self {
             Block::Paragraph(inlines)
             | Block::Divider(inlines)
+            | Block::Math(inlines)
             | Block::Heading {
                 content: inlines, ..
             } => inlines,
@@ -155,6 +165,7 @@ impl Block {
         match self {
             Block::Paragraph(inlines)
             | Block::Divider(inlines)
+            | Block::Math(inlines)
             | Block::Heading {
                 content: inlines, ..
             } => inlines,
@@ -170,6 +181,10 @@ impl Block {
         matches!(self, Block::Divider(_))
     }
 
+    pub fn is_math(&self) -> bool {
+        matches!(self, Block::Math(_))
+    }
+
     pub fn is_code(&self) -> bool {
         matches!(self, Block::CodeLine { .. })
     }
@@ -179,30 +194,48 @@ impl Inline {
     fn text(&self) -> &str {
         match self {
             Inline::Text(t) => &t.text,
+            // U+FFFC gives every flat-text consumer exactly one position.
+            Inline::Math(_) => "\u{FFFC}",
         }
     }
 
-    fn text_mut(&mut self) -> &mut String {
+    fn text_mut(&mut self) -> Option<&mut String> {
         match self {
-            Inline::Text(t) => &mut t.text,
+            Inline::Text(t) => Some(&mut t.text),
+            // Math is edited through its tree, never as prose.
+            Inline::Math(_) => None,
         }
     }
 
     fn style(&self) -> Style {
         match self {
             Inline::Text(t) => t.style,
+            Inline::Math(_) => Style::PLAIN,
         }
     }
 
     fn set_style(&mut self, style: Style) {
         match self {
             Inline::Text(t) => t.style = style,
+            Inline::Math(_) => {}
         }
     }
 }
 
 fn run_len(run: &Inline) -> usize {
-    run.text().chars().count()
+    match run {
+        Inline::Text(t) => t.text.chars().count(),
+        // Opaque math always costs one flat position.
+        Inline::Math(_) => 1,
+    }
+}
+
+fn merge_style(run: &Inline) -> Option<Style> {
+    match run {
+        Inline::Text(t) => Some(t.style),
+        // An atom is never a prose merge target.
+        Inline::Math(_) => None,
+    }
 }
 
 fn style_matches(style: Style, mask: Style) -> bool {
@@ -225,6 +258,11 @@ fn divider_block() -> Block {
         text: String::new(),
         style: Style::PLAIN,
     })])
+}
+
+/// A display math block starts with one empty opaque atom.
+fn math_block() -> Block {
+    Block::Math(vec![Inline::Math(Vec::new())])
 }
 
 /// Inserts `s` at character offset `char_idx` of `text`.
@@ -267,6 +305,26 @@ fn split_run(run: Inline, at: usize) -> (Inline, Inline) {
                 }),
             )
         }
+        Inline::Math(list) => {
+            // An atom cannot split; the empty side is pruned after the edit.
+            if at == 0 {
+                (
+                    Inline::Text(Text {
+                        text: String::new(),
+                        style: Style::PLAIN,
+                    }),
+                    Inline::Math(list),
+                )
+            } else {
+                (
+                    Inline::Math(list),
+                    Inline::Text(Text {
+                        text: String::new(),
+                        style: Style::PLAIN,
+                    }),
+                )
+            }
+        }
     }
 }
 
@@ -287,6 +345,7 @@ impl Document {
                 offset: 0,
                 style: Style::PLAIN,
             },
+            math: None,
         }
     }
 
@@ -337,6 +396,7 @@ impl Document {
     }
 
     /// Returns text in a range, inserting logical newlines between blocks.
+    /// A range containing math yields ATOM; yank serialization is future work.
     pub fn range_text(&self, range: FlatRange) -> String {
         let range = range.normalized();
         let start = self.position(range.start.block, range.start.offset);
@@ -515,21 +575,27 @@ impl Document {
         let mut result = Vec::new();
         let mut cursor = 0;
         for run in self.blocks[block].inlines() {
-            let text = run.text();
             let run_start = cursor;
-            let run_end = cursor + text.chars().count();
+            let run_end = cursor + run_len(run);
             let from = start.max(run_start).min(run_end);
             let to = end.max(run_start).min(run_end);
             if from < to {
-                let value: String = text
-                    .chars()
-                    .skip(from - run_start)
-                    .take(to - from)
-                    .collect();
-                result.push(Inline::Text(Text {
-                    text: value,
-                    style: run.style(),
-                }));
+                match run {
+                    Inline::Text(t) => {
+                        let value: String = t
+                            .text
+                            .chars()
+                            .skip(from - run_start)
+                            .take(to - from)
+                            .collect();
+                        result.push(Inline::Text(Text {
+                            text: value,
+                            style: t.style,
+                        }));
+                    }
+                    // Slices cover the whole opaque atom or none of it.
+                    Inline::Math(_) => result.push(run.clone()),
+                }
             }
             cursor = run_end;
         }
@@ -553,6 +619,7 @@ impl Document {
         match block {
             Block::Paragraph(_) => Block::Paragraph(runs),
             Block::Divider(_) => Block::Divider(runs),
+            Block::Math(_) => Block::Math(runs),
             Block::Heading { level, .. } => Block::Heading {
                 level: *level,
                 content: runs,
@@ -833,6 +900,9 @@ impl Document {
         self.caret.inline = inline;
         let len = run_len(&runs[inline]);
         self.caret.offset = self.caret.offset.min(len);
+        if !matches!(runs[inline], Inline::Math(_)) {
+            self.math = None;
+        }
     }
 
     /// Enforces the invariants: non-empty blocks, every block has ≥1 run,
@@ -856,6 +926,15 @@ impl Document {
             if block.is_divider() && block.inlines().iter().any(|r| !r.text().is_empty()) {
                 *block = Block::Paragraph(std::mem::take(block.inlines_mut()));
             }
+            if block.is_math() {
+                if block.inlines().is_empty() {
+                    *block = math_block();
+                } else if !matches!(block.inlines(), [Inline::Math(_)]) {
+                    // Prose in a display atom means this is prose now; keep
+                    // the atom inline rather than discarding its tree.
+                    *block = Block::Paragraph(std::mem::take(block.inlines_mut()));
+                }
+            }
             if block.inlines().is_empty() {
                 *block = match block {
                     Block::Heading { level, .. } => Block::Heading {
@@ -877,6 +956,7 @@ impl Document {
                         lang: lang.clone(),
                     },
                     Block::Divider(_) => divider_block(),
+                    Block::Math(_) => math_block(),
                     Block::Paragraph(_) => empty_block(),
                 };
             }
@@ -1022,37 +1102,61 @@ impl Document {
         let placeholder = runs.len() == 1 && runs[0].text().is_empty();
         let li = run_len(&runs[i]);
         let left_style = if o > 0 {
-            Some(runs[i].style())
+            merge_style(&runs[i])
         } else if i > 0 {
-            Some(runs[i - 1].style())
+            merge_style(&runs[i - 1])
         } else {
             None
         };
         let right_style = if o < li {
-            Some(runs[i].style())
+            merge_style(&runs[i])
         } else if i + 1 < runs.len() {
-            Some(runs[i + 1].style())
+            merge_style(&runs[i + 1])
         } else {
             None
         };
 
         if placeholder {
             let runs = self.blocks[b].inlines_mut();
-            runs[0].text_mut().push_str(text);
+            runs[0]
+                .text_mut()
+                .expect("placeholder is always a text run")
+                .push_str(text);
             runs[0].set_style(s);
         } else if left_style == Some(s) {
             let runs = self.blocks[b].inlines_mut();
             if o > 0 {
-                insert_str(runs[i].text_mut(), o, text);
+                insert_str(
+                    runs[i]
+                        .text_mut()
+                        .expect("merge target is always a text run"),
+                    o,
+                    text,
+                );
             } else {
-                runs[i - 1].text_mut().push_str(text);
+                runs[i - 1]
+                    .text_mut()
+                    .expect("merge target is always a text run")
+                    .push_str(text);
             }
         } else if right_style == Some(s) {
             let runs = self.blocks[b].inlines_mut();
             if o < li {
-                insert_str(runs[i].text_mut(), o, text);
+                insert_str(
+                    runs[i]
+                        .text_mut()
+                        .expect("merge target is always a text run"),
+                    o,
+                    text,
+                );
             } else {
-                insert_str(runs[i + 1].text_mut(), 0, text);
+                insert_str(
+                    runs[i + 1]
+                        .text_mut()
+                        .expect("merge target is always a text run"),
+                    0,
+                    text,
+                );
             }
         } else {
             // Splice a new run at the caret, splitting the current run.
@@ -1086,11 +1190,22 @@ impl Document {
         let before = self.caret_flat(b);
         if o > 0 {
             let runs = self.blocks[b].inlines_mut();
-            remove_char_at(runs[i].text_mut(), o - 1);
+            if matches!(runs[i], Inline::Math(_)) {
+                runs.remove(i);
+            } else {
+                remove_char_at(runs[i].text_mut().expect("non-math run is text"), o - 1);
+            }
         } else if i > 0 {
             let runs = self.blocks[b].inlines_mut();
-            let prev_len = run_len(&runs[i - 1]);
-            remove_char_at(runs[i - 1].text_mut(), prev_len - 1);
+            if matches!(runs[i - 1], Inline::Math(_)) {
+                runs.remove(i - 1);
+            } else {
+                let prev_len = run_len(&runs[i - 1]);
+                remove_char_at(
+                    runs[i - 1].text_mut().expect("non-math run is text"),
+                    prev_len - 1,
+                );
+            }
         } else if b > 0 {
             self.merge_into_previous();
             self.dirty = true;
@@ -1101,11 +1216,12 @@ impl Document {
             return; // start of document
         }
         // One char vanished before the caret: it sits exactly one char back.
-        let (ni, no) = self.flat_to_pos(b, before.saturating_sub(1));
-        self.caret.inline = ni;
-        self.caret.offset = no;
+        let target = before.saturating_sub(1);
         self.dirty = true;
         self.enforce();
+        let (ni, no) = self.flat_to_pos(b, target.min(self.block_flat_len(b)));
+        self.caret.inline = ni;
+        self.caret.offset = no;
         self.refresh_context();
     }
 
@@ -1136,10 +1252,18 @@ impl Document {
         let li = run_len(&runs[i]);
         if o < li {
             let runs = self.blocks[b].inlines_mut();
-            remove_char_at(runs[i].text_mut(), o);
+            if matches!(runs[i], Inline::Math(_)) {
+                runs.remove(i);
+            } else {
+                remove_char_at(runs[i].text_mut().expect("non-math run is text"), o);
+            }
         } else if i + 1 < runs.len() {
             let runs = self.blocks[b].inlines_mut();
-            remove_char_at(runs[i + 1].text_mut(), 0);
+            if matches!(runs[i + 1], Inline::Math(_)) {
+                runs.remove(i + 1);
+            } else {
+                remove_char_at(runs[i + 1].text_mut().expect("non-math run is text"), 0);
+            }
         } else if b + 1 < self.blocks.len() {
             self.merge_block_into_next();
         } else {
@@ -1209,7 +1333,11 @@ impl Document {
         }
         let (i, o) = self.flat_to_pos(b, flat);
         let runs = self.blocks[b].inlines_mut();
-        remove_char_at(runs[i].text_mut(), o);
+        if matches!(runs[i], Inline::Math(_)) {
+            runs.remove(i);
+        } else {
+            remove_char_at(runs[i].text_mut().expect("non-math run is text"), o);
+        }
         self.dirty = true;
         self.enforce();
         self.refresh_context();
@@ -1409,6 +1537,131 @@ impl Document {
         self.set_caret(at + 1, 0, 0);
         self.dirty = true;
         self.enforce();
+    }
+
+    /// Inserts and focuses one inline math atom at the current flat caret.
+    pub fn insert_inline_math(&mut self) {
+        self.clamp_caret();
+        let b = self.caret.block;
+        let i = self.caret.inline;
+        let o = self.caret.offset;
+        let flat = self.caret_flat(b);
+        let (prefix, suffix) = split_run(self.blocks[b].inlines_mut().remove(i), o);
+        self.blocks[b]
+            .inlines_mut()
+            .splice(i..i, [prefix, Inline::Math(Vec::new()), suffix]);
+        self.dirty = true;
+        self.enforce();
+        let (inline, offset) = self.flat_to_pos(b, flat);
+        self.set_caret(b, inline, offset);
+        self.math = Some(math::MathCursor::default());
+    }
+
+    /// Inserts a focused display math block, replacing an empty block.
+    pub fn insert_math_block(&mut self) {
+        self.clamp_caret();
+        let b = self.caret.block;
+        let at = if self.block_len(b) == 0 {
+            self.blocks[b] = math_block();
+            b
+        } else {
+            self.blocks.insert(b + 1, math_block());
+            b + 1
+        };
+        self.set_caret(at, 0, 0);
+        self.math = Some(math::MathCursor::default());
+        self.dirty = true;
+        self.enforce();
+    }
+
+    /// The focused atom's tree and cursor, or None when focus is stale.
+    fn focused_math(&mut self) -> Option<(&mut math::MathList, &mut math::MathCursor)> {
+        self.clamp_caret();
+        let block = self.caret.block;
+        let inline = self.caret.inline;
+        if !matches!(
+            self.blocks[block].inlines().get(inline),
+            Some(Inline::Math(_))
+        ) {
+            self.math = None;
+            return None;
+        }
+        let cursor = self.math.as_mut()?;
+        let list = match self.blocks[block].inlines_mut().get_mut(inline) {
+            Some(Inline::Math(list)) => list,
+            _ => unreachable!("math focus was checked above"),
+        };
+        Some((list, cursor))
+    }
+
+    pub fn math_insert_char(&mut self, c: char) {
+        if let Some((list, cursor)) = self.focused_math() {
+            math::insert_char(list, cursor, c);
+            self.dirty = true;
+        }
+    }
+
+    pub fn math_insert_fraction(&mut self) {
+        if let Some((list, cursor)) = self.focused_math() {
+            math::insert_fraction(list, cursor);
+            self.dirty = true;
+        }
+    }
+
+    pub fn math_backspace(&mut self) -> Option<math::Removed> {
+        let result = self
+            .focused_math()
+            .map(|(list, cursor)| math::backspace(list, cursor));
+        if result == Some(math::Removed::Edited) {
+            self.dirty = true;
+        }
+        result
+    }
+
+    pub fn math_move_left(&mut self) -> bool {
+        self.focused_math()
+            .is_some_and(|(list, cursor)| math::move_left(list, cursor))
+    }
+
+    pub fn math_move_right(&mut self) -> bool {
+        self.focused_math()
+            .is_some_and(|(list, cursor)| math::move_right(list, cursor))
+    }
+
+    pub fn math_slot_next(&mut self) -> bool {
+        self.focused_math()
+            .is_some_and(|(list, cursor)| math::slot_next(list, cursor))
+    }
+
+    pub fn math_slot_prev(&mut self) -> bool {
+        self.focused_math()
+            .is_some_and(|(list, cursor)| math::slot_prev(list, cursor))
+    }
+
+    pub fn math_pop(&mut self) -> bool {
+        self.focused_math()
+            .is_some_and(|(list, cursor)| math::pop_level(list, cursor))
+    }
+
+    pub fn math_exit(&mut self) {
+        self.clamp_caret();
+        let block = self.caret.block;
+        let inline = self.caret.inline;
+        if !matches!(
+            self.blocks[block].inlines().get(inline),
+            Some(Inline::Math(_))
+        ) {
+            self.math = None;
+            return;
+        }
+        self.math = None;
+        self.caret.offset = 1;
+        self.refresh_context();
+    }
+
+    pub fn math_path_names(&mut self) -> Vec<&'static str> {
+        self.focused_math()
+            .map_or_else(Vec::new, |(_, cursor)| math::path_names(cursor))
     }
 
     /// After a deletion the context is the style of the char now before the
@@ -2003,6 +2256,117 @@ mod tests {
         d.delete_char(); // caret now on the bold run, deletion continues
         assert_eq!(text_of_block(&d, 0), "f");
         assert_invariants(&d);
+    }
+
+    #[test]
+    fn an_atom_counts_as_one_char() {
+        let mut d = doc();
+        d.blocks[0] = Block::Paragraph(vec![
+            plain_run("ab"),
+            Inline::Math(vec![math::MathNode::Sym('x')]),
+            plain_run("cd"),
+        ]);
+        assert_eq!(d.block_len(0), 5);
+        assert_eq!(d.block_text(0), format!("ab{ATOM}cd"));
+        d.set_caret(0, 0, 2);
+        d.move_right();
+        assert_eq!(d.caret_position().offset, 3);
+        d.move_left();
+        assert!(matches!(
+            d.blocks[0].inlines()[d.caret.inline],
+            Inline::Math(_)
+        ));
+    }
+
+    #[test]
+    fn inserting_an_inline_atom_splits_the_run() {
+        let mut d = doc();
+        d.insert_text("abcd");
+        d.set_caret(0, 0, 2);
+        d.insert_inline_math();
+        assert!(matches!(
+            d.blocks[0].inlines(),
+            [Inline::Text(Text { text: left, .. }), Inline::Math(_), Inline::Text(Text { text: right, .. })]
+                if left == "ab" && right == "cd"
+        ));
+        assert_eq!((d.caret.inline, d.caret.offset), (1, 0));
+        assert!(d.math.is_some());
+    }
+
+    #[test]
+    fn typing_beside_an_atom_never_merges_into_it() {
+        let mut d = doc();
+        d.insert_inline_math();
+        d.set_caret(0, 0, 1);
+        d.insert_text("x");
+        assert!(matches!(d.blocks[0].inlines()[0], Inline::Math(_)));
+        assert_eq!(d.block_text(0), format!("{ATOM}x"));
+        assert!(
+            matches!(d.blocks[0].inlines()[1], Inline::Text(Text { ref text, .. }) if text == "x")
+        );
+    }
+
+    #[test]
+    fn backspace_removes_an_atom_whole() {
+        let mut d = doc();
+        d.blocks[0] = Block::Paragraph(vec![Inline::Math(vec![math::MathNode::Frac {
+            num: vec![math::MathNode::Sym('1')],
+            den: vec![math::MathNode::Sym('2')],
+        }])]);
+        d.set_caret(0, 0, 1);
+        d.backspace();
+        assert!(matches!(d.blocks[0], Block::Paragraph(_)));
+        assert_eq!(d.block_text(0), "");
+    }
+
+    #[test]
+    fn a_math_block_that_gains_prose_demotes_to_a_paragraph() {
+        let mut d = doc();
+        d.blocks[0] = Block::Math(vec![
+            Inline::Math(vec![math::MathNode::Sym('x')]),
+            plain_run(" prose"),
+        ]);
+        d.enforce();
+        assert!(matches!(d.blocks[0], Block::Paragraph(_)));
+        assert!(matches!(d.blocks[0].inlines()[0], Inline::Math(_)));
+    }
+
+    #[test]
+    fn insert_math_block_replaces_an_empty_block() {
+        let mut d = doc();
+        d.insert_math_block();
+        assert_eq!(d.blocks.len(), 1);
+        assert!(d.blocks[0].is_math());
+        assert_eq!((d.caret.block, d.caret.inline, d.caret.offset), (0, 0, 0));
+        assert!(d.math.is_some());
+    }
+
+    #[test]
+    fn math_ops_route_into_the_focused_atom() {
+        let mut d = doc();
+        d.insert_inline_math();
+        d.math_insert_char('1');
+        d.math_insert_fraction();
+        d.math_insert_char('2');
+        assert_eq!(
+            d.blocks[0].inlines()[0],
+            Inline::Math(vec![math::MathNode::Frac {
+                num: vec![math::MathNode::Sym('1')],
+                den: vec![math::MathNode::Sym('2')],
+            }])
+        );
+        d.math_exit();
+        assert!(d.math.is_none());
+        assert_eq!(d.caret.offset, 1);
+    }
+
+    #[test]
+    fn a_stale_focus_is_dropped_by_clamp() {
+        let mut d = doc();
+        d.insert_inline_math();
+        d.blocks.remove(0);
+        d.move_right();
+        assert!(d.math.is_none());
     }
 
     // ---- code-line tests ------------------------------------------------
