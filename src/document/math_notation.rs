@@ -9,7 +9,7 @@
 //! Format change: notation that used `(` for invisible grouping now uses `{`,
 //! while `(` and `[` are visible bracket groups; no migration is provided.
 
-use super::math::{MathList, MathNode, Slot};
+use super::math::{BigOp, MathList, MathNode, Slot, WORDS};
 
 /// The canonical linear form of `list`. Deterministic: equal trees print
 /// equal strings, and the parser reads this exact string back to an equal
@@ -22,14 +22,38 @@ pub fn print(list: &MathList) -> String {
 
 fn print_list(list: &MathList, output: &mut String) {
     for (index, node) in list.iter().enumerate() {
-        if index > 0 && matches!(node, MathNode::Frac { .. } | MathNode::Script { .. }) {
-            // Only fractions and scripts start with an operand and can capture the preceding node.
+        let needs_group = (index > 0
+            && matches!(
+                node,
+                MathNode::Frac { .. }
+                    | MathNode::Script { .. }
+                    | MathNode::Sqrt { .. }
+                    | MathNode::BigOp { .. }
+            ))
+            || (index == 0
+                && matches!(node, MathNode::Frac { .. } | MathNode::Script { .. })
+                && matches!(
+                    list.get(index + 1),
+                    Some(MathNode::Sym(c)) if c.is_alphabetic()
+                ));
+        if needs_group {
+            escape_keyword_suffix(output);
             output.push('{');
             print_node(node, output);
             output.push('}');
         } else {
             print_node(node, output);
         }
+    }
+}
+
+fn escape_keyword_suffix(output: &mut String) {
+    if let Some(keyword) = WORDS
+        .iter()
+        .map(|(keyword, _)| *keyword)
+        .find(|keyword| output.ends_with(keyword))
+    {
+        output.insert(output.len() - keyword.len() + keyword.len() - 1, '\\');
     }
 }
 
@@ -64,6 +88,28 @@ fn print_node(node: &MathNode, output: &mut String) {
             output.push(*open);
             print_list(body, output);
             output.push(*close);
+        }
+        MathNode::Sqrt { body } => {
+            output.push_str("sqrt");
+            output.push('{');
+            print_list(body, output);
+            output.push('}');
+        }
+        MathNode::BigOp { kind, lower, upper } => {
+            output.push_str(kind.keyword());
+            for slot in [Slot::Lower, Slot::Upper] {
+                if slot == Slot::Upper && *kind == BigOp::Limit {
+                    break;
+                }
+                output.push('{');
+                let list = match slot {
+                    Slot::Lower => lower,
+                    Slot::Upper => upper,
+                    _ => unreachable!("big operators only print limit slots"),
+                };
+                print_list(list, output);
+                output.push('}');
+            }
         }
     }
 }
@@ -179,6 +225,39 @@ impl Parser {
                 self.position += 1;
                 Some((vec![MathNode::Sym(')')], false))
             }
+            c if c.is_alphabetic() => {
+                let start = self.position;
+                while self
+                    .chars
+                    .get(self.position)
+                    .is_some_and(|c| c.is_alphabetic())
+                {
+                    self.position += 1;
+                }
+                let word: String = self.chars[start..self.position].iter().collect();
+                let Some(build) = WORDS
+                    .iter()
+                    .find(|(keyword, _)| {
+                        *keyword == word && self.chars.get(self.position) == Some(&'{')
+                    })
+                    .map(|(_, build)| *build)
+                else {
+                    return Some((word.chars().map(MathNode::Sym).collect(), false));
+                };
+                let mut node = build();
+                for slot in node.slots() {
+                    let list = if self.chars.get(self.position) == Some(&'{') {
+                        self.position += 1;
+                        self.parse_list(Some('}'))
+                    } else {
+                        Vec::new()
+                    };
+                    *node
+                        .slot_mut(slot)
+                        .expect("keyword node slots must resolve") = list;
+                }
+                Some((vec![node], false))
+            }
             c => {
                 self.position += 1;
                 Some((vec![MathNode::Sym(c)], false))
@@ -195,7 +274,9 @@ fn attach_or_wrap_script(items: &mut Vec<(MathList, bool)>, which: Slot, script:
         let target = match which {
             Slot::Sup => sup,
             Slot::Sub => sub,
-            Slot::Base | Slot::Num | Slot::Den | Slot::Body => unreachable!(),
+            Slot::Base | Slot::Num | Slot::Den | Slot::Body | Slot::Lower | Slot::Upper => {
+                unreachable!()
+            }
         };
         if target.is_none() {
             *target = Some(script);
@@ -207,7 +288,9 @@ fn attach_or_wrap_script(items: &mut Vec<(MathList, bool)>, which: Slot, script:
     let (sup, sub) = match which {
         Slot::Sup => (Some(script), None),
         Slot::Sub => (None, Some(script)),
-        Slot::Base | Slot::Num | Slot::Den | Slot::Body => unreachable!(),
+        Slot::Base | Slot::Num | Slot::Den | Slot::Body | Slot::Lower | Slot::Upper => {
+            unreachable!()
+        }
     };
     items.push((vec![MathNode::Script { base, sup, sub }], false));
 }
@@ -230,6 +313,14 @@ mod tests {
 
     fn group(open: char, close: char, body: MathList) -> MathNode {
         MathNode::Group { open, close, body }
+    }
+
+    fn sqrt(body: MathList) -> MathNode {
+        MathNode::Sqrt { body }
+    }
+
+    fn big_op(kind: BigOp, lower: MathList, upper: MathList) -> MathNode {
+        MathNode::BigOp { kind, lower, upper }
     }
 
     #[test]
@@ -321,6 +412,48 @@ mod tests {
     }
 
     #[test]
+    fn a_radical_prints_its_braced_body() {
+        let list = vec![sqrt(sym("1+x"))];
+
+        assert_eq!(print(&list), "sqrt{1+x}");
+        assert_eq!(parse("sqrt{1+x}"), list);
+    }
+
+    #[test]
+    fn a_big_operator_prints_a_group_per_slot() {
+        let sum = vec![big_op(BigOp::Sum, sym("i=0"), sym("n"))];
+        let limit = vec![big_op(BigOp::Limit, sym("x"), Vec::new())];
+        let empty = vec![big_op(BigOp::Sum, Vec::new(), Vec::new())];
+
+        assert_eq!(print(&sum), "sum{i=0}{n}");
+        assert_eq!(parse("sum{i=0}{n}"), sum);
+        assert_eq!(print(&limit), "lim{x}");
+        assert_eq!(parse("lim{x}"), limit);
+        assert_eq!(print(&empty), "sum{}{}");
+        assert_eq!(parse("sum{}{}"), empty);
+    }
+
+    #[test]
+    fn a_keyword_not_followed_by_a_group_is_just_letters() {
+        let list = sym("sum");
+
+        assert_eq!(print(&list), "sum");
+        assert_eq!(parse("sum"), list);
+    }
+
+    #[test]
+    fn a_keyword_suffix_before_a_braced_operand_stays_letters() {
+        let list = vec![
+            group('(', ')', vec![frac(sym("limintsum"), sym("alim"))]),
+            frac(Vec::new(), Vec::new()),
+        ];
+
+        let printed = print(&list);
+        assert_eq!(printed, "({limintsum}/{alim}){{}/{}}");
+        assert_eq!(parse(&printed), list);
+    }
+
+    #[test]
     fn a_literal_slash_is_escaped() {
         let list = sym("12/34");
 
@@ -407,13 +540,17 @@ mod tests {
     fn generated_list(generator: &mut Generator, depth: usize) -> MathList {
         let length = (generator.next() % 5) as usize;
         (0..length)
-            .map(|_| {
-                let choice = if depth > 0 { generator.next() % 7 } else { 6 };
+            .flat_map(|_| {
+                let choice = if depth > 0 {
+                    generator.next() % 7
+                } else {
+                    5 + generator.next() % 2
+                };
                 match choice {
-                    0 => frac(
+                    0 => vec![frac(
                         generated_list(generator, depth - 1),
                         generated_list(generator, depth - 1),
-                    ),
+                    )],
                     1 => {
                         let sup = if generator.next().is_multiple_of(2) {
                             Some(generated_list(generator, depth - 1))
@@ -430,7 +567,7 @@ mod tests {
                         } else {
                             (sup, sub)
                         };
-                        script(generated_list(generator, depth - 1), sup, sub)
+                        vec![script(generated_list(generator, depth - 1), sup, sub)]
                     }
                     2 => {
                         let (open, close) = if generator.next().is_multiple_of(2) {
@@ -438,14 +575,39 @@ mod tests {
                         } else {
                             ('[', ']')
                         };
-                        group(open, close, generated_list(generator, depth - 1))
+                        vec![group(open, close, generated_list(generator, depth - 1))]
+                    }
+                    3 => vec![sqrt(generated_list(generator, depth - 1))],
+                    4 => {
+                        let kind = match generator.next() % 4 {
+                            0 => BigOp::Sum,
+                            1 => BigOp::Prod,
+                            2 => BigOp::Integral,
+                            _ => BigOp::Limit,
+                        };
+                        let lower = generated_list(generator, depth - 1);
+                        let upper = if kind == BigOp::Limit {
+                            Vec::new()
+                        } else {
+                            generated_list(generator, depth - 1)
+                        };
+                        vec![big_op(kind, lower, upper)]
+                    }
+                    5 => {
+                        const KEYWORDS: &[&str] = &["sqrt", "sum", "prod", "int", "lim"];
+                        KEYWORDS[(generator.next() % KEYWORDS.len() as u64) as usize]
+                            .chars()
+                            .map(MathNode::Sym)
+                            .collect()
                     }
                     _ => {
                         const SYMBOLS: &[char] = &[
                             'a', 'Z', '0', '9', '+', '-', '=', '.', ' ', '/', '(', ')', '[', ']',
                             '{', '}', '\\', '^', '_',
                         ];
-                        MathNode::Sym(SYMBOLS[(generator.next() % SYMBOLS.len() as u64) as usize])
+                        vec![MathNode::Sym(
+                            SYMBOLS[(generator.next() % SYMBOLS.len() as u64) as usize],
+                        )]
                     }
                 }
             })

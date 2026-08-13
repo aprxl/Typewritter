@@ -25,9 +25,84 @@ pub enum MathNode {
         close: char,
         body: MathList,
     },
+    /// A radical. One slot today; an index is an additive change to this node.
+    Sqrt { body: MathList },
+    /// A large operator carrying its always-present limit slots.
+    BigOp {
+        kind: BigOp,
+        lower: MathList,
+        upper: MathList,
+    },
 }
 
 pub type MathList = Vec<MathNode>;
+
+/// Which large operator, named by what it means rather than by its glyph.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BigOp {
+    Sum,
+    Prod,
+    Integral,
+    Limit,
+}
+
+impl BigOp {
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::Prod => "prod",
+            Self::Integral => "int",
+            Self::Limit => "lim",
+        }
+    }
+}
+
+fn empty_sqrt() -> MathNode {
+    MathNode::Sqrt { body: Vec::new() }
+}
+
+fn empty_sum() -> MathNode {
+    MathNode::BigOp {
+        kind: BigOp::Sum,
+        lower: Vec::new(),
+        upper: Vec::new(),
+    }
+}
+
+fn empty_prod() -> MathNode {
+    MathNode::BigOp {
+        kind: BigOp::Prod,
+        lower: Vec::new(),
+        upper: Vec::new(),
+    }
+}
+
+fn empty_integral() -> MathNode {
+    MathNode::BigOp {
+        kind: BigOp::Integral,
+        lower: Vec::new(),
+        upper: Vec::new(),
+    }
+}
+
+fn empty_limit() -> MathNode {
+    MathNode::BigOp {
+        kind: BigOp::Limit,
+        lower: Vec::new(),
+        upper: Vec::new(),
+    }
+}
+
+/// Words that become structures when a space is typed after them.
+pub(crate) type Word = (&'static str, fn() -> MathNode);
+
+pub(crate) const WORDS: &[Word] = &[
+    ("sqrt", empty_sqrt),
+    (BigOp::Sum.keyword(), empty_sum),
+    (BigOp::Prod.keyword(), empty_prod),
+    (BigOp::Integral.keyword(), empty_integral),
+    (BigOp::Limit.keyword(), empty_limit),
+];
 
 /// A named slot of a structural node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,6 +113,8 @@ pub enum Slot {
     Sup,
     Sub,
     Body,
+    Lower,
+    Upper,
 }
 
 impl Slot {
@@ -49,6 +126,8 @@ impl Slot {
             Self::Sup => "sup",
             Self::Sub => "sub",
             Self::Body => "body",
+            Self::Lower => "lower",
+            Self::Upper => "upper",
         }
     }
 }
@@ -85,6 +164,14 @@ impl MathNode {
                 slots
             }
             Self::Group { .. } => vec![Slot::Body],
+            Self::Sqrt { .. } => vec![Slot::Body],
+            Self::BigOp { kind, .. } => {
+                if *kind == BigOp::Limit {
+                    vec![Slot::Lower]
+                } else {
+                    vec![Slot::Lower, Slot::Upper]
+                }
+            }
         }
     }
 
@@ -100,8 +187,15 @@ impl MathNode {
             (Self::Script { sup: Some(sup), .. }, Slot::Sup) => Some(sup),
             (Self::Script { sub: Some(sub), .. }, Slot::Sub) => Some(sub),
             (Self::Group { body, .. }, Slot::Body) => Some(body),
+            (Self::Sqrt { body }, Slot::Body) => Some(body),
+            (Self::BigOp { lower, .. }, Slot::Lower) => Some(lower),
+            (Self::BigOp { kind, upper, .. }, Slot::Upper) if *kind != BigOp::Limit => Some(upper),
             (Self::Sym(_), _) => None,
-            (Self::Frac { .. }, _) | (Self::Script { .. }, _) | (Self::Group { .. }, _) => None,
+            (Self::Frac { .. }, _)
+            | (Self::Script { .. }, _)
+            | (Self::Group { .. }, _)
+            | (Self::Sqrt { .. }, _)
+            | (Self::BigOp { .. }, _) => None,
         }
     }
 
@@ -113,8 +207,15 @@ impl MathNode {
             (Self::Script { sup: Some(sup), .. }, Slot::Sup) => Some(sup),
             (Self::Script { sub: Some(sub), .. }, Slot::Sub) => Some(sub),
             (Self::Group { body, .. }, Slot::Body) => Some(body),
+            (Self::Sqrt { body }, Slot::Body) => Some(body),
+            (Self::BigOp { lower, .. }, Slot::Lower) => Some(lower),
+            (Self::BigOp { kind, upper, .. }, Slot::Upper) if *kind != BigOp::Limit => Some(upper),
             (Self::Sym(_), _) => None,
-            (Self::Frac { .. }, _) | (Self::Script { .. }, _) | (Self::Group { .. }, _) => None,
+            (Self::Frac { .. }, _)
+            | (Self::Script { .. }, _)
+            | (Self::Group { .. }, _)
+            | (Self::Sqrt { .. }, _)
+            | (Self::BigOp { .. }, _) => None,
         }
     }
 }
@@ -159,6 +260,47 @@ pub fn insert_char(root: &mut MathList, cursor: &mut MathCursor, c: char) {
     let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
     list.insert(cursor.index, MathNode::Sym(c));
     cursor.index += 1;
+}
+
+/// A space was typed: replace a standalone trigger word and enter its first slot.
+pub fn insert_word(root: &mut MathList, cursor: &mut MathCursor) -> bool {
+    clamp(root, cursor);
+    let path = cursor.path.clone();
+    let index = cursor.index;
+    let Some((start, build)) = list_at(root, &path).and_then(|list| {
+        if index == 0 || !matches!(list[index - 1], MathNode::Sym(c) if c.is_alphabetic()) {
+            return None;
+        }
+        let mut start = index;
+        while start > 0 && matches!(list[start - 1], MathNode::Sym(c) if c.is_alphabetic()) {
+            start -= 1;
+        }
+        if start > 0
+            && matches!(list[start - 1], MathNode::Sym(c) if c.is_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        WORDS
+            .iter()
+            .find(|(word, _)| {
+                word.chars().count() == index - start
+                    && list[start..index]
+                        .iter()
+                        .zip(word.chars())
+                        .all(|(node, c)| matches!(node, MathNode::Sym(atom) if *atom == c))
+            })
+            .map(|(_, build)| (start, *build))
+    }) else {
+        return false;
+    };
+
+    let node = build();
+    let slot = node.slots()[0];
+    let list = list_at_mut(root, &path).expect("cursor path must resolve");
+    list.splice(start..index, std::iter::once(node));
+    cursor.path.push(Step { index: start, slot });
+    cursor.index = 0;
+    true
 }
 
 /// The delimiter pairs a typed opener produces. Braces are deliberately
@@ -287,7 +429,9 @@ pub fn insert_script(root: &mut MathList, cursor: &mut MathCursor, which: Slot) 
             let other = match which {
                 Slot::Sup => sup,
                 Slot::Sub => sub,
-                Slot::Base | Slot::Num | Slot::Den | Slot::Body => unreachable!(),
+                Slot::Base | Slot::Num | Slot::Den | Slot::Body | Slot::Lower | Slot::Upper => {
+                    unreachable!()
+                }
             };
             if other.is_none() {
                 *other = Some(Vec::new());
@@ -311,7 +455,9 @@ pub fn insert_script(root: &mut MathList, cursor: &mut MathCursor, which: Slot) 
         let target = match which {
             Slot::Sup => sup,
             Slot::Sub => sub,
-            Slot::Base | Slot::Num | Slot::Den | Slot::Body => unreachable!(),
+            Slot::Base | Slot::Num | Slot::Den | Slot::Body | Slot::Lower | Slot::Upper => {
+                unreachable!()
+            }
         };
         if target.is_none() {
             *target = Some(Vec::new());
@@ -400,6 +546,29 @@ pub fn backspace(root: &mut MathList, cursor: &mut MathCursor) -> Removed {
                         .chain(std::iter::once(MathNode::Sym(close))),
                 );
                 cursor.index = position + 1;
+            }
+            MathNode::Sqrt { body } => {
+                let keyword = "sqrt";
+                list.remove(position);
+                list.splice(
+                    position..position,
+                    keyword.chars().map(MathNode::Sym).chain(body),
+                );
+                cursor.index = position + keyword.chars().count();
+            }
+            MathNode::BigOp { kind, lower, upper } => {
+                let keyword = kind.keyword();
+                let keyword_len = keyword.chars().count();
+                let mut replacement = keyword.chars().map(MathNode::Sym).collect::<MathList>();
+                replacement.push(MathNode::Sym('_'));
+                replacement.extend(lower);
+                if kind != BigOp::Limit {
+                    replacement.push(MathNode::Sym('^'));
+                    replacement.extend(upper);
+                }
+                list.remove(position);
+                list.splice(position..position, replacement);
+                cursor.index = position + keyword_len;
             }
         }
         Removed::Edited
@@ -600,6 +769,14 @@ mod tests {
         MathNode::Group { open, close, body }
     }
 
+    fn sqrt(body: MathList) -> MathNode {
+        MathNode::Sqrt { body }
+    }
+
+    fn big_op(kind: BigOp, lower: MathList, upper: MathList) -> MathNode {
+        MathNode::BigOp { kind, lower, upper }
+    }
+
     fn at(index: usize) -> MathCursor {
         MathCursor {
             path: Vec::new(),
@@ -627,6 +804,42 @@ mod tests {
 
         assert_eq!(root, sym("1+x"));
         assert_eq!(cursor, at(3));
+    }
+
+    #[test]
+    fn a_word_becomes_its_structure_on_space() {
+        let mut root = sym("sqrt");
+        let mut cursor = at(4);
+        assert!(insert_word(&mut root, &mut cursor));
+        assert_eq!(root, vec![sqrt(Vec::new())]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
+
+        let mut root = sym("sum");
+        let mut cursor = at(3);
+        assert!(insert_word(&mut root, &mut cursor));
+        assert_eq!(root, vec![big_op(BigOp::Sum, Vec::new(), Vec::new())]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Lower)], 0));
+    }
+
+    #[test]
+    fn a_word_inside_an_identifier_is_left_alone() {
+        let mut root = sym("resum");
+        let mut cursor = at(5);
+        assert!(!insert_word(&mut root, &mut cursor));
+        assert_eq!(root, sym("resum"));
+
+        let mut root = sym("1sum");
+        let mut cursor = at(4);
+        assert!(!insert_word(&mut root, &mut cursor));
+        assert_eq!(root, sym("1sum"));
+    }
+
+    #[test]
+    fn a_limit_has_no_upper_slot() {
+        let node = big_op(BigOp::Limit, Vec::new(), Vec::new());
+
+        assert_eq!(node.slots(), vec![Slot::Lower]);
+        assert_eq!(node.slot(Slot::Upper), None);
     }
 
     #[test]
@@ -832,6 +1045,16 @@ mod tests {
     }
 
     #[test]
+    fn backspace_reverts_a_big_operator_to_its_letters() {
+        let mut root = vec![big_op(BigOp::Sum, sym("i=0"), sym("n"))];
+        let mut cursor = at(1);
+
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, sym("sum_i=0^n"));
+        assert_eq!(cursor, at(3));
+    }
+
+    #[test]
     fn backspace_at_a_slot_start_climbs_out_without_deleting() {
         let mut root = vec![frac(sym("a"), Vec::new())];
         let original = root.clone();
@@ -969,6 +1192,17 @@ mod tests {
 
         assert!(slot_next(&root, &mut cursor));
         assert_eq!(cursor, at_path(&[(0, Slot::Sup)], 0));
+    }
+
+    #[test]
+    fn tab_walks_a_big_operator_s_limits() {
+        let root = vec![big_op(BigOp::Sum, Vec::new(), Vec::new())];
+        let mut cursor = MathCursor::default();
+
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Lower)], 0));
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Upper)], 0));
     }
 
     #[test]

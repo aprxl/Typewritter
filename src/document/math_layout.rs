@@ -130,7 +130,38 @@ fn layout_node(
         MathNode::Script { .. } => script(node, level, measure),
         // Real delimiter layout lands next; groups currently lay out as their body.
         MathNode::Group { body, .. } => layout(body, level, measure),
+        // Real radical layout lands next; the body remains visible for now.
+        MathNode::Sqrt { body } => layout(body, level, measure),
+        // Real large-operator glyph and limit placement land next.
+        MathNode::BigOp { kind, lower, upper } => big_op(kind, lower, upper, level, measure),
     }
+}
+
+fn big_op(
+    kind: &crate::document::math::BigOp,
+    lower: &MathList,
+    upper: &MathList,
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> MathBox {
+    let operator = layout(
+        &kind.keyword().chars().map(MathNode::Sym).collect(),
+        level,
+        measure,
+    );
+    let operand_level = (level + 1).min(2);
+    let lower = layout(lower, operand_level, measure);
+    let mut children = vec![(0.0, 0.0, operator)];
+    let operator_width = children[0].2.width;
+    children.push((operator_width, 0.0, lower));
+    if *kind != crate::document::math::BigOp::Limit {
+        children.push((
+            operator_width + children[1].2.width,
+            0.0,
+            layout(upper, operand_level, measure),
+        ));
+    }
+    row_box(children)
 }
 
 fn script(node: &MathNode, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
@@ -157,7 +188,9 @@ fn script(node: &MathNode, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f
             }
             Slot::Sup => (base_width, size(level) * SCRIPT_RISE + child.descent),
             Slot::Sub => (base_width, -(size(level) * SCRIPT_DROP + child.ascent)),
-            Slot::Num | Slot::Den | Slot::Body => unreachable!("fraction slots cannot be scripts"),
+            Slot::Num | Slot::Den | Slot::Body | Slot::Lower | Slot::Upper => {
+                unreachable!("fraction slots cannot be scripts")
+            }
         };
         let index = slot_child_index(node, slot).expect("script slot must have a child index");
         children[index] = Some((x, y, child));
@@ -228,11 +261,9 @@ fn slot_child_index(node: &MathNode, slot: Slot) -> Option<usize> {
         .slots()
         .iter()
         .position(|candidate| *candidate == slot)?;
-    Some(if matches!(node, MathNode::Frac { .. }) && slot_index > 0 {
-        slot_index + 1
-    } else {
-        slot_index
-    })
+    let offset = matches!(node, MathNode::BigOp { .. })
+        || matches!(node, MathNode::Frac { .. }) && slot_index > 0;
+    Some(slot_index + usize::from(offset))
 }
 
 fn row_box(children: Vec<(f32, f32, MathBox)>) -> MathBox {
@@ -338,6 +369,7 @@ fn child_level(node: &MathNode, slot: Slot, level: usize) -> usize {
     match node {
         MathNode::Script { .. } if slot == Slot::Base => level,
         MathNode::Group { .. } => level,
+        MathNode::Sqrt { .. } => level,
         _ => (level + 1).min(2),
     }
 }
