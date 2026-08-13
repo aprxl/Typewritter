@@ -8,7 +8,7 @@
 //! Box origins are anchor-left. Every child tuple stores `(x, y, box)` with
 //! `y` positive upward; a denominator therefore has a negative y offset.
 
-use crate::document::math::{MathCursor, MathList, MathNode, Slot, Step};
+use crate::document::math::{BigOp, MathCursor, MathList, MathNode, Slot, Step};
 use crate::theme::{self, TextStyle};
 
 /// Math base size at script level 0. Matches body text so an inline expression
@@ -35,6 +35,14 @@ pub const BAR: f32 = 1.0;
 pub const SCRIPT_RISE: f32 = 0.10;
 /// The mirror for a subscript's upper edge below the anchor line.
 pub const SCRIPT_DROP: f32 = 0.10;
+/// How much of a group's body height its delimiters are drawn to fill.
+pub const DELIM_FILL: f32 = 1.15;
+/// Clearance between a radicand and the bar drawn over it.
+pub const RADICAL_GAP: f32 = 0.10;
+/// How much larger than surrounding text a large operator is drawn.
+pub const BIGOP_SCALE: f32 = 1.6;
+/// Clearance between a large operator and each of its limits.
+pub const BIGOP_GAP: f32 = 0.12;
 
 // The renderer centers glyphs vertically, so glyph boxes are symmetric about
 // the anchor. Structural boxes use their near edge when clearance matters.
@@ -128,40 +136,134 @@ fn layout_node(
         MathNode::Sym(ch) => glyph(*ch, level, measure),
         MathNode::Frac { num, den } => fraction(node, num, den, level, measure),
         MathNode::Script { .. } => script(node, level, measure),
-        // Real delimiter layout lands next; groups currently lay out as their body.
-        MathNode::Group { body, .. } => layout(body, level, measure),
-        // Real radical layout lands next; the body remains visible for now.
-        MathNode::Sqrt { body } => layout(body, level, measure),
-        // Real large-operator glyph and limit placement land next.
-        MathNode::BigOp { kind, lower, upper } => big_op(kind, lower, upper, level, measure),
+        MathNode::Group { open, close, body } => group(node, *open, *close, body, level, measure),
+        MathNode::Sqrt { body } => radical(node, body, level, measure),
+        MathNode::BigOp { kind, lower, upper } => big_op(node, kind, lower, upper, level, measure),
+    }
+}
+
+fn text_glyph(text: &str, size: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
+    let half = size * 0.5;
+    MathBox {
+        width: measure(text, &TextStyle::math(size, theme::INK)),
+        ascent: half,
+        descent: half,
+        kind: BoxKind::Glyph {
+            text: text.to_owned(),
+            size,
+        },
     }
 }
 
 fn big_op(
-    kind: &crate::document::math::BigOp,
+    node: &MathNode,
+    kind: &BigOp,
     lower: &MathList,
     upper: &MathList,
     level: usize,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> MathBox {
-    let operator = layout(
-        &kind.keyword().chars().map(MathNode::Sym).collect(),
-        level,
-        measure,
-    );
+    let (operator_text, operator_size) = match kind {
+        BigOp::Sum => ("∑", size(level) * BIGOP_SCALE),
+        BigOp::Prod => ("∏", size(level) * BIGOP_SCALE),
+        BigOp::Integral => ("∫", size(level) * BIGOP_SCALE),
+        BigOp::Limit => ("lim", size(level)),
+    };
+    let operator = text_glyph(operator_text, operator_size, measure);
     let operand_level = (level + 1).min(2);
     let lower = layout(lower, operand_level, measure);
-    let mut children = vec![(0.0, 0.0, operator)];
-    let operator_width = children[0].2.width;
-    children.push((operator_width, 0.0, lower));
-    if *kind != crate::document::math::BigOp::Limit {
-        children.push((
-            operator_width + children[1].2.width,
-            0.0,
-            layout(upper, operand_level, measure),
-        ));
+    let upper = if *kind == BigOp::Limit {
+        None
+    } else {
+        Some(layout(upper, operand_level, measure))
+    };
+    let width = operator
+        .width
+        .max(lower.width)
+        .max(upper.as_ref().map_or(0.0, |upper| upper.width));
+    let gap = size(level) * BIGOP_GAP;
+    let operator_ascent = operator.ascent;
+    let operator_descent = operator.descent;
+    let lower_y = -(operator_descent + gap + lower.ascent);
+    let mut children = (0..(1 + node.slots().len()))
+        .map(|_| None)
+        .collect::<Vec<_>>();
+    children[0] = Some(((width - operator.width) * 0.5, 0.0, operator));
+    children[slot_child_index(node, Slot::Lower).expect("big operator lower slot index")] =
+        Some(((width - lower.width) * 0.5, lower_y, lower));
+    if let Some(upper) = upper {
+        let upper_y = operator_ascent + gap + upper.descent;
+        children[slot_child_index(node, Slot::Upper).expect("big operator upper slot index")] =
+            Some(((width - upper.width) * 0.5, upper_y, upper));
     }
-    row_box(children)
+    row_box(
+        children
+            .into_iter()
+            .map(|child| child.expect("every big operator child must be laid out"))
+            .collect(),
+    )
+}
+
+fn stretchy_size(body: &MathBox, level: usize) -> f32 {
+    size(level).max((body.ascent + body.descent) * DELIM_FILL)
+}
+
+fn group(
+    node: &MathNode,
+    open: char,
+    close: char,
+    body: &MathList,
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> MathBox {
+    let body = layout(body, level, measure);
+    let delimiter_size = stretchy_size(&body, level);
+    let opener = text_glyph(&open.to_string(), delimiter_size, measure);
+    let closer = text_glyph(&close.to_string(), delimiter_size, measure);
+    let body_x = opener.width;
+    let closer_x = body_x + body.width;
+    let mut children = (0..3).map(|_| None).collect::<Vec<_>>();
+    children[0] = Some((0.0, 0.0, opener));
+    children[slot_child_index(node, Slot::Body).expect("group body slot index")] =
+        Some((body_x, 0.0, body));
+    children[2] = Some((closer_x, 0.0, closer));
+    row_box(
+        children
+            .into_iter()
+            .map(|child| child.expect("every group child must be laid out"))
+            .collect(),
+    )
+}
+
+fn radical(
+    node: &MathNode,
+    body: &MathList,
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> MathBox {
+    let body = layout(body, level, measure);
+    let radical_size = stretchy_size(&body, level);
+    let sign = text_glyph("√", radical_size, measure);
+    let body_x = sign.width;
+    let gap = size(level) * RADICAL_GAP;
+    let bar_y = body.ascent + gap + BAR * 0.5;
+    let bar = MathBox {
+        width: body.width,
+        ascent: BAR * 0.5,
+        descent: BAR * 0.5,
+        kind: BoxKind::Bar { thickness: BAR },
+    };
+    let mut children = (0..3).map(|_| None).collect::<Vec<_>>();
+    children[0] = Some((0.0, 0.0, sign));
+    children[1] = Some((body_x, bar_y, bar));
+    children[slot_child_index(node, Slot::Body).expect("radical body slot index")] =
+        Some((body_x, 0.0, body));
+    row_box(
+        children
+            .into_iter()
+            .map(|child| child.expect("every radical child must be laid out"))
+            .collect(),
+    )
 }
 
 fn script(node: &MathNode, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
@@ -261,9 +363,17 @@ fn slot_child_index(node: &MathNode, slot: Slot) -> Option<usize> {
         .slots()
         .iter()
         .position(|candidate| *candidate == slot)?;
-    let offset = matches!(node, MathNode::BigOp { .. })
-        || matches!(node, MathNode::Frac { .. }) && slot_index > 0;
-    Some(slot_index + usize::from(offset))
+    // Structural slots follow each node's fixed visual children: delimiters
+    // flank groups, a radical sign and bar precede its body, an operator
+    // precedes limits, and a fraction bar sits between numerator and denominator.
+    let visual_offset = match node {
+        MathNode::Group { .. } => 1,
+        MathNode::Sqrt { .. } => 2,
+        MathNode::BigOp { .. } => 1,
+        MathNode::Frac { .. } => usize::from(slot_index > 0),
+        MathNode::Sym(_) | MathNode::Script { .. } => 0,
+    };
+    Some(slot_index + visual_offset)
 }
 
 fn row_box(children: Vec<(f32, f32, MathBox)>) -> MathBox {
@@ -473,6 +583,22 @@ mod tests {
 
     fn script(base: MathList, sup: Option<MathList>, sub: Option<MathList>) -> MathNode {
         MathNode::Script { base, sup, sub }
+    }
+
+    fn group(body: MathList) -> MathNode {
+        MathNode::Group {
+            open: '(',
+            close: ')',
+            body,
+        }
+    }
+
+    fn radical(body: MathList) -> MathNode {
+        MathNode::Sqrt { body }
+    }
+
+    fn big_op(kind: BigOp, lower: MathList, upper: MathList) -> MathNode {
+        MathNode::BigOp { kind, lower, upper }
     }
 
     #[test]
@@ -955,5 +1081,197 @@ mod tests {
         assert_eq!(sub_x, base_width);
         assert!(sup_y > 0.0);
         assert!(sub_y < 0.0);
+    }
+
+    #[test]
+    fn a_bracket_grows_with_what_it_holds() {
+        let plain = layout(&symbols("x"), 0, &fake_measure);
+        let single = layout(&vec![group(symbols("x"))], 0, &fake_measure);
+        let nested = layout(
+            &vec![group(vec![fraction(symbols("x"), symbols("y"))])],
+            0,
+            &fake_measure,
+        );
+        let BoxKind::Row {
+            children: single_list,
+        } = single.kind
+        else {
+            panic!("group list must produce row");
+        };
+        let BoxKind::Row {
+            children: single_group,
+        } = &single_list[0].2.kind
+        else {
+            panic!("group must produce row");
+        };
+        let BoxKind::Glyph {
+            size: single_size, ..
+        } = &single_group[0].2.kind
+        else {
+            panic!("group opener must be glyph");
+        };
+        let BoxKind::Row {
+            children: nested_list,
+        } = nested.kind
+        else {
+            panic!("group list must produce row");
+        };
+        let BoxKind::Row {
+            children: nested_group,
+        } = &nested_list[0].2.kind
+        else {
+            panic!("group must produce row");
+        };
+        let BoxKind::Glyph {
+            size: nested_size, ..
+        } = &nested_group[0].2.kind
+        else {
+            panic!("group opener must be glyph");
+        };
+
+        assert!(*nested_size > *single_size);
+        assert!(nested_list[0].2.ascent + nested_list[0].2.descent > plain.ascent + plain.descent);
+    }
+
+    #[test]
+    fn a_bracket_is_never_smaller_than_its_text() {
+        let list = layout(&vec![group(symbols("x"))], 0, &fake_measure);
+        let BoxKind::Row { children } = list.kind else {
+            panic!("group list must produce row");
+        };
+        let BoxKind::Row { children: group } = &children[0].2.kind else {
+            panic!("group must produce row");
+        };
+        assert!(matches!(
+            group[0].2.kind,
+            BoxKind::Glyph { size, .. } if size >= BASE_SIZE
+        ));
+        assert!(matches!(
+            group[2].2.kind,
+            BoxKind::Glyph { size, .. } if size >= BASE_SIZE
+        ));
+    }
+
+    #[test]
+    fn a_radical_covers_its_body() {
+        let list = layout(&vec![radical(symbols("xy"))], 0, &fake_measure);
+        let BoxKind::Row { children } = list.kind else {
+            panic!("radical list must produce row");
+        };
+        let radical_box = &children[0].2;
+        let BoxKind::Row { children: radical } = &radical_box.kind else {
+            panic!("radical must produce row");
+        };
+        let bar = &radical[1];
+        let body = &radical[2];
+        assert_eq!(bar.2.width, body.2.width);
+        assert!(bar.1 - bar.2.descent > body.1 + body.2.ascent);
+        assert!(radical_box.ascent >= bar.1 + bar.2.ascent);
+    }
+
+    #[test]
+    fn a_big_operator_stacks_its_limits() {
+        let list = layout(
+            &vec![big_op(BigOp::Sum, symbols("long"), symbols("u"))],
+            0,
+            &fake_measure,
+        );
+        let BoxKind::Row { children } = list.kind else {
+            panic!("big operator list must produce row");
+        };
+        let op_box = &children[0].2;
+        let BoxKind::Row { children: op } = &op_box.kind else {
+            panic!("big operator must produce row");
+        };
+        let operator = &op[0];
+        let lower = &op[1];
+        let upper = &op[2];
+        let operator_center = operator.0 + operator.2.width * 0.5;
+        assert!((operator_center - (op_box.width * 0.5)).abs() < 0.0001);
+        assert!((lower.0 + lower.2.width * 0.5 - op_box.width * 0.5).abs() < 0.0001);
+        assert!((upper.0 + upper.2.width * 0.5 - op_box.width * 0.5).abs() < 0.0001);
+        assert!(upper.1 - upper.2.descent > operator.1 + operator.2.ascent);
+        assert!(lower.1 + lower.2.ascent < operator.1 - operator.2.descent);
+        assert!(matches!(
+            operator.2.kind,
+            BoxKind::Glyph { size, .. } if size == BASE_SIZE * BIGOP_SCALE
+        ));
+    }
+
+    #[test]
+    fn a_limit_has_no_upper_child() {
+        let list = layout(
+            &vec![big_op(BigOp::Limit, symbols("x"), symbols("ignored"))],
+            0,
+            &fake_measure,
+        );
+        let BoxKind::Row { children } = list.kind else {
+            panic!("limit list must produce row");
+        };
+        let BoxKind::Row { children: limit } = &children[0].2.kind else {
+            panic!("limit must produce row");
+        };
+        assert_eq!(limit.len(), 2);
+        assert!(matches!(
+            limit[0].2.kind,
+            BoxKind::Glyph { ref text, size } if text == "lim" && size == BASE_SIZE
+        ));
+    }
+
+    #[test]
+    fn the_cursor_reaches_every_new_slot() {
+        let group_list = vec![group(symbols("xy"))];
+        let group_box = layout(&group_list, 0, &fake_measure);
+        let BoxKind::Row { children } = &group_box.kind else {
+            panic!("group list must produce row");
+        };
+        let BoxKind::Row { children: group } = &children[0].2.kind else {
+            panic!("group must produce row");
+        };
+        let group_cursor = MathCursor {
+            path: vec![Step {
+                index: 0,
+                slot: Slot::Body,
+            }],
+            index: 1,
+        };
+        let (group_x, _, _) = cursor_pos(&group_list, &group_cursor, 0, &fake_measure);
+        assert!(group_x > group[1].0 && group_x < group[1].0 + group[1].2.width);
+
+        let radical_list = vec![radical(symbols("xy"))];
+        let radical_box = layout(&radical_list, 0, &fake_measure);
+        let BoxKind::Row { children } = &radical_box.kind else {
+            panic!("radical list must produce row");
+        };
+        let BoxKind::Row { children: radical } = &children[0].2.kind else {
+            panic!("radical must produce row");
+        };
+        let radical_cursor = MathCursor {
+            path: vec![Step {
+                index: 0,
+                slot: Slot::Body,
+            }],
+            index: 1,
+        };
+        let (radical_x, _, _) = cursor_pos(&radical_list, &radical_cursor, 0, &fake_measure);
+        assert!(radical_x > radical[2].0 && radical_x < radical[2].0 + radical[2].2.width);
+
+        let sum_list = vec![big_op(BigOp::Sum, symbols("lo"), symbols("up"))];
+        let sum_box = layout(&sum_list, 0, &fake_measure);
+        let BoxKind::Row { children } = &sum_box.kind else {
+            panic!("sum list must produce row");
+        };
+        let BoxKind::Row { children: sum } = &children[0].2.kind else {
+            panic!("sum must produce row");
+        };
+        for slot in [Slot::Lower, Slot::Upper] {
+            let cursor = MathCursor {
+                path: vec![Step { index: 0, slot }],
+                index: 1,
+            };
+            let (x, _, _) = cursor_pos(&sum_list, &cursor, 0, &fake_measure);
+            let child = &sum[slot_child_index(&sum_list[0], slot).expect("sum slot index")];
+            assert!(x > child.0 && x < child.0 + child.2.width);
+        }
     }
 }
