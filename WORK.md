@@ -6,6 +6,61 @@ warnings` clean, 205 tests passing, and the tree committed as `d5caaa1`
 
 ---
 
+## Session log — current work
+
+**`src/document/mod.rs`, `src/document/layout.rs`, `src/document/markdown.rs`**
+— line dividers. `Block::Divider` holds one always-empty run, satisfying the
+"every block has a run" invariant. Typing on a rule turns it back into a
+paragraph, enforced centrally in `prune_runs` rather than at each edit site.
+Divider metrics are deliberately tighter than a blank line: a big hole
+disrupts reading more than the separation is worth. Markdown writes `---`,
+with an escape guard for a paragraph that would re-read as a rule.
+
+**`arboard`, `src/shell/`** — OS clipboard. `arboard` was chosen over pulling
+in a second UI toolkit. All clipboard I/O lives in the shell, so document and
+tab models stay pure and their tests stay headless. The yank register exports
+once per frame by comparing state, covering every yank path without a hook at
+each one.
+
+**`src/shell/`, `src/components/`** — right-click menus. Research first:
+winit has no menu API, and `muda` (the standard cross-platform menu crate)
+needs GTK3 and libxdo on Linux, which would link a second UI toolkit into an
+app that draws its own title bar. The menu is drawn in-app on the same
+detached-overlay pattern as the palette and slash menu; the clipboard goes
+through the OS, which is the part that genuinely has to interoperate. Menus
+now cover the editor, a file-tree row, and empty tree space.
+
+**`src/document/outline.rs`, `src/components/editor.rs`, `src/components/topics.rs`**
+— document outline. One pure function has three consumers: editor margin
+numbers, Topics panel, and breadcrumb trail. All derive from the same blocks,
+so a number can never disagree with the heading beside it. Headings nest by
+insertion order rather than level arithmetic, so a document that opens at H3
+or skips a level still comes out sensible. Auto-numbers are virtual: hung in
+the margin and drawn rather than laid out, so the caret can never reach one
+and it never shifts the heading it labels.
+
+**`MATH.md`, `src/document/math.rs`, `src/document/math_layout.rs`,
+`src/document/math_notation.rs`, `src/document/layout.rs`, `src/shell/`** —
+math mode. The design lives in `MATH.md`; this log does not restate it. The
+math tree uses single-character atoms in the TeX hlist model, so the cursor is
+an index and never a string offset. It has cursor and edit operations, `/`
+trigger operand capture, and structural revert on backspace. Recursive box
+layout makes nesting work because a nested fraction is just a tall child its
+ancestors grow to hold. Canonical linear notation is deterministic and
+property-tested both ways. In containers, an inline atom costs exactly one
+character in flat-text space, so existing motion and selection work unchanged.
+Real drawing and content-driven line heights are in place. Shell wiring makes
+`/math`, the fraction trigger, Tab between slots, and Esc popping levels work
+in the running app. JuliaMono is the math font, chosen for glyph coverage.
+Verified end to end in the app: typing `1 / 2 / 3` builds a nested fraction,
+saves as `gain is $(19)/(2/3)$`, and reopens as the same tree.
+
+**Next for math** — `^` and `_` scripts, brackets and groups, the in-math
+completion palette, word triggers (`sqrt`, `sum`, `int`, `lim`), typed
+identifiers, and the raw text node.
+
+---
+
 ## Session log
 
 **`src/markdown.rs`, `src/document/mod.rs`, `src/document/layout.rs`,

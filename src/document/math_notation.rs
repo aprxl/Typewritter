@@ -21,8 +21,7 @@ pub fn print(list: &MathList) -> String {
 fn print_list(list: &MathList, output: &mut String) {
     for (index, node) in list.iter().enumerate() {
         if index > 0 && matches!(node, MathNode::Frac { .. }) {
-            // A later fraction would otherwise let its slash capture the
-            // preceding node as numerator (for example, `a1/2`).
+            // A later fraction with an empty numerator would capture the preceding node.
             output.push('(');
             print_node(node, output);
             output.push(')');
@@ -206,6 +205,15 @@ mod tests {
         assert_ne!(print(&left_associative), print(&denominator_fraction));
         assert_eq!(parse(&print(&left_associative)), left_associative);
         assert_eq!(parse(&print(&denominator_fraction)), denominator_fraction);
+    }
+
+    #[test]
+    fn an_empty_numerator_after_an_atom_keeps_its_parens() {
+        let list = vec![MathNode::Sym('a'), frac(Vec::new(), sym("b"))];
+
+        let printed = print(&list);
+        assert_eq!(printed, "a(()/b)");
+        assert_eq!(parse(&printed), list);
     }
 
     #[test]

@@ -537,6 +537,16 @@ fn caret_for_click(
         if segment.style.badge {
             cum += theme::BADGE_PAD;
         }
+        if matches!(run, Inline::Math(_)) {
+            let w = advance(run, &text, block, segment.style, measure);
+            if x <= cum + w / 2.0 {
+                pos = seg_flat;
+                break 'segments;
+            }
+            cum += w;
+            seg_flat += segment.len;
+            continue;
+        }
         for (ci, ch) in text.chars().enumerate() {
             let w = measure(&ch.to_string(), &text_style(block, segment.style));
             if x <= cum + w / 2.0 {
@@ -1138,6 +1148,35 @@ mod tests {
         assert!(block.lines[0].height > LINE_BODY);
         assert_eq!(block.lines[1].y, block.lines[0].height);
         assert_eq!(block.height, block.lines[0].height + block.lines[1].height);
+    }
+
+    #[test]
+    fn a_click_past_an_expression_lands_after_it() {
+        let block = Block::Paragraph(vec![
+            Inline::Math(vec![MathNode::Frac {
+                num: vec![MathNode::Sym('1')],
+                den: vec![MathNode::Sym('2')],
+            }]),
+            Inline::Text(Text {
+                text: " text".into(),
+                style: Style::PLAIN,
+            }),
+        ]);
+        let d = doc_with(vec![block]);
+        let laid = layout(&d, 300.0, &fake_measure);
+        let atom_width = advance(
+            &d.blocks[0].inlines()[0],
+            "\u{FFFC}",
+            &d.blocks[0],
+            Style::PLAIN,
+            &fake_measure,
+        );
+
+        let past = laid.hit(atom_width + 1.0, LINE_BODY / 2.0, &fake_measure);
+        assert_eq!(flat_of_caret(&d.blocks, past), 1);
+
+        let inside_left = laid.hit(atom_width / 4.0, LINE_BODY / 2.0, &fake_measure);
+        assert_eq!(flat_of_caret(&d.blocks, inside_left), 0);
     }
 
     #[test]
