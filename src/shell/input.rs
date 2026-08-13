@@ -15,12 +15,12 @@ use super::commands;
 use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
-    ContextMenu, Dialog, FileFinder, FileTree, Onboarding, Palette, SlashMenu, context_menu,
-    file_finder, file_tree, onboarding, title_bar,
+    ContextMenu, Dialog, FileFinder, FileTree, MathMenu, Onboarding, Palette, SlashMenu,
+    context_menu, file_finder, file_tree, math_menu, onboarding, title_bar,
 };
 use crate::config::Config;
 use crate::document::math::{self, Slot};
-use crate::document::{FlatPos, FlatRange, Style};
+use crate::document::{FlatPos, FlatRange, Style, math_layout};
 use crate::input::Input;
 use crate::layout::Rect;
 use crate::theme::{self, TextStyle};
@@ -33,7 +33,7 @@ use crate::vim::{
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{ContextMenuState, PaletteState, Shell, SlashMenuState};
+use super::{ContextMenuState, MathMenuState, PaletteState, Shell, SlashMenuState};
 
 impl Shell {
     /// Choosing a vault is a shell job: the picker persists the config and
@@ -120,6 +120,14 @@ impl Shell {
                 self.open_context_menu(commands::EDITOR_MENU, input.mouse_position());
                 return;
             }
+        }
+
+        // The in-math completion card claims its pick-and-accept chords
+        // ahead of the command table — Ctrl+N and Ctrl+1..4 are global
+        // commands outside math. Only claimed while the card is actually
+        // showing; every other key keeps its math meaning.
+        if self.math_menu.is_some() && self.handle_math_menu_input(input) {
+            return;
         }
 
         if let Some(command) = commands::matching(input) {
@@ -1462,6 +1470,188 @@ impl Shell {
         }
     }
 
+    // ---- math completion card --------------------------------------------
+
+    /// The card's claims while it is showing: `Esc` dismisses it for the
+    /// word it is on, `Enter` accepts the selected row, `↑`/`↓` and
+    /// `Ctrl+N`/`Ctrl+P` move the selection, and `Ctrl+1..9` pick a row
+    /// outright. Returns whether a claim was consumed. Deliberately does not
+    /// claim `Tab`, which must keep walking slots, `←`/`→`, which move the
+    /// math cursor, or any typed character, which keeps typing — the word
+    /// changing is what closes and reopens the card.
+    fn handle_math_menu_input(&mut self, input: &Input) -> bool {
+        if input.is_key_pressed(KeyCode::Escape) {
+            self.dismiss_math_menu();
+            return true;
+        }
+        if input.is_key_typed(KeyCode::Enter) {
+            self.accept_math_menu();
+            return true;
+        }
+        if input.is_key_typed(KeyCode::ArrowDown) {
+            self.move_math_menu(1);
+            return true;
+        }
+        if input.is_key_typed(KeyCode::ArrowUp) {
+            self.move_math_menu(-1);
+            return true;
+        }
+        if input.ctrl() {
+            let digits = [
+                KeyCode::Digit1,
+                KeyCode::Digit2,
+                KeyCode::Digit3,
+                KeyCode::Digit4,
+                KeyCode::Digit5,
+                KeyCode::Digit6,
+                KeyCode::Digit7,
+                KeyCode::Digit8,
+                KeyCode::Digit9,
+            ];
+            if let Some(row) = digits.iter().position(|key| input.is_key_typed(*key)) {
+                self.accept_math_menu_row(row);
+                return true;
+            }
+            if input.is_key_typed(KeyCode::KeyN) {
+                self.move_math_menu(1);
+                return true;
+            }
+            if input.is_key_typed(KeyCode::KeyP) {
+                self.move_math_menu(-1);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Esc on the card: stop offering completions for the current word, but
+    /// leave the word itself alone — typing more letters brings the card
+    /// back.
+    fn dismiss_math_menu(&mut self) {
+        self.math_dismissed = self.math_menu.as_ref().map(|state| state.word.clone());
+        self.math_menu = None;
+        self.refresh_math_menu();
+    }
+
+    fn accept_math_menu(&mut self) {
+        let selected = self.math_menu.as_ref().map_or(0, |state| state.selected);
+        self.accept_math_menu_row(selected);
+    }
+
+    fn accept_math_menu_row(&mut self, index: usize) {
+        let Some(word) = self.math_menu.as_ref().map(|state| state.word.clone()) else {
+            return;
+        };
+        let Some(completion) = math::completions(&word).get(index).copied() else {
+            return;
+        };
+        match completion {
+            math::Completion::Symbol { glyph, .. } => {
+                self.docs.borrow_mut().math_accept_symbol(glyph);
+            }
+            math::Completion::Structure { name, .. } => {
+                self.docs.borrow_mut().math_insert_structure(name);
+            }
+        }
+        self.math_dismissed = None;
+        self.math_menu = None;
+        self.refresh_math_menu();
+    }
+
+    fn move_math_menu(&mut self, delta: isize) {
+        let Some(state) = &mut self.math_menu else {
+            return;
+        };
+        let count = math::completions(&state.word).len();
+        if count == 0 {
+            return;
+        }
+        let next = ((state.selected as isize + delta).clamp(0, count as isize - 1)) as usize;
+        if next != state.selected {
+            state.selected = next;
+            self.refresh_math_menu();
+        }
+    }
+
+    /// Recomputed every frame, the card's whole life: show it when the word
+    /// under the math cursor has completions it was not dismissed for, hide
+    /// it otherwise. A backspace, an arrow move and a click elsewhere all
+    /// just change the word, so there is no state to fall out of step.
+    pub(super) fn sync_math_menu(&mut self) {
+        let word = self.docs.borrow().math_word_before();
+        let Some(word) = word else {
+            if self.math_menu.take().is_some() {
+                self.refresh_math_menu();
+            }
+            return;
+        };
+        if self.math_dismissed.as_deref() == Some(word.as_str())
+            || math::completions(&word).is_empty()
+        {
+            if self.math_menu.take().is_some() {
+                self.refresh_math_menu();
+            }
+            return;
+        }
+        let anchor = self.compute_math_menu_anchor();
+        let changed = match &self.math_menu {
+            Some(state) => state.word != word,
+            None => true,
+        };
+        let state = self.math_menu.get_or_insert_with(|| MathMenuState {
+            word: word.clone(),
+            selected: 0,
+            anchor,
+        });
+        let moved = state.anchor != anchor;
+        state.anchor = anchor;
+        // A new word is a new list: reset the selection and rebuild the
+        // rows, which are derived from the word held here.
+        if changed {
+            state.word = word.clone();
+            state.selected = 0;
+        }
+        if changed || moved {
+            self.refresh_math_menu();
+        }
+    }
+
+    /// The math caret's screen position, used as the card's anchor. The
+    /// same coordinate math the editor's `draw()` uses: the atom's pen
+    /// position from `caret_pos`, plus the math cursor's offset within the
+    /// expression from `math_layout::cursor_pos`.
+    fn compute_math_menu_anchor(&mut self) -> (f32, f32) {
+        let rect = self.layout.rect(self.text_column);
+        let width = crate::components::editor::Editor::content_width(rect);
+        let layout = self.current_layout(width);
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+        let (base_x, base_y, scroll, offset_x, offset_y) = {
+            let docs = self.docs.borrow();
+            let Some(tab) = docs.active() else {
+                return (rect.x, rect.y);
+            };
+            let doc = &tab.document;
+            let (cx, cy, _) = layout.caret_pos(doc.caret, &measure);
+            let Some((list, cursor)) = doc.focused_math_view() else {
+                return (rect.x, rect.y);
+            };
+            let (ox, oy, _) = math_layout::cursor_pos(list, cursor, 0, &measure);
+            (cx, cy, docs.editor_scroll, ox, oy)
+        };
+        let screen_x = rect.x + crate::components::editor::INSET + base_x + offset_x;
+        let screen_y = rect.y + crate::components::editor::TOP + base_y - offset_y - scroll;
+        (screen_x, screen_y)
+    }
+
+    fn refresh_math_menu(&mut self) {
+        let menu = match &self.math_menu {
+            Some(state) => MathMenu::new(math_menu_rows(&state.word), state.selected, state.anchor),
+            None => MathMenu::closed(),
+        };
+        self.regions[self.math_menu_region].set_component(Box::new(menu));
+    }
+
     fn divider_drag(&mut self, input: &Input) {
         let mouse = input.mouse_position();
         let over = input
@@ -1786,6 +1976,26 @@ fn slash_menu_input(state: &mut SlashMenuState, input: &Input) -> bool {
         changed = true;
     }
     changed
+}
+
+/// The completion card's rows for a word: symbols first, structures second,
+/// in the order [`math::completions`] offers them.
+fn math_menu_rows(word: &str) -> Vec<math_menu::Row> {
+    math::completions(word)
+        .into_iter()
+        .map(|completion| match completion {
+            math::Completion::Symbol { name, group, glyph } => math_menu::Row {
+                name: name.to_owned(),
+                group: group.to_owned(),
+                preview: glyph.to_string(),
+            },
+            math::Completion::Structure { name, preview } => math_menu::Row {
+                name: name.to_owned(),
+                group: "Structure".to_owned(),
+                preview: preview.to_owned(),
+            },
+        })
+        .collect()
 }
 
 fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {

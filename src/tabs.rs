@@ -458,6 +458,20 @@ impl Tabs {
         inserted
     }
 
+    /// The word being typed before the math cursor — the completion query.
+    pub fn math_word_before(&self) -> Option<String> {
+        self.active()
+            .and_then(|tab| tab.document.math_word_before())
+    }
+
+    pub fn math_accept_symbol(&mut self, glyph: char) {
+        self.edit(|doc| doc.math_accept_symbol(glyph));
+    }
+
+    pub fn math_insert_structure(&mut self, name: &str) {
+        self.edit(|doc| doc.math_insert_structure(name));
+    }
+
     pub fn math_backspace(&mut self) {
         self.edit(|doc| {
             doc.math_backspace();

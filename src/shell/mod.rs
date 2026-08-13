@@ -38,8 +38,8 @@ use crate::components::sidenotes::Note;
 use crate::components::tab_strip::TabView;
 use crate::components::topics::Entry;
 use crate::components::{
-    Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileFinder, FileTree, Onboarding, Palette,
-    SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics, breadcrumb, editor,
+    Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileFinder, FileTree, MathMenu, Onboarding,
+    Palette, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics, breadcrumb, editor,
     file_tree, sidenotes, status_line, tab_strip, title_bar, topics,
 };
 use crate::config::Config;
@@ -96,6 +96,16 @@ struct SlashMenuState {
 /// different entry than the one that was drawn.
 struct ContextMenuState {
     items: Vec<&'static commands::Command>,
+    selected: usize,
+    anchor: (f32, f32),
+}
+
+/// The in-math completion card while it is showing: the word being completed
+/// (the query — it lives in the document, not here), the selected row, and
+/// the anchor point. Recomputed every frame from `math::word_before`; it has
+/// no open/closed state of its own.
+struct MathMenuState {
+    word: String,
     selected: usize,
     anchor: (f32, f32),
 }
@@ -175,6 +185,12 @@ pub struct Shell {
     slash_menu: Option<SlashMenuState>,
     /// The open context menu's rows, selection, and anchor point, if open.
     context_menu: Option<ContextMenuState>,
+    /// The in-math completion card while it is showing.
+    math_menu: Option<MathMenuState>,
+    /// The word the reader dismissed the completion card for: while the word
+    /// under the math cursor equals this, the card stays hidden. Typing more
+    /// letters changes the word and brings it back.
+    math_dismissed: Option<String>,
     tree_menu_request: file_tree::MenuRequest,
     /// Indices into `regions` of the regions the shell rebuilds.
     title_region: usize,
@@ -191,6 +207,7 @@ pub struct Shell {
     #[allow(dead_code)] // wired up in a later task
     slash_region: usize,
     menu_region: usize,
+    math_menu_region: usize,
     /// Blinks the caret in the editor and the name prompt.
     caret: Stepped,
     /// Fades the writing indicator.
@@ -396,6 +413,8 @@ impl Shell {
             Box::new(ContextMenu::closed()),
         ));
         let menu_region = regions.len() - 1;
+        regions.push(Region::detached(Layout::ROOT, Box::new(MathMenu::closed())));
+        let math_menu_region = regions.len() - 1;
 
         Self {
             layout,
@@ -415,6 +434,8 @@ impl Shell {
             finder: None,
             slash_menu: None,
             context_menu: None,
+            math_menu: None,
+            math_dismissed: None,
             tree_menu_request,
             title_region,
             tree_region,
@@ -429,6 +450,7 @@ impl Shell {
             finder_region,
             slash_region,
             menu_region,
+            math_menu_region,
             // Two steps, because a caret is on or off: every frame between
             // two flips repaints the same pixels. The writing indicator is
             // a fade, but `Topics` already rounds it to sixteenths, so
@@ -485,6 +507,7 @@ impl Shell {
         renderer: &mut Renderer,
     ) -> bool {
         self.handle_input(input, viewport);
+        self.sync_math_menu();
         self.export_yank();
         self.sync_overlay_layers(renderer);
 
@@ -540,6 +563,7 @@ impl Shell {
                 || self.palette.is_some()
                 || self.slash_menu.is_some()
                 || self.context_menu.is_some()
+                || self.math_menu.is_some()
                 || self.finder.is_some(),
         };
         for region in &mut self.regions {
@@ -629,6 +653,7 @@ impl Shell {
             (self.slash_region, self.slash_menu.is_some()),
             (self.finder_region, self.finder.is_some()),
             (self.menu_region, self.context_menu.is_some()),
+            (self.math_menu_region, self.math_menu.is_some()),
         ];
         for (index, open) in overlays {
             match (open, self.regions[index].is_attached()) {

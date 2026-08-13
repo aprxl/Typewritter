@@ -104,6 +104,104 @@ pub(crate) const WORDS: &[Word] = &[
     (BigOp::Limit.keyword(), empty_limit),
 ];
 
+/// A structure the completion palette offers by name, with the preview its
+/// card row shows.
+pub struct Structure {
+    pub name: &'static str,
+    pub preview: &'static str,
+}
+
+/// The palette's structure offers: the space-trigger words plus the ones
+/// only the palette reaches, in offer order.
+pub const STRUCTURES: &[Structure] = &[
+    Structure {
+        name: "frac",
+        preview: "a/b",
+    },
+    Structure {
+        name: "sqrt",
+        preview: "√",
+    },
+    Structure {
+        name: "sum",
+        preview: "∑",
+    },
+    Structure {
+        name: "prod",
+        preview: "∏",
+    },
+    Structure {
+        name: "int",
+        preview: "∫",
+    },
+    Structure {
+        name: "lim",
+        preview: "lim",
+    },
+    Structure {
+        name: "sup",
+        preview: "x^2",
+    },
+    Structure {
+        name: "sub",
+        preview: "x_2",
+    },
+    Structure {
+        name: "paren",
+        preview: "( )",
+    },
+    Structure {
+        name: "brack",
+        preview: "[ ]",
+    },
+];
+
+/// One completion offered inside an expression.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Completion {
+    /// A symbol from the symbol table, replacing the typed word.
+    Symbol {
+        name: &'static str,
+        group: &'static str,
+        glyph: char,
+    },
+    /// A structure built in place of the typed word.
+    Structure {
+        name: &'static str,
+        preview: &'static str,
+    },
+}
+
+/// Everything that completes `word`, symbols first and structures second,
+/// each with an exact match before its prefixes — the same ordering rule
+/// as the symbol table's own matching.
+pub fn completions(word: &str) -> Vec<Completion> {
+    let mut out: Vec<Completion> = crate::document::math_symbols::matching(word)
+        .iter()
+        .map(|symbol| Completion::Symbol {
+            name: symbol.name,
+            group: symbol.group,
+            glyph: symbol.glyph,
+        })
+        .collect();
+    for structure in STRUCTURES.iter().filter(|structure| structure.name == word) {
+        out.push(Completion::Structure {
+            name: structure.name,
+            preview: structure.preview,
+        });
+    }
+    for structure in STRUCTURES
+        .iter()
+        .filter(|structure| structure.name != word && structure.name.starts_with(word))
+    {
+        out.push(Completion::Structure {
+            name: structure.name,
+            preview: structure.preview,
+        });
+    }
+    out
+}
+
 /// A named slot of a structural node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Slot {
@@ -267,7 +365,7 @@ pub fn insert_word(root: &mut MathList, cursor: &mut MathCursor) -> bool {
     clamp(root, cursor);
     let path = cursor.path.clone();
     let index = cursor.index;
-    let Some((start, build)) = list_at(root, &path).and_then(|list| {
+    let Some((_, build)) = list_at(root, &path).and_then(|list| {
         if index == 0 || !matches!(list[index - 1], MathNode::Sym(c) if c.is_alphabetic()) {
             return None;
         }
@@ -294,12 +392,48 @@ pub fn insert_word(root: &mut MathList, cursor: &mut MathCursor) -> bool {
         return false;
     };
 
-    let node = build();
+    take_word(root, cursor);
+    insert_node(root, cursor, build());
+    true
+}
+
+/// Inserts `node` at the cursor and enters its first slot — the shared tail
+/// of the word trigger and a structure completion.
+fn insert_node(root: &mut MathList, cursor: &mut MathCursor, node: MathNode) {
+    let path = cursor.path.clone();
+    let index = cursor.index;
     let slot = node.slots()[0];
-    let list = list_at_mut(root, &path).expect("cursor path must resolve");
-    list.splice(start..index, std::iter::once(node));
-    cursor.path.push(Step { index: start, slot });
+    let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
+    list.insert(index, node);
+    cursor.path.push(Step { index, slot });
     cursor.index = 0;
+}
+
+/// Builds the palette structure named `name` in place of the word before the
+/// cursor, entering its first slot. `false` when `name` is not one of
+/// [`STRUCTURES`].
+pub fn insert_structure(root: &mut MathList, cursor: &mut MathCursor, name: &str) -> bool {
+    if !STRUCTURES.iter().any(|structure| structure.name == name) {
+        return false;
+    }
+    take_word(root, cursor);
+    match name {
+        "frac" => insert_fraction(root, cursor),
+        "sup" => insert_script(root, cursor, Slot::Sup),
+        "sub" => insert_script(root, cursor, Slot::Sub),
+        "paren" => {
+            insert_group(root, cursor, '(');
+        }
+        "brack" => {
+            insert_group(root, cursor, '[');
+        }
+        "sqrt" => insert_node(root, cursor, empty_sqrt()),
+        "sum" => insert_node(root, cursor, empty_sum()),
+        "prod" => insert_node(root, cursor, empty_prod()),
+        "int" => insert_node(root, cursor, empty_integral()),
+        "lim" => insert_node(root, cursor, empty_limit()),
+        _ => unreachable!("checked against STRUCTURES"),
+    }
     true
 }
 
@@ -732,64 +866,136 @@ pub fn move_left(root: &MathList, cursor: &mut MathCursor) -> bool {
     true
 }
 
-fn collect_slot_paths(list: &MathList, prefix: &mut Vec<Step>, paths: &mut Vec<Vec<Step>>) {
-    for (index, node) in list.iter().enumerate() {
-        for slot in node.slots() {
-            prefix.push(Step { index, slot });
-            paths.push(prefix.clone());
-            collect_slot_paths(
-                node.slot(slot).expect("listed slot must exist"),
-                prefix,
-                paths,
-            );
-            prefix.pop();
+/// One Tab stop inside an expression: a structural slot (cursor at its end)
+/// or an exit (cursor right after a structural node, back in its parent
+/// list). Every template contributes both, in document order, so Tab walks
+/// its slots and then out of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Position {
+    path: Vec<Step>,
+    index: usize,
+    exit: bool,
+}
+
+/// The Tab order of every slot and exit in the expression. Content first,
+/// then a slot's own stop, then the node's exit.
+fn tab_positions(root: &MathList) -> Vec<Position> {
+    fn collect(list: &MathList, path: &[Step], out: &mut Vec<Position>) {
+        for (index, node) in list.iter().enumerate() {
+            for slot in node.slots() {
+                let slot_list = node.slot(slot).expect("listed slot must exist");
+                let mut child = path.to_vec();
+                child.push(Step { index, slot });
+                collect(slot_list, &child, out);
+                out.push(Position {
+                    path: child,
+                    index: slot_list.len(),
+                    exit: false,
+                });
+            }
+            if node.is_structural() {
+                // A slot stop and a nested exit can be the same spot (a
+                // group is the only child of a slot); keep the first.
+                let exit = Position {
+                    path: path.to_vec(),
+                    index: index + 1,
+                    exit: true,
+                };
+                if !out
+                    .iter()
+                    .any(|p| p.path == exit.path && p.index == exit.index)
+                {
+                    out.push(exit);
+                }
+            }
         }
+    }
+    let mut out = Vec::new();
+    collect(root, &[], &mut out);
+    out
+}
+
+/// Document order of two cursor positions. Slot ranks are only compared
+/// between slots of one node, so their order just has to match `slots()`.
+fn slot_rank(slot: Slot) -> u8 {
+    match slot {
+        Slot::Num => 0,
+        Slot::Den => 1,
+        Slot::Base => 2,
+        Slot::Sup => 3,
+        Slot::Sub => 4,
+        Slot::Body => 5,
+        Slot::Lower => 6,
+        Slot::Upper => 7,
     }
 }
 
-fn slot_paths(root: &MathList) -> Vec<Vec<Step>> {
-    let mut paths = Vec::new();
-    collect_slot_paths(root, &mut Vec::new(), &mut paths);
-    paths
+/// Whether the position at `a` comes before the one at `b`, in reading
+/// order: into a node's slots, through their content, then past the node.
+fn position_less(a_path: &[Step], a_index: usize, b_path: &[Step], b_index: usize) -> bool {
+    for k in 0..a_path.len().min(b_path.len()) {
+        let (a, b) = (&a_path[k], &b_path[k]);
+        if a.index != b.index {
+            return a.index < b.index;
+        }
+        if a.slot != b.slot {
+            return slot_rank(a.slot) < slot_rank(b.slot);
+        }
+    }
+    if a_path.len() == b_path.len() {
+        return a_index < b_index;
+    }
+    if a_path.len() < b_path.len() {
+        return a_index <= b_path[a_path.len()].index;
+    }
+    a_path[b_path.len()].index < b_index
 }
 
 fn move_to_slot(root: &MathList, cursor: &mut MathCursor, next: bool) -> bool {
     clamp(root, cursor);
-    let paths = slot_paths(root);
-    if paths.is_empty() {
+    let positions = tab_positions(root);
+    if positions.is_empty() {
         return false;
     }
-    let empty_exists = paths
+    let empty_exists = positions
         .iter()
-        .any(|path| list_at(root, path).is_some_and(Vec::is_empty));
-    let candidates: Vec<&Vec<Step>> = paths
+        .any(|p| !p.exit && list_at(root, &p.path).is_some_and(Vec::is_empty));
+    let candidates: Vec<&Position> = positions
         .iter()
-        .filter(|path| !empty_exists || list_at(root, path).is_some_and(Vec::is_empty))
+        .filter(|p| p.exit || !empty_exists || list_at(root, &p.path).is_some_and(Vec::is_empty))
         .collect();
-    let current = candidates
+
+    // The cursor sits anywhere inside the slot it names; treat it as that
+    // slot's stop rather than as a raw position between atoms.
+    let path = cursor.path.clone();
+    let index = candidates
         .iter()
-        .position(|path| path.as_slice() == cursor.path.as_slice());
+        .find(|p| !p.exit && p.path == path)
+        .map_or(cursor.index, |p| p.index);
     let target = if next {
-        current.map_or(0, |index| (index + 1) % candidates.len())
+        candidates
+            .iter()
+            .position(|p| position_less(&path, index, &p.path, p.index))
+            .unwrap_or(0)
     } else {
-        current.map_or(candidates.len() - 1, |index| {
-            (index + candidates.len() - 1) % candidates.len()
-        })
+        candidates
+            .iter()
+            .rposition(|p| position_less(&p.path, p.index, &path, index))
+            .map_or(candidates.len() - 1, |index| index)
     };
-    cursor.path = candidates[target].clone();
-    cursor.index = list_at(root, &cursor.path)
-        .expect("enumerated slot path must resolve")
-        .len();
+    cursor.path = candidates[target].path.clone();
+    cursor.index = candidates[target].index;
     true
 }
 
-/// Moves to the next empty slot, or the next slot when all slots are filled.
+/// Moves to the next Tab stop: an empty slot first when one exists, and
+/// always each structural node's exit after its last slot, so a template can
+/// be left behind with one more Tab.
 pub fn slot_next(root: &MathList, cursor: &mut MathCursor) -> bool {
     move_to_slot(root, cursor, true)
 }
 
-/// Moves to the previous empty slot, or the previous slot when all slots are
-/// filled.
+/// The mirror of [`slot_next`] for Shift+Tab.
 pub fn slot_prev(root: &MathList, cursor: &mut MathCursor) -> bool {
     move_to_slot(root, cursor, false)
 }
@@ -923,6 +1129,112 @@ mod tests {
 
         assert_eq!(root, vec![frac(Vec::new(), Vec::new())]);
         assert_eq!(cursor, at_path(&[(0, Slot::Num)], 0));
+    }
+
+    #[test]
+    fn completions_offer_symbols_before_structures() {
+        let found = completions("s");
+
+        assert!(matches!(
+            found.first(),
+            Some(Completion::Symbol { name, .. }) if *name != "sqrt"
+        ));
+        let first_structure = found
+            .iter()
+            .position(|completion| matches!(completion, Completion::Structure { .. }))
+            .expect("structures must be offered");
+        assert!(
+            found[first_structure..]
+                .iter()
+                .all(|completion| matches!(completion, Completion::Structure { .. }))
+        );
+    }
+
+    #[test]
+    fn an_exact_structure_outranks_its_prefixes() {
+        let found = completions("su");
+
+        let structures: Vec<&str> = found
+            .iter()
+            .filter_map(|completion| match completion {
+                Completion::Structure { name, .. } => Some(*name),
+                Completion::Symbol { .. } => None,
+            })
+            .collect();
+        assert_eq!(structures, ["sum", "sup", "sub"]);
+    }
+
+    #[test]
+    fn every_space_trigger_is_also_a_palette_structure() {
+        for (word, _) in WORDS {
+            assert!(
+                STRUCTURES.iter().any(|structure| structure.name == *word),
+                "{word} must be a palette structure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_structure_completion_builds_in_place_of_the_word() {
+        let mut root = sym("sqrt");
+        let mut cursor = at(4);
+
+        assert!(insert_structure(&mut root, &mut cursor, "sqrt"));
+
+        assert_eq!(root, vec![sqrt(Vec::new())]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
+    }
+
+    #[test]
+    fn frac_captures_the_operand_before_the_word() {
+        let mut root = sym("1frac");
+        let mut cursor = at(5);
+
+        assert!(insert_structure(&mut root, &mut cursor, "frac"));
+
+        assert_eq!(root, vec![frac(sym("1"), Vec::new())]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Den)], 0));
+    }
+
+    #[test]
+    fn a_script_completion_builds_a_script_on_an_empty_base() {
+        // The word before the cursor is one identifier, so the whole of it
+        // goes; the script's base slot is where typing continues, Tab walks
+        // to the script slot.
+        let mut root = sym("sup");
+        let mut cursor = at(3);
+
+        assert!(insert_structure(&mut root, &mut cursor, "sup"));
+
+        assert_eq!(root, vec![script(Vec::new(), Some(Vec::new()), None)]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Base)], 0));
+    }
+
+    #[test]
+    fn a_group_completion_opens_a_bracket_group() {
+        let mut root = Vec::new();
+        let mut cursor = MathCursor::default();
+        insert_char(&mut root, &mut cursor, 'p');
+        insert_char(&mut root, &mut cursor, 'a');
+        insert_char(&mut root, &mut cursor, 'r');
+        insert_char(&mut root, &mut cursor, 'e');
+        insert_char(&mut root, &mut cursor, 'n');
+
+        assert!(insert_structure(&mut root, &mut cursor, "paren"));
+
+        assert_eq!(root, vec![group('(', ')', Vec::new())]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
+    }
+
+    #[test]
+    fn an_unknown_structure_name_is_refused() {
+        let mut root = sym("ab");
+        let mut cursor = at(2);
+
+        assert!(!insert_structure(&mut root, &mut cursor, "nope"));
+
+        assert_eq!(root, sym("ab"));
+        assert_eq!(cursor, at(2));
     }
 
     #[test]
@@ -1238,7 +1550,16 @@ mod tests {
         assert!(move_right(&root, &mut cursor));
         assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
         assert!(slot_next(&root, &mut cursor));
-        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 1));
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn tab_from_a_mid_slot_position_exits_its_template() {
+        let root = vec![group('(', ')', sym("x+1"))];
+        let mut cursor = at_path(&[(0, Slot::Body)], 0);
+
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
     }
 
     #[test]
@@ -1251,6 +1572,10 @@ mod tests {
         assert!(slot_next(&root, &mut cursor));
         assert_eq!(cursor, at_path(&[(0, Slot::Den), (0, Slot::Den)], 0));
         assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Den)], 1));
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
+        assert!(slot_next(&root, &mut cursor));
         assert_eq!(cursor, at_path(&[(0, Slot::Den), (0, Slot::Num)], 0));
     }
 
@@ -1259,10 +1584,11 @@ mod tests {
         let root = vec![frac(vec![frac(sym("a"), sym("b"))], sym("c"))];
         let mut cursor = MathCursor::default();
         let paths = [
-            at_path(&[(0, Slot::Num)], 1),
             at_path(&[(0, Slot::Num), (0, Slot::Num)], 1),
             at_path(&[(0, Slot::Num), (0, Slot::Den)], 1),
+            at_path(&[(0, Slot::Num)], 1),
             at_path(&[(0, Slot::Den)], 1),
+            at(1),
         ];
         for expected in &paths {
             assert!(slot_next(&root, &mut cursor));
@@ -1294,6 +1620,62 @@ mod tests {
         assert_eq!(cursor, at_path(&[(0, Slot::Lower)], 0));
         assert!(slot_next(&root, &mut cursor));
         assert_eq!(cursor, at_path(&[(0, Slot::Upper)], 0));
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn tab_exits_a_filled_template() {
+        let mut root = vec![group('(', ')', sym("x"))];
+        let mut cursor = at_path(&[(0, Slot::Body)], 1);
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
+
+        root = vec![big_op(BigOp::Sum, sym("i=0"), sym("n"))];
+        cursor = at_path(&[(0, Slot::Upper)], 1);
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
+
+        root = vec![sqrt(sym("x"))];
+        cursor = at_path(&[(0, Slot::Body)], 1);
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
+
+        root = vec![script(sym("x"), Some(sym("2")), Some(sym("i")))];
+        cursor = at_path(&[(0, Slot::Sub)], 1);
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn tab_exits_nested_templates_one_level_at_a_time() {
+        let root = vec![frac(sym("1"), vec![group('(', ')', sym("2"))])];
+        let mut cursor = at_path(&[(0, Slot::Den), (0, Slot::Body)], 1);
+
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Den)], 1));
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn shift_tab_retraces_the_exits_in_reverse() {
+        let root = vec![frac(sym("a"), sym("b"))];
+        let mut cursor = at(1);
+
+        assert!(slot_prev(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Den)], 1));
+        assert!(slot_prev(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Num)], 1));
+    }
+
+    #[test]
+    fn tab_from_a_mid_slot_position_moves_on_not_into_the_same_slot() {
+        let root = vec![group('(', ')', sym("x+1"))];
+        let mut cursor = at_path(&[(0, Slot::Body)], 0);
+
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
     }
 
     #[test]

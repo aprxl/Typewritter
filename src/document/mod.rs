@@ -1651,6 +1651,42 @@ impl Document {
         inserted
     }
 
+    /// The focused expression and cursor, read-only, for the shell's
+    /// geometry and completion queries.
+    pub fn focused_math_view(&self) -> Option<(&math::MathList, &math::MathCursor)> {
+        let cursor = self.math.as_ref()?;
+        let list = match self.blocks[self.caret.block]
+            .inlines()
+            .get(self.caret.inline)
+        {
+            Some(Inline::Math(list)) => list,
+            _ => return None,
+        };
+        Some((list, cursor))
+    }
+
+    /// The word being typed before the math cursor — the completion query.
+    pub fn math_word_before(&self) -> Option<String> {
+        let (list, cursor) = self.focused_math_view()?;
+        math::word_before(list, cursor)
+    }
+
+    /// A symbol completion was accepted: replace the word with its glyph.
+    pub fn math_accept_symbol(&mut self, glyph: char) {
+        if let Some((list, cursor)) = self.focused_math() {
+            math::accept_symbol(list, cursor, glyph);
+            self.dirty = true;
+        }
+    }
+
+    /// A structure completion was accepted: build it in place of the word.
+    pub fn math_insert_structure(&mut self, name: &str) {
+        if let Some((list, cursor)) = self.focused_math() {
+            math::insert_structure(list, cursor, name);
+            self.dirty = true;
+        }
+    }
+
     pub fn math_backspace(&mut self) -> Option<math::Removed> {
         let result = self
             .focused_math()
