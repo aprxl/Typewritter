@@ -1,8 +1,22 @@
 # Work log
 
 State at handoff: `cargo fmt --check` clean, `cargo clippy --all-targets -D
-warnings` clean, 205 tests passing, and the tree committed as `d5caaa1`
-(`Initial commit: Typewritter, plus today's bug-fix wave`).
+warnings` clean, 330 tests passing, and the tree committed as `4da46c2`
+(`Add the symbol table and the word under the math cursor`).
+
+How the work is being done, since `AGENTS.md` is out of date on this: coding is
+delegated to the `opencode` CLI rather than to in-process subagents —
+`openrouter/openai/gpt-5.6-luna --variant high` for design-carrying work,
+`openrouter/~deepseek/deepseek-v4-flash-latest --variant high` for mechanical
+work. Each task spec names the exact files that run owns, and no two runs in a
+wave own the same file; waves run one at a time, because parallel `cargo` builds
+contend. A spec must say *do the work yourself, do not delegate it further* —
+runs that delegate have stalled and produced nothing. Delegated runs never
+commit; whoever is driving verifies `cargo fmt --check`, `cargo clippy
+--all-targets -- -D warnings` and `cargo test` and commits the wave. When
+judging whether a run has stalled, look at the **child** `opencode` process's
+CPU time, not the log size — the parent shell buffers, and an empty log on its
+own has already caused one wrong diagnosis.
 
 ---
 
@@ -55,9 +69,95 @@ in the running app. JuliaMono is the math font, chosen for glyph coverage.
 Verified end to end in the app: typing `1 / 2 / 3` builds a nested fraction,
 saves as `gain is $(19)/(2/3)$`, and reopens as the same tree.
 
-**Next for math** — `^` and `_` scripts, brackets and groups, the in-math
-completion palette, word triggers (`sqrt`, `sum`, `int`, `lim`), typed
-identifiers, and the raw text node.
+**`src/document/math.rs`, `src/document/math_layout.rs`,
+`src/components/editor.rs`** — superscripts and subscripts. `^` and `_` capture
+the preceding operand and wrap it in a `Script`, whose `sup` and `sub` are
+options rather than always-present lists: a script that has not been asked for
+does not exist, so Tab does not walk through empty slots nobody wanted. Because
+of that, `MathNode::slots()` returns an owned `Vec` — a script's slot list
+depends on which of its scripts exist, so it cannot be a `&'static` slice.
+Typing `i^2_2` straight through attaches the second script to the same base
+rather than nesting it inside the first, which is what MathQuill and LaTeX both
+do and what the fingers expect. The cost is that a script directly inside
+another script can no longer be typed in one flow; it needs grouping brackets,
+which now exist.
+
+**`src/document/math_layout.rs`** — two placement bugs, one the cause of the
+other, both worth recording because the coordinate model is the trap. The
+renderer draws glyphs vertically **centred** (`theme::LEFT`), so the anchor line
+is a centre line, not a baseline. Placing children by baseline made a fraction's
+numerator sit closer to the bar than its denominator. The first fix made every
+box symmetric about the anchor line (ascent == descent == height/2) and put the
+bar on the anchor line, deleting `AXIS_RISE`, `ASCENT_RATIO` and `DESCENT_RATIO`
+— correct for glyphs, wrong for anything lopsided: `C_x` has ascent 8.75 and
+descent 15.4, and half-height placement pushed it through the bar. The rule that
+actually holds, and that `fraction`, `script`, the delimiters and the big
+operators all now follow, is **place a box by the edge that faces whatever it
+must clear**. Anything added here has to obey it.
+
+**`src/document/math.rs`, `src/document/math_notation.rs`** — bracket groups.
+TeX's split is adopted wholesale: `{ }` is the notation's invisible grouping and
+`( )` / `[ ]` are visible `Group` nodes, so the printer's grouping can never be
+confused with a bracket the reader typed. This changed the on-disk grouping
+character from `( )` to `{ }`; no migration was written, since nothing outside
+this machine has files in the old form. Typing a closer steps out of the group
+rather than inserting anything, and types literally when there is no group to
+leave.
+
+**`src/document/math.rs`, `src/document/math_notation.rs`,
+`src/document/math_layout.rs`** — word triggers. `sqrt`, `sum`, `prod`, `int`
+and `lim` followed by a space become their structure. A big operator's limits
+are always-present lists, unlike a script's options, because a `∑` always has
+somewhere to put its bounds — they start empty and are typed into, and that is
+what Tab walks. `BigOp::keyword()` is the single place the typed word and the
+on-disk word come from, so they cannot drift. The trigger fires on standalone
+tokens only, so a variable named `sum` and the `sum` inside `resum` both
+survive. On disk a keyword is a structure only when immediately followed by `{`,
+which is unambiguous in both directions and still greppable. Layout draws a
+delimiter and a radical sign as glyphs scaled from the body height (`DELIM_FILL`,
+floored at the text size), an overbar as the existing `Bar`, and a big operator
+as a vertical column centred on its widest member — no new `BoxKind` was needed.
+
+**`src/theme.rs`, `src/components/editor.rs`** — a display math block gets its
+own slab, drawn in the same pass as a code block's. `theme::MATH` is a sibling
+of `CODE` rather than the same tint: cooler and greyer, so the two block kinds
+are told apart at a glance without either shouting.
+
+**`src/document/math_symbols.rs`, `src/document/math.rs`** — the symbol table:
+79 completions under Greek, Relations, Operators, Arrows, Sets and Calculus,
+named the way LaTeX names them, which is the vocabulary this reader arrives
+with. Matching is prefix rather than fuzzy with an exact name first, so `in`
+offers `∈` ahead of `infty`, and case-sensitive, since case is the only thing
+separating `delta` from `Delta`. `word_before` reads the query out of the tree
+rather than tracking what was typed, so backspace, an arrow move and a click
+elsewhere all just change the answer and there is no state to fall out of step.
+`take_word` exists so accepting a structure completion can remove the letters
+before firing the trigger — otherwise a fraction captures them as its numerator.
+
+**Next for math**, in priority order:
+
+1. **The completion palette** — the card itself and its keystrokes; the only
+   piece of the in-math palette still missing. It has no open/closed state of
+   its own: it shows whenever `math::word_before` reports a word with matches,
+   so backspace, an arrow and a click elsewhere need no handling and it cannot
+   disagree with the document. Its only state is the selected row and whether
+   the reader dismissed it for the word they are on. It offers symbols first and structures second (`frac`, `sqrt`,
+   `sum`, `prod`, `int`, `lim`, `sup`, `sub`, `paren`, `brack`), claims only
+   keys that would otherwise do nothing (`Enter`, `Ctrl+1`–`Ctrl+9`,
+   `Ctrl+N`/`Ctrl+P`, `Esc`), and deliberately does **not** claim `Tab`, which
+   must keep walking slots. Build it as a sibling of `src/components/slash_menu.rs`
+   on the detached-overlay pattern.
+2. **Copy and paste of an expression** — `range_text` yields the U+FFFC atom, so
+   a copied expression pastes as a placeholder character and the maths is lost.
+3. **Undo inside an expression** — `edit_frame_math` opens no transaction, so
+   undo is per keystroke rather than per edit.
+4. **A display block should look like one** — centred, at display size, rather
+   than inline-sized text on a slab.
+5. **Typed identifiers** — variables, constants and functions distinguished, and
+   scalars from vectors. This is what the reader asked for in the original brief
+   and it is the last piece of that brief not started.
+6. **A raw text node** — explicitly deferred by the reader as not a problem yet.
+7. **Matrices and cases**, once the above settles.
 
 ---
 
