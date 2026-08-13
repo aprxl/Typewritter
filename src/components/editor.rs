@@ -5,6 +5,8 @@
 use std::rc::Rc;
 
 use crate::document::layout::{self, DocLayout};
+use crate::document::math::MathCursor;
+use crate::document::math_layout::{self, BoxKind, MathBox};
 use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style};
 use crate::layout::Rect;
 use crate::renderer::{Layer, Rounding};
@@ -59,6 +61,50 @@ pub const OVERSCROLL: f32 = 0.5;
 /// One measured piece of a visual line: `(text, style, x, width)`.
 type Painted = (String, Style, f32, f32);
 
+/// Draws a laid-out expression. `origin` is the box's baseline-left point
+/// on screen; child offsets are baseline-relative with y positive upward,
+/// so descending into a child subtracts its y.
+fn draw_math(layer: &Layer, box_: &MathBox, origin: (f32, f32)) {
+    match &box_.kind {
+        BoxKind::Glyph { text, size } => {
+            // Math boxes use glyph centers as their baseline for now; LEFT's
+            // vertical centering therefore matches the prose baseline draw.
+            theme::draw(
+                layer,
+                text,
+                origin,
+                &TextStyle::math(*size, theme::INK),
+                theme::LEFT,
+            );
+        }
+        BoxKind::Bar { thickness } => {
+            // A fractional one-pixel rule smears across adjacent rows.
+            theme::rule(
+                layer,
+                (origin.0, (origin.1 - thickness * 0.5).round()),
+                box_.width,
+                *thickness,
+                theme::INK,
+            );
+        }
+        BoxKind::Slot { .. } => {
+            let rect = Rect {
+                x: origin.0,
+                y: origin.1 - box_.ascent,
+                width: box_.width,
+                height: box_.ascent + box_.descent,
+            };
+            layer.draw_rectangle(rect.position(), rect.size(), theme::ALT, Rounding::NONE);
+            theme::outline(layer, rect, theme::NON_TEXT);
+        }
+        BoxKind::Row { children } => {
+            for (x, y, child) in children {
+                draw_math(layer, child, (origin.0 + x, origin.1 - y));
+            }
+        }
+    }
+}
+
 /// Maximal runs of adjacent pieces matching `pred`, as `(start_x, end_x)`.
 /// Adjacent pieces merge into one span so a decoration split across runs —
 /// a bold word inside a highlight, two code spans touching — reads as a
@@ -108,6 +154,10 @@ pub struct Editor {
     /// with this component (see [`Component::draw`]), so it can never hold
     /// a halo for a bar that is no longer there.
     glow: Option<Layer>,
+    /// Math cursor, when the caret is inside an atom. Its bar replaces the
+    /// document caret — two blinking bars would be two claims about where
+    /// typing goes.
+    math: Option<MathCursor>,
     dirty: Dirty,
 }
 
@@ -133,10 +183,16 @@ impl Editor {
             numbers,
             selection: None,
             line_selection: false,
+            math: None,
             caret_on: true,
             glow: None,
             dirty: Dirty::new(),
         }
+    }
+
+    pub fn with_math(mut self, math: Option<MathCursor>) -> Self {
+        self.math = math;
+        self
     }
 
     /// Attaches the glow layer. Separate from `new` because the shell keeps
@@ -167,6 +223,7 @@ impl Editor {
             numbers: Vec::new(),
             selection: None,
             line_selection: false,
+            math: None,
             caret_on: true,
             glow: None,
             dirty: Dirty::new(),
@@ -248,6 +305,17 @@ impl Component for Editor {
             .caret_pos(self.caret, &|text, style| theme::width(layer, text, style));
         let (band_top, band_bottom) = self.layout.caret_band(self.caret);
         let content = rect.y + TOP;
+        let math_focus = if self.math.is_some()
+            && self.caret.block < self.layout.source.len()
+            && self.caret.inline < self.layout.source[self.caret.block].inlines().len()
+            && matches!(
+                self.layout.source[self.caret.block].inlines()[self.caret.inline],
+                Inline::Math(_)
+            ) {
+            self.math.as_ref()
+        } else {
+            None
+        };
 
         // The current-line band does not blink — it identifies the line the
         // caret is on, regardless of caret visibility.
@@ -323,7 +391,6 @@ impl Component for Editor {
                 let baseline = top + line.height * 0.5;
                 let mut cursor = x;
                 pieces.clear();
-                let mut atom_pieces = Vec::new();
                 for segment in &line.segments {
                     let run = &kind.inlines()[segment.inline];
                     let is_math = matches!(run, Inline::Math(_));
@@ -336,8 +403,9 @@ impl Component for Editor {
                             .collect(),
                         Inline::Math(_) => ATOM.to_string(),
                     };
-                    let width =
-                        theme::width(layer, &text, &layout::text_style(kind, segment.style));
+                    let width = layout::advance(run, &text, kind, segment.style, &|text, style| {
+                        theme::width(layer, text, style)
+                    });
                     // A badge's label starts inside its box, and the box is
                     // part of the advance — same arithmetic the caret does
                     // in `layout::advance`, so the two cannot drift.
@@ -345,19 +413,31 @@ impl Component for Editor {
                         cursor += theme::BADGE_PAD;
                     }
                     pieces.push((text, segment.style, cursor, width));
-                    atom_pieces.push(is_math);
                     if is_math {
-                        // Placeholder only; the math renderer will replace this box.
-                        theme::outline(
-                            layer,
-                            Rect {
-                                x: cursor,
-                                y: baseline - line.height * 0.5 + 2.0,
-                                width,
-                                height: line.height - 4.0,
-                            },
-                            theme::NON_TEXT,
-                        );
+                        let Inline::Math(list) = run else {
+                            unreachable!("math flag must match math run")
+                        };
+                        let measure =
+                            |text: &str, style: &TextStyle| theme::width(layer, text, style);
+                        let box_ = math_layout::layout(list, 0, &measure);
+                        draw_math(layer, &box_, (cursor, baseline));
+                        if let Some(math_cursor) = math_focus
+                            && bi == self.caret.block
+                            && segment.inline == self.caret.inline
+                            && self.caret_on
+                        {
+                            let (cursor_x, cursor_y, cursor_height) =
+                                math_layout::cursor_pos(list, math_cursor, 0, &measure);
+                            layer.draw_rectangle(
+                                (
+                                    cursor + cursor_x,
+                                    baseline - cursor_y - cursor_height * 0.5 + 2.0,
+                                ),
+                                (2.0, cursor_height - 4.0),
+                                theme::ACCENT,
+                                Rounding::NONE,
+                            );
+                        }
                     }
                     cursor += width;
                     if segment.style.badge {
@@ -407,8 +487,8 @@ impl Component for Editor {
                         );
                     }
                 }
-                for ((text, style, at, _), is_math) in pieces.iter().zip(&atom_pieces) {
-                    if *is_math {
+                for ((text, style, at, _), segment) in pieces.iter().zip(&line.segments) {
+                    if matches!(kind.inlines()[segment.inline], Inline::Math(_)) {
                         continue;
                     }
                     let style = layout::text_style(kind, *style);
@@ -445,6 +525,9 @@ impl Component for Editor {
         let screen_x = x + caret_x;
         let screen_y = content + caret_baseline - self.scroll;
 
+        if self.math.is_some() {
+            return;
+        }
         if self.block_caret {
             // Faded rather than opaque, so whatever glyph is under it stays
             // legible. Falls back to a space's advance past the end of the
@@ -575,7 +658,7 @@ impl Editor {
                 Inline::Math(_) => ATOM.to_string(),
             };
             if flat >= cursor + segment.len {
-                x += layout::advance(&text, block, segment.style, &|text, style| {
+                x += layout::advance(run, &text, block, segment.style, &|text, style| {
                     theme::width(layer, text, style)
                 });
             } else {
@@ -628,6 +711,7 @@ pub fn max_scroll(content_height: f32, view_height: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::math::MathNode;
     use crate::document::{Document, Text};
     use std::path::Path;
 
@@ -728,5 +812,24 @@ mod tests {
             editor.numbers,
             vec![None, Some("1".into()), Some("1.1".into())]
         );
+    }
+
+    #[test]
+    fn an_atom_measures_as_its_box_not_as_a_glyph() {
+        let run = Inline::Math(vec![MathNode::Frac {
+            num: vec![MathNode::Sym('1')],
+            den: vec![MathNode::Sym('2')],
+        }]);
+        let block = Block::Paragraph(vec![run.clone()]);
+        let atom = ATOM.to_string();
+        let measure =
+            |text: &str, style: &TextStyle| text.chars().count() as f32 * style.size * 0.5;
+        let width = layout::advance(&run, &atom, &block, Style::PLAIN, &measure);
+        let box_width = match &run {
+            Inline::Math(list) => math_layout::layout(list, 0, &measure).width,
+            Inline::Text(_) => unreachable!(),
+        };
+        assert_eq!(width, box_width);
+        assert!(width > measure(&atom, &TextStyle::serif(17.5, theme::INK)));
     }
 }

@@ -11,7 +11,7 @@
 //! prose collapses whitespace and carries no source offsets, both fatal to
 //! caret mapping.
 
-use crate::document::{Block, Caret, Document, Inline, Style};
+use crate::document::{Block, Caret, Document, Inline, Style, math_layout};
 use crate::theme::{self, TextStyle};
 
 /// Visual line heights, in logical pixels.
@@ -24,6 +24,13 @@ pub const LINE_H4: f32 = 30.0;
 /// separates, and a big hole around it disrupts reading more than the
 /// separation it buys is worth.
 pub const LINE_DIVIDER: f32 = 20.0;
+/// Vertical breathing room above and below a display expression, each
+/// side. A display block is its own paragraph; it should not sit tighter
+/// than one.
+pub const MATH_PAD: f32 = 10.0;
+/// Extra room above and below an inline expression inside a text line,
+/// so a tall fraction does not touch the lines around it.
+pub const MATH_LEADING: f32 = 4.0;
 /// Space below a paragraph.
 pub const GAP_PARAGRAPH: f32 = 14.0;
 /// Space *above* a heading (the first block gets none).
@@ -51,6 +58,7 @@ pub struct Segment {
 pub struct VisLine {
     /// Top of the line, relative to content top.
     pub y: f32,
+    /// Actual line height: the block's floor or its tallest content.
     pub height: f32,
     pub segments: Vec<Segment>,
 }
@@ -77,10 +85,6 @@ pub struct DocLayout {
 /// The font a run renders with. Body is serif 17.5; headings are serif at
 /// 24/21/18.5 and always bold; a run's `bold`/`italic` stack on top.
 pub fn text_style(kind: &Block, style: Style) -> TextStyle {
-    if kind.is_math() {
-        // Placeholder only; the math layout task will replace body prose here.
-        return TextStyle::serif(17.5, theme::INK);
-    }
     if style.code {
         return TextStyle::mono(17.5, theme::INK);
     }
@@ -125,7 +129,7 @@ struct Piece {
     space: bool,
 }
 
-/// How far a run of text moves the cursor: its shaped width, plus the box
+/// How far a run moves the cursor: its shaped width, plus the box
 /// a badge draws around its label. A chip's box is part of the flow, not
 /// decoration on top of it — measured as bare glyphs, a badge would sit
 /// under the word after it.
@@ -134,23 +138,40 @@ struct Piece {
 /// what the caret and the editor both walk. Wrapping asks per whitespace-
 /// split piece instead, so a multi-word label is measured a few pixels
 /// wide there; it wraps a shade early and nothing drifts, since the caret
-/// and the drawing agree with each other.
+/// and the drawing agree with each other. The run is a parameter because an
+/// atom cannot be measured from its opaque placeholder text; its math tree is
+/// the thing that determines its width.
 pub fn advance(
+    run: &Inline,
     text: &str,
     block: &Block,
     style: Style,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> f32 {
+    let width = match run {
+        Inline::Math(list) => {
+            // Atom placement is always body level; level is for its nested
+            // fraction operands, not for making the atom itself larger.
+            math_layout::layout(list, 0, measure).width
+        }
+        Inline::Text(_) => measure(text, &text_style(block, style)),
+    };
     let box_pad = if style.badge {
         theme::BADGE_PAD * 2.0
     } else {
         0.0
     };
-    measure(text, &text_style(block, style)) + box_pad
+    width + box_pad
 }
 
 fn piece_width(piece: &Piece, block: &Block, measure: &dyn Fn(&str, &TextStyle) -> f32) -> f32 {
-    advance(&piece.text, block, piece.style, measure)
+    advance(
+        &block.inlines()[piece.inline],
+        &piece.text,
+        block,
+        piece.style,
+        measure,
+    )
 }
 
 /// Greedy wrap over a block's pieces. A word goes on the current line if it
@@ -219,6 +240,8 @@ fn tokens(block: &Block) -> Vec<Piece> {
                 len: j - k,
                 space,
             });
+            // Math text is one opaque ATOM character, so this already creates
+            // one unsplittable non-space piece for the whole expression.
             k = j;
         }
     }
@@ -263,32 +286,54 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
         y += gap_above;
         first_block = false;
 
-        let line_height = match block {
+        let base_line_height = match block {
             Block::Heading { level: 1, .. } => LINE_H1,
             Block::Heading { level: 2, .. } => LINE_H2,
             Block::Heading { level: 3, .. } => LINE_H3,
             Block::Heading { level: 4, .. } => LINE_H4,
             Block::Divider(_) => LINE_DIVIDER,
-            // Placeholder only; display math gets real sizing later.
-            Block::Math(_) => LINE_BODY,
+            Block::Math(runs) => {
+                let Inline::Math(list) = &runs[0] else {
+                    unreachable!("math block must contain one math atom")
+                };
+                let expression = math_layout::layout(list, 0, measure);
+                expression.ascent + expression.descent + MATH_PAD * 2.0
+            }
             Block::Heading { .. } | Block::Paragraph(_) | Block::CodeLine { .. } => LINE_BODY,
         };
 
         let pieces = tokens(block);
         let grouped = wrap(&pieces, block, width, measure);
-        let line_count = grouped.len() as f32;
-
+        let mut line_y = y;
         let lines = grouped
             .iter()
-            .enumerate()
-            .map(|(i, line_pieces)| VisLine {
-                y: y + i as f32 * line_height,
-                height: line_height,
-                segments: segments_for(&pieces, line_pieces),
+            .map(|line_pieces| {
+                let content_height = line_pieces
+                    .iter()
+                    .filter_map(
+                        |&piece_index| match &block.inlines()[pieces[piece_index].inline] {
+                            Inline::Math(list) => {
+                                let expression = math_layout::layout(list, 0, measure);
+                                Some(expression.ascent + expression.descent + MATH_LEADING)
+                            }
+                            Inline::Text(_) => None,
+                        },
+                    )
+                    .fold(0.0, f32::max);
+                let height = base_line_height.max(content_height);
+                let line = VisLine {
+                    y: line_y,
+                    height,
+                    segments: segments_for(&pieces, line_pieces),
+                };
+                line_y += height;
+                line
             })
             .collect::<Vec<_>>();
 
-        let height = line_count * line_height;
+        // VisLine heights are content-driven, so later lines start after the
+        // actual height of every earlier line rather than a copied constant.
+        let height = lines.iter().map(|line| line.height).sum();
         blocks.push(BlockLayout { y, lines, height });
         y += height;
 
@@ -400,7 +445,7 @@ fn x_of_flat(
         let text = segment_text(run, segment);
         let seg_len = segment.len;
         if flat >= seg_flat + seg_len {
-            x += advance(&text, block, segment.style, measure);
+            x += advance(run, &text, block, segment.style, measure);
             seg_flat += seg_len;
         } else {
             // The caret is inside this segment: measure its prefix, past
@@ -643,6 +688,7 @@ impl DocLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::math::MathNode;
     use crate::document::{Inline, Text};
 
     /// Every glyph 10 wide, so line breaks are countable by hand.
@@ -985,11 +1031,17 @@ mod tests {
         // The box counts: bare glyphs would put `x` under the chip.
         let bare = fake_measure("PS", &text_style(&block, badge));
         assert_eq!(
-            advance("PS", &block, badge, &fake_measure),
+            advance(&block.inlines()[0], "PS", &block, badge, &fake_measure),
             bare + theme::BADGE_PAD * 2.0
         );
         assert_eq!(
-            advance("PS", &block, Style::PLAIN, &fake_measure),
+            advance(
+                &block.inlines()[0],
+                "PS",
+                &block,
+                Style::PLAIN,
+                &fake_measure,
+            ),
             bare,
             "only a badge pays for a box"
         );
@@ -1065,5 +1117,41 @@ mod tests {
             (gap - GAP_PARAGRAPH).abs() < f32::EPSILON,
             "separate CodeLine groups should have GAP_PARAGRAPH, got {gap}"
         );
+    }
+
+    #[test]
+    fn a_line_with_a_tall_atom_grows_and_pushes_the_next_line_down() {
+        let fraction = Inline::Math(vec![MathNode::Frac {
+            num: vec![MathNode::Sym('1')],
+            den: vec![MathNode::Sym('2')],
+        }]);
+        let d = doc_with(vec![Block::Paragraph(vec![
+            fraction,
+            Inline::Text(Text {
+                text: " next".into(),
+                style: Style::PLAIN,
+            }),
+        ])]);
+        let laid = layout(&d, 30.0, &fake_measure);
+        let block = &laid.blocks[0];
+        assert_eq!(block.lines.len(), 2);
+        assert!(block.lines[0].height > LINE_BODY);
+        assert_eq!(block.lines[1].y, block.lines[0].height);
+        assert_eq!(block.height, block.lines[0].height + block.lines[1].height);
+    }
+
+    #[test]
+    fn a_display_math_block_is_as_tall_as_its_expression() {
+        let single = Block::Math(vec![Inline::Math(vec![MathNode::Sym('x')])]);
+        let nested = Block::Math(vec![Inline::Math(vec![MathNode::Frac {
+            num: vec![MathNode::Frac {
+                num: vec![MathNode::Sym('1')],
+                den: vec![MathNode::Sym('2')],
+            }],
+            den: vec![MathNode::Sym('3')],
+        }])]);
+        let single_height = layout(&doc_with(vec![single]), 300.0, &fake_measure).blocks[0].height;
+        let nested_height = layout(&doc_with(vec![nested]), 300.0, &fake_measure).blocks[0].height;
+        assert!(nested_height > single_height);
     }
 }
