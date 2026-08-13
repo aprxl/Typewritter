@@ -200,8 +200,38 @@ pub fn insert_script(root: &mut MathList, cursor: &mut MathCursor, which: Slot) 
     clamp(root, cursor);
     let path = cursor.path.clone();
     let index = cursor.index;
+
+    // 1. Inside one script slot, fill the parent's other empty slot. A script
+    // nested directly inside another script can no longer be typed in one
+    // flow; grouping brackets from the next structure are required for that.
+    if let Some(step) = path.last()
+        && matches!(step.slot, Slot::Sup | Slot::Sub)
+        && step.slot != which
+    {
+        let parent_path = &path[..path.len() - 1];
+        let parent_list = list_at_mut(root, parent_path).expect("clamped cursor path must resolve");
+        if let MathNode::Script { sup, sub, .. } = &mut parent_list[step.index] {
+            let other = match which {
+                Slot::Sup => sup,
+                Slot::Sub => sub,
+                Slot::Base | Slot::Num | Slot::Den => unreachable!(),
+            };
+            if other.is_none() {
+                *other = Some(Vec::new());
+                cursor
+                    .path
+                    .last_mut()
+                    .expect("cursor path is non-empty")
+                    .slot = which;
+                cursor.index = 0;
+                return;
+            }
+        }
+    }
+
     let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
 
+    // 2. Immediately after a script, enter its missing slot.
     if index > 0
         && let MathNode::Script { sup, sub, .. } = &mut list[index - 1]
     {
@@ -221,6 +251,7 @@ pub fn insert_script(root: &mut MathList, cursor: &mut MathCursor, which: Slot) 
         }
     }
 
+    // 3. Otherwise, capture the preceding operand and wrap it.
     let (start, operand) = capture_operand(list, index);
     let empty_operand = operand.is_empty();
     list.insert(
@@ -589,11 +620,22 @@ mod tests {
     }
 
     #[test]
-    fn a_trigger_inside_a_script_nests_rather_than_attaching() {
+    fn a_second_trigger_typed_straight_through_attaches_to_the_same_base() {
         let mut root = sym("x");
         let mut cursor = at(1);
         insert_script(&mut root, &mut cursor, Slot::Sup);
         insert_char(&mut root, &mut cursor, '2');
+        insert_script(&mut root, &mut cursor, Slot::Sub);
+        insert_char(&mut root, &mut cursor, 'i');
+
+        assert_eq!(root, vec![script(sym("x"), Some(sym("2")), Some(sym("i")))]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Sub)], 1));
+    }
+
+    #[test]
+    fn a_trigger_nests_when_the_slot_is_already_taken() {
+        let mut root = vec![script(sym("x"), Some(sym("2")), Some(sym("i")))];
+        let mut cursor = at_path(&[(0, Slot::Sup)], 1);
         insert_script(&mut root, &mut cursor, Slot::Sub);
 
         assert_eq!(
@@ -601,7 +643,7 @@ mod tests {
             vec![script(
                 sym("x"),
                 Some(vec![script(sym("2"), None, Some(Vec::new()))]),
-                None,
+                Some(sym("i")),
             )]
         );
         assert_eq!(cursor, at_path(&[(0, Slot::Sup), (0, Slot::Sub)], 0));
