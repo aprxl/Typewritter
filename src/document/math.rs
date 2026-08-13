@@ -11,6 +11,13 @@ pub enum MathNode {
     Sym(char),
     /// A fraction. Slots may be empty; an incomplete expression is legal.
     Frac { num: MathList, den: MathList },
+    /// A base with scripts attached. `None` means that script was not asked for;
+    /// `Some` (possibly empty) means the slot exists and can be typed into.
+    Script {
+        base: MathList,
+        sup: Option<MathList>,
+        sub: Option<MathList>,
+    },
 }
 
 pub type MathList = Vec<MathNode>;
@@ -18,15 +25,21 @@ pub type MathList = Vec<MathNode>;
 /// A named slot of a structural node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Slot {
+    Base,
     Num,
     Den,
+    Sup,
+    Sub,
 }
 
 impl Slot {
     pub fn name(self) -> &'static str {
         match self {
+            Self::Base => "base",
             Self::Num => "num",
             Self::Den => "denom",
+            Self::Sup => "sup",
+            Self::Sub => "sub",
         }
     }
 }
@@ -48,10 +61,20 @@ pub struct MathCursor {
 }
 
 impl MathNode {
-    pub fn slots(&self) -> &'static [Slot] {
+    pub fn slots(&self) -> Vec<Slot> {
         match self {
-            Self::Sym(_) => &[],
-            Self::Frac { .. } => &[Slot::Num, Slot::Den],
+            Self::Sym(_) => Vec::new(),
+            Self::Frac { .. } => vec![Slot::Num, Slot::Den],
+            Self::Script { sup, sub, .. } => {
+                let mut slots = vec![Slot::Base];
+                if sup.is_some() {
+                    slots.push(Slot::Sup);
+                }
+                if sub.is_some() {
+                    slots.push(Slot::Sub);
+                }
+                slots
+            }
         }
     }
 
@@ -63,7 +86,11 @@ impl MathNode {
         match (self, slot) {
             (Self::Frac { num, .. }, Slot::Num) => Some(num),
             (Self::Frac { den, .. }, Slot::Den) => Some(den),
+            (Self::Script { base, .. }, Slot::Base) => Some(base),
+            (Self::Script { sup: Some(sup), .. }, Slot::Sup) => Some(sup),
+            (Self::Script { sub: Some(sub), .. }, Slot::Sub) => Some(sub),
             (Self::Sym(_), _) => None,
+            (Self::Frac { .. }, _) | (Self::Script { .. }, _) => None,
         }
     }
 
@@ -71,7 +98,11 @@ impl MathNode {
         match (self, slot) {
             (Self::Frac { num, .. }, Slot::Num) => Some(num),
             (Self::Frac { den, .. }, Slot::Den) => Some(den),
+            (Self::Script { base, .. }, Slot::Base) => Some(base),
+            (Self::Script { sup: Some(sup), .. }, Slot::Sup) => Some(sup),
+            (Self::Script { sub: Some(sub), .. }, Slot::Sub) => Some(sub),
             (Self::Sym(_), _) => None,
+            (Self::Frac { .. }, _) | (Self::Script { .. }, _) => None,
         }
     }
 }
@@ -118,13 +149,7 @@ pub fn insert_char(root: &mut MathList, cursor: &mut MathCursor, c: char) {
     cursor.index += 1;
 }
 
-/// The `/` trigger wraps the preceding operand in a fraction and enters its
-/// empty denominator, or its numerator when no operand was present.
-pub fn insert_fraction(root: &mut MathList, cursor: &mut MathCursor) {
-    clamp(root, cursor);
-    let path = cursor.path.clone();
-    let index = cursor.index;
-    let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
+fn capture_operand(list: &mut MathList, index: usize) -> (usize, MathList) {
     let start = if index > 0 && list[index - 1].is_structural() {
         index - 1
     } else {
@@ -132,7 +157,8 @@ pub fn insert_fraction(root: &mut MathList, cursor: &mut MathCursor) {
         while start > 0 {
             let is_operand_char = matches!(
                 list[start - 1],
-                MathNode::Sym(c) if c.is_alphanumeric() || matches!(c, '.' | '_')
+                // `_` is a trigger now, so never swallow it into an identifier.
+                MathNode::Sym(c) if c.is_alphanumeric() || c == '.'
             );
             if !is_operand_char {
                 break;
@@ -141,7 +167,17 @@ pub fn insert_fraction(root: &mut MathList, cursor: &mut MathCursor) {
         }
         start
     };
-    let operand: MathList = list.drain(start..index).collect();
+    (start, list.drain(start..index).collect())
+}
+
+/// The `/` trigger wraps the preceding operand in a fraction and enters its
+/// empty denominator, or its numerator when no operand was present.
+pub fn insert_fraction(root: &mut MathList, cursor: &mut MathCursor) {
+    clamp(root, cursor);
+    let path = cursor.path.clone();
+    let index = cursor.index;
+    let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
+    let (start, operand) = capture_operand(list, index);
     list.insert(
         start,
         MathNode::Frac {
@@ -152,6 +188,52 @@ pub fn insert_fraction(root: &mut MathList, cursor: &mut MathCursor) {
     cursor.path.push(Step {
         index: start,
         slot: if index == start { Slot::Num } else { Slot::Den },
+    });
+    cursor.index = 0;
+}
+
+/// The `^` and `_` triggers attach a script to the preceding operand.
+pub fn insert_script(root: &mut MathList, cursor: &mut MathCursor, which: Slot) {
+    if !matches!(which, Slot::Sup | Slot::Sub) {
+        return;
+    }
+    clamp(root, cursor);
+    let path = cursor.path.clone();
+    let index = cursor.index;
+    let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
+
+    if index > 0
+        && let MathNode::Script { sup, sub, .. } = &mut list[index - 1]
+    {
+        let target = match which {
+            Slot::Sup => sup,
+            Slot::Sub => sub,
+            Slot::Base | Slot::Num | Slot::Den => unreachable!(),
+        };
+        if target.is_none() {
+            *target = Some(Vec::new());
+            cursor.path.push(Step {
+                index: index - 1,
+                slot: which,
+            });
+            cursor.index = 0;
+            return;
+        }
+    }
+
+    let (start, operand) = capture_operand(list, index);
+    let empty_operand = operand.is_empty();
+    list.insert(
+        start,
+        MathNode::Script {
+            base: operand,
+            sup: (which == Slot::Sup).then(Vec::new),
+            sub: (which == Slot::Sub).then(Vec::new),
+        },
+    );
+    cursor.path.push(Step {
+        index: start,
+        slot: if empty_operand { Slot::Base } else { which },
     });
     cursor.index = 0;
 }
@@ -188,6 +270,22 @@ pub fn backspace(root: &mut MathList, cursor: &mut MathCursor) -> Removed {
                         .chain(den),
                 );
                 cursor.index = position + num_len + 1;
+            }
+            MathNode::Script { base, sup, sub } => {
+                let base_len = base.len();
+                let first_trigger_offset = base_len + usize::from(sup.is_some() || sub.is_some());
+                let mut replacement = base;
+                if let Some(sup) = sup {
+                    replacement.push(MathNode::Sym('^'));
+                    replacement.extend(sup);
+                }
+                if let Some(sub) = sub {
+                    replacement.push(MathNode::Sym('_'));
+                    replacement.extend(sub);
+                }
+                list.remove(position);
+                list.splice(position..position, replacement);
+                cursor.index = position + first_trigger_offset;
             }
         }
         Removed::Edited
@@ -293,7 +391,7 @@ pub fn move_left(root: &MathList, cursor: &mut MathCursor) -> bool {
 
 fn collect_slot_paths(list: &MathList, prefix: &mut Vec<Step>, paths: &mut Vec<Vec<Step>>) {
     for (index, node) in list.iter().enumerate() {
-        for &slot in node.slots() {
+        for slot in node.slots() {
             prefix.push(Step { index, slot });
             paths.push(prefix.clone());
             collect_slot_paths(
@@ -380,6 +478,10 @@ mod tests {
         MathNode::Frac { num, den }
     }
 
+    fn script(base: MathList, sup: Option<MathList>, sub: Option<MathList>) -> MathNode {
+        MathNode::Script { base, sup, sub }
+    }
+
     fn at(index: usize) -> MathCursor {
         MathCursor {
             path: Vec::new(),
@@ -461,6 +563,61 @@ mod tests {
     }
 
     #[test]
+    fn the_caret_trigger_wraps_the_preceding_operand() {
+        let mut root = sym("x");
+        let mut cursor = at(1);
+        insert_script(&mut root, &mut cursor, Slot::Sup);
+
+        assert_eq!(root, vec![script(sym("x"), Some(Vec::new()), None)]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Sup)], 0));
+    }
+
+    #[test]
+    fn a_second_trigger_fills_the_other_script_slot() {
+        let mut root = sym("x");
+        let mut cursor = at(1);
+        insert_script(&mut root, &mut cursor, Slot::Sup);
+        insert_char(&mut root, &mut cursor, '2');
+        assert!(pop_level(&root, &mut cursor));
+        insert_script(&mut root, &mut cursor, Slot::Sub);
+
+        assert_eq!(
+            root,
+            vec![script(sym("x"), Some(sym("2")), Some(Vec::new()))]
+        );
+        assert_eq!(cursor, at_path(&[(0, Slot::Sub)], 0));
+    }
+
+    #[test]
+    fn a_trigger_inside_a_script_nests_rather_than_attaching() {
+        let mut root = sym("x");
+        let mut cursor = at(1);
+        insert_script(&mut root, &mut cursor, Slot::Sup);
+        insert_char(&mut root, &mut cursor, '2');
+        insert_script(&mut root, &mut cursor, Slot::Sub);
+
+        assert_eq!(
+            root,
+            vec![script(
+                sym("x"),
+                Some(vec![script(sym("2"), None, Some(Vec::new()))]),
+                None,
+            )]
+        );
+        assert_eq!(cursor, at_path(&[(0, Slot::Sup), (0, Slot::Sub)], 0));
+    }
+
+    #[test]
+    fn an_underscore_no_longer_extends_an_identifier() {
+        let mut root = sym("R");
+        let mut cursor = at(1);
+        insert_script(&mut root, &mut cursor, Slot::Sub);
+
+        assert_eq!(root, vec![script(sym("R"), None, Some(Vec::new()))]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Sub)], 0));
+    }
+
+    #[test]
     fn backspace_removes_a_sym() {
         let mut root = sym("ab");
         let mut cursor = at(2);
@@ -478,6 +635,16 @@ mod tests {
         assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
         assert_eq!(root, sym("12/34"));
         assert_eq!(cursor, at(3));
+    }
+
+    #[test]
+    fn backspace_reverts_a_script_to_its_literal_atoms() {
+        let mut root = vec![script(sym("x"), Some(sym("2")), Some(sym("i")))];
+        let mut cursor = at(1);
+
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, sym("x^2_i"));
+        assert_eq!(cursor, at(2));
     }
 
     #[test]
@@ -540,6 +707,32 @@ mod tests {
     }
 
     #[test]
+    fn arrows_walk_a_script_s_slots_in_document_order() {
+        let root = vec![
+            MathNode::Sym('a'),
+            script(sym("b"), Some(sym("c")), Some(sym("d"))),
+            MathNode::Sym('e'),
+        ];
+        let mut cursor = MathCursor::default();
+
+        for expected in [
+            at(1),
+            at_path(&[(1, Slot::Base)], 0),
+            at_path(&[(1, Slot::Base)], 1),
+            at_path(&[(1, Slot::Sup)], 0),
+            at_path(&[(1, Slot::Sup)], 1),
+            at_path(&[(1, Slot::Sub)], 0),
+            at_path(&[(1, Slot::Sub)], 1),
+            at(2),
+            at(3),
+        ] {
+            assert!(move_right(&root, &mut cursor));
+            assert_eq!(cursor, expected);
+        }
+        assert!(!move_right(&root, &mut cursor));
+    }
+
+    #[test]
     fn tab_visits_empty_slots_first() {
         let root = vec![frac(sym("x"), vec![frac(Vec::new(), Vec::new())])];
         let mut cursor = MathCursor::default();
@@ -572,6 +765,15 @@ mod tests {
             assert!(slot_prev(&root, &mut cursor));
             assert_eq!(&cursor, expected);
         }
+    }
+
+    #[test]
+    fn tab_visits_an_empty_script_slot() {
+        let root = vec![script(sym("x"), Some(Vec::new()), None)];
+        let mut cursor = MathCursor::default();
+
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Sup)], 0));
     }
 
     #[test]

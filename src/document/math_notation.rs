@@ -7,7 +7,7 @@
 //! strings produced by `print`. Structural characters in `Sym` nodes are
 //! escaped with a backslash; a trailing backslash is the literal backslash.
 
-use super::math::{MathList, MathNode};
+use super::math::{MathList, MathNode, Slot};
 
 /// The canonical linear form of `list`. Deterministic: equal trees print
 /// equal strings, and the parser reads this exact string back to an equal
@@ -20,8 +20,8 @@ pub fn print(list: &MathList) -> String {
 
 fn print_list(list: &MathList, output: &mut String) {
     for (index, node) in list.iter().enumerate() {
-        if index > 0 && matches!(node, MathNode::Frac { .. }) {
-            // A later fraction with an empty numerator would capture the preceding node.
+        if index > 0 && node.is_structural() {
+            // A later structural node with an empty first slot would capture the preceding node.
             output.push('(');
             print_node(node, output);
             output.push(')');
@@ -34,7 +34,7 @@ fn print_list(list: &MathList, output: &mut String) {
 fn print_node(node: &MathNode, output: &mut String) {
     match node {
         MathNode::Sym(c) => {
-            if matches!(c, '/' | '(' | ')' | '\\') {
+            if matches!(c, '/' | '(' | ')' | '\\' | '^' | '_') {
                 output.push('\\');
             }
             output.push(*c);
@@ -44,15 +44,26 @@ fn print_node(node: &MathNode, output: &mut String) {
             output.push('/');
             print_operand(den, true, output);
         }
+        MathNode::Script { base, sup, sub } => {
+            print_operand(base, false, output);
+            if let Some(sup) = sup {
+                output.push('^');
+                print_operand(sup, true, output);
+            }
+            if let Some(sub) = sub {
+                output.push('_');
+                print_operand(sub, true, output);
+            }
+        }
     }
 }
 
-fn print_operand(list: &MathList, denominator: bool, output: &mut String) {
-    let bare = list.len() == 1
-        // Left associativity reconstructs a single fraction numerator. A
-        // denominator fraction needs parentheses or it becomes that same
-        // left-associated numerator.
-        && !(denominator && matches!(list.first(), Some(MathNode::Frac { .. })));
+fn print_operand(list: &MathList, symbol_only: bool, output: &mut String) {
+    let bare = match list.as_slice() {
+        [MathNode::Sym(_)] => true,
+        [_] if !symbol_only => true,
+        _ => false,
+    };
     if bare {
         print_node(&list[0], output);
     } else {
@@ -98,6 +109,15 @@ impl Parser {
                     Vec::new()
                 };
                 items.push(vec![MathNode::Frac { num, den }]);
+            } else if matches!(current, '^' | '_') {
+                self.position += 1;
+                let which = if current == '^' { Slot::Sup } else { Slot::Sub };
+                let script = if self.starts_operand(grouped) {
+                    self.parse_item().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                attach_or_wrap_script(&mut items, which, script);
             } else if let Some(item) = self.parse_item() {
                 items.push(item);
             }
@@ -108,7 +128,7 @@ impl Parser {
 
     fn starts_operand(&self, grouped: bool) -> bool {
         match self.chars.get(self.position) {
-            None | Some('/') => false,
+            None | Some('/' | '^' | '_') => false,
             Some(')') if grouped => false,
             _ => true,
         }
@@ -118,6 +138,7 @@ impl Parser {
         let current = *self.chars.get(self.position)?;
         match current {
             '/' => None,
+            '^' | '_' => None,
             '(' => {
                 self.position += 1;
                 Some(self.parse_list(true))
@@ -142,6 +163,30 @@ impl Parser {
     }
 }
 
+fn attach_or_wrap_script(items: &mut Vec<MathList>, which: Slot, script: MathList) {
+    if let Some(item) = items.last_mut()
+        && let [MathNode::Script { sup, sub, .. }] = item.as_mut_slice()
+    {
+        let target = match which {
+            Slot::Sup => sup,
+            Slot::Sub => sub,
+            Slot::Base | Slot::Num | Slot::Den => unreachable!(),
+        };
+        if target.is_none() {
+            *target = Some(script);
+            return;
+        }
+    }
+
+    let base = items.pop().unwrap_or_default();
+    let (sup, sub) = match which {
+        Slot::Sup => (Some(script), None),
+        Slot::Sub => (None, Some(script)),
+        Slot::Base | Slot::Num | Slot::Den => unreachable!(),
+    };
+    items.push(vec![MathNode::Script { base, sup, sub }]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +197,10 @@ mod tests {
 
     fn frac(num: MathList, den: MathList) -> MathNode {
         MathNode::Frac { num, den }
+    }
+
+    fn script(base: MathList, sup: Option<MathList>, sub: Option<MathList>) -> MathNode {
+        MathNode::Script { base, sup, sub }
     }
 
     #[test]
@@ -166,9 +215,42 @@ mod tests {
     fn a_fraction_prints_operands_bare_only_when_single() {
         let fraction = frac(sym("R_2"), sym("R_1"));
 
-        assert_eq!(print(&vec![fraction.clone()]), "(R_2)/(R_1)");
-        assert_eq!(parse("(R_2)/(R_1)"), vec![fraction]);
+        assert_eq!(print(&vec![fraction.clone()]), "(R\\_2)/(R\\_1)");
+        assert_eq!(parse("(R\\_2)/(R\\_1)"), vec![fraction]);
         assert_eq!(print(&vec![frac(sym("a"), sym("b"))]), "a/b");
+    }
+
+    #[test]
+    fn a_script_prints_bare_only_for_a_single_symbol() {
+        assert_eq!(print(&vec![script(sym("x"), Some(sym("2")), None)]), "x^2");
+        assert_eq!(
+            print(&vec![script(sym("x"), Some(sym("2n")), None)]),
+            "x^(2n)"
+        );
+        assert_eq!(
+            print(&vec![script(
+                sym("x"),
+                Some(vec![frac(sym("a"), sym("b"))]),
+                None,
+            )]),
+            "x^(a/b)"
+        );
+    }
+
+    #[test]
+    fn both_scripts_print_and_read_back_as_one_base() {
+        let tree = vec![script(sym("x"), Some(sym("2")), Some(sym("i")))];
+
+        assert_eq!(print(&tree), "x^2_i");
+        assert_eq!(parse("x^2_i"), tree);
+    }
+
+    #[test]
+    fn a_literal_caret_is_escaped() {
+        let tree = sym("^");
+
+        assert_eq!(print(&tree), "\\^");
+        assert_eq!(parse("\\^"), tree);
     }
 
     #[test]
@@ -264,16 +346,37 @@ mod tests {
         let length = (generator.next() % 5) as usize;
         (0..length)
             .map(|_| {
-                if depth > 0 && generator.next().is_multiple_of(4) {
-                    frac(
+                let choice = if depth > 0 { generator.next() % 6 } else { 5 };
+                match choice {
+                    0 => frac(
                         generated_list(generator, depth - 1),
                         generated_list(generator, depth - 1),
-                    )
-                } else {
-                    const SYMBOLS: &[char] = &[
-                        'a', 'Z', '0', '9', '+', '-', '=', '.', ' ', '/', '(', ')', '\\',
-                    ];
-                    MathNode::Sym(SYMBOLS[(generator.next() % SYMBOLS.len() as u64) as usize])
+                    ),
+                    1 => {
+                        let sup = if generator.next().is_multiple_of(2) {
+                            Some(generated_list(generator, depth - 1))
+                        } else {
+                            None
+                        };
+                        let sub = if generator.next().is_multiple_of(2) {
+                            Some(generated_list(generator, depth - 1))
+                        } else {
+                            None
+                        };
+                        let (sup, sub) = if sup.is_none() && sub.is_none() {
+                            (Some(Vec::new()), None)
+                        } else {
+                            (sup, sub)
+                        };
+                        script(generated_list(generator, depth - 1), sup, sub)
+                    }
+                    _ => {
+                        const SYMBOLS: &[char] = &[
+                            'a', 'Z', '0', '9', '+', '-', '=', '.', ' ', '/', '(', ')', '\\', '^',
+                            '_',
+                        ];
+                        MathNode::Sym(SYMBOLS[(generator.next() % SYMBOLS.len() as u64) as usize])
+                    }
                 }
             })
             .collect()

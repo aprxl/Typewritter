@@ -121,6 +121,10 @@ fn layout_node(
     match node {
         MathNode::Sym(ch) => glyph(*ch, level, measure),
         MathNode::Frac { num, den } => fraction(num, den, level, measure),
+        MathNode::Script { base, .. } => {
+            // Real script layout lands in the next layout task.
+            layout(base, level, measure)
+        }
     }
 }
 
@@ -263,6 +267,8 @@ fn fraction_slot<'a>(
     let (list, child) = match slot {
         Slot::Num => (num, children.first()?),
         Slot::Den => (den, children.get(2)?),
+        // Script cursor geometry lands with script layout in the next task.
+        Slot::Base | Slot::Sup | Slot::Sub => return None,
     };
     Some((list, &child.2, child.0, child.1))
 }
