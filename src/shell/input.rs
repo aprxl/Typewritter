@@ -19,6 +19,7 @@ use crate::components::{
     file_finder, file_tree, onboarding, title_bar,
 };
 use crate::config::Config;
+use crate::document::math::Slot;
 use crate::document::{FlatPos, FlatRange, Style};
 use crate::input::Input;
 use crate::layout::Rect;
@@ -161,15 +162,17 @@ impl Shell {
             _ => self.edit_frame_normal(input),
         }
 
-        if has_tab
-            && input.is_mouse_pressed(MouseButton::Left)
-            && over_editor
-            && let Some(caret) = self.caret_at(rect, mouse)
-        {
-            self.goal_x = None;
-            self.docs
-                .borrow_mut()
-                .move_caret_to(caret.block, caret.inline, caret.offset);
+        if has_tab && input.is_mouse_pressed(MouseButton::Left) && over_editor {
+            if let Some((block, inline, cursor)) = self.math_at(rect, mouse) {
+                self.goal_x = None;
+                self.docs.borrow_mut().enter_math_at(block, inline, cursor);
+                self.apply(ExtendedAction::Enter(Mode::Insert));
+            } else if let Some(caret) = self.caret_at(rect, mouse) {
+                self.goal_x = None;
+                self.docs
+                    .borrow_mut()
+                    .move_caret_to(caret.block, caret.inline, caret.offset);
+            }
         }
 
         self.divider_drag(input);
@@ -214,9 +217,21 @@ impl Shell {
         // Any other arrow clears the vertical goals.
         self.goal_x = None;
         if input.is_key_typed(KeyCode::ArrowLeft) {
+            if matches!(self.vim.current_mode(), VimMode::Insert) {
+                let entered = self.docs.borrow_mut().enter_math_before();
+                if entered {
+                    return;
+                }
+            }
             self.docs.borrow_mut().move_left();
         }
         if input.is_key_typed(KeyCode::ArrowRight) {
+            if matches!(self.vim.current_mode(), VimMode::Insert) {
+                let entered = self.docs.borrow_mut().enter_math_after();
+                if entered {
+                    return;
+                }
+            }
             self.docs.borrow_mut().move_right();
         }
         if input.is_key_typed(KeyCode::Home) {
@@ -339,10 +354,11 @@ impl Shell {
 
     fn edit_frame_math(&mut self, input: &Input) {
         for c in input.text().chars() {
-            if c == '/' {
-                self.docs.borrow_mut().math_fraction();
-            } else {
-                self.docs.borrow_mut().math_type(c);
+            match c {
+                '/' => self.docs.borrow_mut().math_fraction(),
+                '^' => self.docs.borrow_mut().math_script(Slot::Sup),
+                '_' => self.docs.borrow_mut().math_script(Slot::Sub),
+                _ => self.docs.borrow_mut().math_type(c),
             }
         }
         if input.is_key_typed(KeyCode::Backspace) {

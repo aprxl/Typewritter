@@ -11,6 +11,7 @@
 //! prose collapses whitespace and carries no source offsets, both fatal to
 //! caret mapping.
 
+use crate::document::math::MathCursor;
 use crate::document::{Block, Caret, Document, Inline, Style, math_layout};
 use crate::theme::{self, TextStyle};
 
@@ -613,6 +614,52 @@ impl DocLayout {
         caret_for_click(&self.source, layout_block, block_idx, line_idx, x, measure)
     }
 
+    /// The atom a point landed inside, with the cursor seated where the
+    /// point falls in it. `None` when the point is not inside an atom's box.
+    pub fn hit_math(
+        &self,
+        x: f32,
+        y: f32,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> Option<(usize, usize, MathCursor)> {
+        let block_idx = block_of_y(self, y);
+        let layout_block = &self.blocks[block_idx];
+        let line_idx = line_of_y(layout_block, y);
+        let line = &layout_block.lines[line_idx];
+        let block = &self.source[block_idx];
+        let mut advance_x = 0.0;
+
+        for segment in &line.segments {
+            let run = &block.inlines()[segment.inline];
+            let text = segment_text(run, segment);
+            if segment.style.badge {
+                advance_x += theme::BADGE_PAD;
+            }
+            let width = advance(run, &text, block, segment.style, measure);
+            if let Inline::Math(list) = run
+                && x >= advance_x
+                && x <= advance_x + width
+            {
+                let local_x = x - advance_x;
+                // Math boxes use positive-up y; the line baseline is its centre.
+                let local_y = line.y + line.height / 2.0 - y;
+                let expression = math_layout::layout(list, 0, measure);
+                if local_y >= -expression.descent && local_y <= expression.ascent {
+                    return Some((
+                        block_idx,
+                        segment.inline,
+                        math_layout::hit(list, (local_x, local_y), 0, measure),
+                    ));
+                }
+            }
+            advance_x += width;
+            if segment.style.badge {
+                advance_x += theme::BADGE_PAD;
+            }
+        }
+        None
+    }
+
     /// One visual line up from `caret`, aiming at `goal_x` pixels.
     pub fn line_up(
         &self,
@@ -1177,6 +1224,47 @@ mod tests {
 
         let inside_left = laid.hit(atom_width / 4.0, LINE_BODY / 2.0, &fake_measure);
         assert_eq!(flat_of_caret(&d.blocks, inside_left), 0);
+    }
+
+    #[test]
+    fn a_click_inside_an_expression_finds_its_atom() {
+        let block = Block::Paragraph(vec![
+            Inline::Text(Text {
+                text: "before ".into(),
+                style: Style::PLAIN,
+            }),
+            Inline::Math(vec![MathNode::Frac {
+                num: vec![MathNode::Sym('1')],
+                den: vec![MathNode::Sym('2')],
+            }]),
+            Inline::Text(Text {
+                text: " after".into(),
+                style: Style::PLAIN,
+            }),
+        ]);
+        let d = doc_with(vec![block]);
+        let laid = layout(&d, 300.0, &fake_measure);
+        let atom_width = advance(
+            &d.blocks[0].inlines()[1],
+            "\u{FFFC}",
+            &d.blocks[0],
+            Style::PLAIN,
+            &fake_measure,
+        );
+        let line = &laid.blocks[0].lines[0];
+        let inside = laid.hit_math(
+            70.0 + atom_width / 2.0,
+            line.y + line.height / 2.0,
+            &fake_measure,
+        );
+        assert!(matches!(inside, Some((0, 1, _))));
+
+        let past = laid.hit_math(
+            70.0 + atom_width + 20.0,
+            line.y + line.height / 2.0,
+            &fake_measure,
+        );
+        assert_eq!(past, None);
     }
 
     #[test]

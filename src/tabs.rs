@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::document::{Document, FlatRange, Style};
+use crate::document::{Document, FlatRange, Style, math};
 
 pub struct Tab {
     pub document: Document,
@@ -436,6 +436,10 @@ impl Tabs {
         self.edit(Document::math_insert_fraction);
     }
 
+    pub fn math_script(&mut self, which: math::Slot) {
+        self.edit(|doc| doc.math_insert_script(which));
+    }
+
     pub fn math_backspace(&mut self) {
         self.edit(|doc| {
             doc.math_backspace();
@@ -453,6 +457,22 @@ impl Tabs {
         let mut moved = false;
         self.touch(|doc| moved = doc.math_move_right());
         moved
+    }
+
+    pub fn enter_math_before(&mut self) -> bool {
+        let mut entered = false;
+        self.touch(|doc| entered = doc.enter_math_before());
+        entered
+    }
+
+    pub fn enter_math_after(&mut self) -> bool {
+        let mut entered = false;
+        self.touch(|doc| entered = doc.enter_math_after());
+        entered
+    }
+
+    pub fn enter_math_at(&mut self, block: usize, inline: usize, cursor: math::MathCursor) {
+        self.touch(|doc| doc.enter_math_at(block, inline, cursor));
     }
 
     pub fn math_slot_next(&mut self) -> bool {

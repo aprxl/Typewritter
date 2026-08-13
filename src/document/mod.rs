@@ -1608,6 +1608,13 @@ impl Document {
         }
     }
 
+    pub fn math_insert_script(&mut self, which: math::Slot) {
+        if let Some((list, cursor)) = self.focused_math() {
+            math::insert_script(list, cursor, which);
+            self.dirty = true;
+        }
+    }
+
     pub fn math_backspace(&mut self) -> Option<math::Removed> {
         let result = self
             .focused_math()
@@ -1641,6 +1648,76 @@ impl Document {
     pub fn math_pop(&mut self) -> bool {
         self.focused_math()
             .is_some_and(|(list, cursor)| math::pop_level(list, cursor))
+    }
+
+    /// Enters the atom immediately before the caret, if there is one,
+    /// putting the math cursor at its end — arrowing left into an
+    /// expression continues into its content rather than stepping over
+    /// it, which is the mirror of how the cursor steps out at its edges.
+    pub fn enter_math_before(&mut self) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        let flat = self.caret_flat(block);
+        if flat == 0 {
+            return false;
+        }
+        let (inline, _) = self.flat_to_pos(block, flat - 1);
+        let list_len = match self.blocks[block].inlines().get(inline) {
+            Some(Inline::Math(list)) => list.len(),
+            _ => return false,
+        };
+        // Offset 0 identifies the atom; offset 1 is past it, as math_exit uses.
+        self.set_caret(block, inline, 0);
+        self.math = Some(math::MathCursor {
+            path: Vec::new(),
+            index: list_len,
+        });
+        true
+    }
+
+    /// Enters the atom immediately after the caret, cursor at its start.
+    pub fn enter_math_after(&mut self) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        let flat = self.caret_flat(block);
+        if flat >= self.block_flat_len(block) {
+            return false;
+        }
+        let (inline, _) = self.flat_to_pos(block, flat);
+        if !matches!(
+            self.blocks[block].inlines().get(inline),
+            Some(Inline::Math(_))
+        ) {
+            return false;
+        }
+        self.set_caret(block, inline, 0);
+        self.math = Some(math::MathCursor::default());
+        true
+    }
+
+    /// Enters the atom at `block`/`inline` with an already-resolved
+    /// cursor — the click path, where the geometry decided where inside the
+    /// expression the cursor goes.
+    pub fn enter_math_at(&mut self, block: usize, inline: usize, mut cursor: math::MathCursor) {
+        let list_len = match self
+            .blocks
+            .get(block)
+            .and_then(|block| block.inlines().get(inline))
+        {
+            Some(Inline::Math(list)) => list.len(),
+            _ => return,
+        };
+        self.set_caret(block, inline, 0);
+        cursor.index = cursor.index.min(list_len);
+        let list = match self.blocks[self.caret.block]
+            .inlines()
+            .get(self.caret.inline)
+        {
+            Some(Inline::Math(list)) => list,
+            _ => return,
+        };
+        math::clamp(list, &mut cursor);
+        self.math = Some(cursor);
     }
 
     pub fn math_exit(&mut self) {
@@ -2358,6 +2435,45 @@ mod tests {
         d.math_exit();
         assert!(d.math.is_none());
         assert_eq!(d.caret.offset, 1);
+    }
+
+    #[test]
+    fn arrowing_back_over_an_atom_enters_it() {
+        let mut d = doc();
+        d.blocks[0] = Block::Paragraph(vec![
+            plain_run("before"),
+            Inline::Math(vec![math::MathNode::Sym('x'), math::MathNode::Sym('y')]),
+            plain_run("after"),
+        ]);
+        d.set_caret(0, 1, 1);
+
+        assert!(d.enter_math_before());
+        assert_eq!(
+            d.caret,
+            Caret {
+                block: 0,
+                inline: 1,
+                offset: 0,
+                style: Style::PLAIN
+            }
+        );
+        assert_eq!(
+            d.math,
+            Some(math::MathCursor {
+                path: Vec::new(),
+                index: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn enter_math_before_ignores_prose() {
+        let mut d = doc();
+        d.blocks[0] = Block::Paragraph(vec![plain_run("text")]);
+        d.set_caret(0, 0, 1);
+
+        assert!(!d.enter_math_before());
+        assert!(d.math.is_none());
     }
 
     #[test]

@@ -45,6 +45,7 @@ use crate::components::{
 use crate::config::Config;
 use crate::document::Caret;
 use crate::document::layout::DocLayout;
+use crate::document::math::MathCursor;
 use crate::document::outline;
 use crate::frame::FrameScheduler;
 use crate::input::Input;
@@ -764,20 +765,33 @@ impl Shell {
         self.docs.borrow_mut().set_editor_scroll(scroll);
     }
 
-    /// Mouse position within the editor: the caret nearest the cursor.
-    fn caret_at(&mut self, rect: Rect, mouse: (f32, f32)) -> Option<Caret> {
-        let width = Editor::content_width(rect);
-        let layout = self.current_layout(width);
+    fn editor_point(&self, rect: Rect, mouse: (f32, f32)) -> Option<(f32, f32)> {
         let docs = self.docs.borrow();
         docs.active()?;
-        let layer = self.regions[self.text_region].layer();
-        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
         let local_x = (mouse.0 - (rect.x + editor::INSET)).max(0.0);
         let local_y = mouse.1 - rect.y - editor::TOP + docs.editor_scroll;
         if local_y < 0.0 {
             return None;
         }
+        Some((local_x, local_y))
+    }
+
+    /// Mouse position within the editor: the caret nearest the cursor.
+    fn caret_at(&mut self, rect: Rect, mouse: (f32, f32)) -> Option<Caret> {
+        let layout = self.current_layout(Editor::content_width(rect));
+        let (local_x, local_y) = self.editor_point(rect, mouse)?;
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
         Some(layout.hit(local_x, local_y, &measure))
+    }
+
+    /// Mouse position within a rendered math atom and its nearest cursor.
+    fn math_at(&mut self, rect: Rect, mouse: (f32, f32)) -> Option<(usize, usize, MathCursor)> {
+        let layout = self.current_layout(Editor::content_width(rect));
+        let (local_x, local_y) = self.editor_point(rect, mouse)?;
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+        layout.hit_math(local_x, local_y, &measure)
     }
 
     /// The breadcrumb for the active tab: vault name, then the file's
