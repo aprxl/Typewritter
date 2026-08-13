@@ -11,6 +11,7 @@ pub mod markdown;
 pub mod math;
 pub mod math_layout;
 pub mod math_notation;
+pub mod math_symbols;
 pub mod outline;
 
 /// Flat-text stand-in for one opaque math atom.

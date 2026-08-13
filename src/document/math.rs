@@ -303,6 +303,66 @@ pub fn insert_word(root: &mut MathList, cursor: &mut MathCursor) -> bool {
     true
 }
 
+fn word_range(list: &MathList, index: usize) -> Option<(usize, usize)> {
+    if index == 0 || !matches!(list[index - 1], MathNode::Sym(c) if c.is_alphabetic()) {
+        return None;
+    }
+    let mut start = index;
+    while start > 0 && matches!(list[start - 1], MathNode::Sym(c) if c.is_alphabetic()) {
+        start -= 1;
+    }
+    Some((start, index))
+}
+
+/// The run of letters immediately before the cursor, which is what a
+/// completion is being typed into. `None` when the cursor is not after
+/// one. Read from the tree rather than from what was typed, so it stays
+/// right through backspace, arrow moves and a click elsewhere without
+/// any state of its own to fall out of step.
+pub fn word_before(root: &MathList, cursor: &MathCursor) -> Option<String> {
+    let mut cursor = cursor.clone();
+    clamp(root, &mut cursor);
+    let list = list_at(root, &cursor.path)?;
+    let (start, end) = word_range(list, cursor.index)?;
+    Some(
+        list[start..end]
+            .iter()
+            .map(|node| match node {
+                MathNode::Sym(c) => *c,
+                _ => unreachable!("word range contains only letter atoms"),
+            })
+            .collect(),
+    )
+}
+
+/// Replaces the word before the cursor with `glyph`. Used when a
+/// completion is accepted; the word is what `word_before` reported.
+pub fn accept_symbol(root: &mut MathList, cursor: &mut MathCursor, glyph: char) {
+    clamp(root, cursor);
+    let path = cursor.path.clone();
+    let index = cursor.index;
+    let Some((start, end)) = list_at(root, &path).and_then(|list| word_range(list, index)) else {
+        return;
+    };
+    let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
+    list.splice(start..end, std::iter::once(MathNode::Sym(glyph)));
+    cursor.index = start + 1;
+}
+
+/// Removes the word before the cursor without inserting anything, so a
+/// caller can follow it with a structure trigger.
+pub fn take_word(root: &mut MathList, cursor: &mut MathCursor) {
+    clamp(root, cursor);
+    let path = cursor.path.clone();
+    let index = cursor.index;
+    let Some((start, end)) = list_at(root, &path).and_then(|list| word_range(list, index)) else {
+        return;
+    };
+    let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
+    list.drain(start..end);
+    cursor.index = start;
+}
+
 /// The delimiter pairs a typed opener produces. Braces are deliberately
 /// absent: `{` and `}` are the notation's invisible grouping (see
 /// `math_notation`), and the brace people actually write in notation is the
@@ -832,6 +892,37 @@ mod tests {
         let mut cursor = at(4);
         assert!(!insert_word(&mut root, &mut cursor));
         assert_eq!(root, sym("1sum"));
+    }
+
+    #[test]
+    fn the_word_before_the_cursor_stops_at_a_digit() {
+        let root = sym("alpha2beta");
+
+        assert_eq!(word_before(&root, &at(6)), None);
+        assert_eq!(word_before(&root, &at(10)), Some("beta".to_owned()));
+    }
+
+    #[test]
+    fn accepting_a_symbol_replaces_the_whole_word() {
+        let mut root = sym("alpha");
+        let mut cursor = at(5);
+
+        accept_symbol(&mut root, &mut cursor, 'α');
+
+        assert_eq!(root, sym("α"));
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn taking_the_word_leaves_the_cursor_where_it_began() {
+        let mut root = sym("frac");
+        let mut cursor = at(4);
+
+        take_word(&mut root, &mut cursor);
+        insert_fraction(&mut root, &mut cursor);
+
+        assert_eq!(root, vec![frac(Vec::new(), Vec::new())]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Num)], 0));
     }
 
     #[test]
