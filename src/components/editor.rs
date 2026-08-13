@@ -331,6 +331,27 @@ impl Component for Editor {
         // rounded corners at every join.
         let mut bi = 0;
         while bi < self.layout.blocks.len() {
+            if self.layout.source[bi].is_math() {
+                let first_line = self.layout.blocks[bi].lines.first();
+                let last_line = self.layout.blocks[bi].lines.last();
+                if let (Some(first_line), Some(last_line)) = (first_line, last_line) {
+                    let top = content + first_line.y - self.scroll;
+                    let bottom = content + last_line.y + last_line.height - self.scroll;
+                    if bottom >= rect.y && top <= rect.bottom() {
+                        layer.draw_rectangle(
+                            (x - BLOCK_PAD.0, top - BLOCK_PAD.1),
+                            (
+                                Self::content_width(rect) + BLOCK_PAD.0 * 2.0,
+                                bottom - top + BLOCK_PAD.1 * 2.0,
+                            ),
+                            theme::MATH,
+                            CODE_ROUNDING,
+                        );
+                    }
+                }
+                bi += 1;
+                continue;
+            }
             if !self.layout.source[bi].is_code() {
                 bi += 1;
                 continue;

@@ -23,6 +23,12 @@ pub const SELECTION: Color = Color::rgb(0xD2, 0xB2, 0x6E);
 /// the boundary of a code span has to read at a glance, since nothing else
 /// marks it.
 pub const CODE: Color = Color::rgb(0xD9, 0xC9, 0x9E);
+/// Behind a display math block. A sibling of `CODE` rather than the same
+/// tint: both are slabs of machinery on a page of prose, and telling one
+/// from the other at a glance is the whole point of tinting them at all.
+/// Cooler and greyer than code's warm tan, which is what separates them
+/// without introducing a colour the palette does not already live in.
+pub const MATH: Color = Color::rgb(0xD5, 0xCD, 0xB4);
 pub const BORDER: Color = Color::rgb(0xDD, 0xD0, 0xA0);
 
 // -- Badges and highlights --
