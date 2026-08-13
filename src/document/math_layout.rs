@@ -17,8 +17,8 @@ pub const BASE_SIZE: f32 = 17.5;
 /// Font scale per script level: full, script, scriptscript. Clamped at level
 /// 2 because deeper TeX scripts do not shrink further.
 pub const LEVEL_SCALE: [f32; 3] = [1.0, 0.78, 0.62];
-/// Vertical clearance between the bar and each operand, as a fraction of the
-/// current size.
+/// Vertical clearance from the bar to each operand's near edge, as a fraction
+/// of the current size.
 pub const FRAC_GAP: f32 = 0.12;
 /// The bar's horizontal overhang past the wider operand, in pixels at level 0
 /// and scaled with the current level.
@@ -36,8 +36,8 @@ pub const SCRIPT_RISE: f32 = 0.10;
 /// The mirror for a subscript's upper edge below the anchor line.
 pub const SCRIPT_DROP: f32 = 0.10;
 
-// The renderer centers glyphs vertically, so the anchor line is a center line.
-// Symmetric boxes make equal clearance above and below the line exact.
+// The renderer centers glyphs vertically, so glyph boxes are symmetric about
+// the anchor. Structural boxes use their near edge when clearance matters.
 
 /// A laid-out node and its positioned children.
 #[derive(Clone, Debug, PartialEq)]
@@ -195,10 +195,11 @@ fn fraction(
     // Anchor line is the inline prose middle, so placing the bar at zero
     // aligns it with the math axis instead of lifting the whole fraction.
     let bar_y = 0.0;
-    let numerator_half = (numerator.ascent + numerator.descent) * 0.5;
-    let denominator_half = (denominator.ascent + denominator.descent) * 0.5;
-    let numerator_offset = BAR * 0.5 + gap + numerator_half;
-    let denominator_offset = BAR * 0.5 + gap + denominator_half;
+    // Like scripts, place each operand by the edge facing the bar so lopsided
+    // boxes keep the requested clearance.
+    let clearance = BAR * 0.5 + gap;
+    let numerator_offset = clearance + numerator.descent;
+    let denominator_offset = clearance + denominator.ascent;
     let numerator_y = numerator_offset;
     let denominator_y = -denominator_offset;
     let mut children = (0..3).map(|_| None).collect::<Vec<_>>();
@@ -621,7 +622,7 @@ mod tests {
     #[test]
     fn a_fraction_puts_its_operands_the_same_distance_from_the_bar() {
         let list = vec![fraction(
-            symbols("x"),
+            vec![script(symbols("x"), None, Some(symbols("i")))],
             vec![fraction(symbols("yz"), symbols("w"))],
         )];
         let box_ = layout(&list, 0, &fake_measure);
@@ -640,23 +641,113 @@ mod tests {
     }
 
     #[test]
-    fn a_fraction_is_centred_on_its_own_anchor_line() {
-        let one_level = layout(
-            &vec![fraction(symbols("x"), symbols("y"))],
-            0,
-            &fake_measure,
-        );
-        assert_eq!(one_level.ascent, one_level.descent);
+    fn the_bar_sits_on_the_anchor_line_whatever_the_operands_are() {
+        let list = vec![fraction(
+            symbols("x"),
+            vec![fraction(symbols("z"), symbols("w"))],
+        )];
+        let box_ = layout(&list, 0, &fake_measure);
+        let BoxKind::Row { children } = box_.kind else {
+            panic!("fraction must produce row");
+        };
+        let fraction_box = &children[0].2;
+        let BoxKind::Row { children: fraction } = &fraction_box.kind else {
+            panic!("fraction must produce row");
+        };
+        let numerator = &fraction[0];
+        let bar = &fraction[1];
+        let denominator = &fraction[2];
+        let clearance = BAR * 0.5 + BASE_SIZE * FRAC_GAP;
 
-        let two_deep = layout(
+        assert_eq!(bar.1, 0.0);
+        assert!(
+            (fraction_box.ascent - (clearance + numerator.2.ascent + numerator.2.descent)).abs()
+                < 0.0001
+        );
+        assert!(
+            (fraction_box.descent - (clearance + denominator.2.ascent + denominator.2.descent))
+                .abs()
+                < 0.0001
+        );
+    }
+
+    #[test]
+    fn a_scripted_operand_clears_the_bar() {
+        let list = vec![fraction(
+            vec![script(symbols("C"), None, Some(symbols("i")))],
+            vec![script(symbols("M"), Some(symbols("s")), None)],
+        )];
+        let box_ = layout(&list, 0, &fake_measure);
+        let BoxKind::Row { children } = box_.kind else {
+            panic!("fraction must produce row");
+        };
+        let BoxKind::Row { children: fraction } = &children[0].2.kind else {
+            panic!("fraction must produce row");
+        };
+        let numerator = &fraction[0];
+        let bar = &fraction[1];
+        let denominator = &fraction[2];
+        let expected_gap = BASE_SIZE * FRAC_GAP;
+        let numerator_gap = numerator.1 - numerator.2.descent - (bar.1 + bar.2.ascent);
+        let denominator_gap = bar.1 - bar.2.descent - (denominator.1 + denominator.2.ascent);
+
+        assert!((numerator_gap - expected_gap).abs() < 0.0001);
+        assert!((denominator_gap - expected_gap).abs() < 0.0001);
+    }
+
+    #[test]
+    fn a_lopsided_operand_is_placed_by_the_edge_that_faces_the_bar() {
+        let subscript = layout(
             &vec![fraction(
-                vec![fraction(symbols("x"), symbols("y"))],
-                vec![fraction(symbols("z"), symbols("w"))],
+                vec![script(symbols("x"), None, Some(symbols("i")))],
+                symbols("y"),
             )],
             0,
             &fake_measure,
         );
-        assert_eq!(two_deep.ascent, two_deep.descent);
+        let superscript = layout(
+            &vec![fraction(
+                vec![script(symbols("x"), Some(symbols("i")), None)],
+                symbols("y"),
+            )],
+            0,
+            &fake_measure,
+        );
+        let BoxKind::Row {
+            children: subscript_children,
+        } = subscript.kind
+        else {
+            panic!("fraction must produce row");
+        };
+        let BoxKind::Row {
+            children: superscript_children,
+        } = superscript.kind
+        else {
+            panic!("fraction must produce row");
+        };
+        let BoxKind::Row {
+            children: subscript_fraction,
+        } = &subscript_children[0].2.kind
+        else {
+            panic!("fraction must produce row");
+        };
+        let BoxKind::Row {
+            children: superscript_fraction,
+        } = &superscript_children[0].2.kind
+        else {
+            panic!("fraction must produce row");
+        };
+        let subscript_numerator = &subscript_fraction[0].2;
+        let superscript_numerator = &superscript_fraction[0].2;
+
+        assert!(
+            (subscript_numerator.ascent + subscript_numerator.descent
+                - superscript_numerator.ascent
+                - superscript_numerator.descent)
+                .abs()
+                < 0.0001
+        );
+        assert!(subscript_fraction[0].1 > superscript_fraction[0].1);
     }
 
     #[test]
