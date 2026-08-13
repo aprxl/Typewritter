@@ -18,6 +18,13 @@ pub enum MathNode {
         sup: Option<MathList>,
         sub: Option<MathList>,
     },
+    /// A bracketed group. The delimiters are stored as the characters they
+    /// are drawn as, so one node covers every pair without a variant each.
+    Group {
+        open: char,
+        close: char,
+        body: MathList,
+    },
 }
 
 pub type MathList = Vec<MathNode>;
@@ -30,6 +37,7 @@ pub enum Slot {
     Den,
     Sup,
     Sub,
+    Body,
 }
 
 impl Slot {
@@ -40,6 +48,7 @@ impl Slot {
             Self::Den => "denom",
             Self::Sup => "sup",
             Self::Sub => "sub",
+            Self::Body => "body",
         }
     }
 }
@@ -75,6 +84,7 @@ impl MathNode {
                 }
                 slots
             }
+            Self::Group { .. } => vec![Slot::Body],
         }
     }
 
@@ -89,8 +99,9 @@ impl MathNode {
             (Self::Script { base, .. }, Slot::Base) => Some(base),
             (Self::Script { sup: Some(sup), .. }, Slot::Sup) => Some(sup),
             (Self::Script { sub: Some(sub), .. }, Slot::Sub) => Some(sub),
+            (Self::Group { body, .. }, Slot::Body) => Some(body),
             (Self::Sym(_), _) => None,
-            (Self::Frac { .. }, _) | (Self::Script { .. }, _) => None,
+            (Self::Frac { .. }, _) | (Self::Script { .. }, _) | (Self::Group { .. }, _) => None,
         }
     }
 
@@ -101,8 +112,9 @@ impl MathNode {
             (Self::Script { base, .. }, Slot::Base) => Some(base),
             (Self::Script { sup: Some(sup), .. }, Slot::Sup) => Some(sup),
             (Self::Script { sub: Some(sub), .. }, Slot::Sub) => Some(sub),
+            (Self::Group { body, .. }, Slot::Body) => Some(body),
             (Self::Sym(_), _) => None,
-            (Self::Frac { .. }, _) | (Self::Script { .. }, _) => None,
+            (Self::Frac { .. }, _) | (Self::Script { .. }, _) | (Self::Group { .. }, _) => None,
         }
     }
 }
@@ -147,6 +159,67 @@ pub fn insert_char(root: &mut MathList, cursor: &mut MathCursor, c: char) {
     let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
     list.insert(cursor.index, MathNode::Sym(c));
     cursor.index += 1;
+}
+
+/// The delimiter pairs a typed opener produces. Braces are deliberately
+/// absent: `{` and `}` are the notation's invisible grouping (see
+/// `math_notation`), and the brace people actually write in notation is the
+/// one a `cases` block draws, which is a structure of its own.
+pub const PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']')];
+
+/// Opens a bracket group at the cursor and enters it, if `c` is an opener.
+/// Auto-paired: the closer is part of the node, so it can never be left
+/// unmatched by typing.
+pub fn insert_group(root: &mut MathList, cursor: &mut MathCursor, c: char) -> bool {
+    let Some(&(_, close)) = PAIRS.iter().find(|&&(open, _)| open == c) else {
+        return false;
+    };
+    clamp(root, cursor);
+    let path = cursor.path.clone();
+    let index = cursor.index;
+    let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
+
+    // Unlike `/` and `^`, a bracket wraps what comes next, not what came before.
+    list.insert(
+        index,
+        MathNode::Group {
+            open: c,
+            close,
+            body: Vec::new(),
+        },
+    );
+    cursor.path.push(Step {
+        index,
+        slot: Slot::Body,
+    });
+    cursor.index = 0;
+    true
+}
+
+/// Steps out of the innermost group when `c` closes it — typing the closing
+/// bracket means "I am done in here", not "insert a character", since the
+/// closer already exists. `false` when the cursor is not in a group `c` closes,
+/// and the caller should type it literally.
+pub fn close_group(root: &mut MathList, cursor: &mut MathCursor, c: char) -> bool {
+    clamp(root, cursor);
+    for path_index in (0..cursor.path.len()).rev() {
+        let step = cursor.path[path_index];
+        if step.slot != Slot::Body {
+            continue;
+        }
+        let parent_path = &cursor.path[..path_index];
+        let Some(MathNode::Group { close, .. }) =
+            list_at(root, parent_path).and_then(|list| list.get(step.index))
+        else {
+            continue;
+        };
+        if *close == c {
+            cursor.path.truncate(path_index);
+            cursor.index = step.index + 1;
+            return true;
+        }
+    }
+    false
 }
 
 fn capture_operand(list: &mut MathList, index: usize) -> (usize, MathList) {
@@ -214,7 +287,7 @@ pub fn insert_script(root: &mut MathList, cursor: &mut MathCursor, which: Slot) 
             let other = match which {
                 Slot::Sup => sup,
                 Slot::Sub => sub,
-                Slot::Base | Slot::Num | Slot::Den => unreachable!(),
+                Slot::Base | Slot::Num | Slot::Den | Slot::Body => unreachable!(),
             };
             if other.is_none() {
                 *other = Some(Vec::new());
@@ -238,7 +311,7 @@ pub fn insert_script(root: &mut MathList, cursor: &mut MathCursor, which: Slot) 
         let target = match which {
             Slot::Sup => sup,
             Slot::Sub => sub,
-            Slot::Base | Slot::Num | Slot::Den => unreachable!(),
+            Slot::Base | Slot::Num | Slot::Den | Slot::Body => unreachable!(),
         };
         if target.is_none() {
             *target = Some(Vec::new());
@@ -317,6 +390,16 @@ pub fn backspace(root: &mut MathList, cursor: &mut MathCursor) -> Removed {
                 list.remove(position);
                 list.splice(position..position, replacement);
                 cursor.index = position + first_trigger_offset;
+            }
+            MathNode::Group { open, close, body } => {
+                list.remove(position);
+                list.splice(
+                    position..position,
+                    std::iter::once(MathNode::Sym(open))
+                        .chain(body)
+                        .chain(std::iter::once(MathNode::Sym(close))),
+                );
+                cursor.index = position + 1;
             }
         }
         Removed::Edited
@@ -513,6 +596,10 @@ mod tests {
         MathNode::Script { base, sup, sub }
     }
 
+    fn group(open: char, close: char, body: MathList) -> MathNode {
+        MathNode::Group { open, close, body }
+    }
+
     fn at(index: usize) -> MathCursor {
         MathCursor {
             path: Vec::new(),
@@ -540,6 +627,50 @@ mod tests {
 
         assert_eq!(root, sym("1+x"));
         assert_eq!(cursor, at(3));
+    }
+
+    #[test]
+    fn an_opener_makes_an_empty_group_and_enters_it() {
+        let mut root = Vec::new();
+        let mut cursor = MathCursor::default();
+
+        assert!(insert_group(&mut root, &mut cursor, '('));
+
+        assert_eq!(root, vec![group('(', ')', Vec::new())]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
+    }
+
+    #[test]
+    fn a_group_wraps_what_comes_next_not_what_came_before() {
+        let mut root = sym("x");
+        let mut cursor = at(1);
+
+        assert!(insert_group(&mut root, &mut cursor, '('));
+
+        assert_eq!(root, vec![MathNode::Sym('x'), group('(', ')', Vec::new())]);
+        assert_eq!(cursor, at_path(&[(1, Slot::Body)], 0));
+    }
+
+    #[test]
+    fn typing_the_closer_steps_out_rather_than_inserting() {
+        let mut root = vec![group('(', ')', sym("x"))];
+        let mut cursor = at_path(&[(0, Slot::Body)], 1);
+
+        assert!(close_group(&mut root, &mut cursor, ')'));
+
+        assert_eq!(root, vec![group('(', ')', sym("x"))]);
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn a_closer_that_matches_nothing_is_not_consumed() {
+        let mut root = vec![group('[', ']', sym("x"))];
+        let mut cursor = MathCursor::default();
+
+        assert!(!close_group(&mut root, &mut cursor, ')'));
+        cursor = at_path(&[(0, Slot::Body)], 1);
+        assert!(!close_group(&mut root, &mut cursor, ')'));
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 1));
     }
 
     #[test]
@@ -690,6 +821,17 @@ mod tests {
     }
 
     #[test]
+    fn backspace_reverts_a_group_to_its_literal_brackets() {
+        let mut root = vec![group('(', ')', sym("x"))];
+        let mut cursor = at(1);
+
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+
+        assert_eq!(root, sym("(x)"));
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
     fn backspace_at_a_slot_start_climbs_out_without_deleting() {
         let mut root = vec![frac(sym("a"), Vec::new())];
         let original = root.clone();
@@ -772,6 +914,17 @@ mod tests {
             assert_eq!(cursor, expected);
         }
         assert!(!move_right(&root, &mut cursor));
+    }
+
+    #[test]
+    fn arrows_and_tab_reach_a_group_body() {
+        let root = vec![group('(', ')', sym("x"))];
+        let mut cursor = MathCursor::default();
+
+        assert!(move_right(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 1));
     }
 
     #[test]

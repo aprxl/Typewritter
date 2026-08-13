@@ -128,6 +128,8 @@ fn layout_node(
         MathNode::Sym(ch) => glyph(*ch, level, measure),
         MathNode::Frac { num, den } => fraction(node, num, den, level, measure),
         MathNode::Script { .. } => script(node, level, measure),
+        // Real delimiter layout lands next; groups currently lay out as their body.
+        MathNode::Group { body, .. } => layout(body, level, measure),
     }
 }
 
@@ -155,7 +157,7 @@ fn script(node: &MathNode, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f
             }
             Slot::Sup => (base_width, size(level) * SCRIPT_RISE + child.descent),
             Slot::Sub => (base_width, -(size(level) * SCRIPT_DROP + child.ascent)),
-            Slot::Num | Slot::Den => unreachable!("fraction slots cannot be scripts"),
+            Slot::Num | Slot::Den | Slot::Body => unreachable!("fraction slots cannot be scripts"),
         };
         let index = slot_child_index(node, slot).expect("script slot must have a child index");
         children[index] = Some((x, y, child));
@@ -333,10 +335,10 @@ fn structural_slot<'a>(
 }
 
 fn child_level(node: &MathNode, slot: Slot, level: usize) -> usize {
-    if matches!(node, MathNode::Script { .. }) && slot == Slot::Base {
-        level
-    } else {
-        (level + 1).min(2)
+    match node {
+        MathNode::Script { .. } if slot == Slot::Base => level,
+        MathNode::Group { .. } => level,
+        _ => (level + 1).min(2),
     }
 }
 
