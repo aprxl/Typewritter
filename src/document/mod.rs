@@ -1615,6 +1615,41 @@ impl Document {
         }
     }
 
+    /// Opens a bracket group. `false` when `c` is not an opener, so the
+    /// caller can type it literally instead.
+    pub fn math_open_group(&mut self, c: char) -> bool {
+        let opened = self
+            .focused_math()
+            .is_some_and(|(list, cursor)| math::insert_group(list, cursor, c));
+        if opened {
+            self.dirty = true;
+        }
+        opened
+    }
+
+    /// Steps out of the group `c` closes, if the cursor is in one.
+    pub fn math_close_group(&mut self, c: char) -> bool {
+        let closed = self
+            .focused_math()
+            .is_some_and(|(list, cursor)| math::close_group(list, cursor, c));
+        if closed {
+            self.dirty = true;
+        }
+        closed
+    }
+
+    /// A space was typed: turns a trigger word before the cursor into its
+    /// structure. `false` means the space is an ordinary space.
+    pub fn math_insert_word(&mut self) -> bool {
+        let inserted = self
+            .focused_math()
+            .is_some_and(|(list, cursor)| math::insert_word(list, cursor));
+        if inserted {
+            self.dirty = true;
+        }
+        inserted
+    }
+
     pub fn math_backspace(&mut self) -> Option<math::Removed> {
         let result = self
             .focused_math()
@@ -2435,6 +2470,38 @@ mod tests {
         d.math_exit();
         assert!(d.math.is_none());
         assert_eq!(d.caret.offset, 1);
+    }
+
+    #[test]
+    fn an_opener_routes_into_a_group_and_a_stray_closer_does_not() {
+        let mut d = doc();
+        d.insert_inline_math();
+
+        assert!(d.math_open_group('('));
+        assert_eq!(
+            d.blocks[0].inlines()[0],
+            Inline::Math(vec![math::MathNode::Group {
+                open: '(',
+                close: ')',
+                body: Vec::new(),
+            }])
+        );
+        assert!(!d.math_close_group(']'));
+    }
+
+    #[test]
+    fn a_space_after_a_trigger_word_builds_its_structure() {
+        let mut d = doc();
+        d.insert_inline_math();
+        for c in ['s', 'q', 'r', 't'] {
+            d.math_insert_char(c);
+        }
+
+        assert!(d.math_insert_word());
+        assert_eq!(
+            d.blocks[0].inlines()[0],
+            Inline::Math(vec![math::MathNode::Sqrt { body: Vec::new() }])
+        );
     }
 
     #[test]

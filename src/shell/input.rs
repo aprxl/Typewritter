@@ -19,7 +19,7 @@ use crate::components::{
     file_finder, file_tree, onboarding, title_bar,
 };
 use crate::config::Config;
-use crate::document::math::Slot;
+use crate::document::math::{self, Slot};
 use crate::document::{FlatPos, FlatRange, Style};
 use crate::input::Input;
 use crate::layout::Rect;
@@ -355,6 +355,21 @@ impl Shell {
     fn edit_frame_math(&mut self, input: &Input) {
         for c in input.text().chars() {
             match c {
+                c if math::PAIRS.iter().any(|&(open, _)| open == c) => {
+                    self.docs.borrow_mut().math_open_group(c);
+                }
+                c if math::PAIRS.iter().any(|&(_, close)| close == c) => {
+                    let closed = self.docs.borrow_mut().math_close_group(c);
+                    if !closed {
+                        self.docs.borrow_mut().math_type(c);
+                    }
+                }
+                ' ' => {
+                    let inserted = self.docs.borrow_mut().math_insert_word();
+                    if !inserted {
+                        self.docs.borrow_mut().math_type(c);
+                    }
+                }
                 '/' => self.docs.borrow_mut().math_fraction(),
                 '^' => self.docs.borrow_mut().math_script(Slot::Sup),
                 '_' => self.docs.borrow_mut().math_script(Slot::Sub),

@@ -440,6 +440,24 @@ impl Tabs {
         self.edit(|doc| doc.math_insert_script(which));
     }
 
+    pub fn math_open_group(&mut self, c: char) -> bool {
+        let mut opened = false;
+        self.edit(|doc| opened = doc.math_open_group(c));
+        opened
+    }
+
+    pub fn math_close_group(&mut self, c: char) -> bool {
+        let mut closed = false;
+        self.edit(|doc| closed = doc.math_close_group(c));
+        closed
+    }
+
+    pub fn math_insert_word(&mut self) -> bool {
+        let mut inserted = false;
+        self.edit(|doc| inserted = doc.math_insert_word());
+        inserted
+    }
+
     pub fn math_backspace(&mut self) {
         self.edit(|doc| {
             doc.math_backspace();
