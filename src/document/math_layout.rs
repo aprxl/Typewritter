@@ -29,6 +29,12 @@ pub const SLOT_W: f32 = 12.0;
 pub const SLOT_H: f32 = 16.0;
 /// The fraction bar's thickness.
 pub const BAR: f32 = 1.0;
+/// How far a superscript's lower edge sits above the anchor line, as a
+/// fraction of the current size — measured from the edge rather than the
+/// centre so the gap does not change when the script grows taller.
+pub const SCRIPT_RISE: f32 = 0.10;
+/// The mirror for a subscript's upper edge below the anchor line.
+pub const SCRIPT_DROP: f32 = 0.10;
 
 // The renderer centers glyphs vertically, so the anchor line is a center line.
 // Symmetric boxes make equal clearance above and below the line exact.
@@ -120,15 +126,53 @@ fn layout_node(
 ) -> MathBox {
     match node {
         MathNode::Sym(ch) => glyph(*ch, level, measure),
-        MathNode::Frac { num, den } => fraction(num, den, level, measure),
-        MathNode::Script { base, .. } => {
-            // Real script layout lands in the next layout task.
-            layout(base, level, measure)
-        }
+        MathNode::Frac { num, den } => fraction(node, num, den, level, measure),
+        MathNode::Script { .. } => script(node, level, measure),
     }
 }
 
+fn script(node: &MathNode, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
+    let operand_level = (level + 1).min(2);
+    let slots = node.slots();
+    let mut children = (0..slots.len()).map(|_| None).collect::<Vec<_>>();
+    let mut base_width = 0.0;
+
+    for slot in slots {
+        let child_list = node.slot(slot).expect("script slots must resolve");
+        let child = layout(
+            child_list,
+            if slot == Slot::Base {
+                level
+            } else {
+                operand_level
+            },
+            measure,
+        );
+        let (x, y) = match slot {
+            Slot::Base => {
+                base_width = child.width;
+                (0.0, 0.0)
+            }
+            Slot::Sup => (base_width, size(level) * SCRIPT_RISE + child.descent),
+            Slot::Sub => (base_width, -(size(level) * SCRIPT_DROP + child.ascent)),
+            Slot::Num | Slot::Den => unreachable!("fraction slots cannot be scripts"),
+        };
+        let index = slot_child_index(node, slot).expect("script slot must have a child index");
+        children[index] = Some((x, y, child));
+    }
+
+    // `slots` drives both this order and `slot_child_index`, so traversal sees
+    // exactly the children this layout emitted.
+    row_box(
+        children
+            .into_iter()
+            .map(|child| child.expect("every script slot must be laid out"))
+            .collect(),
+    )
+}
+
 fn fraction(
+    node: &MathNode,
     num: &MathList,
     den: &MathList,
     level: usize,
@@ -157,16 +201,35 @@ fn fraction(
     let denominator_offset = BAR * 0.5 + gap + denominator_half;
     let numerator_y = numerator_offset;
     let denominator_y = -denominator_offset;
-    let children = vec![
-        ((width - numerator.width) * 0.5, numerator_y, numerator),
-        (0.0, bar_y, bar),
-        (
-            (width - denominator.width) * 0.5,
-            denominator_y,
-            denominator,
-        ),
-    ];
-    row_box(children)
+    let mut children = (0..3).map(|_| None).collect::<Vec<_>>();
+    children
+        [slot_child_index(node, Slot::Num).expect("fraction numerator must have a child index")] =
+        Some(((width - numerator.width) * 0.5, numerator_y, numerator));
+    children[1] = Some((0.0, bar_y, bar));
+    children[slot_child_index(node, Slot::Den)
+        .expect("fraction denominator must have a child index")] = Some((
+        (width - denominator.width) * 0.5,
+        denominator_y,
+        denominator,
+    ));
+    row_box(
+        children
+            .into_iter()
+            .map(|child| child.expect("every fraction child must be laid out"))
+            .collect(),
+    )
+}
+
+fn slot_child_index(node: &MathNode, slot: Slot) -> Option<usize> {
+    let slot_index = node
+        .slots()
+        .iter()
+        .position(|candidate| *candidate == slot)?;
+    Some(if matches!(node, MathNode::Frac { .. }) && slot_index > 0 {
+        slot_index + 1
+    } else {
+        slot_index
+    })
 }
 
 fn row_box(children: Vec<(f32, f32, MathBox)>) -> MathBox {
@@ -226,7 +289,7 @@ fn cursor_in(
     }
 
     let step = cursor.path[path_index];
-    let Some(MathNode::Frac { num, den }) = list.get(step.index) else {
+    let Some(node) = list.get(step.index) else {
         return (
             origin_x + children.get(index).map_or(box_.width, |(x, _, _)| *x),
             origin_y,
@@ -236,7 +299,7 @@ fn cursor_in(
     let Some((_, _, parent)) = children.get(step.index) else {
         return (origin_x + box_.width, origin_y, cursor_height(list, level));
     };
-    let Some((slot_list, slot_box, slot_x, slot_y)) = fraction_slot(parent, step.slot, num, den)
+    let Some((slot_list, slot_box, slot_x, slot_y)) = structural_slot(node, parent, step.slot)
     else {
         return (origin_x + box_.width, origin_y, cursor_height(list, level));
     };
@@ -245,7 +308,7 @@ fn cursor_in(
         slot_box,
         cursor,
         path_index + 1,
-        (level + 1).min(2),
+        child_level(node, step.slot, level),
         origin_x + children[step.index].0 + slot_x,
         origin_y + children[step.index].1 + slot_y,
     )
@@ -255,27 +318,30 @@ fn cursor_height(_list: &MathList, level: usize) -> f32 {
     size(level)
 }
 
-fn fraction_slot<'a>(
+fn structural_slot<'a>(
+    node: &'a MathNode,
     parent: &'a MathBox,
     slot: Slot,
-    num: &'a MathList,
-    den: &'a MathList,
 ) -> Option<(&'a MathList, &'a MathBox, f32, f32)> {
     let BoxKind::Row { children } = &parent.kind else {
         return None;
     };
-    let (list, child) = match slot {
-        Slot::Num => (num, children.first()?),
-        Slot::Den => (den, children.get(2)?),
-        // Script cursor geometry lands with script layout in the next task.
-        Slot::Base | Slot::Sup | Slot::Sub => return None,
-    };
+    let list = node.slot(slot)?;
+    let child = children.get(slot_child_index(node, slot)?)?;
     Some((list, &child.2, child.0, child.1))
+}
+
+fn child_level(node: &MathNode, slot: Slot, level: usize) -> usize {
+    if matches!(node, MathNode::Script { .. }) && slot == Slot::Base {
+        level
+    } else {
+        (level + 1).min(2)
+    }
 }
 
 /// Hit-test a laid-out list and return its nearest model cursor.
 ///
-/// A click descends into a fraction only when it lies inside one operand's
+/// A click descends into a structural slot only when it lies inside its
 /// horizontal and vertical box. Bar and ambiguous points use the nearest
 /// boundary in the current list, which keeps root-list fallback predictable.
 pub fn hit(
@@ -304,14 +370,14 @@ fn hit_list(
     cursor.index = nearest_boundary(children, point.0);
 
     for (index, node) in list.iter().enumerate() {
-        let MathNode::Frac { num, den } = node else {
+        if !node.is_structural() {
             continue;
-        };
+        }
         let Some((child_x, child_y, parent)) = children.get(index) else {
             continue;
         };
         let Some((slot, slot_list, slot_box, slot_x, slot_y)) =
-            clean_fraction_hit(parent, *child_x, *child_y, point, num, den)
+            clean_structural_hit(node, parent, *child_x, *child_y, point)
         else {
             continue;
         };
@@ -320,34 +386,28 @@ fn hit_list(
             slot_list,
             slot_box,
             (point.0 - child_x - slot_x, point.1 - child_y - slot_y),
-            (level + 1).min(2),
+            child_level(node, slot, level),
             cursor,
         );
         return;
     }
 }
 
-fn clean_fraction_hit<'a>(
+fn clean_structural_hit<'a>(
+    node: &'a MathNode,
     parent: &'a MathBox,
     parent_x: f32,
     parent_y: f32,
     point: (f32, f32),
-    num: &'a MathList,
-    den: &'a MathList,
 ) -> Option<(Slot, &'a MathList, &'a MathBox, f32, f32)> {
-    let BoxKind::Row { children } = &parent.kind else {
-        return None;
-    };
-    for (slot, list, child) in [
-        (Slot::Num, num, children.first()?),
-        (Slot::Den, den, children.get(2)?),
-    ] {
-        let left = parent_x + child.0;
-        let right = left + child.2.width;
-        let top = parent_y + child.1 + child.2.ascent;
-        let bottom = parent_y + child.1 - child.2.descent;
+    for slot in node.slots() {
+        let (list, child, child_x, child_y) = structural_slot(node, parent, slot)?;
+        let left = parent_x + child_x;
+        let right = left + child.width;
+        let top = parent_y + child_y + child.ascent;
+        let bottom = parent_y + child_y - child.descent;
         if point.0 > left && point.0 < right && point.1 < top && point.1 > bottom {
-            return Some((slot, list, &child.2, child.0, child.1));
+            return Some((slot, list, child, child_x, child_y));
         }
     }
     None
@@ -374,6 +434,10 @@ mod tests {
 
     fn fraction(num: MathList, den: MathList) -> MathNode {
         MathNode::Frac { num, den }
+    }
+
+    fn script(base: MathList, sup: Option<MathList>, sub: Option<MathList>) -> MathNode {
+        MathNode::Script { base, sup, sub }
     }
 
     #[test]
@@ -633,5 +697,138 @@ mod tests {
         assert_eq!(root_height, BASE_SIZE);
         assert_eq!(operand_height, BASE_SIZE * LEVEL_SCALE[1]);
         assert_eq!(operand_height / root_height, LEVEL_SCALE[1]);
+    }
+
+    #[test]
+    fn a_superscript_sits_above_the_anchor_and_a_subscript_below() {
+        let list = vec![script(symbols("x"), Some(symbols("s")), Some(symbols("i")))];
+        let BoxKind::Row { children } = &layout(&list, 0, &fake_measure).kind else {
+            panic!("list must produce row");
+        };
+        let BoxKind::Row { children: script } = &children[0].2.kind else {
+            panic!("script must produce row");
+        };
+        let sup = &script[1];
+        let sub = &script[2];
+        assert!((sup.1 - sup.2.descent - BASE_SIZE * SCRIPT_RISE).abs() < 0.0001);
+        assert!((-sub.1 - sub.2.ascent - BASE_SIZE * SCRIPT_DROP).abs() < 0.0001);
+    }
+
+    #[test]
+    fn both_scripts_share_the_column_after_the_base() {
+        let list = vec![script(
+            symbols("xy"),
+            Some(symbols("s")),
+            Some(symbols("long")),
+        )];
+        let BoxKind::Row { children } = &layout(&list, 0, &fake_measure).kind else {
+            panic!("list must produce row");
+        };
+        let script_box = &children[0].2;
+        let BoxKind::Row { children: script } = &script_box.kind else {
+            panic!("script must produce row");
+        };
+        let base_width = script[0].2.width;
+        assert_eq!(script[1].0, base_width);
+        assert_eq!(script[2].0, base_width);
+        assert_eq!(
+            script_box.width,
+            base_width + script[1].2.width.max(script[2].2.width)
+        );
+    }
+
+    #[test]
+    fn a_script_grows_the_expression_that_holds_it() {
+        let plain = layout(&symbols("x"), 0, &fake_measure);
+        let scripted = layout(
+            &vec![script(
+                symbols("x"),
+                Some(vec![fraction(symbols("a"), symbols("b"))]),
+                None,
+            )],
+            0,
+            &fake_measure,
+        );
+        let BoxKind::Row { children } = scripted.kind else {
+            panic!("list must produce row");
+        };
+        assert!(children[0].2.ascent > plain.ascent);
+    }
+
+    #[test]
+    fn an_absent_script_costs_nothing() {
+        let base = layout(&symbols("xy"), 0, &fake_measure);
+        let scripted = layout(&vec![script(symbols("xy"), None, None)], 0, &fake_measure);
+        let BoxKind::Row { children } = scripted.kind else {
+            panic!("list must produce row");
+        };
+        assert_eq!(children[0].2.width, base.width);
+    }
+
+    #[test]
+    fn scripts_shrink_one_level() {
+        let list = vec![script(
+            symbols("x"),
+            Some(vec![
+                MathNode::Sym('s'),
+                script(symbols("t"), Some(symbols("u")), None),
+            ]),
+            None,
+        )];
+        let BoxKind::Row { children } = &layout(&list, 0, &fake_measure).kind else {
+            panic!("list must produce row");
+        };
+        let BoxKind::Row { children: outer } = &children[0].2.kind else {
+            panic!("script must produce row");
+        };
+        let BoxKind::Row { children: sup } = &outer[1].2.kind else {
+            panic!("superscript must produce row");
+        };
+        let BoxKind::Glyph { size: sup_size, .. } = &sup[0].2.kind else {
+            panic!("superscript symbol must be a glyph");
+        };
+        assert_eq!(*sup_size, BASE_SIZE * LEVEL_SCALE[1]);
+        let BoxKind::Row { children: nested } = &sup[1].2.kind else {
+            panic!("nested script must produce row");
+        };
+        let BoxKind::Row {
+            children: nested_sup,
+        } = &nested[1].2.kind
+        else {
+            panic!("nested superscript must produce row");
+        };
+        let BoxKind::Glyph {
+            size: nested_size, ..
+        } = &nested_sup[0].2.kind
+        else {
+            panic!("nested superscript symbol must be a glyph");
+        };
+        assert_eq!(*nested_size, BASE_SIZE * LEVEL_SCALE[2]);
+    }
+
+    #[test]
+    fn the_cursor_reaches_a_script_slot() {
+        let list = vec![script(symbols("x"), Some(symbols("s")), Some(symbols("i")))];
+        let base_width = layout(&symbols("x"), 0, &fake_measure).width;
+        let sup_cursor = MathCursor {
+            path: vec![Step {
+                index: 0,
+                slot: Slot::Sup,
+            }],
+            index: 1,
+        };
+        let sub_cursor = MathCursor {
+            path: vec![Step {
+                index: 0,
+                slot: Slot::Sub,
+            }],
+            index: 0,
+        };
+        let (sup_x, sup_y, _) = cursor_pos(&list, &sup_cursor, 0, &fake_measure);
+        let (sub_x, sub_y, _) = cursor_pos(&list, &sub_cursor, 0, &fake_measure);
+        assert!(sup_x > base_width);
+        assert_eq!(sub_x, base_width);
+        assert!(sup_y > 0.0);
+        assert!(sub_y < 0.0);
     }
 }
