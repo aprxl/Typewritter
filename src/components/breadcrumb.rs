@@ -1,5 +1,6 @@
-//! Where the note is. The status line answers what the editor is doing —
-//! spec §3.2 keeps those two jobs apart.
+//! Where the note is: the vault path to the file followed by the heading
+//! trail the caret sits under. The status line answers what the editor is
+//! doing — spec §3.2 keeps those two jobs apart.
 
 use crate::layout::Rect;
 use crate::renderer::{Layer, Rounding};

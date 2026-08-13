@@ -8,19 +8,20 @@ use crate::ui::{Component, Context, Dirty, Hover};
 
 pub const WIDTH: f32 = 214.0;
 
-/// One outline entry. `sub` is the second level — spec §3.1 stops there.
+/// One outline row. `depth` is the outline's nesting depth, not the
+/// heading's level — a document that opens at H3 still has depth-0 roots.
 pub struct Entry {
     pub number: String,
     pub name: String,
-    pub sub: bool,
+    pub depth: usize,
 }
 
 impl Entry {
-    pub fn new(number: &str, name: &str, sub: bool) -> Self {
+    pub fn new(number: &str, name: &str, depth: usize) -> Self {
         Self {
             number: number.into(),
             name: name.into(),
-            sub,
+            depth,
         }
     }
 }
@@ -124,26 +125,27 @@ impl Component for Topics {
             if !active && self.hovered == Some(index) {
                 theme::hover_fill(layer, row, self.hover.value());
             }
-            let (x, size, color) = if entry.sub {
-                (rect.x + 32.0, 13.0, theme::COMMENT)
+            let depth = entry.depth.min(3);
+            let x = rect.x + 18.0 + depth as f32 * 13.0;
+            let size = 14.5 - depth as f32 * 0.6;
+            let color = if entry.depth == 0 {
+                theme::DIM
             } else {
-                (rect.x + 18.0, 14.5, theme::DIM)
+                theme::COMMENT
             };
-            theme::draw(
-                layer,
-                &entry.number,
-                (x, y),
-                &TextStyle::mono(size - 3.0, if active { theme::DIM } else { theme::FAINT }),
-                theme::LEFT,
-            );
+            let number_style =
+                TextStyle::mono(size - 3.0, if active { theme::DIM } else { theme::FAINT });
+            theme::draw(layer, &entry.number, (x, y), &number_style, theme::LEFT);
+            // Measure number so long values do not collide with heading text.
+            let name_x = x + theme::width(layer, &entry.number, &number_style) + 10.0;
             theme::draw(
                 layer,
                 &entry.name,
-                (x + 28.0, y),
+                (name_x, y),
                 &TextStyle::serif(size, if active { theme::INK } else { color }),
                 theme::LEFT,
             );
-            y += if entry.sub { 21.0 } else { 24.0 };
+            y += if entry.depth == 0 { 24.0 } else { 21.0 };
         }
 
         y += 12.0;

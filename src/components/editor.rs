@@ -15,6 +15,13 @@ use crate::ui::{Component, Context, Dirty};
 /// document's own H1 is the title).
 pub const TOP: f32 = 28.0;
 pub const INSET: f32 = 56.0;
+/// The gutter between a heading's auto-number and the text it belongs to.
+/// The number is drawn right-aligned against this, so numbers of different
+/// depths line up on their right edge instead of ragging.
+const NUMBER_GUTTER: f32 = 12.0;
+/// The auto-number's size. Constant rather than scaled per heading level:
+/// it is a margin annotation, not part of the heading's own typography.
+const NUMBER_SIZE: f32 = 11.0;
 /// The design's measure: the content column is never wider than this.
 pub const MEASURE: f32 = 634.0;
 /// Space kept past the right edge before a line may wrap.
@@ -88,6 +95,11 @@ pub struct Editor {
     /// The pending style context (SPEC §4.2): what typed text becomes. The
     /// edit showing it as a tiny mono marker is its only affordance.
     caret_style: Style,
+    /// Each block's auto-number, indexed the same way `layout.source` is.
+    /// Resolved once here rather than per redraw, and derived from the very
+    /// blocks that are drawn, so a number can never disagree with the
+    /// heading beside it.
+    numbers: Vec<Option<String>>,
     selection: Option<FlatRange>,
     line_selection: bool,
     caret_on: bool,
@@ -107,6 +119,10 @@ impl Editor {
         block_caret: bool,
         caret_style: Style,
     ) -> Self {
+        let mut numbers = vec![None; layout.source.len()];
+        for node in crate::document::outline::outline(&layout.source) {
+            numbers[node.block] = Some(node.number);
+        }
         Self {
             layout,
             caret,
@@ -114,6 +130,7 @@ impl Editor {
             has_file: true,
             block_caret,
             caret_style,
+            numbers,
             selection: None,
             line_selection: false,
             caret_on: true,
@@ -147,6 +164,7 @@ impl Editor {
             has_file: false,
             block_caret: false,
             caret_style: Style::PLAIN,
+            numbers: Vec::new(),
             selection: None,
             line_selection: false,
             caret_on: true,
@@ -297,7 +315,7 @@ impl Component for Editor {
                 }
                 continue;
             }
-            for line in &block.lines {
+            for (line_index, line) in block.lines.iter().enumerate() {
                 let top = content + line.y - self.scroll;
                 if top + line.height < rect.y || top > rect.bottom() {
                     continue;
@@ -375,6 +393,21 @@ impl Component for Editor {
                 for (text, style, at, _) in &pieces {
                     let style = layout::text_style(kind, *style);
                     theme::draw(layer, text, (*at, baseline), &style, theme::LEFT);
+                }
+                // The auto-number, hung in the margin: virtual, so it is
+                // drawn rather than laid out — the caret cannot reach it and
+                // it never shifts the heading it labels.
+                if line_index == 0
+                    && kind.is_heading()
+                    && let Some(number) = &self.numbers[bi]
+                {
+                    theme::draw(
+                        layer,
+                        number,
+                        (x - NUMBER_GUTTER, baseline),
+                        &TextStyle::mono(NUMBER_SIZE, theme::NON_TEXT),
+                        theme::RIGHT,
+                    );
                 }
             }
         }
@@ -573,6 +606,8 @@ pub fn max_scroll(content_height: f32, view_height: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::{Document, Text};
+    use std::path::Path;
 
     #[test]
     fn adjacent_decorated_pieces_merge_into_one_span() {
@@ -628,5 +663,48 @@ mod tests {
         assert_eq!(max_scroll(100.0, 800.0), 0.0);
         // Document exactly at the threshold: ceiling is zero.
         assert_eq!(max_scroll(400.0, 800.0), 0.0);
+    }
+
+    #[test]
+    fn heading_numbers_are_indexed_by_block() {
+        let text = |value: &str| {
+            Inline::Text(Text {
+                text: value.into(),
+                style: Style::PLAIN,
+            })
+        };
+        let blocks = vec![
+            Block::Paragraph(vec![text("intro")]),
+            Block::Heading {
+                level: 1,
+                content: vec![text("First")],
+            },
+            Block::Heading {
+                level: 2,
+                content: vec![text("Nested")],
+            },
+        ];
+        let mut document = Document::new(Path::new("notes/test.md"));
+        document.blocks = blocks;
+        let layout = layout::layout(&document, 1000.0, &|value, _| {
+            value.chars().count() as f32 * 10.0
+        });
+        let editor = Editor::new(
+            Rc::new(layout),
+            Caret {
+                block: 0,
+                inline: 0,
+                offset: 0,
+                style: Style::PLAIN,
+            },
+            0.0,
+            false,
+            Style::PLAIN,
+        );
+
+        assert_eq!(
+            editor.numbers,
+            vec![None, Some("1".into()), Some("1.1".into())]
+        );
     }
 }

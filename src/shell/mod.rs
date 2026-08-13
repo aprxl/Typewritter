@@ -5,8 +5,7 @@
 //! The left tree reads the actual vault on disk (see [`crate::vault`]) and
 //! the centre column is a working buffer: files open into tabs (a click
 //! previews, a double-click pins), the text is editable, and `Ctrl+S` saves.
-//! Still mock: the sidenote margin and the topics outline, which belong to
-//! the structural document model that has not landed yet.
+//! Still mock: the sidenote margin, which belongs to document anchors.
 //!
 //! Everything visible is a [`Component`] in its own [`Region`], so each part
 //! measures itself, redraws only when it changes, and is scissored to its
@@ -46,6 +45,7 @@ use crate::components::{
 use crate::config::Config;
 use crate::document::Caret;
 use crate::document::layout::DocLayout;
+use crate::document::outline;
 use crate::frame::FrameScheduler;
 use crate::input::Input;
 use crate::layout::{Layout, NodeId, Rect, Size, Style};
@@ -181,6 +181,7 @@ pub struct Shell {
     onboard_region: usize,
     tab_region: usize,
     breadcrumb_region: usize,
+    topics_region: usize,
     text_region: usize,
     status_region: usize,
     dialog_region: usize,
@@ -333,7 +334,7 @@ impl Shell {
                 sidenotes,
                 Box::new(SidenoteMargin::new(mock_notes())),
             ),
-            region(renderer, topics, Box::new(Topics::new(mock_topics(), 4))),
+            region(renderer, topics, Box::new(Topics::new(Vec::new(), 0))),
             region(
                 renderer,
                 status,
@@ -357,7 +358,8 @@ impl Shell {
         };
         let title_region = idx(title);
         let (tree_region, tab_region) = (idx(tree), idx(tabs));
-        let (breadcrumb_region, text_region) = (idx(breadcrumb), idx(text_column));
+        let (breadcrumb_region, topics_region, text_region) =
+            (idx(breadcrumb), idx(topics), idx(text_column));
         let status_region = idx(status);
 
         // The overlays span the viewport by sitting on the root node, each
@@ -418,6 +420,7 @@ impl Shell {
             onboard_region,
             tab_region,
             breadcrumb_region,
+            topics_region,
             text_region,
             status_region,
             dialog_region,
@@ -778,14 +781,21 @@ impl Shell {
     }
 
     /// The breadcrumb for the active tab: vault name, then the file's
-    /// folders, then the file. Falls back to the vault name.
+    /// folders, then the file and the heading trail under the caret. Falls
+    /// back to the vault name.
     fn crumb(&self) -> Vec<String> {
         let mut out = vault_name(&self.vault);
-        let (root, active) = (
-            self.vault.as_ref().map(|v| v.borrow().root().to_path_buf()),
-            self.docs.borrow().active().map(|t| t.path().to_path_buf()),
-        );
-        if let (Some(root), Some(path)) = (root, active)
+        let root = self
+            .vault
+            .as_ref()
+            .map(|vault| vault.borrow().root().to_path_buf());
+        let active = {
+            let docs = self.docs.borrow();
+            docs.active()
+                .map(|tab| (tab.path().to_path_buf(), tab.document.caret.block))
+        };
+        if let Some((path, _)) = active.as_ref()
+            && let Some(root) = root
             && let Ok(relative) = path.strip_prefix(&root)
         {
             out.extend(
@@ -794,7 +804,29 @@ impl Shell {
                     .map(|c| c.as_os_str().to_string_lossy().into_owned()),
             );
         }
+        // Headings join same list because last crumb is current place, and
+        // deepest heading is exactly that place inside document.
+        let nodes = self.outline();
+        if let Some((_, caret_block)) = active {
+            out.extend(
+                outline::trail(&nodes, caret_block)
+                    .iter()
+                    .filter(|node| !node.text.is_empty())
+                    .map(|node| format!("{} {}", node.number, node.text).trim().to_owned()),
+            );
+        }
         out
+    }
+
+    /// The active document's heading outline. Derived on demand — nothing
+    /// in the model stores it, and it is O(blocks) over a document that is
+    /// already walked every rebuild.
+    fn outline(&self) -> Vec<outline::Node> {
+        self.docs
+            .borrow()
+            .active()
+            .map(|tab| outline::outline(&tab.document.blocks))
+            .unwrap_or_default()
     }
 
     /// Rebuilds the view regions (tab strip, breadcrumb, editor, status
@@ -853,6 +885,20 @@ impl Shell {
 
         let crumb = self.crumb();
         self.regions[self.breadcrumb_region].set_component(Box::new(Breadcrumb::new(crumb)));
+
+        let caret_block = {
+            let docs = self.docs.borrow();
+            docs.active()
+                .map(|tab| tab.document.caret.block)
+                .unwrap_or(0)
+        };
+        let nodes = self.outline();
+        let active = outline::active(&nodes, caret_block).unwrap_or(0);
+        let entries = nodes
+            .iter()
+            .map(|node| Entry::new(&node.number, &node.text, node.depth))
+            .collect();
+        self.regions[self.topics_region].set_component(Box::new(Topics::new(entries, active)));
 
         // The badge and the caret shape both read peripherally, so both get
         // a colour/shape pair rather than just a label.
@@ -962,18 +1008,6 @@ fn mock_notes() -> Vec<Note> {
             "2",
             vec![Run::text("measured 10.94 at 1 kHz, bench rig B", body)],
         ),
-    ]
-}
-
-/// Placeholder outline. The real one comes from the document model.
-fn mock_topics() -> Vec<Entry> {
-    vec![
-        Entry::new("1", "Topology", false),
-        Entry::new("1.1", "Ideal", true),
-        Entry::new("1.2", "Bias", true),
-        Entry::new("2", "Gain", false),
-        Entry::new("2.1", "Closed-loop", true),
-        Entry::new("2.2", "Open-loop", true),
     ]
 }
 
