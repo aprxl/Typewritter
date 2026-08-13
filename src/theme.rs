@@ -77,10 +77,15 @@ pub fn mono() -> Font {
     Font::Named("Essential PragmataPro".into())
 }
 
-/// Math. Kept separate from `mono` because it will diverge — the math
-/// stack needs a font chosen for its glyph coverage, not its labels.
+/// Math. Stays separate from `mono` because the two answer different
+/// needs — `mono` is for labels and machinery, this one is for notation.
+/// JuliaMono is chosen for glyph coverage: Greek, blackboard bold,
+/// operators, and the wide symbol range mathematical notation reaches
+/// for, which a UI monospace does not carry. Its monospace advance keeps
+/// every glyph's width uniform, so an expression's boxes stay predictable
+/// as it is edited.
 pub fn math() -> Font {
-    Font::Named("Iosevka".into())
+    Font::Named("JuliaMono".into())
 }
 
 /// A font plus everything `draw_text` needs to reproduce one look.
