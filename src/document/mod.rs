@@ -10,6 +10,7 @@ pub mod layout;
 pub mod markdown;
 pub mod math;
 pub mod math_layout;
+pub mod math_notation;
 pub mod outline;
 
 /// A document: an ordered list of blocks with a caret.
