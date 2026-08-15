@@ -772,7 +772,66 @@ pub fn insert_script(root: &mut MathList, cursor: &mut MathCursor, which: Slot) 
     cursor.index = 0;
 }
 
-/// What backspace did, so the shell can decide whether to exit math.
+/// Replaces one structural node with the literal atoms that trigger it and
+/// returns the cursor position immediately after that trigger.
+fn flatten_structure(list: &mut MathList, position: usize) -> Option<usize> {
+    let (replacement, trigger_offset) = match list.get(position)?.clone() {
+        MathNode::Sym(_) => return None,
+        MathNode::Frac { num, den } => {
+            let trigger_offset = num.len() + 1;
+            let mut replacement = num;
+            replacement.push(MathNode::Sym('/'));
+            replacement.extend(den);
+            (replacement, trigger_offset)
+        }
+        MathNode::Script { base, sup, sub } => {
+            let trigger_offset = base.len() + usize::from(sup.is_some() || sub.is_some());
+            let mut replacement = base;
+            if let Some(sup) = sup {
+                replacement.push(MathNode::Sym('^'));
+                replacement.extend(sup);
+            }
+            if let Some(sub) = sub {
+                replacement.push(MathNode::Sym('_'));
+                replacement.extend(sub);
+            }
+            (replacement, trigger_offset)
+        }
+        MathNode::Group { open, close, body } => {
+            let mut replacement = vec![MathNode::Sym(open)];
+            replacement.extend(body);
+            replacement.push(MathNode::Sym(close));
+            (replacement, 1)
+        }
+        MathNode::Sqrt { body } => {
+            let keyword = "sqrt";
+            let mut replacement = keyword.chars().map(MathNode::Sym).collect::<MathList>();
+            replacement.extend(body);
+            (replacement, keyword.chars().count())
+        }
+        MathNode::Accent { kind, body } => {
+            let keyword = kind.keyword();
+            let mut replacement = keyword.chars().map(MathNode::Sym).collect::<MathList>();
+            replacement.extend(body);
+            (replacement, keyword.chars().count())
+        }
+        MathNode::BigOp { kind, lower, upper } => {
+            let keyword = kind.keyword();
+            let mut replacement = keyword.chars().map(MathNode::Sym).collect::<MathList>();
+            replacement.push(MathNode::Sym('_'));
+            replacement.extend(lower);
+            if kind != BigOp::Limit {
+                replacement.push(MathNode::Sym('^'));
+                replacement.extend(upper);
+            }
+            (replacement, keyword.chars().count())
+        }
+    };
+    list.splice(position..=position, replacement);
+    Some(position + trigger_offset)
+}
+
+/// What deletion did, so the shell can decide whether to exit math.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Removed {
     /// An atom or structure before the cursor was removed or reverted.
@@ -781,6 +840,8 @@ pub enum Removed {
     Climbed,
     /// The cursor was at the start of the root list.
     AtStart,
+    /// The cursor was at the end of the root list.
+    AtEnd,
 }
 
 pub fn backspace(root: &mut MathList, cursor: &mut MathCursor) -> Removed {
@@ -789,87 +850,53 @@ pub fn backspace(root: &mut MathList, cursor: &mut MathCursor) -> Removed {
         let path = cursor.path.clone();
         let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
         let position = cursor.index - 1;
-        match list[position].clone() {
-            MathNode::Sym(_) => {
-                list.remove(position);
-                cursor.index -= 1;
-            }
-            MathNode::Frac { num, den } => {
-                let num_len = num.len();
-                list.remove(position);
-                list.splice(
-                    position..position,
-                    num.into_iter()
-                        .chain(std::iter::once(MathNode::Sym('/')))
-                        .chain(den),
-                );
-                cursor.index = position + num_len + 1;
-            }
-            MathNode::Script { base, sup, sub } => {
-                let base_len = base.len();
-                let first_trigger_offset = base_len + usize::from(sup.is_some() || sub.is_some());
-                let mut replacement = base;
-                if let Some(sup) = sup {
-                    replacement.push(MathNode::Sym('^'));
-                    replacement.extend(sup);
-                }
-                if let Some(sub) = sub {
-                    replacement.push(MathNode::Sym('_'));
-                    replacement.extend(sub);
-                }
-                list.remove(position);
-                list.splice(position..position, replacement);
-                cursor.index = position + first_trigger_offset;
-            }
-            MathNode::Group { open, close, body } => {
-                list.remove(position);
-                list.splice(
-                    position..position,
-                    std::iter::once(MathNode::Sym(open))
-                        .chain(body)
-                        .chain(std::iter::once(MathNode::Sym(close))),
-                );
-                cursor.index = position + 1;
-            }
-            MathNode::Sqrt { body } => {
-                let keyword = "sqrt";
-                list.remove(position);
-                list.splice(
-                    position..position,
-                    keyword.chars().map(MathNode::Sym).chain(body),
-                );
-                cursor.index = position + keyword.chars().count();
-            }
-            MathNode::Accent { kind, body } => {
-                let keyword = kind.keyword();
-                list.remove(position);
-                list.splice(
-                    position..position,
-                    keyword.chars().map(MathNode::Sym).chain(body),
-                );
-                cursor.index = position + keyword.chars().count();
-            }
-            MathNode::BigOp { kind, lower, upper } => {
-                let keyword = kind.keyword();
-                let keyword_len = keyword.chars().count();
-                let mut replacement = keyword.chars().map(MathNode::Sym).collect::<MathList>();
-                replacement.push(MathNode::Sym('_'));
-                replacement.extend(lower);
-                if kind != BigOp::Limit {
-                    replacement.push(MathNode::Sym('^'));
-                    replacement.extend(upper);
-                }
-                list.remove(position);
-                list.splice(position..position, replacement);
-                cursor.index = position + keyword_len;
-            }
+        if let Some(landing) = flatten_structure(list, position) {
+            cursor.index = landing;
+        } else {
+            list.remove(position);
+            cursor.index -= 1;
         }
+        Removed::Edited
+    } else if !cursor.path.is_empty()
+        && list_at(root, &cursor.path)
+            .expect("clamped cursor path must resolve")
+            .is_empty()
+    {
+        let step = *cursor.path.last().expect("cursor path is non-empty");
+        let parent_path = cursor.path[..cursor.path.len() - 1].to_vec();
+        let parent = list_at_mut(root, &parent_path).expect("clamped cursor path must resolve");
+        cursor.index = flatten_structure(parent, step.index)
+            .expect("a cursor slot must belong to a structural node");
+        cursor.path.pop();
         Removed::Edited
     } else if let Some(step) = cursor.path.pop() {
         cursor.index = step.index;
         Removed::Climbed
     } else {
         Removed::AtStart
+    }
+}
+
+/// Deletes the next atom, crossing slot boundaries in document order.
+pub fn delete_forward(root: &mut MathList, cursor: &mut MathCursor) -> Removed {
+    clamp(root, cursor);
+    loop {
+        let path = cursor.path.clone();
+        let list_len = list_at(root, &path)
+            .expect("clamped cursor path must resolve")
+            .len();
+        if cursor.index < list_len {
+            let list = list_at_mut(root, &path).expect("clamped cursor path must resolve");
+            if let Some(landing) = flatten_structure(list, cursor.index) {
+                cursor.index = landing;
+            } else {
+                list.remove(cursor.index);
+            }
+            return Removed::Edited;
+        }
+        if !move_right(root, cursor) {
+            return Removed::AtEnd;
+        }
     }
 }
 
@@ -1628,8 +1655,48 @@ mod tests {
     }
 
     #[test]
-    fn backspace_at_a_slot_start_climbs_out_without_deleting() {
-        let mut root = vec![frac(sym("a"), Vec::new())];
+    fn backspace_in_an_empty_fraction_template_restores_the_slash() {
+        let mut root = vec![frac(Vec::new(), Vec::new())];
+        let mut cursor = at_path(&[(0, Slot::Num)], 0);
+
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, sym("/"));
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn backspace_in_a_captured_fraction_restores_the_numerator_and_slash() {
+        let mut root = vec![frac(sym("12"), Vec::new())];
+        let mut cursor = at_path(&[(0, Slot::Den)], 0);
+
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, sym("12/"));
+        assert_eq!(cursor, at(3));
+    }
+
+    #[test]
+    fn backspace_in_an_empty_script_slot_restores_the_trigger() {
+        let mut root = vec![script(sym("x"), Some(Vec::new()), None)];
+        let mut cursor = at_path(&[(0, Slot::Sup)], 0);
+
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, sym("x^"));
+        assert_eq!(cursor, at(2));
+    }
+
+    #[test]
+    fn backspace_in_an_empty_named_structure_restores_its_word() {
+        let mut root = vec![sqrt(Vec::new())];
+        let mut cursor = at_path(&[(0, Slot::Body)], 0);
+
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, sym("sqrt"));
+        assert_eq!(cursor, at(4));
+    }
+
+    #[test]
+    fn backspace_at_the_start_of_a_nonempty_slot_only_climbs() {
+        let mut root = vec![frac(sym("a"), sym("b"))];
         let original = root.clone();
         let mut cursor = at_path(&[(0, Slot::Den)], 0);
 
@@ -1646,6 +1713,46 @@ mod tests {
         assert_eq!(backspace(&mut root, &mut cursor), Removed::AtStart);
         assert_eq!(root, sym("a"));
         assert_eq!(cursor, MathCursor::default());
+    }
+
+    #[test]
+    fn delete_forward_removes_the_current_sym() {
+        let mut root = sym("ab");
+        let mut cursor = at(0);
+
+        assert_eq!(delete_forward(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, sym("b"));
+        assert_eq!(cursor, at(0));
+    }
+
+    #[test]
+    fn delete_forward_reverts_the_current_structure() {
+        let mut root = vec![frac(sym("12"), sym("34"))];
+        let mut cursor = at(0);
+
+        assert_eq!(delete_forward(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, sym("12/34"));
+        assert_eq!(cursor, at(3));
+    }
+
+    #[test]
+    fn delete_forward_at_a_nested_slot_end_finds_the_next_atom() {
+        let mut root = vec![frac(sym("a"), Vec::new()), MathNode::Sym('z')];
+        let mut cursor = at_path(&[(0, Slot::Num)], 1);
+
+        assert_eq!(delete_forward(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, vec![frac(sym("a"), Vec::new())]);
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn delete_forward_at_the_root_end_reports_at_end() {
+        let mut root = sym("a");
+        let mut cursor = at(1);
+
+        assert_eq!(delete_forward(&mut root, &mut cursor), Removed::AtEnd);
+        assert_eq!(root, sym("a"));
+        assert_eq!(cursor, at(1));
     }
 
     #[test]

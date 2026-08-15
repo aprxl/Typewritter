@@ -70,6 +70,17 @@ pub struct MathBox {
     pub kind: BoxKind,
 }
 
+/// The full area in which an expression can receive structural input.
+/// Unlike [`MathBox`]'s visual measurements, this includes non-painting
+/// children such as empty integral limits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InteractionBounds {
+    pub left: f32,
+    pub right: f32,
+    pub ascent: f32,
+    pub descent: f32,
+}
+
 /// Renderer-independent geometry emitted by math layout.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MathPrimitive {
@@ -658,6 +669,27 @@ fn row_box(children: Vec<(f32, f32, MathBox)>) -> MathBox {
         highlight: false,
         kind: BoxKind::Row { children },
     }
+}
+
+/// Return the recursive hit-test envelope of a laid-out expression without
+/// changing its visual width, ascent, or descent.
+pub fn interaction_bounds(box_: &MathBox) -> InteractionBounds {
+    let mut bounds = InteractionBounds {
+        left: 0.0,
+        right: box_.width,
+        ascent: box_.ascent,
+        descent: box_.descent,
+    };
+    if let BoxKind::Row { children } = &box_.kind {
+        for (x, y, child) in children {
+            let child = interaction_bounds(child);
+            bounds.left = bounds.left.min(x + child.left);
+            bounds.right = bounds.right.max(x + child.right);
+            bounds.ascent = bounds.ascent.max(y + child.ascent);
+            bounds.descent = bounds.descent.max(child.descent - y);
+        }
+    }
+    bounds
 }
 
 /// Resolve cursor to `(x, anchor_offset, height)`.
@@ -1559,6 +1591,9 @@ mod tests {
         for (kind, glyph) in [(BigOp::Integral, "∫"), (BigOp::ContourIntegral, "∮")] {
             let source = vec![big_op(kind, Vec::new(), Vec::new())];
             let list = layout(&source, 0, &fake_measure);
+            let bounds = interaction_bounds(&list);
+            assert!(bounds.ascent > list.ascent);
+            assert!(bounds.descent > list.descent);
             let BoxKind::Row { children } = &list.kind else {
                 panic!("list must produce row");
             };

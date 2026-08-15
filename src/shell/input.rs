@@ -20,9 +20,10 @@ use crate::components::{
 };
 use crate::config::Config;
 use crate::document::math::{self, Slot};
-use crate::document::{FlatPos, FlatRange, Style, math_layout};
+use crate::document::{FlatPos, FlatRange, Style, math_conversion, math_layout};
 use crate::input::Input;
 use crate::layout::Rect;
+use crate::tabs::Tabs;
 use crate::theme::{self, TextStyle};
 use crate::vault::Vault;
 use crate::vim::{
@@ -385,7 +386,10 @@ impl Shell {
             }
         }
         if input.is_key_typed(KeyCode::Backspace) {
-            self.docs.borrow_mut().math_backspace();
+            let _ = delete_inside_math(&mut self.docs.borrow_mut(), false);
+        }
+        if input.is_key_typed(KeyCode::Delete) {
+            let _ = delete_inside_math(&mut self.docs.borrow_mut(), true);
         }
         if input.is_key_typed(KeyCode::Tab) {
             if input.shift() {
@@ -397,24 +401,23 @@ impl Shell {
         if input.is_key_typed(KeyCode::ArrowLeft) {
             let moved = self.docs.borrow_mut().math_left();
             if !moved {
-                self.docs.borrow_mut().math_exit();
-                self.docs.borrow_mut().move_left();
+                self.docs.borrow_mut().math_exit_before();
             }
         }
         if input.is_key_typed(KeyCode::ArrowRight) {
             let moved = self.docs.borrow_mut().math_right();
             if !moved {
-                self.docs.borrow_mut().math_exit();
+                self.docs.borrow_mut().math_exit_after();
             }
         }
         if input.is_key_pressed(KeyCode::Escape) {
             let popped = self.docs.borrow_mut().math_pop();
             if !popped {
-                self.docs.borrow_mut().math_exit();
+                self.docs.borrow_mut().math_exit_after();
             }
         }
         if input.is_key_typed(KeyCode::Enter) {
-            self.docs.borrow_mut().math_exit();
+            self.docs.borrow_mut().math_exit_after();
             self.docs.borrow_mut().newline();
         }
     }
@@ -488,9 +491,10 @@ impl Shell {
             }
             ExtendedAction::Move(m, count) => {
                 self.visual_override = None;
-                self.docs
-                    .borrow_mut()
-                    .touch(|doc| motion::apply(doc, m, count));
+                let mut docs = self.docs.borrow_mut();
+                if !move_inside_math(&mut docs, m, count) {
+                    docs.touch(|doc| motion::apply(doc, m, count));
+                }
                 self.goal_x = None;
             }
             ExtendedAction::InsertAt(m) => {
@@ -1084,12 +1088,7 @@ impl Shell {
         let count = count.max(1);
         match edit {
             Edit::DeleteChar => {
-                let mut docs = self.docs.borrow_mut();
-                docs.transaction(|docs| {
-                    for _ in 0..count {
-                        docs.delete_char();
-                    }
-                });
+                delete_chars(&mut self.docs.borrow_mut(), count);
             }
             Edit::DeleteLine => {
                 let mut docs = self.docs.borrow_mut();
@@ -1528,7 +1527,7 @@ impl Shell {
     /// leave the word itself alone — typing more letters brings the card
     /// back.
     fn dismiss_math_menu(&mut self) {
-        self.math_dismissed = self.math_menu.as_ref().map(|state| state.word.clone());
+        self.math_dismissed = self.math_menu.as_ref().map(|state| state.query.clone());
         self.math_menu = None;
         self.refresh_math_menu();
     }
@@ -1539,20 +1538,15 @@ impl Shell {
     }
 
     fn accept_math_menu_row(&mut self, index: usize) {
-        let Some(word) = self.math_menu.as_ref().map(|state| state.word.clone()) else {
+        let Some(query) = self.math_menu.as_ref().map(|state| state.query.clone()) else {
             return;
         };
-        let Some(completion) = math::completions(&word).get(index).copied() else {
+        let Some(offer) = math_conversion::offers(&query).offers.get(index).cloned() else {
             return;
         };
-        match completion {
-            math::Completion::Symbol { glyph, .. } => {
-                self.docs.borrow_mut().math_accept_symbol(glyph);
-            }
-            math::Completion::Structure { name, .. } => {
-                self.docs.borrow_mut().math_insert_structure(name);
-            }
-        }
+        self.docs
+            .borrow_mut()
+            .math_accept_conversion(&query, &offer);
         self.math_dismissed = None;
         self.math_menu = None;
         self.refresh_math_menu();
@@ -1562,7 +1556,7 @@ impl Shell {
         let Some(state) = &mut self.math_menu else {
             return;
         };
-        let count = math::completions(&state.word).len();
+        let count = math_conversion::offers(&state.query).offers.len();
         if count == 0 {
             return;
         }
@@ -1574,19 +1568,18 @@ impl Shell {
     }
 
     /// Recomputed every frame, the card's whole life: show it when the word
-    /// under the math cursor has completions it was not dismissed for, hide
-    /// it otherwise. A backspace, an arrow move and a click elsewhere all
-    /// just change the word, so there is no state to fall out of step.
+    /// under the math cursor has offers it was not dismissed for, hide it
+    /// otherwise. Movement and edits replace the precise tree query.
     pub(super) fn sync_math_menu(&mut self) {
-        let word = self.docs.borrow().math_word_before();
-        let Some(word) = word else {
+        let query = self.docs.borrow().math_conversion_query();
+        let Some(query) = query else {
             if self.math_menu.take().is_some() {
                 self.refresh_math_menu();
             }
             return;
         };
-        if self.math_dismissed.as_deref() == Some(word.as_str())
-            || math::completions(&word).is_empty()
+        if self.math_dismissed.as_ref() == Some(&query)
+            || math_conversion::offers(&query).offers.is_empty()
         {
             if self.math_menu.take().is_some() {
                 self.refresh_math_menu();
@@ -1595,20 +1588,19 @@ impl Shell {
         }
         let anchor = self.compute_math_menu_anchor();
         let changed = match &self.math_menu {
-            Some(state) => state.word != word,
+            Some(state) => state.query != query,
             None => true,
         };
         let state = self.math_menu.get_or_insert_with(|| MathMenuState {
-            word: word.clone(),
+            query: query.clone(),
             selected: 0,
             anchor,
         });
         let moved = state.anchor != anchor;
         state.anchor = anchor;
-        // A new word is a new list: reset the selection and rebuild the
-        // rows, which are derived from the word held here.
+        // A new query is a new list: reset the selection and rebuild rows.
         if changed {
-            state.word = word.clone();
+            state.query = query;
             state.selected = 0;
         }
         if changed || moved {
@@ -1646,7 +1638,11 @@ impl Shell {
 
     fn refresh_math_menu(&mut self) {
         let menu = match &self.math_menu {
-            Some(state) => MathMenu::new(math_menu_rows(&state.word), state.selected, state.anchor),
+            Some(state) => MathMenu::new(
+                math_menu_rows(&math_conversion::offers(&state.query).offers),
+                state.selected,
+                state.anchor,
+            ),
             None => MathMenu::closed(),
         };
         self.regions[self.math_menu_region].set_component(Box::new(menu));
@@ -1920,6 +1916,63 @@ impl Shell {
     }
 }
 
+/// Deletes structurally while math is focused and exits at the matching root
+/// edge. Returns the tree result when math owned the keypress.
+fn delete_inside_math(docs: &mut Tabs, forward: bool) -> Option<math::Removed> {
+    if !docs.in_math() {
+        return None;
+    }
+    let removed = if forward {
+        docs.math_delete_forward()
+    } else {
+        docs.math_backspace()
+    }?;
+    match (forward, removed) {
+        (false, math::Removed::AtStart) => docs.math_exit_before(),
+        (true, math::Removed::AtEnd) => docs.math_exit_after(),
+        _ => {}
+    }
+    Some(removed)
+}
+
+/// Normal-mode h/l traverses a focused tree before returning to prose.
+fn move_inside_math(docs: &mut Tabs, motion: Motion, count: usize) -> bool {
+    if !docs.in_math() || !matches!(motion, Motion::Left | Motion::Right) {
+        return false;
+    }
+    for _ in 0..count.max(1) {
+        let moved = match motion {
+            Motion::Left => docs.math_left(),
+            Motion::Right => docs.math_right(),
+            _ => unreachable!("math motion was checked above"),
+        };
+        if !moved {
+            match motion {
+                Motion::Left => docs.math_exit_before(),
+                Motion::Right => docs.math_exit_after(),
+                _ => unreachable!("math motion was checked above"),
+            }
+            break;
+        }
+    }
+    true
+}
+
+/// Normal `x`: focused math deletes structurally; an opaque math position
+/// enters its tree through `Document::delete_char` on the first iteration.
+fn delete_chars(docs: &mut Tabs, count: usize) {
+    docs.transaction(|docs| {
+        for _ in 0..count.max(1) {
+            if matches!(
+                delete_inside_math(docs, true),
+                None | Some(math::Removed::AtEnd)
+            ) {
+                docs.delete_char();
+            }
+        }
+    });
+}
+
 /// Edits `state` from one frame's input. Returns whether anything changed
 /// enough to need the palette region rebuilt. A free function rather than
 /// a method: it only ever needs the one field's worth of state, and taking
@@ -1978,21 +2031,34 @@ fn slash_menu_input(state: &mut SlashMenuState, input: &Input) -> bool {
     changed
 }
 
-/// The completion card's rows for a word: symbols first, structures second,
-/// in the order [`math::completions`] offers them.
-fn math_menu_rows(word: &str) -> Vec<math_menu::Row> {
-    math::completions(word)
-        .into_iter()
-        .map(|completion| match completion {
-            math::Completion::Symbol { name, group, glyph } => math_menu::Row {
-                name: name.to_owned(),
-                group: group.to_owned(),
-                preview: glyph.to_string(),
-            },
-            math::Completion::Structure { name, preview } => math_menu::Row {
-                name: name.to_owned(),
-                group: "Structure".to_owned(),
-                preview: preview.to_owned(),
+/// The completion card rows, preserving the conversion engine's ranking.
+fn math_menu_rows(offers: &[math_conversion::Offer]) -> Vec<math_menu::Row> {
+    offers
+        .iter()
+        .map(|offer| match offer {
+            math_conversion::Offer::Named(math::Completion::Symbol { name, group, glyph }) => {
+                math_menu::Row {
+                    name: (*name).to_owned(),
+                    group: (*group).to_owned(),
+                    preview: glyph.to_string(),
+                }
+            }
+            math_conversion::Offer::Named(math::Completion::Structure { name, preview }) => {
+                math_menu::Row {
+                    name: (*name).to_owned(),
+                    group: "Structure".to_owned(),
+                    preview: (*preview).to_owned(),
+                }
+            }
+            math_conversion::Offer::Rewrite {
+                title,
+                group,
+                preview,
+                ..
+            } => math_menu::Row {
+                name: title.to_string(),
+                group: group.to_string(),
+                preview: preview.to_string(),
             },
         })
         .collect()
@@ -2023,8 +2089,22 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::document::Document;
-    use std::path::Path;
+    use super::{delete_chars, delete_inside_math, math_menu_rows, move_inside_math};
+    use crate::document::{Document, Inline, math_conversion};
+    use crate::tabs::Tabs;
+    use crate::vim::Motion;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn math_tabs(tag: &str) -> Tabs {
+        let path: PathBuf =
+            std::env::temp_dir().join(format!("tw-shell-math-{tag}-{}.md", std::process::id()));
+        fs::write(&path, "").unwrap();
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        tabs.insert_inline_math();
+        tabs
+    }
 
     #[test]
     fn inline_code_toggles_the_caret_context_without_dirtying() {
@@ -2035,5 +2115,107 @@ mod tests {
         doc.toggle_code();
         assert!(!doc.caret.style.code);
         assert!(!doc.is_dirty());
+    }
+
+    #[test]
+    fn directional_delete_exits_math_at_the_matching_outer_edge() {
+        let mut tabs = math_tabs("delete-edges");
+        tabs.math_type('x');
+        tabs.math_left();
+
+        assert!(delete_inside_math(&mut tabs, true).is_some());
+        assert!(tabs.in_math(), "deleting content keeps the atom focused");
+        assert!(delete_inside_math(&mut tabs, true).is_some());
+        assert!(!tabs.in_math());
+        assert_eq!(tabs.active().unwrap().document.caret.offset, 1);
+
+        assert!(tabs.enter_math_before());
+        assert!(delete_inside_math(&mut tabs, false).is_some());
+        assert!(!tabs.in_math());
+        assert_eq!(tabs.active().unwrap().document.caret.offset, 0);
+    }
+
+    #[test]
+    fn normal_horizontal_motions_traverse_math_then_exit() {
+        let mut tabs = math_tabs("normal-motion");
+        tabs.math_type('x');
+        tabs.math_type('y');
+
+        assert!(move_inside_math(&mut tabs, Motion::Left, 2));
+        assert_eq!(
+            tabs.active().unwrap().document.math.as_ref().unwrap().index,
+            0
+        );
+        assert!(move_inside_math(&mut tabs, Motion::Left, 1));
+        assert!(!tabs.in_math());
+        assert_eq!(tabs.active().unwrap().document.caret.offset, 0);
+
+        assert!(tabs.enter_math_after());
+        assert!(move_inside_math(&mut tabs, Motion::Right, 3));
+        assert!(!tabs.in_math());
+        assert_eq!(tabs.active().unwrap().document.caret.offset, 1);
+    }
+
+    #[test]
+    fn normal_x_enters_an_atom_and_starts_structural_deletion() {
+        let mut tabs = math_tabs("normal-delete");
+        tabs.math_type('x');
+        tabs.math_exit_before();
+
+        delete_chars(&mut tabs, 1);
+
+        assert!(tabs.in_math());
+        assert!(matches!(
+            tabs.active().unwrap().document.blocks[0].inlines()[0],
+            Inline::Math(ref list) if list.is_empty()
+        ));
+    }
+
+    #[test]
+    fn counted_normal_x_retries_after_exiting_math_at_end() {
+        let mut tabs = math_tabs("counted-normal-delete");
+        tabs.math_type('x');
+        tabs.math_exit_after();
+        tabs.type_text("abc");
+        tabs.move_caret_to(0, 0, 0);
+
+        delete_chars(&mut tabs, 2);
+
+        let doc = &tabs.active().unwrap().document;
+        assert!(!tabs.in_math());
+        assert!(matches!(doc.blocks[0].inlines()[0], Inline::Math(ref list) if list.is_empty()));
+        assert!(matches!(
+            doc.blocks[0].inlines()[1],
+            Inline::Text(ref text) if text.text == "bc"
+        ));
+    }
+
+    #[test]
+    fn menu_rows_include_explicit_compact_rewrites_and_named_offers() {
+        let e0 = math_conversion::Query {
+            path: Vec::new(),
+            start: 0,
+            end: 2,
+            source: "e0".into(),
+        };
+        let rows = math_menu_rows(&math_conversion::offers(&e0).offers);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].name, "Vacuum permittivity");
+        assert_eq!(rows[0].preview, "ε₀");
+
+        let alpha = math_conversion::Query {
+            source: "alpha".into(),
+            end: 5,
+            ..e0
+        };
+        let rows = math_menu_rows(&math_conversion::offers(&alpha).offers);
+        assert!(rows.iter().any(|row| row.preview == "α"));
+        let sqrt = math_conversion::Query {
+            source: "sqrt".into(),
+            end: 4,
+            ..alpha
+        };
+        let rows = math_menu_rows(&math_conversion::offers(&sqrt).offers);
+        assert!(rows.iter().any(|row| row.group == "Structure"));
     }
 }

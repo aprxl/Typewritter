@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 pub mod layout;
 pub mod markdown;
 pub mod math;
+pub mod math_conversion;
 pub mod math_layout;
 pub mod math_notation;
 pub mod math_symbols;
@@ -1189,6 +1190,28 @@ impl Document {
         let i = self.caret.inline;
         let o = self.caret.offset;
         let before = self.caret_flat(b);
+        let math_inline = if o > 0 && matches!(self.blocks[b].inlines()[i], Inline::Math(_)) {
+            Some(i)
+        } else if o == 0 && i > 0 && matches!(self.blocks[b].inlines()[i - 1], Inline::Math(_)) {
+            Some(i - 1)
+        } else {
+            None
+        };
+        if let Some(inline) = math_inline {
+            let len = match &self.blocks[b].inlines()[inline] {
+                Inline::Math(list) => list.len(),
+                Inline::Text(_) => unreachable!("math target was checked above"),
+            };
+            if len > 0 || self.blocks[b].is_math() {
+                self.set_caret(b, inline, 0);
+                self.math = Some(math::MathCursor {
+                    path: Vec::new(),
+                    index: len,
+                });
+                let _ = self.math_backspace();
+                return;
+            }
+        }
         if o > 0 {
             let runs = self.blocks[b].inlines_mut();
             if matches!(runs[i], Inline::Math(_)) {
@@ -1207,6 +1230,23 @@ impl Document {
                     prev_len - 1,
                 );
             }
+        } else if b > 0 && self.blocks[b - 1].is_math() {
+            let previous = b - 1;
+            let len = match self.blocks[previous].inlines() {
+                [Inline::Math(list)] => list.len(),
+                _ => unreachable!("display math must contain exactly one math atom"),
+            };
+            self.set_caret(previous, 0, 0);
+            self.math = Some(math::MathCursor {
+                path: Vec::new(),
+                index: len,
+            });
+            let _ = self.math_backspace();
+            return;
+        } else if b > 0 && self.blocks[b].is_math() {
+            self.set_caret(b, 0, 0);
+            self.math = Some(math::MathCursor::default());
+            return;
         } else if b > 0 {
             self.merge_into_previous();
             self.dirty = true;
@@ -1251,6 +1291,25 @@ impl Document {
         let o = self.caret.offset;
         let runs = self.blocks[b].inlines();
         let li = run_len(&runs[i]);
+        let math_inline = if o < li && matches!(runs[i], Inline::Math(_)) {
+            Some(i)
+        } else if o == li && i + 1 < runs.len() && matches!(runs[i + 1], Inline::Math(_)) {
+            Some(i + 1)
+        } else {
+            None
+        };
+        if let Some(inline) = math_inline {
+            let empty = match &self.blocks[b].inlines()[inline] {
+                Inline::Math(list) => list.is_empty(),
+                Inline::Text(_) => unreachable!("math target was checked above"),
+            };
+            if !empty || self.blocks[b].is_math() {
+                self.set_caret(b, inline, 0);
+                self.math = Some(math::MathCursor::default());
+                let _ = self.math_delete_forward();
+                return;
+            }
+        }
         if o < li {
             let runs = self.blocks[b].inlines_mut();
             if matches!(runs[i], Inline::Math(_)) {
@@ -1265,6 +1324,14 @@ impl Document {
             } else {
                 remove_char_at(runs[i + 1].text_mut().expect("non-math run is text"), 0);
             }
+        } else if b + 1 < self.blocks.len() && self.blocks[b].is_math() {
+            return;
+        } else if b + 1 < self.blocks.len() && self.blocks[b + 1].is_math() {
+            let next = b + 1;
+            self.set_caret(next, 0, 0);
+            self.math = Some(math::MathCursor::default());
+            let _ = self.math_delete_forward();
+            return;
         } else if b + 1 < self.blocks.len() {
             self.merge_block_into_next();
         } else {
@@ -1333,6 +1400,14 @@ impl Document {
             return;
         }
         let (i, o) = self.flat_to_pos(b, flat);
+        if let Inline::Math(list) = &self.blocks[b].inlines()[i]
+            && (!list.is_empty() || self.blocks[b].is_math())
+        {
+            self.set_caret(b, i, 0);
+            self.math = Some(math::MathCursor::default());
+            let _ = self.math_delete_forward();
+            return;
+        }
         let runs = self.blocks[b].inlines_mut();
         if matches!(runs[i], Inline::Math(_)) {
             runs.remove(i);
@@ -1665,32 +1740,41 @@ impl Document {
         Some((list, cursor))
     }
 
-    /// The word being typed before the math cursor — the completion query.
-    pub fn math_word_before(&self) -> Option<String> {
+    /// The precise token before the math cursor, including its tree location.
+    pub fn math_conversion_query(&self) -> Option<math_conversion::Query> {
         let (list, cursor) = self.focused_math_view()?;
-        math::word_before(list, cursor)
+        math_conversion::query_before(list, cursor)
     }
 
-    /// A symbol completion was accepted: replace the word with its glyph.
-    pub fn math_accept_symbol(&mut self, glyph: char) {
-        if let Some((list, cursor)) = self.focused_math() {
-            math::accept_symbol(list, cursor, glyph);
+    /// Applies a still-current completion or compact-input rewrite.
+    pub fn math_accept_conversion(
+        &mut self,
+        query: &math_conversion::Query,
+        offer: &math_conversion::Offer,
+    ) -> bool {
+        let accepted = self
+            .focused_math()
+            .is_some_and(|(list, cursor)| math_conversion::accept(list, cursor, query, offer));
+        if accepted {
             self.dirty = true;
         }
-    }
-
-    /// A structure completion was accepted: build it in place of the word.
-    pub fn math_insert_structure(&mut self, name: &str) {
-        if let Some((list, cursor)) = self.focused_math() {
-            math::insert_structure(list, cursor, name);
-            self.dirty = true;
-        }
+        accepted
     }
 
     pub fn math_backspace(&mut self) -> Option<math::Removed> {
         let result = self
             .focused_math()
             .map(|(list, cursor)| math::backspace(list, cursor));
+        if result == Some(math::Removed::Edited) {
+            self.dirty = true;
+        }
+        result
+    }
+
+    pub fn math_delete_forward(&mut self) -> Option<math::Removed> {
+        let result = self
+            .focused_math()
+            .map(|(list, cursor)| math::delete_forward(list, cursor));
         if result == Some(math::Removed::Edited) {
             self.dirty = true;
         }
@@ -1771,16 +1855,15 @@ impl Document {
     /// cursor — the click path, where the geometry decided where inside the
     /// expression the cursor goes.
     pub fn enter_math_at(&mut self, block: usize, inline: usize, mut cursor: math::MathCursor) {
-        let list_len = match self
-            .blocks
-            .get(block)
-            .and_then(|block| block.inlines().get(inline))
-        {
-            Some(Inline::Math(list)) => list.len(),
-            _ => return,
-        };
+        if !matches!(
+            self.blocks
+                .get(block)
+                .and_then(|block| block.inlines().get(inline)),
+            Some(Inline::Math(_))
+        ) {
+            return;
+        }
         self.set_caret(block, inline, 0);
-        cursor.index = cursor.index.min(list_len);
         let list = match self.blocks[self.caret.block]
             .inlines()
             .get(self.caret.inline)
@@ -1792,7 +1875,7 @@ impl Document {
         self.math = Some(cursor);
     }
 
-    pub fn math_exit(&mut self) {
+    fn math_exit_at(&mut self, offset: usize) {
         self.clamp_caret();
         let block = self.caret.block;
         let inline = self.caret.inline;
@@ -1804,8 +1887,16 @@ impl Document {
             return;
         }
         self.math = None;
-        self.caret.offset = 1;
+        self.caret.offset = offset;
         self.refresh_context();
+    }
+
+    pub fn math_exit_before(&mut self) {
+        self.math_exit_at(0);
+    }
+
+    pub fn math_exit_after(&mut self) {
+        self.math_exit_at(1);
     }
 
     pub fn math_path_names(&mut self) -> Vec<&'static str> {
@@ -2456,16 +2547,128 @@ mod tests {
     }
 
     #[test]
-    fn backspace_removes_an_atom_whole() {
+    fn backspace_enters_a_nonempty_atom_then_removes_it_only_when_empty() {
         let mut d = doc();
-        d.blocks[0] = Block::Paragraph(vec![Inline::Math(vec![math::MathNode::Frac {
-            num: vec![math::MathNode::Sym('1')],
-            den: vec![math::MathNode::Sym('2')],
-        }])]);
-        d.set_caret(0, 0, 1);
+        d.blocks[0] = Block::Paragraph(vec![
+            plain_run("before"),
+            Inline::Math(vec![math::MathNode::Sym('x')]),
+            plain_run("after"),
+        ]);
+        d.set_caret(0, 2, 0);
+
         d.backspace();
-        assert!(matches!(d.blocks[0], Block::Paragraph(_)));
-        assert_eq!(d.block_text(0), "");
+        assert!(matches!(d.blocks[0].inlines()[1], Inline::Math(ref list) if list.is_empty()));
+        assert_eq!(d.math, Some(math::MathCursor::default()));
+
+        d.math_exit_after();
+        d.backspace();
+        assert_eq!(d.block_text(0), "beforeafter");
+        assert!(
+            d.blocks[0]
+                .inlines()
+                .iter()
+                .all(|inline| !matches!(inline, Inline::Math(_)))
+        );
+    }
+
+    #[test]
+    fn delete_forward_enters_a_nonempty_atom_then_removes_it_only_when_empty() {
+        let mut d = doc();
+        d.blocks[0] = Block::Paragraph(vec![
+            plain_run("before"),
+            Inline::Math(vec![math::MathNode::Sym('x')]),
+            plain_run("after"),
+        ]);
+        d.set_caret(0, 0, 6);
+
+        d.delete_forward();
+        assert!(matches!(d.blocks[0].inlines()[1], Inline::Math(ref list) if list.is_empty()));
+        assert_eq!(d.math, Some(math::MathCursor::default()));
+
+        d.math_exit_before();
+        d.delete_forward();
+        assert_eq!(d.block_text(0), "beforeafter");
+    }
+
+    #[test]
+    fn normal_delete_starts_inside_a_math_atom() {
+        let mut d = doc();
+        d.blocks[0] = Block::Paragraph(vec![Inline::Math(vec![math::MathNode::Sym('x')])]);
+        d.set_caret(0, 0, 0);
+
+        d.delete_char();
+
+        assert!(matches!(d.blocks[0].inlines()[0], Inline::Math(ref list) if list.is_empty()));
+        assert_eq!(d.math, Some(math::MathCursor::default()));
+    }
+
+    #[test]
+    fn deleting_around_an_empty_display_atom_preserves_the_math_block() {
+        let mut d = doc();
+        d.insert_math_block();
+        d.math_exit_after();
+
+        d.backspace();
+        assert!(d.blocks[0].is_math());
+        assert!(matches!(d.blocks[0].inlines(), [Inline::Math(list)] if list.is_empty()));
+        assert_eq!(d.block_text(0), ATOM.to_string());
+    }
+
+    #[test]
+    fn backspace_from_prose_after_display_math_enters_without_merging_blocks() {
+        let mut d = doc();
+        d.blocks = vec![
+            Block::Math(vec![Inline::Math(vec![math::MathNode::Sym('x')])]),
+            Block::Paragraph(vec![plain_run("after")]),
+        ];
+        d.set_caret(1, 0, 0);
+
+        d.backspace();
+
+        assert_eq!(d.blocks.len(), 2);
+        assert!(matches!(d.blocks[0], Block::Math(ref inlines)
+            if matches!(inlines.as_slice(), [Inline::Math(list)] if list.is_empty())));
+        assert_eq!(d.block_text(1), "after");
+        assert_eq!(d.caret.block, 0);
+        assert_eq!(d.math, Some(math::MathCursor::default()));
+    }
+
+    #[test]
+    fn delete_from_prose_before_display_math_enters_without_merging_blocks() {
+        let mut d = doc();
+        d.blocks = vec![
+            Block::Paragraph(vec![plain_run("before")]),
+            Block::Math(vec![Inline::Math(vec![math::MathNode::Sym('x')])]),
+        ];
+        d.set_caret(0, 0, 6);
+
+        d.delete_forward();
+
+        assert_eq!(d.blocks.len(), 2);
+        assert_eq!(d.block_text(0), "before");
+        assert!(matches!(d.blocks[1], Block::Math(ref inlines)
+            if matches!(inlines.as_slice(), [Inline::Math(list)] if list.is_empty())));
+        assert_eq!(d.caret.block, 1);
+        assert_eq!(d.math, Some(math::MathCursor::default()));
+    }
+
+    #[test]
+    fn delete_after_display_math_retains_the_block_boundary() {
+        let mut d = doc();
+        d.blocks = vec![
+            Block::Math(vec![Inline::Math(vec![math::MathNode::Sym('x')])]),
+            Block::Paragraph(vec![plain_run("after")]),
+        ];
+        d.set_caret(0, 0, 1);
+
+        d.delete_forward();
+
+        assert_eq!(d.blocks.len(), 2);
+        assert!(d.blocks[0].is_math());
+        assert_eq!(d.block_text(1), "after");
+        assert_eq!(d.caret.block, 0);
+        assert_eq!(d.caret.offset, 1);
+        assert!(d.math.is_none());
     }
 
     #[test]
@@ -2504,7 +2707,7 @@ mod tests {
                 den: vec![math::MathNode::Sym('2')],
             }])
         );
-        d.math_exit();
+        d.math_exit_after();
         assert!(d.math.is_none());
         assert_eq!(d.caret.offset, 1);
     }
@@ -2568,6 +2771,64 @@ mod tests {
                 index: 2,
             })
         );
+    }
+
+    #[test]
+    fn click_entry_clamps_against_a_deep_denominator_not_the_root() {
+        let mut d = doc();
+        d.blocks[0] = Block::Paragraph(vec![Inline::Math(vec![math::MathNode::Frac {
+            num: Vec::new(),
+            den: vec![math::MathNode::Frac {
+                num: Vec::new(),
+                den: vec![
+                    math::MathNode::Sym('a'),
+                    math::MathNode::Sym('b'),
+                    math::MathNode::Sym('c'),
+                ],
+            }],
+        }])]);
+        let cursor = math::MathCursor {
+            path: vec![
+                math::Step {
+                    index: 0,
+                    slot: math::Slot::Den,
+                },
+                math::Step {
+                    index: 0,
+                    slot: math::Slot::Den,
+                },
+            ],
+            index: usize::MAX,
+        };
+
+        d.enter_math_at(0, 0, cursor.clone());
+
+        assert_eq!(
+            d.math,
+            Some(math::MathCursor {
+                path: cursor.path,
+                index: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn document_accepts_an_explicit_compact_conversion_offer() {
+        let mut d = doc();
+        d.insert_inline_math();
+        for c in "e0".chars() {
+            d.math_insert_char(c);
+        }
+        let query = d.math_conversion_query().unwrap();
+        let offer = math_conversion::offers(&query).offers[0].clone();
+
+        assert!(d.math_accept_conversion(&query, &offer));
+        assert!(matches!(
+            d.blocks[0].inlines()[0],
+            Inline::Math(ref list)
+                if matches!(list.as_slice(), [math::MathNode::Script { sub: Some(sub), .. }]
+                    if sub == &vec![math::MathNode::Sym('0')])
+        ));
     }
 
     #[test]

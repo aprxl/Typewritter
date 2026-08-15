@@ -625,7 +625,35 @@ impl DocLayout {
         let block_idx = block_of_y(self, y);
         let layout_block = &self.blocks[block_idx];
         let line_idx = line_of_y(layout_block, y);
-        let line = &layout_block.lines[line_idx];
+        if let Some(hit) = self.hit_math_on_line(block_idx, line_idx, x, y, measure) {
+            return Some(hit);
+        }
+
+        // Non-painting structural slots deliberately do not grow their line.
+        // Search the other lines only after the visual line under the pointer,
+        // so ordinary content keeps priority where interaction envelopes meet.
+        for (other_block, layout_block) in self.blocks.iter().enumerate() {
+            for other_line in 0..layout_block.lines.len() {
+                if (other_block, other_line) == (block_idx, line_idx) {
+                    continue;
+                }
+                if let Some(hit) = self.hit_math_on_line(other_block, other_line, x, y, measure) {
+                    return Some(hit);
+                }
+            }
+        }
+        None
+    }
+
+    fn hit_math_on_line(
+        &self,
+        block_idx: usize,
+        line_idx: usize,
+        x: f32,
+        y: f32,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> Option<(usize, usize, MathCursor)> {
+        let line = &self.blocks[block_idx].lines[line_idx];
         let block = &self.source[block_idx];
         let mut advance_x = 0.0;
 
@@ -636,15 +664,17 @@ impl DocLayout {
                 advance_x += theme::BADGE_PAD;
             }
             let width = advance(run, &text, block, segment.style, measure);
-            if let Inline::Math(list) = run
-                && x >= advance_x
-                && x <= advance_x + width
-            {
+            if let Inline::Math(list) = run {
                 let local_x = x - advance_x;
                 // Math boxes use positive-up y; the line baseline is its centre.
                 let local_y = line.y + line.height / 2.0 - y;
                 let expression = math_layout::layout(list, 0, measure);
-                if local_y >= -expression.descent && local_y <= expression.ascent {
+                let bounds = math_layout::interaction_bounds(&expression);
+                if local_x >= bounds.left
+                    && local_x <= bounds.right
+                    && local_y >= -bounds.descent
+                    && local_y <= bounds.ascent
+                {
                     return Some((
                         block_idx,
                         segment.inline,
@@ -745,7 +775,8 @@ impl DocLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::math::MathNode;
+    use crate::document::math::{BigOp, MathNode, Slot, Step};
+    use crate::document::math_layout::BoxKind;
     use crate::document::{Inline, Text};
 
     /// Every glyph 10 wide, so line breaks are countable by hand.
@@ -1265,6 +1296,104 @@ mod tests {
             &fake_measure,
         );
         assert_eq!(past, None);
+    }
+
+    #[test]
+    fn a_click_descends_to_the_requested_fraction_position() {
+        let list = vec![MathNode::Frac {
+            num: vec![MathNode::Sym('n')],
+            den: vec![MathNode::Sym('x'), MathNode::Sym('y'), MathNode::Sym('z')],
+        }];
+        let d = doc_with(vec![Block::Paragraph(vec![Inline::Math(list.clone())])]);
+        let laid = layout(&d, 300.0, &fake_measure);
+        let expression = math_layout::layout(&list, 0, &fake_measure);
+        let BoxKind::Row { children } = &expression.kind else {
+            panic!("expression must be a row");
+        };
+        let BoxKind::Row { children: fraction } = &children[0].2.kind else {
+            panic!("fraction must be a row");
+        };
+        let denominator = &fraction[2];
+        let x = children[0].0 + denominator.0 + denominator.2.width * 0.95;
+        let baseline = laid.blocks[0].lines[0].height * 0.5;
+        let y = baseline - children[0].1 - denominator.1;
+
+        let (_, _, cursor) = laid
+            .hit_math(x, y, &fake_measure)
+            .expect("denominator must be interactive");
+        assert_eq!(
+            cursor.path,
+            vec![Step {
+                index: 0,
+                slot: Slot::Den,
+            }]
+        );
+        assert_eq!(cursor.index, 3);
+    }
+
+    #[test]
+    fn hidden_integral_limits_are_clickable_without_growing_the_line() {
+        let list = vec![MathNode::BigOp {
+            kind: BigOp::ContourIntegral,
+            lower: vec![],
+            upper: vec![],
+        }];
+        let d = doc_with(vec![Block::Paragraph(vec![
+            Inline::Math(list.clone()),
+            Inline::Text(Text {
+                text: " next".into(),
+                style: Style::PLAIN,
+            }),
+        ])]);
+        let laid = layout(&d, 20.0, &fake_measure);
+        assert_eq!(laid.blocks[0].lines.len(), 2);
+        let line = &laid.blocks[0].lines[0];
+        let expression = math_layout::layout(&list, 0, &fake_measure);
+        assert_eq!(
+            line.height,
+            LINE_BODY.max(expression.ascent + expression.descent + MATH_LEADING)
+        );
+        let bounds = math_layout::interaction_bounds(&expression);
+        assert!(bounds.ascent > expression.ascent);
+        assert!(bounds.descent > expression.descent);
+
+        let BoxKind::Row { children } = &expression.kind else {
+            panic!("expression must be a row");
+        };
+        let BoxKind::Row { children: operator } = &children[0].2.kind else {
+            panic!("operator must be a row");
+        };
+        for (slot, child) in [(Slot::Lower, &operator[1]), (Slot::Upper, &operator[2])] {
+            let x = children[0].0 + child.0 + child.2.width * 0.5;
+            let local_y = children[0].1 + child.1;
+            let y = line.y + line.height * 0.5 - local_y;
+            let (_, _, cursor) = laid
+                .hit_math(x, y, &fake_measure)
+                .expect("hidden limit must remain interactive");
+            assert_eq!(cursor.path, vec![Step { index: 0, slot }]);
+            assert_eq!(cursor.index, 0);
+        }
+    }
+
+    #[test]
+    fn the_boundary_between_math_atoms_enters_the_left_atom_at_its_end() {
+        let first = Inline::Math(vec![MathNode::Sym('x')]);
+        let second = Inline::Math(vec![MathNode::Sym('y')]);
+        let d = doc_with(vec![Block::Paragraph(vec![first.clone(), second])]);
+        let laid = layout(&d, 300.0, &fake_measure);
+        let first_width = advance(
+            &first,
+            "\u{FFFC}",
+            &d.blocks[0],
+            Style::PLAIN,
+            &fake_measure,
+        );
+        let line = &laid.blocks[0].lines[0];
+        let (_, inline, cursor) = laid
+            .hit_math(first_width, line.y + line.height * 0.5, &fake_measure)
+            .expect("shared boundary must delegate to math hit-testing");
+        assert_eq!(inline, 0);
+        assert_eq!(cursor.index, 1);
     }
 
     #[test]

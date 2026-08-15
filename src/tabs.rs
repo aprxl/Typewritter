@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::document::{Document, FlatRange, Style, math};
+use crate::document::{Document, FlatRange, Style, math, math_conversion};
 
 pub struct Tab {
     pub document: Document,
@@ -458,24 +458,31 @@ impl Tabs {
         inserted
     }
 
-    /// The word being typed before the math cursor — the completion query.
-    pub fn math_word_before(&self) -> Option<String> {
+    pub fn math_conversion_query(&self) -> Option<math_conversion::Query> {
         self.active()
-            .and_then(|tab| tab.document.math_word_before())
+            .and_then(|tab| tab.document.math_conversion_query())
     }
 
-    pub fn math_accept_symbol(&mut self, glyph: char) {
-        self.edit(|doc| doc.math_accept_symbol(glyph));
+    pub fn math_accept_conversion(
+        &mut self,
+        query: &math_conversion::Query,
+        offer: &math_conversion::Offer,
+    ) -> bool {
+        let mut accepted = false;
+        self.edit(|doc| accepted = doc.math_accept_conversion(query, offer));
+        accepted
     }
 
-    pub fn math_insert_structure(&mut self, name: &str) {
-        self.edit(|doc| doc.math_insert_structure(name));
+    pub fn math_backspace(&mut self) -> Option<math::Removed> {
+        let mut removed = None;
+        self.edit(|doc| removed = doc.math_backspace());
+        removed
     }
 
-    pub fn math_backspace(&mut self) {
-        self.edit(|doc| {
-            doc.math_backspace();
-        });
+    pub fn math_delete_forward(&mut self) -> Option<math::Removed> {
+        let mut removed = None;
+        self.edit(|doc| removed = doc.math_delete_forward());
+        removed
     }
 
     // Math movement changes caret state, not content, so it touches rather than edits.
@@ -525,8 +532,12 @@ impl Tabs {
         popped
     }
 
-    pub fn math_exit(&mut self) {
-        self.touch(Document::math_exit);
+    pub fn math_exit_before(&mut self) {
+        self.touch(Document::math_exit_before);
+    }
+
+    pub fn math_exit_after(&mut self) {
+        self.touch(Document::math_exit_after);
     }
 
     /// Whether the caret is inside a math expression — the shell routes
@@ -709,6 +720,45 @@ mod tests {
         tabs.active_mut().unwrap().document.insert_inline_math();
         tabs.math_left();
         assert!(tabs.active().unwrap().preview);
+    }
+
+    #[test]
+    fn math_directional_deletions_return_root_boundaries_to_the_shell() {
+        let path = temp_file("math-delete-results", "");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        tabs.insert_inline_math();
+        tabs.math_type('x');
+
+        assert_eq!(tabs.math_backspace(), Some(math::Removed::Edited));
+        assert_eq!(tabs.math_backspace(), Some(math::Removed::AtStart));
+        tabs.math_exit_before();
+        assert_eq!(tabs.active().unwrap().document.caret.offset, 0);
+
+        tabs.enter_math_after();
+        assert_eq!(tabs.math_delete_forward(), Some(math::Removed::AtEnd));
+        tabs.math_exit_after();
+        assert_eq!(tabs.active().unwrap().document.caret.offset, 1);
+    }
+
+    #[test]
+    fn tabs_accept_the_exact_conversion_query_selected_by_the_menu() {
+        let path = temp_file("math-conversion", "");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        tabs.insert_inline_math();
+        for c in "x2".chars() {
+            tabs.math_type(c);
+        }
+        let query = tabs.math_conversion_query().unwrap();
+        let offer = math_conversion::offers(&query).offers[1].clone();
+
+        assert!(tabs.math_accept_conversion(&query, &offer));
+        assert!(matches!(
+            tabs.active().unwrap().document.blocks[0].inlines()[0],
+            crate::document::Inline::Math(ref list)
+                if matches!(list.as_slice(), [math::MathNode::Script { sub: Some(_), .. }])
+        ));
     }
 
     #[test]

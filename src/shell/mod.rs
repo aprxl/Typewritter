@@ -46,6 +46,7 @@ use crate::config::Config;
 use crate::document::Caret;
 use crate::document::layout::DocLayout;
 use crate::document::math::MathCursor;
+use crate::document::math_conversion;
 use crate::document::outline;
 use crate::frame::FrameScheduler;
 use crate::input::Input;
@@ -100,12 +101,10 @@ struct ContextMenuState {
     anchor: (f32, f32),
 }
 
-/// The in-math completion card while it is showing: the word being completed
-/// (the query — it lives in the document, not here), the selected row, and
-/// the anchor point. Recomputed every frame from `math::word_before`; it has
-/// no open/closed state of its own.
+/// The in-math completion card while it is showing: the precise tree query,
+/// selected row, and anchor point. It has no open/closed state of its own.
 struct MathMenuState {
-    word: String,
+    query: math_conversion::Query,
     selected: usize,
     anchor: (f32, f32),
 }
@@ -187,10 +186,9 @@ pub struct Shell {
     context_menu: Option<ContextMenuState>,
     /// The in-math completion card while it is showing.
     math_menu: Option<MathMenuState>,
-    /// The word the reader dismissed the completion card for: while the word
-    /// under the math cursor equals this, the card stays hidden. Typing more
-    /// letters changes the word and brings it back.
-    math_dismissed: Option<String>,
+    /// The exact query dismissed by the reader. A changed path, range, or
+    /// source is a new query and brings the card back.
+    math_dismissed: Option<math_conversion::Query>,
     tree_menu_request: file_tree::MenuRequest,
     /// Indices into `regions` of the regions the shell rebuilds.
     title_region: usize,

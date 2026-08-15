@@ -34,6 +34,7 @@ pub const RIGHT_MARGIN: f32 = 24.0;
 const BLOCK_PAD: (f32, f32) = (10.0, 6.0);
 const INLINE_PAD: (f32, f32) = (3.0, 1.0);
 const CODE_ROUNDING: Rounding = Rounding::uniform(6.0);
+const INLINE_MATH_ROUNDING: Rounding = Rounding::uniform(5.0);
 /// The highlight bar: an underline, not a wash, so the glyphs keep the
 /// page's own contrast. `DROP` is measured down from the line's centre.
 const HIGHLIGHT_DROP: f32 = 8.0;
@@ -66,6 +67,15 @@ type Painted = (String, Style, f32, f32);
 /// so descending into a child subtracts its y.
 fn draw_math(layer: &Layer, box_: &MathBox, origin: (f32, f32)) {
     draw_math_inner(layer, box_, origin, false);
+}
+
+fn math_rect(box_: &MathBox, origin: (f32, f32)) -> Rect {
+    Rect {
+        x: origin.0,
+        y: origin.1 - box_.ascent,
+        width: box_.width,
+        height: box_.ascent + box_.descent,
+    }
 }
 
 fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: bool) {
@@ -477,11 +487,19 @@ impl Component for Editor {
                         let measure =
                             |text: &str, style: &TextStyle| theme::width(layer, text, style);
                         let box_ = math_layout::layout(list, 0, &measure);
+                        if !kind.is_math() {
+                            let rect = math_rect(&box_, (cursor, baseline));
+                            layer.draw_rectangle(
+                                rect.position(),
+                                rect.size(),
+                                theme::INLINE_MATH,
+                                INLINE_MATH_ROUNDING,
+                            );
+                        }
                         draw_math(layer, &box_, (cursor, baseline));
                         if let Some(math_cursor) = math_focus
                             && bi == self.caret.block
                             && segment.inline == self.caret.inline
-                            && self.caret_on
                         {
                             let (cursor_x, cursor_y, cursor_height) =
                                 math_layout::cursor_pos(list, math_cursor, 0, &measure);
@@ -888,5 +906,27 @@ mod tests {
         };
         assert_eq!(width, box_width);
         assert!(width > measure(&atom, &TextStyle::serif(17.5, theme::INK)));
+    }
+
+    #[test]
+    fn inline_math_background_matches_the_complete_box() {
+        let box_ = MathBox {
+            width: 42.0,
+            ascent: 19.0,
+            descent: 11.0,
+            highlight: false,
+            kind: BoxKind::Row { children: vec![] },
+        };
+        assert_eq!(
+            math_rect(&box_, (7.0, 31.0)),
+            Rect {
+                x: 7.0,
+                y: 12.0,
+                width: 42.0,
+                height: 30.0,
+            }
+        );
+        assert_ne!(theme::INLINE_MATH, theme::MATH);
+        assert_ne!(theme::INLINE_MATH, theme::VARIABLE);
     }
 }
