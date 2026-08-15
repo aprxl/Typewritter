@@ -185,6 +185,13 @@ pub struct Shell {
     slash_menu: Option<SlashMenuState>,
     /// The open context menu's rows, selection, and anchor point, if open.
     context_menu: Option<ContextMenuState>,
+    /// Persistent Ctrl-brush selection, plus the targets currently under the
+    /// brush so a held stroke toggles each target only on entry.
+    brush_selected: Vec<ContextHit>,
+    brush_inside: Vec<ContextHit>,
+    brush_point: Option<(f32, f32)>,
+    brush_revision: u64,
+    last_brush_revision: u64,
     /// The in-math completion card while it is showing.
     math_menu: Option<MathMenuState>,
     /// The exact query dismissed by the reader. A changed path, range, or
@@ -433,6 +440,11 @@ impl Shell {
             finder: None,
             slash_menu: None,
             context_menu: None,
+            brush_selected: Vec::new(),
+            brush_inside: Vec::new(),
+            brush_point: None,
+            brush_revision: 0,
+            last_brush_revision: 0,
             math_menu: None,
             math_dismissed: None,
             tree_menu_request,
@@ -609,12 +621,14 @@ impl Shell {
             || visual_state != self.last_visual_state
             || width != self.last_width
             || search != self.rendered_search
+            || self.brush_revision != self.last_brush_revision
         {
             self.last_revision = revision;
             self.last_mode = mode;
             self.last_visual_state = visual_state;
             self.last_width = width;
             self.rendered_search = search;
+            self.last_brush_revision = self.brush_revision;
             self.rebuild_views();
         }
         animating
@@ -1049,6 +1063,7 @@ impl Shell {
                         Editor::new(layout, caret, scroll, block_caret, caret.style)
                             .with_math(math)
                             .with_math_selection(math_selection)
+                            .with_context_selections(self.brush_selected.clone(), self.brush_point)
                             .with_selection(selection, line_selection),
                         StatusLine::new(
                             mode_label,

@@ -16,7 +16,7 @@ use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
     ContextMenu, Dialog, FileFinder, FileTree, MathMenu, Onboarding, Palette, SlashMenu,
-    context_menu, file_finder, file_tree, math_menu, onboarding, title_bar,
+    context_menu, editor, file_finder, file_tree, math_menu, onboarding, title_bar,
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, RangeKind};
@@ -47,6 +47,15 @@ impl Shell {
     /// for it. Once a vault is open, every chord in [`commands`] dispatches
     /// normally, `Ctrl+O` included.
     pub(super) fn handle_input(&mut self, input: &Input, viewport: Rect) {
+        if input.is_key_pressed(KeyCode::Escape)
+            && reset_brush_selection(
+                &mut self.brush_selected,
+                &mut self.brush_inside,
+                &mut self.brush_point,
+            )
+        {
+            self.brush_revision = self.brush_revision.wrapping_add(1);
+        }
         // The finder owns all input while open, including title-bar clicks.
         if self.finder.is_some() {
             self.handle_finder_input(input);
@@ -62,16 +71,21 @@ impl Shell {
             self.handle_slash_menu_input(input);
             return;
         }
-        // The context menu swallows input while it is open.
-        if self.context_menu.is_some() && self.handle_context_menu_input(input, viewport) {
-            return;
-        }
-        // A dialog swallows everything else until it resolves.
+        // A dialog owns mouse input too, including Ctrl+clicks.
         if self.dialog.is_some() {
             self.handle_dialog_input(input, viewport);
             return;
         }
-
+        // Ctrl+drag is an editor gesture, not a click-to-place or context
+        // click. It also gets first refusal over an already-open context
+        // menu so the existing multi-selection survives another stroke.
+        if self.handle_brush_input(input) {
+            return;
+        }
+        // The context menu swallows input while it is open.
+        if self.context_menu.is_some() && self.handle_context_menu_input(input, viewport) {
+            return;
+        }
         // Onboarding has exactly one live command — opening a vault — and the
         // splash's button and Enter key are the same request. Matching it out
         // of the table rather than against a literal chord keeps `COMMANDS`
@@ -142,6 +156,73 @@ impl Shell {
         // is open — the leader has to reach the palette either way, and
         // `Tabs::touch`/`Tabs::edit` already no-op against an empty `Tabs`.
         self.edit_frame(input);
+    }
+
+    fn handle_brush_input(&mut self, input: &Input) -> bool {
+        if !(input.ctrl() && input.is_mouse_down(MouseButton::Left)) {
+            if self.brush_point.take().is_some() || !self.brush_inside.is_empty() {
+                self.brush_inside.clear();
+                self.brush_revision = self.brush_revision.wrapping_add(1);
+            }
+            return false;
+        }
+
+        let rect = self.layout.rect(self.text_column);
+        let point = input.mouse_position();
+        let over_editor = self.docs.borrow().active().is_some()
+            && input.is_cursor_in_window()
+            && rect.contains(point);
+        if !over_editor {
+            let was_brushing = self.brush_point.is_some() || !self.brush_inside.is_empty();
+            if self.brush_point.take().is_some() || !self.brush_inside.is_empty() {
+                self.brush_inside.clear();
+                self.brush_revision = self.brush_revision.wrapping_add(1);
+            }
+            return was_brushing;
+        }
+
+        if self.context_menu.is_some() {
+            self.close_context_menu();
+        }
+        let Some((x, y)) = self.editor_point(rect, point) else {
+            return true;
+        };
+        let content_width = editor::Editor::content_width(rect);
+        let layout = self.current_layout(content_width);
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+        let current_hits =
+            layout.hit_contexts_in_circle(x, y, editor::BRUSH_RADIUS, content_width, &measure);
+        let mut swept_hits = current_hits.clone();
+        if let Some(previous) = self
+            .brush_point
+            .and_then(|previous| self.editor_point(rect, previous))
+        {
+            for (sample_x, sample_y) in brush_sweep_samples(previous, (x, y), editor::BRUSH_RADIUS)
+            {
+                for hit in layout.hit_contexts_in_circle(
+                    sample_x,
+                    sample_y,
+                    editor::BRUSH_RADIUS,
+                    content_width,
+                    &measure,
+                ) {
+                    if !swept_hits.contains(&hit) {
+                        swept_hits.push(hit);
+                    }
+                }
+            }
+        }
+
+        toggle_brush_hits(
+            &mut self.brush_selected,
+            &mut self.brush_inside,
+            swept_hits,
+            current_hits,
+        );
+        self.brush_point = Some(point);
+        self.brush_revision = self.brush_revision.wrapping_add(1);
+        true
     }
 
     /// Scroll, click-to-place, and the arrow/Home/End keys need an actual
@@ -2380,6 +2461,46 @@ fn moved_math_menu_selection(selected: usize, count: usize, delta: isize) -> usi
     ((selected as isize + delta).clamp(0, count as isize - 1)) as usize
 }
 
+fn toggle_brush_hits(
+    selected: &mut Vec<ContextHit>,
+    inside: &mut Vec<ContextHit>,
+    swept_hits: Vec<ContextHit>,
+    current_hits: Vec<ContextHit>,
+) {
+    for hit in swept_hits.iter().filter(|hit| !inside.contains(hit)) {
+        if let Some(index) = selected.iter().position(|selected| selected == hit) {
+            selected.remove(index);
+        } else {
+            selected.push(hit.clone());
+        }
+    }
+    *inside = current_hits;
+}
+
+fn brush_sweep_samples(from: (f32, f32), to: (f32, f32), radius: f32) -> Vec<(f32, f32)> {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let steps = (dx.hypot(dy) / radius).ceil() as usize;
+    (1..steps)
+        .map(|step| {
+            let t = step as f32 / steps as f32;
+            (from.0 + dx * t, from.1 + dy * t)
+        })
+        .collect()
+}
+
+fn reset_brush_selection(
+    selected: &mut Vec<ContextHit>,
+    inside: &mut Vec<ContextHit>,
+    point: &mut Option<(f32, f32)>,
+) -> bool {
+    let changed = !selected.is_empty() || !inside.is_empty() || point.is_some();
+    selected.clear();
+    inside.clear();
+    *point = None;
+    changed
+}
+
 fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
     let mut changed = false;
     if !input.text().is_empty() {
@@ -2406,11 +2527,13 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        delete_chars, delete_inside_math, math_menu_rows, math_menu_variant_start,
-        move_inside_math, moved_math_menu_selection, symbol_base_glyph, symbol_context_ids,
+        brush_sweep_samples, delete_chars, delete_inside_math, math_menu_rows,
+        math_menu_variant_start, move_inside_math, moved_math_menu_selection,
+        reset_brush_selection, symbol_base_glyph, symbol_context_ids, toggle_brush_hits,
     };
+    use crate::document::layout::{ContextHit, RangeKind};
     use crate::document::math::MathNode;
-    use crate::document::{Document, Inline, math_conversion, math_symbols};
+    use crate::document::{Document, FlatPos, FlatRange, Inline, math_conversion, math_symbols};
     use crate::tabs::Tabs;
 
     #[test]
@@ -2432,6 +2555,156 @@ mod tests {
         let greek = symbol_context_ids('α', "italic");
         assert!(greek.contains(&"context.variant.plain"));
         assert!(!greek.contains(&"context.variant.sans"));
+    }
+
+    #[test]
+    fn brush_toggles_only_when_a_target_is_entered() {
+        let target = ContextHit::Range {
+            range: FlatRange::new(
+                FlatPos {
+                    block: 0,
+                    offset: 0,
+                },
+                FlatPos {
+                    block: 0,
+                    offset: 1,
+                },
+            ),
+            kind: RangeKind::Word,
+        };
+        let mut selected = Vec::new();
+        let mut inside = Vec::new();
+
+        toggle_brush_hits(
+            &mut selected,
+            &mut inside,
+            vec![target.clone()],
+            vec![target.clone()],
+        );
+        assert_eq!(selected, vec![target.clone()]);
+        toggle_brush_hits(
+            &mut selected,
+            &mut inside,
+            vec![target.clone()],
+            vec![target.clone()],
+        );
+        assert_eq!(selected, vec![target.clone()]);
+
+        toggle_brush_hits(&mut selected, &mut inside, Vec::new(), Vec::new());
+        toggle_brush_hits(
+            &mut selected,
+            &mut inside,
+            vec![target.clone()],
+            vec![target],
+        );
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn brush_click_preserves_unrelated_selected_targets() {
+        let word = |offset| ContextHit::Range {
+            range: FlatRange::new(
+                FlatPos { block: 0, offset },
+                FlatPos {
+                    block: 0,
+                    offset: offset + 1,
+                },
+            ),
+            kind: RangeKind::Word,
+        };
+        let (first, second, third) = (word(0), word(2), word(4));
+        let mut selected = vec![first.clone(), second.clone()];
+        let mut inside = Vec::new();
+
+        toggle_brush_hits(
+            &mut selected,
+            &mut inside,
+            vec![third.clone()],
+            vec![third.clone()],
+        );
+        assert_eq!(selected, vec![first.clone(), second.clone(), third]);
+        toggle_brush_hits(&mut selected, &mut inside, Vec::new(), Vec::new());
+        toggle_brush_hits(&mut selected, &mut inside, vec![first.clone()], vec![first]);
+        assert_eq!(selected, vec![second, word(4)]);
+    }
+
+    #[test]
+    fn fast_brush_motion_is_sampled_no_farther_apart_than_its_radius() {
+        let radius = 18.0;
+        let from = (0.0, 5.0);
+        let to = (100.0, 5.0);
+        let mut points = vec![from];
+        points.extend(brush_sweep_samples(from, to, radius));
+        points.push(to);
+
+        assert!(points.len() > 2);
+        assert!(points.windows(2).all(|pair| {
+            let dx: f32 = pair[1].0 - pair[0].0;
+            let dy: f32 = pair[1].1 - pair[0].1;
+            dx.hypot(dy) <= radius
+        }));
+    }
+
+    #[test]
+    fn swept_hits_toggle_once_but_inside_tracks_only_the_current_circle() {
+        let word = |offset| ContextHit::Range {
+            range: FlatRange::new(
+                FlatPos { block: 0, offset },
+                FlatPos {
+                    block: 0,
+                    offset: offset + 1,
+                },
+            ),
+            kind: RangeKind::Word,
+        };
+        let (crossed, current) = (word(0), word(2));
+        let mut selected = Vec::new();
+        let mut inside = Vec::new();
+
+        toggle_brush_hits(
+            &mut selected,
+            &mut inside,
+            vec![crossed.clone(), current.clone()],
+            vec![current.clone()],
+        );
+
+        assert_eq!(selected, vec![crossed.clone(), current.clone()]);
+        assert_eq!(inside, vec![current]);
+
+        toggle_brush_hits(
+            &mut selected,
+            &mut inside,
+            vec![crossed.clone()],
+            vec![crossed.clone()],
+        );
+        assert_eq!(selected, vec![word(2)]);
+        assert_eq!(inside, vec![crossed]);
+    }
+
+    #[test]
+    fn escape_reset_clears_the_entire_brush_selection() {
+        let target = ContextHit::Math {
+            block: 2,
+            inline: 0,
+            node: None,
+        };
+        let mut selected = vec![target.clone()];
+        let mut inside = vec![target];
+        let mut point = Some((20.0, 30.0));
+
+        assert!(reset_brush_selection(
+            &mut selected,
+            &mut inside,
+            &mut point
+        ));
+        assert!(selected.is_empty());
+        assert!(inside.is_empty());
+        assert_eq!(point, None);
+        assert!(!reset_brush_selection(
+            &mut selected,
+            &mut inside,
+            &mut point
+        ));
     }
     use crate::vim::Motion;
     use std::fs;

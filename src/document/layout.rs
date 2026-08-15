@@ -774,6 +774,230 @@ impl DocLayout {
         self.hit_hidden_math_node(block_idx, line_idx, x, y, measure)
     }
 
+    /// Every Normal-mode target touched by a circular selection brush.
+    ///
+    /// The query uses the same measured boxes as drawing and contextual
+    /// clicks. A target is returned once even when it spans runs or lines.
+    pub fn hit_contexts_in_circle(
+        &self,
+        x: f32,
+        y: f32,
+        radius: f32,
+        content_width: f32,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> Vec<ContextHit> {
+        let point = (x, y);
+        let radius = radius.max(0.0);
+        let mut hits = Vec::new();
+
+        for (block_idx, layout_block) in self.blocks.iter().enumerate() {
+            let block = &self.source[block_idx];
+            if block.is_code() {
+                let target = self.code_block_target(block_idx);
+                for line in &layout_block.lines {
+                    if circle_intersects_rect(
+                        point,
+                        radius,
+                        0.0,
+                        line.y,
+                        content_width,
+                        line.y + line.height,
+                    ) {
+                        push_unique(&mut hits, target.clone());
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            let chars: Vec<char> = block
+                .inlines()
+                .iter()
+                .flat_map(|run| run_text(run).chars())
+                .collect();
+            for line in &layout_block.lines {
+                let baseline = line.y + line.height * 0.5;
+                let mut advance_x = 0.0;
+                for segment in &line.segments {
+                    let run = &block.inlines()[segment.inline];
+                    let text = segment_text(run, segment);
+                    let width = advance(run, &text, block, segment.style, measure);
+                    let run_start: usize = block.inlines()[..segment.inline]
+                        .iter()
+                        .map(|run| run_text(run).chars().count())
+                        .sum();
+                    let run_len = run_text(run).chars().count();
+
+                    if let Inline::Math(list) = run {
+                        let local = (x - advance_x, baseline - y);
+                        let expression = math_layout::layout(list, 0, measure);
+                        let bounds = math_layout::interaction_bounds(&expression);
+                        if circle_intersects_rect(
+                            local,
+                            radius,
+                            bounds.left,
+                            -bounds.descent,
+                            bounds.right,
+                            bounds.ascent,
+                        ) {
+                            if list.is_empty() {
+                                push_unique(
+                                    &mut hits,
+                                    ContextHit::Math {
+                                        block: block_idx,
+                                        inline: segment.inline,
+                                        node: None,
+                                    },
+                                );
+                            } else {
+                                for node in math_layout::hit_nodes_in_circle(
+                                    list, local, radius, 0, measure,
+                                ) {
+                                    push_unique(
+                                        &mut hits,
+                                        ContextHit::Math {
+                                            block: block_idx,
+                                            inline: segment.inline,
+                                            node: Some(node),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        let whole_run = FlatRange::new(
+                            FlatPos {
+                                block: block_idx,
+                                offset: run_start,
+                            },
+                            FlatPos {
+                                block: block_idx,
+                                offset: run_start + run_len,
+                            },
+                        );
+                        if segment.style.badge {
+                            if circle_intersects_rect(
+                                point,
+                                radius,
+                                advance_x,
+                                baseline - theme::BADGE_HEIGHT * 0.5,
+                                advance_x + width,
+                                baseline + theme::BADGE_HEIGHT * 0.5,
+                            ) {
+                                push_unique(
+                                    &mut hits,
+                                    ContextHit::Range {
+                                        range: whole_run,
+                                        kind: RangeKind::Badge,
+                                    },
+                                );
+                            }
+                        } else if segment.style.code {
+                            if circle_intersects_rect(
+                                point,
+                                radius,
+                                advance_x,
+                                line.y,
+                                advance_x + width,
+                                line.y + line.height,
+                            ) {
+                                push_unique(
+                                    &mut hits,
+                                    ContextHit::Range {
+                                        range: whole_run,
+                                        kind: RangeKind::InlineCode,
+                                    },
+                                );
+                            }
+                        } else {
+                            let mut char_x = advance_x;
+                            for (within_segment, ch) in text.chars().enumerate() {
+                                let char_width =
+                                    measure(&ch.to_string(), &text_style(block, segment.style));
+                                if (ch.is_alphanumeric() || ch == '_')
+                                    && circle_intersects_rect(
+                                        point,
+                                        radius,
+                                        char_x,
+                                        line.y,
+                                        char_x + char_width,
+                                        line.y + line.height,
+                                    )
+                                {
+                                    let clicked = run_start + segment.start + within_segment;
+                                    let mut start = clicked;
+                                    while start > 0
+                                        && (chars[start - 1].is_alphanumeric()
+                                            || chars[start - 1] == '_')
+                                    {
+                                        start -= 1;
+                                    }
+                                    let mut end = clicked + 1;
+                                    while end < chars.len()
+                                        && (chars[end].is_alphanumeric() || chars[end] == '_')
+                                    {
+                                        end += 1;
+                                    }
+                                    push_unique(
+                                        &mut hits,
+                                        ContextHit::Range {
+                                            range: FlatRange::new(
+                                                FlatPos {
+                                                    block: block_idx,
+                                                    offset: start,
+                                                },
+                                                FlatPos {
+                                                    block: block_idx,
+                                                    offset: end,
+                                                },
+                                            ),
+                                            kind: RangeKind::Word,
+                                        },
+                                    );
+                                }
+                                char_x += char_width;
+                            }
+                        }
+                    }
+                    advance_x += width;
+                }
+            }
+        }
+        hits
+    }
+
+    fn code_block_target(&self, block_idx: usize) -> ContextHit {
+        let mut first = block_idx;
+        while first > 0
+            && matches!(
+                self.source.get(first),
+                Some(Block::CodeLine { first: false, .. })
+            )
+        {
+            first -= 1;
+        }
+        let mut last = block_idx;
+        while matches!(
+            self.source.get(last + 1),
+            Some(Block::CodeLine { first: false, .. })
+        ) {
+            last += 1;
+        }
+        ContextHit::Range {
+            range: FlatRange::new(
+                FlatPos {
+                    block: first,
+                    offset: 0,
+                },
+                FlatPos {
+                    block: last,
+                    offset: block_flat_len(&self.source[last]),
+                },
+            ),
+            kind: RangeKind::CodeBlock,
+        }
+    }
+
     fn hit_hidden_math_node(
         &self,
         current_block: usize,
@@ -986,6 +1210,27 @@ impl DocLayout {
         let line_idx = line_of_flat(layout_block, flat);
         let line = &layout_block.lines[line_idx];
         (line.y, line.y + line.height)
+    }
+}
+
+fn circle_intersects_rect(
+    point: (f32, f32),
+    radius: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+) -> bool {
+    let nearest_x = point.0.clamp(left.min(right), left.max(right));
+    let nearest_y = point.1.clamp(top.min(bottom), top.max(bottom));
+    let dx = point.0 - nearest_x;
+    let dy = point.1 - nearest_y;
+    dx * dx + dy * dy <= radius * radius
+}
+
+fn push_unique(hits: &mut Vec<ContextHit>, hit: ContextHit) {
+    if !hits.contains(&hit) {
+        hits.push(hit);
     }
 }
 
@@ -1647,6 +1892,112 @@ mod tests {
                     index: 0,
                 }),
             })
+        );
+    }
+
+    #[test]
+    fn circular_context_hit_includes_a_tangent_corner() {
+        let d = doc_with(vec![para("a")]);
+        let laid = layout(&d, 300.0, &fake_measure);
+        let expected = ContextHit::Range {
+            range: FlatRange::new(
+                FlatPos {
+                    block: 0,
+                    offset: 0,
+                },
+                FlatPos {
+                    block: 0,
+                    offset: 1,
+                },
+            ),
+            kind: RangeKind::Word,
+        };
+
+        assert_eq!(
+            laid.hit_contexts_in_circle(-3.0, -4.0, 5.0, 300.0, &fake_measure),
+            vec![expected]
+        );
+        assert!(
+            laid.hit_contexts_in_circle(-3.0, -4.0, 4.99, 300.0, &fake_measure)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn circular_context_hit_mixes_targets_and_deduplicates_runs() {
+        let badge = Style {
+            badge: true,
+            ..Style::PLAIN
+        };
+        let d = doc_with(vec![Block::Paragraph(vec![
+            Inline::Text(Text {
+                text: "A B".into(),
+                style: badge,
+            }),
+            Inline::Text(Text {
+                text: " word ".into(),
+                style: Style::PLAIN,
+            }),
+            Inline::Math(Vec::new()),
+        ])]);
+        let laid = layout(&d, 35.0, &fake_measure);
+        let hits = laid.hit_contexts_in_circle(0.0, 0.0, 1_000.0, 35.0, &fake_measure);
+
+        assert_eq!(hits.len(), 3);
+        assert!(hits.contains(&ContextHit::Range {
+            range: FlatRange::new(
+                FlatPos {
+                    block: 0,
+                    offset: 0,
+                },
+                FlatPos {
+                    block: 0,
+                    offset: 3,
+                },
+            ),
+            kind: RangeKind::Badge,
+        }));
+        assert!(hits.contains(&ContextHit::Range {
+            range: FlatRange::new(
+                FlatPos {
+                    block: 0,
+                    offset: 4,
+                },
+                FlatPos {
+                    block: 0,
+                    offset: 8,
+                },
+            ),
+            kind: RangeKind::Word,
+        }));
+        assert!(hits.contains(&ContextHit::Math {
+            block: 0,
+            inline: 2,
+            node: None,
+        }));
+    }
+
+    #[test]
+    fn circular_context_hit_uses_the_full_code_block_width() {
+        let d = doc_with(vec![code_line_run("x", true)]);
+        let laid = layout(&d, 300.0, &fake_measure);
+        let y = laid.blocks[0].lines[0].height * 0.5;
+
+        assert_eq!(
+            laid.hit_contexts_in_circle(299.0, y, 1.0, 300.0, &fake_measure),
+            vec![ContextHit::Range {
+                range: FlatRange::new(
+                    FlatPos {
+                        block: 0,
+                        offset: 0,
+                    },
+                    FlatPos {
+                        block: 0,
+                        offset: 1,
+                    },
+                ),
+                kind: RangeKind::CodeBlock,
+            }]
         );
     }
 

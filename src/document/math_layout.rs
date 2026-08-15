@@ -885,6 +885,80 @@ pub fn hit_node(
     hit_node_in(list, &box_, point, &mut Vec::new())
 }
 
+/// Return every smallest math node touched by a circular brush.
+///
+/// Structural children take precedence over their parent, and later siblings
+/// are returned first to match paint order. A structure itself is returned
+/// when the brush only touches its own geometry or one of its empty slots.
+pub fn hit_nodes_in_circle(
+    list: &MathList,
+    point: (f32, f32),
+    radius: f32,
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> Vec<NodeAddress> {
+    let box_ = layout(list, level, measure);
+    let mut hits = Vec::new();
+    hit_nodes_in_circle_in(
+        list,
+        &box_,
+        point,
+        radius.max(0.0),
+        &mut Vec::new(),
+        &mut hits,
+    );
+    hits
+}
+
+fn hit_nodes_in_circle_in(
+    list: &MathList,
+    box_: &MathBox,
+    point: (f32, f32),
+    radius: f32,
+    path: &mut Vec<Step>,
+    hits: &mut Vec<NodeAddress>,
+) {
+    let BoxKind::Row { children } = &box_.kind else {
+        return;
+    };
+    for (index, node) in list.iter().enumerate().rev() {
+        let Some((child_x, child_y, child)) = children.get(index) else {
+            continue;
+        };
+        let local = (point.0 - child_x, point.1 - child_y);
+        if !circle_intersects_box(child, local, radius) {
+            continue;
+        }
+
+        let address = NodeAddress {
+            path: path.clone(),
+            index,
+        };
+        if matches!(node, MathNode::Sym(_) | MathNode::Resolved { .. }) {
+            hits.push(address);
+            continue;
+        }
+
+        let before = hits.len();
+        for slot in node.slots().into_iter().rev() {
+            let Some((slot_list, slot_box, slot_x, slot_y)) = structural_slot(node, child, slot)
+            else {
+                continue;
+            };
+            let slot_point = (local.0 - slot_x, local.1 - slot_y);
+            if slot_list.is_empty() || !circle_intersects_box(slot_box, slot_point, radius) {
+                continue;
+            }
+            path.push(Step { index, slot });
+            hit_nodes_in_circle_in(slot_list, slot_box, slot_point, radius, path, hits);
+            path.pop();
+        }
+        if hits.len() == before {
+            hits.push(address);
+        }
+    }
+}
+
 fn hit_node_in(
     list: &MathList,
     box_: &MathBox,
@@ -932,6 +1006,14 @@ fn hit_node_in(
 
 fn contains(box_: &MathBox, point: (f32, f32)) -> bool {
     point.0 >= 0.0 && point.0 <= box_.width && point.1 >= -box_.descent && point.1 <= box_.ascent
+}
+
+fn circle_intersects_box(box_: &MathBox, point: (f32, f32), radius: f32) -> bool {
+    let nearest_x = point.0.clamp(0.0, box_.width);
+    let nearest_y = point.1.clamp(-box_.descent, box_.ascent);
+    let dx = point.0 - nearest_x;
+    let dy = point.1 - nearest_y;
+    dx * dx + dy * dy <= radius * radius
 }
 
 /// Return the visual bounds of `address` in the expression's coordinate space.
@@ -2190,6 +2272,79 @@ mod tests {
                 &fake_measure,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn circular_hit_includes_a_tangent_corner() {
+        let source = symbols("x");
+        let bounds = node_bounds(
+            &source,
+            &NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            },
+            0,
+            &fake_measure,
+        )
+        .expect("symbol bounds");
+        let point = (bounds.left - 3.0, bounds.bottom - 4.0);
+
+        assert_eq!(
+            hit_nodes_in_circle(&source, point, 5.0, 0, &fake_measure),
+            vec![NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            }]
+        );
+        assert!(hit_nodes_in_circle(&source, point, 4.99, 0, &fake_measure).is_empty());
+    }
+
+    #[test]
+    fn circular_hit_returns_deep_siblings_in_paint_order() {
+        let source = vec![fraction(symbols("ab"), symbols("d"))];
+        let expression = layout(&source, 0, &fake_measure);
+        let BoxKind::Row { children } = &expression.kind else {
+            panic!("expression must be a row");
+        };
+        let fraction = &children[0];
+        let BoxKind::Row {
+            children: fraction_children,
+        } = &fraction.2.kind
+        else {
+            panic!("fraction must be a row");
+        };
+        let numerator = &fraction_children[0];
+        let BoxKind::Row {
+            children: numerator_children,
+        } = &numerator.2.kind
+        else {
+            panic!("numerator must be a row");
+        };
+        let boundary = numerator_children[1].0;
+        let point = (
+            fraction.0 + numerator.0 + boundary,
+            fraction.1 + numerator.1,
+        );
+
+        assert_eq!(
+            hit_nodes_in_circle(&source, point, 0.0, 0, &fake_measure),
+            vec![
+                NodeAddress {
+                    path: vec![Step {
+                        index: 0,
+                        slot: Slot::Num,
+                    }],
+                    index: 1,
+                },
+                NodeAddress {
+                    path: vec![Step {
+                        index: 0,
+                        slot: Slot::Num,
+                    }],
+                    index: 0,
+                },
+            ]
         );
     }
 }

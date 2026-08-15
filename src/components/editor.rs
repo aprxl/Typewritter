@@ -4,7 +4,7 @@
 
 use std::rc::Rc;
 
-use crate::document::layout::{self, DocLayout};
+use crate::document::layout::{self, ContextHit, DocLayout, RangeKind};
 use crate::document::math::{MathCursor, NodeAddress, SymbolRole};
 use crate::document::math_layout::{self, BoxKind, MathBox, MathPrimitive};
 use crate::document::{ATOM, BadgeColor, Block, Caret, FlatRange, Inline, Style};
@@ -28,6 +28,9 @@ const NUMBER_SIZE: f32 = 11.0;
 pub const MEASURE: f32 = 634.0;
 /// Space kept past the right edge before a line may wrap.
 pub const RIGHT_MARGIN: f32 = 24.0;
+/// Radius of the Ctrl-drag selection brush in logical pixels.
+pub const BRUSH_RADIUS: f32 = 18.0;
+const BRUSH_RING: &str = "M 18 0 A 18 18 0 1 0 -18 0 A 18 18 0 1 0 18 0";
 /// Padding of the tint behind code: a fenced block gets the generous one,
 /// an inline span the tight one, so a `` `run` `` mid-sentence doesn't push
 /// the line apart.
@@ -77,6 +80,51 @@ fn math_rect(box_: &MathBox, origin: (f32, f32)) -> Rect {
         width: box_.width,
         height: box_.ascent + box_.descent,
     }
+}
+
+fn draw_math_selection(
+    layer: &Layer,
+    list: &crate::document::math::MathList,
+    address: Option<&NodeAddress>,
+    box_: &MathBox,
+    origin: (f32, f32),
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) {
+    const PAD: f32 = 2.0;
+    let rect = if let Some(address) = address {
+        let Some(bounds) = math_layout::node_bounds(list, address, 0, measure) else {
+            return;
+        };
+        Rect {
+            x: origin.0 + bounds.left - PAD,
+            y: origin.1 - bounds.top - PAD,
+            width: bounds.right - bounds.left + PAD * 2.0,
+            height: bounds.top - bounds.bottom + PAD * 2.0,
+        }
+    } else {
+        let rect = math_rect(box_, origin);
+        Rect {
+            x: rect.x - PAD,
+            y: rect.y - PAD,
+            width: rect.width + PAD * 2.0,
+            height: rect.height + PAD * 2.0,
+        }
+    };
+    layer.draw_rectangle(
+        rect.position(),
+        rect.size(),
+        theme::SELECTION,
+        MATH_SELECTION_ROUNDING,
+    );
+}
+
+fn draw_brush(layer: &Layer, center: (f32, f32)) {
+    layer.draw_circle(center, BRUSH_RADIUS, theme::fade(theme::ACCENT, 0.14));
+    let mut stroke = Stroke::new(theme::ACCENT, 1.5);
+    stroke.cap = LineCap::Round;
+    layer
+        .draw_path(BRUSH_RING, center, PathPaint::Stroke(stroke))
+        .expect("brush ring is a static path");
 }
 
 fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: bool) {
@@ -233,6 +281,8 @@ pub struct Editor {
     /// typing goes.
     math: Option<MathCursor>,
     math_selection: Option<(usize, usize, NodeAddress)>,
+    context_selections: Vec<ContextHit>,
+    brush_point: Option<(f32, f32)>,
     dirty: Dirty,
 }
 
@@ -260,6 +310,8 @@ impl Editor {
             line_selection: false,
             math: None,
             math_selection: None,
+            context_selections: Vec::new(),
+            brush_point: None,
             caret_on: true,
             glow: None,
             dirty: Dirty::new(),
@@ -273,6 +325,16 @@ impl Editor {
 
     pub fn with_math_selection(mut self, selection: Option<(usize, usize, NodeAddress)>) -> Self {
         self.math_selection = selection;
+        self
+    }
+
+    pub fn with_context_selections(
+        mut self,
+        selections: Vec<ContextHit>,
+        brush_point: Option<(f32, f32)>,
+    ) -> Self {
+        self.context_selections = selections;
+        self.brush_point = brush_point;
         self
     }
 
@@ -306,6 +368,8 @@ impl Editor {
             line_selection: false,
             math: None,
             math_selection: None,
+            context_selections: Vec::new(),
+            brush_point: None,
             caret_on: true,
             glow: None,
             dirty: Dirty::new(),
@@ -466,6 +530,18 @@ impl Component for Editor {
         }
 
         self.draw_selection(layer, rect, x, content);
+        for target in &self.context_selections {
+            if let ContextHit::Range { range, kind } = target {
+                self.draw_selection_range(
+                    layer,
+                    rect,
+                    x,
+                    content,
+                    *range,
+                    *kind == RangeKind::CodeBlock,
+                );
+            }
+        }
 
         // (text, style, x, width) for one visual line — measured first so
         // the code tints can be painted underneath the text.
@@ -542,19 +618,34 @@ impl Component for Editor {
                             &self.math_selection
                             && *selected_block == bi
                             && *selected_inline == segment.inline
-                            && let Some(bounds) =
-                                math_layout::node_bounds(list, address, 0, &measure)
                         {
-                            const PAD: f32 = 2.0;
-                            layer.draw_rectangle(
-                                (cursor + bounds.left - PAD, baseline - bounds.top - PAD),
-                                (
-                                    bounds.right - bounds.left + PAD * 2.0,
-                                    bounds.top - bounds.bottom + PAD * 2.0,
-                                ),
-                                theme::SELECTION,
-                                MATH_SELECTION_ROUNDING,
+                            draw_math_selection(
+                                layer,
+                                list,
+                                Some(address),
+                                &box_,
+                                (cursor, baseline),
+                                &measure,
                             );
+                        }
+                        for target in &self.context_selections {
+                            if let ContextHit::Math {
+                                block,
+                                inline,
+                                node,
+                            } = target
+                                && *block == bi
+                                && *inline == segment.inline
+                            {
+                                draw_math_selection(
+                                    layer,
+                                    list,
+                                    node.as_ref(),
+                                    &box_,
+                                    (cursor, baseline),
+                                    &measure,
+                                );
+                            }
                         }
                         draw_math(layer, &box_, (cursor, baseline));
                         if let Some(math_cursor) = math_focus
@@ -657,6 +748,10 @@ impl Component for Editor {
         let screen_x = x + caret_x;
         let screen_y = content + caret_baseline - self.scroll;
 
+        if let Some(point) = self.brush_point {
+            draw_brush(layer, point);
+        }
+
         if self.math.is_some() {
             return;
         }
@@ -712,6 +807,18 @@ impl Editor {
         let Some(selection) = self.selection else {
             return;
         };
+        self.draw_selection_range(layer, rect, x, content, selection, self.line_selection);
+    }
+
+    fn draw_selection_range(
+        &self,
+        layer: &Layer,
+        rect: Rect,
+        x: f32,
+        content: f32,
+        selection: FlatRange,
+        line_selection: bool,
+    ) {
         let range = selection.normalized();
         for (bi, block) in self.layout.blocks.iter().enumerate() {
             let mut line_start = 0;
@@ -719,7 +826,7 @@ impl Editor {
                 let top = content + line.y - self.scroll;
                 let line_end = line_start + line.segments.iter().map(|s| s.len).sum::<usize>();
                 if top + line.height >= rect.y && top <= rect.bottom() {
-                    if self.line_selection {
+                    if line_selection {
                         if (range.start.block..=range.end.block).contains(&bi) {
                             layer.draw_rectangle(
                                 (rect.x, top),
@@ -969,6 +1076,49 @@ mod tests {
             editor.numbers,
             vec![None, Some("1".into()), Some("1.1".into())]
         );
+    }
+
+    #[test]
+    fn editor_keeps_brush_targets_and_pointer_together() {
+        let mut document = Document::new(Path::new("notes/test.md"));
+        document.blocks = vec![Block::Paragraph(vec![Inline::Text(Text {
+            text: "x".into(),
+            style: Style::PLAIN,
+        })])];
+        let target = ContextHit::Range {
+            range: FlatRange::new(
+                crate::document::FlatPos {
+                    block: 0,
+                    offset: 0,
+                },
+                crate::document::FlatPos {
+                    block: 0,
+                    offset: 1,
+                },
+            ),
+            kind: RangeKind::Word,
+        };
+        let layout = layout::layout(&document, 1000.0, &|value, _| {
+            value.chars().count() as f32 * 10.0
+        });
+        let editor = Editor::new(Rc::new(layout), document.caret, 0.0, false, Style::PLAIN)
+            .with_context_selections(vec![target.clone()], Some((42.0, 24.0)));
+
+        assert_eq!(editor.context_selections, vec![target]);
+        assert_eq!(editor.brush_point, Some((42.0, 24.0)));
+    }
+
+    #[test]
+    fn brush_ring_is_valid_renderer_path_data() {
+        use lyon::path::Path;
+        use lyon_extra::parser::{ParserOptions, PathParser, Source};
+
+        let mut parser = PathParser::new();
+        let mut builder = Path::builder();
+        let mut source = Source::new(BRUSH_RING.chars());
+        parser
+            .parse(&ParserOptions::DEFAULT, &mut source, &mut builder)
+            .expect("brush ring path");
     }
 
     #[test]
