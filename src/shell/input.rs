@@ -2468,9 +2468,7 @@ fn toggle_brush_hits(
     current_hits: Vec<ContextHit>,
 ) {
     for hit in swept_hits.iter().filter(|hit| !inside.contains(hit)) {
-        if let Some(index) = selected.iter().position(|selected| selected == hit) {
-            selected.remove(index);
-        } else {
+        if let None = selected.iter().position(|selected| selected == hit) {
             selected.push(hit.clone());
         }
     }

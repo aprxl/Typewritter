@@ -29,7 +29,7 @@ pub const MEASURE: f32 = 634.0;
 /// Space kept past the right edge before a line may wrap.
 pub const RIGHT_MARGIN: f32 = 24.0;
 /// Radius of the Ctrl-drag selection brush in logical pixels.
-pub const BRUSH_RADIUS: f32 = 18.0;
+pub const BRUSH_RADIUS: f32 = 9.0;
 const BRUSH_RING: &str = "M 18 0 A 18 18 0 1 0 -18 0 A 18 18 0 1 0 18 0";
 /// Padding of the tint behind code: a fenced block gets the generous one,
 /// an inline span the tight one, so a `` `run` `` mid-sentence doesn't push
@@ -120,11 +120,6 @@ fn draw_math_selection(
 
 fn draw_brush(layer: &Layer, center: (f32, f32)) {
     layer.draw_circle(center, BRUSH_RADIUS, theme::fade(theme::ACCENT, 0.14));
-    let mut stroke = Stroke::new(theme::ACCENT, 1.5);
-    stroke.cap = LineCap::Round;
-    layer
-        .draw_path(BRUSH_RING, center, PathPaint::Stroke(stroke))
-        .expect("brush ring is a static path");
 }
 
 fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: bool) {
