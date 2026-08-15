@@ -28,6 +28,7 @@ fn print_list(list: &MathList, output: &mut String) {
                 MathNode::Frac { .. }
                     | MathNode::Script { .. }
                     | MathNode::Sqrt { .. }
+                    | MathNode::Accent { .. }
                     | MathNode::BigOp { .. }
             ))
             || (index == 0
@@ -91,6 +92,12 @@ fn print_node(node: &MathNode, output: &mut String) {
         }
         MathNode::Sqrt { body } => {
             output.push_str("sqrt");
+            output.push('{');
+            print_list(body, output);
+            output.push('}');
+        }
+        MathNode::Accent { kind, body } => {
+            output.push_str(kind.keyword());
             output.push('{');
             print_list(body, output);
             output.push('}');
@@ -298,6 +305,7 @@ fn attach_or_wrap_script(items: &mut Vec<(MathList, bool)>, which: Slot, script:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::math::AccentKind;
 
     fn sym(s: &str) -> MathList {
         s.chars().map(MathNode::Sym).collect()
@@ -317,6 +325,10 @@ mod tests {
 
     fn sqrt(body: MathList) -> MathNode {
         MathNode::Sqrt { body }
+    }
+
+    fn accent(kind: AccentKind, body: MathList) -> MathNode {
+        MathNode::Accent { kind, body }
     }
 
     fn big_op(kind: BigOp, lower: MathList, upper: MathList) -> MathNode {
@@ -417,6 +429,21 @@ mod tests {
 
         assert_eq!(print(&list), "sqrt{1+x}");
         assert_eq!(parse("sqrt{1+x}"), list);
+    }
+
+    #[test]
+    fn accents_print_with_their_keyword_and_braced_body() {
+        for (kind, printed) in [
+            (AccentKind::Vector, "vec{x_1}"),
+            (AccentKind::Dot, "dot{x_1}"),
+            (AccentKind::DoubleDot, "ddot{x_1}"),
+            (AccentKind::TripleDot, "dddot{x_1}"),
+        ] {
+            let tree = vec![accent(kind, vec![script(sym("x"), None, Some(sym("1")))])];
+
+            assert_eq!(print(&tree), printed);
+            assert_eq!(parse(printed), tree);
+        }
     }
 
     #[test]
@@ -542,9 +569,9 @@ mod tests {
         (0..length)
             .flat_map(|_| {
                 let choice = if depth > 0 {
-                    generator.next() % 7
+                    generator.next() % 8
                 } else {
-                    5 + generator.next() % 2
+                    6 + generator.next() % 2
                 };
                 match choice {
                     0 => vec![frac(
@@ -594,7 +621,18 @@ mod tests {
                         vec![big_op(kind, lower, upper)]
                     }
                     5 => {
-                        const KEYWORDS: &[&str] = &["sqrt", "sum", "prod", "int", "lim"];
+                        let kind = match generator.next() % 4 {
+                            0 => AccentKind::Vector,
+                            1 => AccentKind::Dot,
+                            2 => AccentKind::DoubleDot,
+                            _ => AccentKind::TripleDot,
+                        };
+                        vec![accent(kind, generated_list(generator, depth - 1))]
+                    }
+                    6 => {
+                        const KEYWORDS: &[&str] = &[
+                            "sqrt", "vec", "dot", "ddot", "dddot", "sum", "prod", "int", "lim",
+                        ];
                         KEYWORDS[(generator.next() % KEYWORDS.len() as u64) as usize]
                             .chars()
                             .map(MathNode::Sym)

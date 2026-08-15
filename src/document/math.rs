@@ -27,6 +27,8 @@ pub enum MathNode {
     },
     /// A radical. One slot today; an index is an additive change to this node.
     Sqrt { body: MathList },
+    /// A notation accent drawn above its body.
+    Accent { kind: AccentKind, body: MathList },
     /// A large operator carrying its always-present limit slots.
     BigOp {
         kind: BigOp,
@@ -36,6 +38,26 @@ pub enum MathNode {
 }
 
 pub type MathList = Vec<MathNode>;
+
+/// Which accent is drawn above a node's body.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AccentKind {
+    Vector,
+    Dot,
+    DoubleDot,
+    TripleDot,
+}
+
+impl AccentKind {
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Vector => "vec",
+            Self::Dot => "dot",
+            Self::DoubleDot => "ddot",
+            Self::TripleDot => "dddot",
+        }
+    }
+}
 
 /// Which large operator, named by what it means rather than by its glyph.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,6 +81,29 @@ impl BigOp {
 
 fn empty_sqrt() -> MathNode {
     MathNode::Sqrt { body: Vec::new() }
+}
+
+fn empty_vec() -> MathNode {
+    empty_accent(AccentKind::Vector)
+}
+
+fn empty_dot() -> MathNode {
+    empty_accent(AccentKind::Dot)
+}
+
+fn empty_ddot() -> MathNode {
+    empty_accent(AccentKind::DoubleDot)
+}
+
+fn empty_dddot() -> MathNode {
+    empty_accent(AccentKind::TripleDot)
+}
+
+fn empty_accent(kind: AccentKind) -> MathNode {
+    MathNode::Accent {
+        kind,
+        body: Vec::new(),
+    }
 }
 
 fn empty_sum() -> MathNode {
@@ -98,6 +143,10 @@ pub(crate) type Word = (&'static str, fn() -> MathNode);
 
 pub(crate) const WORDS: &[Word] = &[
     ("sqrt", empty_sqrt),
+    (AccentKind::Vector.keyword(), empty_vec),
+    (AccentKind::Dot.keyword(), empty_dot),
+    (AccentKind::DoubleDot.keyword(), empty_ddot),
+    (AccentKind::TripleDot.keyword(), empty_dddot),
     (BigOp::Sum.keyword(), empty_sum),
     (BigOp::Prod.keyword(), empty_prod),
     (BigOp::Integral.keyword(), empty_integral),
@@ -121,6 +170,22 @@ pub const STRUCTURES: &[Structure] = &[
     Structure {
         name: "sqrt",
         preview: "√",
+    },
+    Structure {
+        name: "vec",
+        preview: "x⃗",
+    },
+    Structure {
+        name: "dot",
+        preview: "ẋ",
+    },
+    Structure {
+        name: "ddot",
+        preview: "ẍ",
+    },
+    Structure {
+        name: "dddot",
+        preview: "x⃛",
     },
     Structure {
         name: "sum",
@@ -263,6 +328,7 @@ impl MathNode {
             }
             Self::Group { .. } => vec![Slot::Body],
             Self::Sqrt { .. } => vec![Slot::Body],
+            Self::Accent { .. } => vec![Slot::Body],
             Self::BigOp { kind, .. } => {
                 if *kind == BigOp::Limit {
                     vec![Slot::Lower]
@@ -286,6 +352,7 @@ impl MathNode {
             (Self::Script { sub: Some(sub), .. }, Slot::Sub) => Some(sub),
             (Self::Group { body, .. }, Slot::Body) => Some(body),
             (Self::Sqrt { body }, Slot::Body) => Some(body),
+            (Self::Accent { body, .. }, Slot::Body) => Some(body),
             (Self::BigOp { lower, .. }, Slot::Lower) => Some(lower),
             (Self::BigOp { kind, upper, .. }, Slot::Upper) if *kind != BigOp::Limit => Some(upper),
             (Self::Sym(_), _) => None,
@@ -293,6 +360,7 @@ impl MathNode {
             | (Self::Script { .. }, _)
             | (Self::Group { .. }, _)
             | (Self::Sqrt { .. }, _)
+            | (Self::Accent { .. }, _)
             | (Self::BigOp { .. }, _) => None,
         }
     }
@@ -306,6 +374,7 @@ impl MathNode {
             (Self::Script { sub: Some(sub), .. }, Slot::Sub) => Some(sub),
             (Self::Group { body, .. }, Slot::Body) => Some(body),
             (Self::Sqrt { body }, Slot::Body) => Some(body),
+            (Self::Accent { body, .. }, Slot::Body) => Some(body),
             (Self::BigOp { lower, .. }, Slot::Lower) => Some(lower),
             (Self::BigOp { kind, upper, .. }, Slot::Upper) if *kind != BigOp::Limit => Some(upper),
             (Self::Sym(_), _) => None,
@@ -313,6 +382,7 @@ impl MathNode {
             | (Self::Script { .. }, _)
             | (Self::Group { .. }, _)
             | (Self::Sqrt { .. }, _)
+            | (Self::Accent { .. }, _)
             | (Self::BigOp { .. }, _) => None,
         }
     }
@@ -428,6 +498,10 @@ pub fn insert_structure(root: &mut MathList, cursor: &mut MathCursor, name: &str
             insert_group(root, cursor, '[');
         }
         "sqrt" => insert_node(root, cursor, empty_sqrt()),
+        "vec" => insert_node(root, cursor, empty_vec()),
+        "dot" => insert_node(root, cursor, empty_dot()),
+        "ddot" => insert_node(root, cursor, empty_ddot()),
+        "dddot" => insert_node(root, cursor, empty_dddot()),
         "sum" => insert_node(root, cursor, empty_sum()),
         "prod" => insert_node(root, cursor, empty_prod()),
         "int" => insert_node(root, cursor, empty_integral()),
@@ -750,6 +824,15 @@ pub fn backspace(root: &mut MathList, cursor: &mut MathCursor) -> Removed {
                 );
                 cursor.index = position + keyword.chars().count();
             }
+            MathNode::Accent { kind, body } => {
+                let keyword = kind.keyword();
+                list.remove(position);
+                list.splice(
+                    position..position,
+                    keyword.chars().map(MathNode::Sym).chain(body),
+                );
+                cursor.index = position + keyword.chars().count();
+            }
             MathNode::BigOp { kind, lower, upper } => {
                 let keyword = kind.keyword();
                 let keyword_len = keyword.chars().count();
@@ -1039,6 +1122,10 @@ mod tests {
         MathNode::Sqrt { body }
     }
 
+    fn accent(kind: AccentKind, body: MathList) -> MathNode {
+        MathNode::Accent { kind, body }
+    }
+
     fn big_op(kind: BigOp, lower: MathList, upper: MathList) -> MathNode {
         MathNode::BigOp { kind, lower, upper }
     }
@@ -1085,6 +1172,23 @@ mod tests {
         assert!(insert_word(&mut root, &mut cursor));
         assert_eq!(root, vec![big_op(BigOp::Sum, Vec::new(), Vec::new())]);
         assert_eq!(cursor, at_path(&[(0, Slot::Lower)], 0));
+    }
+
+    #[test]
+    fn accent_words_build_their_semantic_nodes() {
+        for (word, kind) in [
+            ("vec", AccentKind::Vector),
+            ("dot", AccentKind::Dot),
+            ("ddot", AccentKind::DoubleDot),
+            ("dddot", AccentKind::TripleDot),
+        ] {
+            let mut root = sym(word);
+            let mut cursor = at(word.chars().count());
+
+            assert!(insert_word(&mut root, &mut cursor));
+            assert_eq!(root, vec![accent(kind, Vec::new())]);
+            assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
+        }
     }
 
     #[test]
@@ -1182,6 +1286,17 @@ mod tests {
         assert!(insert_structure(&mut root, &mut cursor, "sqrt"));
 
         assert_eq!(root, vec![sqrt(Vec::new())]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
+    }
+
+    #[test]
+    fn an_accent_completion_builds_in_place_of_the_word() {
+        let mut root = sym("dddot");
+        let mut cursor = at(5);
+
+        assert!(insert_structure(&mut root, &mut cursor, "dddot"));
+
+        assert_eq!(root, vec![accent(AccentKind::TripleDot, Vec::new())]);
         assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
     }
 
@@ -1448,6 +1563,17 @@ mod tests {
     }
 
     #[test]
+    fn backspace_reverts_an_accent_to_its_keyword_and_body() {
+        let mut root = vec![accent(AccentKind::DoubleDot, sym("x"))];
+        let mut cursor = at(1);
+
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+
+        assert_eq!(root, sym("ddotx"));
+        assert_eq!(cursor, at(4));
+    }
+
+    #[test]
     fn backspace_reverts_a_big_operator_to_its_letters() {
         let mut root = vec![big_op(BigOp::Sum, sym("i=0"), sym("n"))];
         let mut cursor = at(1);
@@ -1551,6 +1677,21 @@ mod tests {
         assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
         assert!(slot_next(&root, &mut cursor));
         assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn arrows_and_tab_walk_an_accent_body() {
+        let root = vec![accent(AccentKind::Vector, sym("x"))];
+        let mut cursor = MathCursor::default();
+
+        assert!(move_right(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
+        assert!(move_right(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 1));
+        assert!(slot_next(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
+        assert!(move_left(&root, &mut cursor));
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 1));
     }
 
     #[test]

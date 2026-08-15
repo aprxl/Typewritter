@@ -8,7 +8,7 @@
 //! Box origins are anchor-left. Every child tuple stores `(x, y, box)` with
 //! `y` positive upward; a denominator therefore has a negative y offset.
 
-use crate::document::math::{BigOp, MathCursor, MathList, MathNode, Slot, Step};
+use crate::document::math::{AccentKind, BigOp, MathCursor, MathList, MathNode, Slot, Step};
 use crate::theme::{self, TextStyle};
 
 /// Math base size at script level 0. Matches body text so an inline expression
@@ -43,6 +43,11 @@ pub const RADICAL_GAP: f32 = 0.10;
 pub const BIGOP_SCALE: f32 = 1.6;
 /// Clearance between a large operator and each of its limits.
 pub const BIGOP_GAP: f32 = 0.12;
+/// Stroke width for scalable math geometry at level zero. Height changes do
+/// not change it, so tall delimiters stay the same visual weight as short ones.
+pub const SHAPE_STROKE: f32 = 1.25;
+/// Vertical clearance between an accent and the body it annotates.
+pub const ACCENT_GAP: f32 = 0.10;
 
 // The renderer centers glyphs vertically, so glyph boxes are symmetric about
 // the anchor. Structural boxes use their near edge when clearance matters.
@@ -55,7 +60,22 @@ pub struct MathBox {
     pub ascent: f32,
     /// Depth below this box's anchor line.
     pub descent: f32,
+    /// Draw a rounded variable background behind this whole box.
+    pub highlight: bool,
     pub kind: BoxKind,
+}
+
+/// Renderer-independent geometry emitted by math layout.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MathPrimitive {
+    Stroke {
+        path: String,
+        thickness: f32,
+    },
+    Dots {
+        centers: Vec<(f32, f32)>,
+        radius: f32,
+    },
 }
 
 /// Visual shape and children of a [`MathBox`].
@@ -71,6 +91,7 @@ pub enum BoxKind {
     Slot {
         size: f32,
     },
+    Primitive(MathPrimitive),
     /// Child y offsets are anchor-relative and positive upward.
     Row {
         children: Vec<(f32, f32, MathBox)>,
@@ -111,6 +132,7 @@ fn glyph(ch: char, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> M
         width: measure(&text, &TextStyle::math(size, theme::INK)),
         ascent: half,
         descent: half,
+        highlight: ch.is_alphabetic(),
         kind: BoxKind::Glyph { text, size },
     }
 }
@@ -123,6 +145,7 @@ fn slot_box(level: usize) -> MathBox {
         width: SLOT_W * scale,
         ascent: half,
         descent: half,
+        highlight: false,
         kind: BoxKind::Slot { size: height },
     }
 }
@@ -138,6 +161,7 @@ fn layout_node(
         MathNode::Script { .. } => script(node, level, measure),
         MathNode::Group { open, close, body } => group(node, *open, *close, body, level, measure),
         MathNode::Sqrt { body } => radical(node, body, level, measure),
+        MathNode::Accent { kind, body } => accent(node, *kind, body, level, measure),
         MathNode::BigOp { kind, lower, upper } => big_op(node, kind, lower, upper, level, measure),
     }
 }
@@ -148,6 +172,7 @@ fn text_glyph(text: &str, size: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) 
         width: measure(text, &TextStyle::math(size, theme::INK)),
         ascent: half,
         descent: half,
+        highlight: false,
         kind: BoxKind::Glyph {
             text: text.to_owned(),
             size,
@@ -208,6 +233,42 @@ fn stretchy_size(body: &MathBox, level: usize) -> f32 {
     size(level).max((body.ascent + body.descent) * DELIM_FILL)
 }
 
+fn stroked_box(width: f32, ascent: f32, descent: f32, path: String, level: usize) -> MathBox {
+    MathBox {
+        width,
+        ascent,
+        descent,
+        highlight: false,
+        kind: BoxKind::Primitive(MathPrimitive::Stroke {
+            path,
+            thickness: SHAPE_STROKE * scale(level),
+        }),
+    }
+}
+
+fn delimiter(ch: char, height: f32, level: usize) -> MathBox {
+    let width = size(level) * 0.34;
+    let stroke = SHAPE_STROKE * scale(level);
+    let top = -height * 0.5 + stroke * 0.5;
+    let bottom = height * 0.5 - stroke * 0.5;
+    let path = match ch {
+        '(' => format!(
+            "M {width} {top} C 0 {top_half}, 0 {bottom_half}, {width} {bottom}",
+            top_half = top * 0.45,
+            bottom_half = bottom * 0.45,
+        ),
+        ')' => format!(
+            "M 0 {top} C {width} {top_half}, {width} {bottom_half}, 0 {bottom}",
+            top_half = top * 0.45,
+            bottom_half = bottom * 0.45,
+        ),
+        '[' => format!("M {width} {top} H 0 V {bottom} H {width}"),
+        ']' => format!("M 0 {top} H {width} V {bottom} H 0"),
+        _ => format!("M {} {top} V {bottom}", width * 0.5),
+    };
+    stroked_box(width, height * 0.5, height * 0.5, path, level)
+}
+
 fn group(
     node: &MathNode,
     open: char,
@@ -217,9 +278,9 @@ fn group(
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> MathBox {
     let body = layout(body, level, measure);
-    let delimiter_size = stretchy_size(&body, level);
-    let opener = text_glyph(&open.to_string(), delimiter_size, measure);
-    let closer = text_glyph(&close.to_string(), delimiter_size, measure);
+    let delimiter_height = stretchy_size(&body, level);
+    let opener = delimiter(open, delimiter_height, level);
+    let closer = delimiter(close, delimiter_height, level);
     let body_x = opener.width;
     let closer_x = body_x + body.width;
     let mut children = (0..3).map(|_| None).collect::<Vec<_>>();
@@ -242,26 +303,101 @@ fn radical(
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> MathBox {
     let body = layout(body, level, measure);
-    let radical_size = stretchy_size(&body, level);
-    let sign = text_glyph("√", radical_size, measure);
-    let body_x = sign.width;
+    let stroke = SHAPE_STROKE * scale(level);
+    let body_x = size(level) * 0.48;
     let gap = size(level) * RADICAL_GAP;
-    let bar_y = body.ascent + gap + BAR * 0.5;
-    let bar = MathBox {
-        width: body.width,
-        ascent: BAR * 0.5,
-        descent: BAR * 0.5,
-        kind: BoxKind::Bar { thickness: BAR },
-    };
-    let mut children = (0..3).map(|_| None).collect::<Vec<_>>();
+    let top = -(body.ascent + gap + stroke * 0.5);
+    let valley = body.descent * 0.65;
+    let width = body_x + body.width;
+    let path = format!(
+        "M {} {} L {} {valley} L {} {} Q {} {top}, {body_x} {top} H {}",
+        stroke * 0.5,
+        body.descent * 0.1,
+        body_x * 0.25,
+        body_x * 0.48,
+        -body.ascent * 0.12,
+        body_x * 0.78,
+        width - stroke * 0.5,
+    );
+    let sign = stroked_box(
+        width,
+        -top + stroke * 0.5,
+        valley + stroke * 0.5,
+        path,
+        level,
+    );
+    let mut children = (0..2).map(|_| None).collect::<Vec<_>>();
     children[0] = Some((0.0, 0.0, sign));
-    children[1] = Some((body_x, bar_y, bar));
     children[slot_child_index(node, Slot::Body).expect("radical body slot index")] =
         Some((body_x, 0.0, body));
     row_box(
         children
             .into_iter()
             .map(|child| child.expect("every radical child must be laid out"))
+            .collect(),
+    )
+}
+
+fn accent(
+    node: &MathNode,
+    kind: AccentKind,
+    body: &MathList,
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> MathBox {
+    let body = layout(body, level, measure);
+    let stroke = SHAPE_STROKE * scale(level);
+    let height = size(level) * 0.22;
+    let y = -height * 0.45;
+    let primitive = match kind {
+        AccentKind::Vector => {
+            let end = body.width - stroke * 0.5;
+            let head = height * 0.75;
+            MathPrimitive::Stroke {
+                path: format!(
+                    "M {} {y} H {end} M {} {} L {end} {y} L {} {}",
+                    stroke * 0.5,
+                    end - head,
+                    y - head * 0.7,
+                    end - head,
+                    y + head * 0.7,
+                ),
+                thickness: stroke,
+            }
+        }
+        AccentKind::Dot | AccentKind::DoubleDot | AccentKind::TripleDot => {
+            let count = match kind {
+                AccentKind::Dot => 1,
+                AccentKind::DoubleDot => 2,
+                AccentKind::TripleDot => 3,
+                AccentKind::Vector => unreachable!(),
+            };
+            let spacing = stroke * 2.5;
+            let start = body.width * 0.5 - spacing * (count as f32 - 1.0) * 0.5;
+            MathPrimitive::Dots {
+                centers: (0..count)
+                    .map(|i| (start + i as f32 * spacing, y))
+                    .collect(),
+                radius: stroke,
+            }
+        }
+    };
+    let mark = MathBox {
+        width: body.width,
+        ascent: height,
+        descent: 0.0,
+        highlight: false,
+        kind: BoxKind::Primitive(primitive),
+    };
+    let mark_y = body.ascent + size(level) * ACCENT_GAP;
+    let mut children = vec![None, None];
+    children[0] = Some((0.0, mark_y, mark));
+    children[slot_child_index(node, Slot::Body).expect("accent body slot index")] =
+        Some((0.0, 0.0, body));
+    row_box(
+        children
+            .into_iter()
+            .map(|child| child.expect("every accent child must be laid out"))
             .collect(),
     )
 }
@@ -300,12 +436,15 @@ fn script(node: &MathNode, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f
 
     // `slots` drives both this order and `slot_child_index`, so traversal sees
     // exactly the children this layout emitted.
-    row_box(
+    let mut box_ = row_box(
         children
             .into_iter()
             .map(|child| child.expect("every script slot must be laid out"))
             .collect(),
-    )
+    );
+    box_.highlight = matches!(node, MathNode::Script { base, .. }
+        if matches!(base.as_slice(), [MathNode::Sym(ch)] if ch.is_alphabetic()));
+    box_
 }
 
 fn fraction(
@@ -327,6 +466,7 @@ fn fraction(
         width,
         ascent: BAR * 0.5,
         descent: BAR * 0.5,
+        highlight: false,
         kind: BoxKind::Bar { thickness: BAR },
     };
     // Anchor line is the inline prose middle, so placing the bar at zero
@@ -368,7 +508,7 @@ fn slot_child_index(node: &MathNode, slot: Slot) -> Option<usize> {
     // precedes limits, and a fraction bar sits between numerator and denominator.
     let visual_offset = match node {
         MathNode::Group { .. } => 1,
-        MathNode::Sqrt { .. } => 2,
+        MathNode::Sqrt { .. } | MathNode::Accent { .. } => 1,
         MathNode::BigOp { .. } => 1,
         MathNode::Frac { .. } => usize::from(slot_index > 0),
         MathNode::Sym(_) | MathNode::Script { .. } => 0,
@@ -393,6 +533,7 @@ fn row_box(children: Vec<(f32, f32, MathBox)>) -> MathBox {
         width,
         ascent,
         descent,
+        highlight: false,
         kind: BoxKind::Row { children },
     }
 }
@@ -480,6 +621,7 @@ fn child_level(node: &MathNode, slot: Slot, level: usize) -> usize {
         MathNode::Script { .. } if slot == Slot::Base => level,
         MathNode::Group { .. } => level,
         MathNode::Sqrt { .. } => level,
+        MathNode::Accent { .. } => level,
         _ => (level + 1).min(2),
     }
 }
@@ -595,6 +737,10 @@ mod tests {
 
     fn radical(body: MathList) -> MathNode {
         MathNode::Sqrt { body }
+    }
+
+    fn accent(kind: AccentKind, body: MathList) -> MathNode {
+        MathNode::Accent { kind, body }
     }
 
     fn big_op(kind: BigOp, lower: MathList, upper: MathList) -> MathNode {
@@ -1104,11 +1250,12 @@ mod tests {
         else {
             panic!("group must produce row");
         };
-        let BoxKind::Glyph {
-            size: single_size, ..
-        } = &single_group[0].2.kind
+        let BoxKind::Primitive(MathPrimitive::Stroke {
+            thickness: single_stroke,
+            ..
+        }) = &single_group[0].2.kind
         else {
-            panic!("group opener must be glyph");
+            panic!("group opener must be stroked geometry");
         };
         let BoxKind::Row {
             children: nested_list,
@@ -1122,14 +1269,16 @@ mod tests {
         else {
             panic!("group must produce row");
         };
-        let BoxKind::Glyph {
-            size: nested_size, ..
-        } = &nested_group[0].2.kind
+        let BoxKind::Primitive(MathPrimitive::Stroke {
+            thickness: nested_stroke,
+            ..
+        }) = &nested_group[0].2.kind
         else {
-            panic!("group opener must be glyph");
+            panic!("group opener must be stroked geometry");
         };
 
-        assert!(*nested_size > *single_size);
+        assert!(nested_group[0].2.ascent > single_group[0].2.ascent);
+        assert_eq!(nested_stroke, single_stroke);
         assert!(nested_list[0].2.ascent + nested_list[0].2.descent > plain.ascent + plain.descent);
     }
 
@@ -1142,14 +1291,10 @@ mod tests {
         let BoxKind::Row { children: group } = &children[0].2.kind else {
             panic!("group must produce row");
         };
-        assert!(matches!(
-            group[0].2.kind,
-            BoxKind::Glyph { size, .. } if size >= BASE_SIZE
-        ));
-        assert!(matches!(
-            group[2].2.kind,
-            BoxKind::Glyph { size, .. } if size >= BASE_SIZE
-        ));
+        assert!(group[0].2.ascent + group[0].2.descent >= BASE_SIZE);
+        assert!(group[2].2.ascent + group[2].2.descent >= BASE_SIZE);
+        assert!(matches!(group[0].2.kind, BoxKind::Primitive(_)));
+        assert!(matches!(group[2].2.kind, BoxKind::Primitive(_)));
     }
 
     #[test]
@@ -1162,11 +1307,70 @@ mod tests {
         let BoxKind::Row { children: radical } = &radical_box.kind else {
             panic!("radical must produce row");
         };
-        let bar = &radical[1];
-        let body = &radical[2];
-        assert_eq!(bar.2.width, body.2.width);
-        assert!(bar.1 - bar.2.descent > body.1 + body.2.ascent);
-        assert!(radical_box.ascent >= bar.1 + bar.2.ascent);
+        let sign = &radical[0];
+        let body = &radical[1];
+        let BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }) = &sign.2.kind else {
+            panic!("radical must be one connected stroke");
+        };
+        assert_eq!(*thickness, SHAPE_STROKE);
+        assert_eq!(path.matches('M').count(), 1);
+        assert_eq!(sign.2.width, body.0 + body.2.width);
+        assert!(sign.2.ascent > body.2.ascent);
+        assert!(radical_box.ascent >= sign.2.ascent);
+    }
+
+    #[test]
+    fn accents_cover_their_body_without_changing_its_level() {
+        for kind in [
+            AccentKind::Vector,
+            AccentKind::Dot,
+            AccentKind::DoubleDot,
+            AccentKind::TripleDot,
+        ] {
+            let list = layout(&vec![accent(kind, symbols("xy"))], 0, &fake_measure);
+            let BoxKind::Row { children } = list.kind else {
+                panic!("accent list must produce row");
+            };
+            let BoxKind::Row { children: accent } = &children[0].2.kind else {
+                panic!("accent must produce row");
+            };
+            let mark = &accent[0];
+            let body = &accent[1];
+            assert_eq!(mark.2.width, body.2.width);
+            assert!(mark.1 - mark.2.descent > body.1 + body.2.ascent);
+            assert_eq!(body.2.width, BASE_SIZE);
+        }
+    }
+
+    #[test]
+    fn alphabetic_and_greek_symbols_are_highlighted() {
+        let box_ = layout(
+            &vec![MathNode::Sym('x'), MathNode::Sym('α'), MathNode::Sym('2')],
+            0,
+            &fake_measure,
+        );
+        let BoxKind::Row { children } = box_.kind else {
+            panic!("list must produce row");
+        };
+        assert!(children[0].2.highlight);
+        assert!(children[1].2.highlight);
+        assert!(!children[2].2.highlight);
+    }
+
+    #[test]
+    fn a_single_variable_base_highlights_the_whole_script_box() {
+        let list = layout(
+            &vec![script(symbols("x"), None, Some(symbols("12")))],
+            0,
+            &fake_measure,
+        );
+        let BoxKind::Row { children } = list.kind else {
+            panic!("list must produce row");
+        };
+        let script = &children[0].2;
+        assert!(script.highlight);
+        assert!(script.descent > BASE_SIZE * 0.5);
+        assert!(script.width > BASE_SIZE * 0.5);
     }
 
     #[test]
@@ -1254,7 +1458,18 @@ mod tests {
             index: 1,
         };
         let (radical_x, _, _) = cursor_pos(&radical_list, &radical_cursor, 0, &fake_measure);
-        assert!(radical_x > radical[2].0 && radical_x < radical[2].0 + radical[2].2.width);
+        assert!(radical_x > radical[1].0 && radical_x < radical[1].0 + radical[1].2.width);
+
+        let accent_list = vec![accent(AccentKind::Vector, symbols("xy"))];
+        let accent_cursor = MathCursor {
+            path: vec![Step {
+                index: 0,
+                slot: Slot::Body,
+            }],
+            index: 1,
+        };
+        let (accent_x, _, _) = cursor_pos(&accent_list, &accent_cursor, 0, &fake_measure);
+        assert!(accent_x > 0.0 && accent_x < layout(&accent_list, 0, &fake_measure).width);
 
         let sum_list = vec![big_op(BigOp::Sum, symbols("lo"), symbols("up"))];
         let sum_box = layout(&sum_list, 0, &fake_measure);
