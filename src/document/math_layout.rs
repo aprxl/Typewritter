@@ -48,6 +48,11 @@ pub const BIGOP_GAP: f32 = 0.12;
 pub const SHAPE_STROKE: f32 = 1.25;
 /// Vertical clearance between an accent and the body it annotates.
 pub const ACCENT_GAP: f32 = 0.10;
+/// Space inside the rounded background of a variable at level zero.
+pub const VARIABLE_PAD_X: f32 = 3.0;
+pub const VARIABLE_PAD_Y: f32 = 2.0;
+/// Optical overlap between adjacent integral-family glyphs at level zero.
+pub const INTEGRAL_OVERLAP: f32 = 2.5;
 
 // The renderer centers glyphs vertically, so glyph boxes are symmetric about
 // the anchor. Structural boxes use their near edge when clearance matters.
@@ -84,12 +89,15 @@ pub enum BoxKind {
     Glyph {
         text: String,
         size: f32,
+        /// Horizontal offset from the box edge to the glyph itself.
+        offset_x: f32,
     },
     Bar {
         thickness: f32,
     },
     Slot {
         size: f32,
+        visible: bool,
     },
     Primitive(MathPrimitive),
     /// Child y offsets are anchor-relative and positive upward.
@@ -108,7 +116,10 @@ pub fn layout(list: &MathList, level: usize, measure: &dyn Fn(&str, &TextStyle) 
 
     let mut children = Vec::with_capacity(list.len());
     let mut x = 0.0;
-    for node in list {
+    for (index, node) in list.iter().enumerate() {
+        if index > 0 && integral_family(&list[index - 1]) && integral_family(node) {
+            x -= INTEGRAL_OVERLAP * scale(level);
+        }
         let child = layout_node(node, level, measure);
         children.push((x, 0.0, child));
         x += children.last().expect("child was pushed").2.width;
@@ -124,16 +135,49 @@ fn size(level: usize) -> f32 {
     BASE_SIZE * scale(level)
 }
 
+fn integral_family(node: &MathNode) -> bool {
+    matches!(
+        node,
+        MathNode::BigOp {
+            kind: BigOp::Integral | BigOp::ContourIntegral,
+            ..
+        }
+    )
+}
+
 fn glyph(ch: char, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
+    glyph_with_highlight(ch, level, measure, ch.is_alphabetic())
+}
+
+fn glyph_with_highlight(
+    ch: char,
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+    highlight: bool,
+) -> MathBox {
     let size = size(level);
     let text = ch.to_string();
     let half = size * 0.5;
+    let pad_x = if highlight {
+        VARIABLE_PAD_X * scale(level)
+    } else {
+        0.0
+    };
+    let pad_y = if highlight {
+        VARIABLE_PAD_Y * scale(level)
+    } else {
+        0.0
+    };
     MathBox {
-        width: measure(&text, &TextStyle::math(size, theme::INK)),
-        ascent: half,
-        descent: half,
-        highlight: ch.is_alphabetic(),
-        kind: BoxKind::Glyph { text, size },
+        width: measure(&text, &TextStyle::math(size, theme::INK)) + pad_x * 2.0,
+        ascent: half + pad_y,
+        descent: half + pad_y,
+        highlight,
+        kind: BoxKind::Glyph {
+            text,
+            size,
+            offset_x: pad_x,
+        },
     }
 }
 
@@ -146,7 +190,31 @@ fn slot_box(level: usize) -> MathBox {
         ascent: half,
         descent: half,
         highlight: false,
-        kind: BoxKind::Slot { size: height },
+        kind: BoxKind::Slot {
+            size: height,
+            visible: true,
+        },
+    }
+}
+
+fn invisible_slot_box(level: usize) -> MathBox {
+    let mut box_ = slot_box(level);
+    let BoxKind::Slot { visible, .. } = &mut box_.kind else {
+        unreachable!("slot_box must produce a slot");
+    };
+    *visible = false;
+    box_
+}
+
+fn contributes_to_measure(box_: &MathBox) -> bool {
+    !matches!(box_.kind, BoxKind::Slot { visible: false, .. })
+}
+
+fn measured_width(box_: &MathBox) -> f32 {
+    if contributes_to_measure(box_) {
+        box_.width
+    } else {
+        0.0
     }
 }
 
@@ -176,6 +244,7 @@ fn text_glyph(text: &str, size: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) 
         kind: BoxKind::Glyph {
             text: text.to_owned(),
             size,
+            offset_x: 0.0,
         },
     }
 }
@@ -192,20 +261,29 @@ fn big_op(
         BigOp::Sum => ("∑", size(level) * BIGOP_SCALE),
         BigOp::Prod => ("∏", size(level) * BIGOP_SCALE),
         BigOp::Integral => ("∫", size(level) * BIGOP_SCALE),
+        BigOp::ContourIntegral => ("∮", size(level) * BIGOP_SCALE),
         BigOp::Limit => ("lim", size(level)),
     };
     let operator = text_glyph(operator_text, operator_size, measure);
     let operand_level = (level + 1).min(2);
-    let lower = layout(lower, operand_level, measure);
+    let hide_empty_limits = matches!(kind, BigOp::Integral | BigOp::ContourIntegral);
+    let lower_visible = !lower.is_empty() || !hide_empty_limits;
+    let lower = if lower_visible {
+        layout(lower, operand_level, measure)
+    } else {
+        invisible_slot_box(operand_level)
+    };
     let upper = if *kind == BigOp::Limit {
         None
+    } else if upper.is_empty() && hide_empty_limits {
+        Some(invisible_slot_box(operand_level))
     } else {
         Some(layout(upper, operand_level, measure))
     };
     let width = operator
         .width
-        .max(lower.width)
-        .max(upper.as_ref().map_or(0.0, |upper| upper.width));
+        .max(measured_width(&lower))
+        .max(upper.as_ref().map_or(0.0, measured_width));
     let gap = size(level) * BIGOP_GAP;
     let operator_ascent = operator.ascent;
     let operator_descent = operator.descent;
@@ -214,12 +292,14 @@ fn big_op(
         .map(|_| None)
         .collect::<Vec<_>>();
     children[0] = Some(((width - operator.width) * 0.5, 0.0, operator));
+    let lower_x = (width - lower.width) * 0.5;
     children[slot_child_index(node, Slot::Lower).expect("big operator lower slot index")] =
-        Some(((width - lower.width) * 0.5, lower_y, lower));
+        Some((lower_x, lower_y, lower));
     if let Some(upper) = upper {
         let upper_y = operator_ascent + gap + upper.descent;
+        let upper_x = (width - upper.width) * 0.5;
         children[slot_child_index(node, Slot::Upper).expect("big operator upper slot index")] =
-            Some(((width - upper.width) * 0.5, upper_y, upper));
+            Some((upper_x, upper_y, upper));
     }
     row_box(
         children
@@ -402,23 +482,60 @@ fn accent(
     )
 }
 
+fn clear_highlights(box_: &mut MathBox) {
+    box_.highlight = false;
+    if let BoxKind::Row { children } = &mut box_.kind {
+        for (_, _, child) in children {
+            clear_highlights(child);
+        }
+    }
+}
+
+fn padded_highlight(mut box_: MathBox, level: usize) -> MathBox {
+    clear_highlights(&mut box_);
+    let pad_x = VARIABLE_PAD_X * scale(level);
+    let pad_y = VARIABLE_PAD_Y * scale(level);
+    if let BoxKind::Row { children } = &mut box_.kind {
+        for (x, _, _) in children {
+            *x += pad_x;
+        }
+    }
+    box_.width += pad_x * 2.0;
+    box_.ascent += pad_y;
+    box_.descent += pad_y;
+    box_.highlight = true;
+    box_
+}
+
 fn script(node: &MathNode, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
     let operand_level = (level + 1).min(2);
     let slots = node.slots();
     let mut children = (0..slots.len()).map(|_| None).collect::<Vec<_>>();
     let mut base_width = 0.0;
+    let variable_base = match node {
+        MathNode::Script { base, .. } => match base.as_slice() {
+            [MathNode::Sym(ch)] if ch.is_alphabetic() => Some(*ch),
+            _ => None,
+        },
+        _ => None,
+    };
 
     for slot in slots {
         let child_list = node.slot(slot).expect("script slots must resolve");
-        let child = layout(
-            child_list,
-            if slot == Slot::Base {
-                level
-            } else {
-                operand_level
-            },
-            measure,
-        );
+        let child = if slot == Slot::Base {
+            variable_base.map_or_else(
+                || layout(child_list, level, measure),
+                |ch| {
+                    row_box(vec![(
+                        0.0,
+                        0.0,
+                        glyph_with_highlight(ch, level, measure, false),
+                    )])
+                },
+            )
+        } else {
+            layout(child_list, operand_level, measure)
+        };
         let (x, y) = match slot {
             Slot::Base => {
                 base_width = child.width;
@@ -436,15 +553,17 @@ fn script(node: &MathNode, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f
 
     // `slots` drives both this order and `slot_child_index`, so traversal sees
     // exactly the children this layout emitted.
-    let mut box_ = row_box(
+    let box_ = row_box(
         children
             .into_iter()
             .map(|child| child.expect("every script slot must be laid out"))
             .collect(),
     );
-    box_.highlight = matches!(node, MathNode::Script { base, .. }
-        if matches!(base.as_slice(), [MathNode::Sym(ch)] if ch.is_alphabetic()));
-    box_
+    if variable_base.is_some() {
+        padded_highlight(box_, level)
+    } else {
+        box_
+    }
 }
 
 fn fraction(
@@ -519,14 +638,17 @@ fn slot_child_index(node: &MathNode, slot: Slot) -> Option<usize> {
 fn row_box(children: Vec<(f32, f32, MathBox)>) -> MathBox {
     let width = children
         .iter()
+        .filter(|(_, _, child)| contributes_to_measure(child))
         .map(|(x, _, child)| x + child.width)
         .fold(0.0, f32::max);
     let ascent = children
         .iter()
+        .filter(|(_, _, child)| contributes_to_measure(child))
         .map(|(_, y, child)| y + child.ascent)
         .fold(0.0, f32::max);
     let descent = children
         .iter()
+        .filter(|(_, _, child)| contributes_to_measure(child))
         .map(|(_, y, child)| child.descent - y)
         .fold(0.0, f32::max);
     MathBox {
@@ -719,6 +841,10 @@ mod tests {
         text.chars().map(MathNode::Sym).collect()
     }
 
+    fn variable_width(level: usize) -> f32 {
+        (BASE_SIZE * 0.5 + VARIABLE_PAD_X * 2.0) * scale(level)
+    }
+
     fn fraction(num: MathList, den: MathList) -> MathNode {
         MathNode::Frac { num, den }
     }
@@ -747,6 +873,17 @@ mod tests {
         MathNode::BigOp { kind, lower, upper }
     }
 
+    fn highlight_count(box_: &MathBox) -> usize {
+        usize::from(box_.highlight)
+            + match &box_.kind {
+                BoxKind::Row { children } => children
+                    .iter()
+                    .map(|(_, _, child)| highlight_count(child))
+                    .sum(),
+                _ => 0,
+            }
+    }
+
     #[test]
     fn a_list_concatenates_widths_on_one_baseline() {
         let box_ = layout(&symbols("xy"), 0, &fake_measure);
@@ -755,10 +892,10 @@ mod tests {
         };
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].0, 0.0);
-        assert_eq!(children[1].0, BASE_SIZE * 0.5);
+        assert_eq!(children[1].0, variable_width(0));
         assert_eq!(children[0].1, 0.0);
         assert_eq!(children[1].1, 0.0);
-        assert_eq!(box_.width, BASE_SIZE);
+        assert_eq!(box_.width, variable_width(0) * 2.0);
     }
 
     #[test]
@@ -768,7 +905,7 @@ mod tests {
         let BoxKind::Row { children } = box_.kind else {
             panic!("list must produce row");
         };
-        let operand = BASE_SIZE * LEVEL_SCALE[1];
+        let operand = variable_width(1) * 2.0;
         assert_eq!(children[0].2.width, operand + FRAC_PAD * 2.0);
     }
 
@@ -776,8 +913,8 @@ mod tests {
     fn operands_shrink_one_script_level() {
         let display = layout(&symbols("x"), 0, &fake_measure);
         let script = layout(&symbols("x"), 1, &fake_measure);
-        assert_eq!(script.width, display.width * LEVEL_SCALE[1]);
-        assert_eq!(script.ascent, display.ascent * LEVEL_SCALE[1]);
+        assert!((script.width - display.width * LEVEL_SCALE[1]).abs() < 0.0001);
+        assert!((script.ascent - display.ascent * LEVEL_SCALE[1]).abs() < 0.0001);
 
         let nested = layout(
             &vec![fraction(
@@ -882,7 +1019,7 @@ mod tests {
         assert_eq!(box_.width / root.width, LEVEL_SCALE[1]);
         assert!((box_.ascent + box_.descent - SLOT_H * LEVEL_SCALE[1]).abs() < 0.0001);
         assert!(
-            matches!(box_.kind, BoxKind::Slot { size } if (size - SLOT_H * LEVEL_SCALE[1]).abs() < 0.0001)
+            matches!(box_.kind, BoxKind::Slot { size, visible: true } if (size - SLOT_H * LEVEL_SCALE[1]).abs() < 0.0001)
         );
     }
 
@@ -1067,11 +1204,11 @@ mod tests {
             index: 1,
         };
         let (x, y, _) = cursor_pos(&list, &cursor, 0, &fake_measure);
-        assert_eq!(x, FRAC_PAD + BASE_SIZE * LEVEL_SCALE[1] * 0.5);
-        assert_eq!(
-            y,
-            -(BAR * 0.5 + BASE_SIZE * FRAC_GAP + BASE_SIZE * LEVEL_SCALE[1] * 0.5)
-        );
+        assert_eq!(x, FRAC_PAD + variable_width(1));
+        let expected_y = -(BAR * 0.5
+            + BASE_SIZE * FRAC_GAP
+            + (BASE_SIZE * 0.5 + VARIABLE_PAD_Y) * LEVEL_SCALE[1]);
+        assert!((y - expected_y).abs() < 0.0001);
 
         let (root_x, root_y, _) = cursor_pos(&list, &MathCursor::default(), 0, &fake_measure);
         assert_eq!(root_x, 0.0);
@@ -1206,7 +1343,7 @@ mod tests {
     #[test]
     fn the_cursor_reaches_a_script_slot() {
         let list = vec![script(symbols("x"), Some(symbols("s")), Some(symbols("i")))];
-        let base_width = layout(&symbols("x"), 0, &fake_measure).width;
+        let base_width = BASE_SIZE * 0.5;
         let sup_cursor = MathCursor {
             path: vec![Step {
                 index: 0,
@@ -1224,7 +1361,7 @@ mod tests {
         let (sup_x, sup_y, _) = cursor_pos(&list, &sup_cursor, 0, &fake_measure);
         let (sub_x, sub_y, _) = cursor_pos(&list, &sub_cursor, 0, &fake_measure);
         assert!(sup_x > base_width);
-        assert_eq!(sub_x, base_width);
+        assert_eq!(sub_x, VARIABLE_PAD_X + base_width);
         assert!(sup_y > 0.0);
         assert!(sub_y < 0.0);
     }
@@ -1338,14 +1475,19 @@ mod tests {
             let body = &accent[1];
             assert_eq!(mark.2.width, body.2.width);
             assert!(mark.1 - mark.2.descent > body.1 + body.2.ascent);
-            assert_eq!(body.2.width, BASE_SIZE);
+            assert_eq!(body.2.width, variable_width(0) * 2.0);
         }
     }
 
     #[test]
     fn alphabetic_and_greek_symbols_are_highlighted() {
         let box_ = layout(
-            &vec![MathNode::Sym('x'), MathNode::Sym('α'), MathNode::Sym('2')],
+            &vec![
+                MathNode::Sym('x'),
+                MathNode::Sym('α'),
+                MathNode::Sym('Ж'),
+                MathNode::Sym('2'),
+            ],
             0,
             &fake_measure,
         );
@@ -1354,7 +1496,12 @@ mod tests {
         };
         assert!(children[0].2.highlight);
         assert!(children[1].2.highlight);
-        assert!(!children[2].2.highlight);
+        assert!(children[2].2.highlight);
+        assert!(!children[3].2.highlight);
+        assert_eq!(children[0].2.width, BASE_SIZE * 0.5 + VARIABLE_PAD_X * 2.0);
+        assert_eq!(children[0].2.ascent, BASE_SIZE * 0.5 + VARIABLE_PAD_Y);
+        assert_eq!(children[1].0, children[0].2.width);
+        assert_ne!(theme::VARIABLE, theme::ALT);
     }
 
     #[test]
@@ -1371,6 +1518,11 @@ mod tests {
         assert!(script.highlight);
         assert!(script.descent > BASE_SIZE * 0.5);
         assert!(script.width > BASE_SIZE * 0.5);
+        assert_eq!(highlight_count(script), 1);
+        let BoxKind::Row { children } = &script.kind else {
+            panic!("script must produce row");
+        };
+        assert_eq!(children[0].0, VARIABLE_PAD_X);
     }
 
     #[test]
@@ -1403,6 +1555,144 @@ mod tests {
     }
 
     #[test]
+    fn empty_integral_limits_are_invisible_without_changing_the_operator_box() {
+        for (kind, glyph) in [(BigOp::Integral, "∫"), (BigOp::ContourIntegral, "∮")] {
+            let source = vec![big_op(kind, Vec::new(), Vec::new())];
+            let list = layout(&source, 0, &fake_measure);
+            let BoxKind::Row { children } = &list.kind else {
+                panic!("list must produce row");
+            };
+            let operator_box = &children[0].2;
+            let BoxKind::Row { children: operator } = &operator_box.kind else {
+                panic!("operator must produce row");
+            };
+            assert!(matches!(
+                operator[0].2.kind,
+                BoxKind::Glyph { ref text, .. } if text == glyph
+            ));
+            assert_eq!(operator_box.width, operator[0].2.width);
+            assert_eq!(operator_box.ascent, operator[0].2.ascent);
+            assert_eq!(operator_box.descent, operator[0].2.descent);
+            for (index, slot) in [Slot::Lower, Slot::Upper].into_iter().enumerate() {
+                let hidden = &operator[index + 1];
+                assert!(matches!(
+                    hidden.2.kind,
+                    BoxKind::Slot { visible: false, .. }
+                ));
+                assert_eq!(hidden.2.width, SLOT_W * LEVEL_SCALE[1]);
+                assert_eq!(hidden.2.ascent + hidden.2.descent, SLOT_H * LEVEL_SCALE[1]);
+                let cursor = MathCursor {
+                    path: vec![Step { index: 0, slot }],
+                    index: 0,
+                };
+                let (_, y, _) = cursor_pos(&source, &cursor, 0, &fake_measure);
+                assert_eq!(y, hidden.1);
+                match slot {
+                    Slot::Lower => assert!(y < 0.0),
+                    Slot::Upper => assert!(y > 0.0),
+                    _ => unreachable!(),
+                }
+
+                let hit_cursor = hit(
+                    &source,
+                    (hidden.0 + hidden.2.width * 0.5, hidden.1),
+                    0,
+                    &fake_measure,
+                );
+                assert_eq!(hit_cursor.path, vec![Step { index: 0, slot }]);
+                assert_eq!(hit_cursor.index, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_non_integral_limits_keep_their_visible_placeholders() {
+        for kind in [BigOp::Sum, BigOp::Limit] {
+            let source = vec![big_op(kind, Vec::new(), Vec::new())];
+            let list = layout(&source, 0, &fake_measure);
+            let BoxKind::Row { children } = &list.kind else {
+                panic!("list must produce row");
+            };
+            let operator_box = &children[0].2;
+            let BoxKind::Row { children: operator } = &operator_box.kind else {
+                panic!("operator must produce row");
+            };
+            assert!(matches!(
+                operator[1].2.kind,
+                BoxKind::Slot { visible: true, .. }
+            ));
+            assert!(operator[1].2.width > 0.0);
+            assert!(operator_box.descent > operator[0].2.descent);
+            if kind == BigOp::Sum {
+                assert!(matches!(
+                    operator[2].2.kind,
+                    BoxKind::Slot { visible: true, .. }
+                ));
+                assert!(operator_box.ascent > operator[0].2.ascent);
+            }
+        }
+    }
+
+    #[test]
+    fn contour_integral_populated_limits_stack_normally() {
+        let list = layout(
+            &vec![big_op(
+                BigOp::ContourIntegral,
+                symbols("lower"),
+                symbols("upper"),
+            )],
+            0,
+            &fake_measure,
+        );
+        let BoxKind::Row { children } = list.kind else {
+            panic!("list must produce row");
+        };
+        let BoxKind::Row { children: operator } = &children[0].2.kind else {
+            panic!("operator must produce row");
+        };
+        assert!(operator[1].1 < 0.0);
+        assert!(operator[2].1 > 0.0);
+        assert!(operator[1].2.width > 0.0);
+        assert!(operator[2].2.width > 0.0);
+    }
+
+    #[test]
+    fn adjacent_integral_family_operators_overlap_only_each_other() {
+        let empty = |kind| big_op(kind, Vec::new(), Vec::new());
+        for left in [BigOp::Integral, BigOp::ContourIntegral] {
+            for right in [BigOp::Integral, BigOp::ContourIntegral] {
+                let left_width = layout(&vec![empty(left)], 0, &fake_measure).width;
+                let right_width = layout(&vec![empty(right)], 0, &fake_measure).width;
+                let pair = layout(&vec![empty(left), empty(right)], 0, &fake_measure);
+                assert!(
+                    (pair.width - (left_width + right_width - INTEGRAL_OVERLAP)).abs() < 0.0001
+                );
+            }
+        }
+
+        let integral = layout(&vec![empty(BigOp::Integral)], 0, &fake_measure).width;
+        let sum = layout(&vec![empty(BigOp::Sum)], 0, &fake_measure).width;
+        let mixed = layout(
+            &vec![empty(BigOp::Integral), empty(BigOp::Sum)],
+            0,
+            &fake_measure,
+        );
+        assert!((mixed.width - (integral + sum)).abs() < 0.0001);
+
+        let script_pair = layout(
+            &vec![empty(BigOp::Integral), empty(BigOp::ContourIntegral)],
+            1,
+            &fake_measure,
+        );
+        let script_singles = layout(&vec![empty(BigOp::Integral)], 1, &fake_measure).width
+            + layout(&vec![empty(BigOp::ContourIntegral)], 1, &fake_measure).width;
+        assert!(
+            (script_pair.width - (script_singles - INTEGRAL_OVERLAP * LEVEL_SCALE[1])).abs()
+                < 0.0001
+        );
+    }
+
+    #[test]
     fn a_limit_has_no_upper_child() {
         let list = layout(
             &vec![big_op(BigOp::Limit, symbols("x"), symbols("ignored"))],
@@ -1418,7 +1708,7 @@ mod tests {
         assert_eq!(limit.len(), 2);
         assert!(matches!(
             limit[0].2.kind,
-            BoxKind::Glyph { ref text, size } if text == "lim" && size == BASE_SIZE
+            BoxKind::Glyph { ref text, size, .. } if text == "lim" && size == BASE_SIZE
         ));
     }
 

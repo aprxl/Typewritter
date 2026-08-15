@@ -461,6 +461,14 @@ mod tests {
     }
 
     #[test]
+    fn a_contour_integral_round_trips_with_both_limits() {
+        let tree = vec![big_op(BigOp::ContourIntegral, sym("C"), sym("R"))];
+
+        assert_eq!(print(&tree), "oint{C}{R}");
+        assert_eq!(parse("oint{C}{R}"), tree);
+    }
+
+    #[test]
     fn a_keyword_not_followed_by_a_group_is_just_letters() {
         let list = sym("sum");
 
@@ -606,10 +614,11 @@ mod tests {
                     }
                     3 => vec![sqrt(generated_list(generator, depth - 1))],
                     4 => {
-                        let kind = match generator.next() % 4 {
+                        let kind = match generator.next() % 5 {
                             0 => BigOp::Sum,
                             1 => BigOp::Prod,
                             2 => BigOp::Integral,
+                            3 => BigOp::ContourIntegral,
                             _ => BigOp::Limit,
                         };
                         let lower = generated_list(generator, depth - 1);
@@ -631,7 +640,8 @@ mod tests {
                     }
                     6 => {
                         const KEYWORDS: &[&str] = &[
-                            "sqrt", "vec", "dot", "ddot", "dddot", "sum", "prod", "int", "lim",
+                            "sqrt", "vec", "dot", "ddot", "dddot", "sum", "prod", "int", "oint",
+                            "lim",
                         ];
                         KEYWORDS[(generator.next() % KEYWORDS.len() as u64) as usize]
                             .chars()

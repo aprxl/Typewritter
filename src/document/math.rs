@@ -65,6 +65,7 @@ pub enum BigOp {
     Sum,
     Prod,
     Integral,
+    ContourIntegral,
     Limit,
 }
 
@@ -74,6 +75,7 @@ impl BigOp {
             Self::Sum => "sum",
             Self::Prod => "prod",
             Self::Integral => "int",
+            Self::ContourIntegral => "oint",
             Self::Limit => "lim",
         }
     }
@@ -130,6 +132,14 @@ fn empty_integral() -> MathNode {
     }
 }
 
+fn empty_contour_integral() -> MathNode {
+    MathNode::BigOp {
+        kind: BigOp::ContourIntegral,
+        lower: Vec::new(),
+        upper: Vec::new(),
+    }
+}
+
 fn empty_limit() -> MathNode {
     MathNode::BigOp {
         kind: BigOp::Limit,
@@ -150,6 +160,7 @@ pub(crate) const WORDS: &[Word] = &[
     (BigOp::Sum.keyword(), empty_sum),
     (BigOp::Prod.keyword(), empty_prod),
     (BigOp::Integral.keyword(), empty_integral),
+    (BigOp::ContourIntegral.keyword(), empty_contour_integral),
     (BigOp::Limit.keyword(), empty_limit),
 ];
 
@@ -198,6 +209,10 @@ pub const STRUCTURES: &[Structure] = &[
     Structure {
         name: "int",
         preview: "∫",
+    },
+    Structure {
+        name: "oint",
+        preview: "∮",
     },
     Structure {
         name: "lim",
@@ -505,6 +520,7 @@ pub fn insert_structure(root: &mut MathList, cursor: &mut MathCursor, name: &str
         "sum" => insert_node(root, cursor, empty_sum()),
         "prod" => insert_node(root, cursor, empty_prod()),
         "int" => insert_node(root, cursor, empty_integral()),
+        "oint" => insert_node(root, cursor, empty_contour_integral()),
         "lim" => insert_node(root, cursor, empty_limit()),
         _ => unreachable!("checked against STRUCTURES"),
     }
@@ -1192,6 +1208,24 @@ mod tests {
     }
 
     #[test]
+    fn contour_integral_word_and_palette_build_a_two_slot_operator() {
+        let expected = big_op(BigOp::ContourIntegral, Vec::new(), Vec::new());
+
+        let mut root = sym("oint");
+        let mut cursor = at(4);
+        assert!(insert_word(&mut root, &mut cursor));
+        assert_eq!(root, vec![expected.clone()]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Lower)], 0));
+        assert_eq!(root[0].slots(), vec![Slot::Lower, Slot::Upper]);
+
+        let mut root = sym("oint");
+        let mut cursor = at(4);
+        assert!(insert_structure(&mut root, &mut cursor, "oint"));
+        assert_eq!(root, vec![expected]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Lower)], 0));
+    }
+
+    #[test]
     fn a_word_inside_an_identifier_is_left_alone() {
         let mut root = sym("resum");
         let mut cursor = at(5);
@@ -1581,6 +1615,16 @@ mod tests {
         assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
         assert_eq!(root, sym("sum_i=0^n"));
         assert_eq!(cursor, at(3));
+    }
+
+    #[test]
+    fn backspace_reverts_a_contour_integral_to_its_letters() {
+        let mut root = vec![big_op(BigOp::ContourIntegral, sym("C"), sym("R"))];
+        let mut cursor = at(1);
+
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, sym("oint_C^R"));
+        assert_eq!(cursor, at(4));
     }
 
     #[test]

@@ -70,22 +70,27 @@ fn draw_math(layer: &Layer, box_: &MathBox, origin: (f32, f32)) {
 
 fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: bool) {
     if box_.highlight && !covered {
+        let height = box_.ascent + box_.descent;
         layer.draw_rectangle(
             (origin.0, origin.1 - box_.ascent),
-            (box_.width, box_.ascent + box_.descent),
-            theme::ALT,
-            Rounding::uniform(3.0),
+            (box_.width, height),
+            theme::VARIABLE,
+            Rounding::uniform(box_.width.min(height) * 0.45),
         );
     }
     let covered = covered || box_.highlight;
     match &box_.kind {
-        BoxKind::Glyph { text, size } => {
+        BoxKind::Glyph {
+            text,
+            size,
+            offset_x,
+        } => {
             // Math boxes use glyph centers as their baseline for now; LEFT's
             // vertical centering therefore matches the prose baseline draw.
             theme::draw(
                 layer,
                 text,
-                origin,
+                (origin.0 + offset_x, origin.1),
                 &TextStyle::math(*size, theme::INK),
                 theme::LEFT,
             );
@@ -100,7 +105,10 @@ fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: b
                 theme::INK,
             );
         }
-        BoxKind::Slot { .. } => {
+        BoxKind::Slot { visible, .. } => {
+            if !visible {
+                return;
+            }
             let rect = Rect {
                 x: origin.0,
                 y: origin.1 - box_.ascent,

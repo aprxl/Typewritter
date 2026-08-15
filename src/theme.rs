@@ -49,6 +49,9 @@ pub const BADGE_HEIGHT: f32 = 16.0;
 /// Underline highlight. Drawn as a bar *below* the text rather than a
 /// wash behind it, so the glyphs keep the page's own contrast.
 pub const HIGHLIGHT: Color = Color::rgb(0xE0, 0xA8, 0x2C);
+/// Saturated gold behind mathematical variables. Brighter than `ALT` so a
+/// variable reads as a semantic token rather than as an empty/editing slot.
+pub const VARIABLE: Color = Color::rgb(0xF2, 0xC7, 0x4A);
 /// Quietest ink that is still ink: dates, hints, disabled glyphs.
 pub const FAINT: Color = Color::rgb(0xA0, 0x91, 0x83);
 /// Non-text: separators inside a line of type, empty-slot outlines.
