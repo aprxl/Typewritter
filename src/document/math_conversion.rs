@@ -72,16 +72,20 @@ pub fn query_before(root: &MathList, cursor: &MathCursor) -> Option<Query> {
 /// completions for the trailing named suffix.
 pub fn offers(query: &Query) -> OfferSet {
     let named_query = trailing_letters(&query.source);
-    let mut offers = rewrites(&query.source);
-    let variants = variant_offers(named_query.as_deref(), &offers);
-    offers.extend(
-        named_query
-            .as_deref()
-            .map(math::completions)
-            .unwrap_or_default()
-            .into_iter()
-            .map(Offer::Named),
-    );
+    let (rewrites, mut generic) = rewrites(&query.source);
+    let variants = variant_offers(named_query.as_deref(), &rewrites, &generic);
+    let mut named: (Vec<_>, Vec<_>) = named_query
+        .as_deref()
+        .map(math::completions)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|completion| !duplicates_role_choice(completion, query, named_query.as_deref()))
+        .partition(|completion| is_exact(completion, named_query.as_deref()));
+
+    let mut offers = rewrites;
+    offers.extend(named.0.drain(..).map(Offer::Named));
+    offers.append(&mut generic);
+    offers.extend(named.1.drain(..).map(Offer::Named));
     offers.extend(variants);
     OfferSet {
         named_query,
@@ -175,10 +179,16 @@ fn trailing_letters(source: &str) -> Option<String> {
     (!letters.is_empty()).then_some(letters)
 }
 
-fn rewrites(source: &str) -> Vec<Offer> {
+fn rewrites(source: &str) -> (Vec<Offer>, Vec<Offer>) {
     let mut offers: Vec<Offer> = known_constant(source).into_iter().collect();
     offers.extend(known_function(source));
-    offers.extend(function_variable(source));
+    let has_constant = offers
+        .iter()
+        .any(|offer| rewrite_role(offer) == Some(SymbolRole::Constant));
+    let has_function = offers
+        .iter()
+        .any(|offer| rewrite_role(offer) == Some(SymbolRole::Function));
+    let roles = role_choices(source, has_constant, has_function);
 
     if let Some((base, digits, tail)) = compact_script(source) {
         offers.push(rewrite(
@@ -195,7 +205,64 @@ fn rewrites(source: &str) -> Vec<Offer> {
         ));
     }
 
-    offers
+    (offers, roles)
+}
+
+fn duplicates_role_choice(
+    completion: &Completion,
+    query: &Query,
+    named_query: Option<&str>,
+) -> bool {
+    let Completion::Symbol { name, .. } = completion else {
+        return false;
+    };
+    named_query == Some(query.source.as_str())
+        && *name == query.source.as_str()
+        && math_symbols::exact(name).is_some_and(|symbol| symbol.role().is_some())
+}
+
+fn is_exact(completion: &Completion, named_query: Option<&str>) -> bool {
+    match completion {
+        Completion::Symbol { name, .. } | Completion::Structure { name, .. } => {
+            Some(*name) == named_query
+        }
+    }
+}
+
+fn rewrite_role(offer: &Offer) -> Option<SymbolRole> {
+    let Offer::Rewrite { replacement, .. } = offer else {
+        return None;
+    };
+    match replacement.as_slice() {
+        [MathNode::Resolved { role, .. }] => Some(*role),
+        _ => None,
+    }
+}
+
+fn role_choices(source: &str, has_constant: bool, has_function: bool) -> Vec<Offer> {
+    if source.is_empty() || !source.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return Vec::new();
+    }
+
+    let body = math_symbols::exact(source)
+        .filter(|symbol| symbol.role().is_some())
+        .map_or_else(|| sym(source), |symbol| sym(&symbol.glyph.to_string()));
+    [
+        (SymbolRole::Variable, "Variable", false),
+        (SymbolRole::Constant, "Constant", has_constant),
+        (SymbolRole::Function, "Function", has_function),
+    ]
+    .into_iter()
+    .filter(|(_, _, already_known)| !already_known)
+    .map(|(role, group, _)| {
+        rewrite(
+            format!("{source} as {}", role.keyword()),
+            group,
+            symbols(&body).expect("a role-choice body contains symbols"),
+            vec![resolved(source, role, "plain", body.clone())],
+        )
+    })
+    .collect()
 }
 
 fn known_function(source: &str) -> Option<Offer> {
@@ -220,20 +287,6 @@ fn function_name(source: &str) -> Option<(&'static str, &'static str)> {
         "exp" => ("exp", "Exponential"),
         _ => return None,
     })
-}
-
-/// Multi-letter functions deliberately retain a Variable interpretation.
-/// `f` and `g` already receive that normal row from the alphabetic catalog.
-fn function_variable(source: &str) -> Option<Offer> {
-    if matches!(source, "f" | "g") || function_name(source).is_none() {
-        return None;
-    }
-    Some(rewrite(
-        format!("Variable {source}"),
-        "Variable",
-        source,
-        vec![resolved(source, SymbolRole::Variable, "plain", sym(source))],
-    ))
 }
 
 fn known_constant(source: &str) -> Option<Offer> {
@@ -341,40 +394,26 @@ fn known_constant(source: &str) -> Option<Offer> {
     ))
 }
 
-fn variant_offers(named_query: Option<&str>, rewrites: &[Offer]) -> Vec<Offer> {
+fn variant_offers(named_query: Option<&str>, rewrites: &[Offer], generic: &[Offer]) -> Vec<Offer> {
     let Some(name) = named_query else {
         return Vec::new();
     };
-    let mut offers = Vec::new();
-
-    for rewrite in rewrites {
+    for rewrite in rewrites.iter().chain(generic) {
         let Offer::Rewrite { replacement, .. } = rewrite else {
             continue;
         };
         let [MathNode::Resolved { id, role, body, .. }] = replacement.as_slice() else {
             continue;
         };
-        offers.extend(variants(id, *role, body));
+        return variants(id, *role, body);
     }
 
     if let Some((symbol, role)) =
         math_symbols::exact(name).and_then(|symbol| symbol.role().map(|role| (symbol, role)))
     {
-        offers.extend(variants(name, role, &sym(&symbol.glyph.to_string())));
+        return variants(name, role, &sym(&symbol.glyph.to_string()));
     }
-
-    let mut seen = Vec::new();
-    offers.retain(|offer| match offer {
-        Offer::Variant { preview, .. } if !seen.contains(preview) => {
-            seen.push(preview.clone());
-            true
-        }
-        Offer::Variant { .. } => false,
-        Offer::Named(_) | Offer::Rewrite { .. } => {
-            unreachable!("only variant offers are built here")
-        }
-    });
-    offers
+    Vec::new()
 }
 
 fn variants(id: &str, role: SymbolRole, body: &MathList) -> Vec<Offer> {
@@ -629,12 +668,16 @@ mod tests {
         assert_eq!(alpha.named_query.as_deref(), Some("alpha"));
         assert!(matches!(
             alpha.offers.first(),
-            Some(Offer::Named(Completion::Symbol {
-                name: "alpha",
-                glyph: 'α',
+            Some(Offer::Rewrite {
+                group: "Variable",
+                preview,
                 ..
-            }))
+            }) if preview == "α"
         ));
+        assert!(!alpha.offers.iter().any(|offer| matches!(
+            offer,
+            Offer::Named(Completion::Symbol { name: "alpha", .. })
+        )));
 
         let frac = offers(&query("1frac"));
         assert_eq!(frac.named_query.as_deref(), Some("frac"));
@@ -710,8 +753,16 @@ mod tests {
         let pi = offers(&pi_query)
             .offers
             .into_iter()
-            .find(|offer| matches!(offer, Offer::Named(Completion::Symbol { name: "pi", .. })))
-            .expect("pi completion");
+            .find(|offer| {
+                matches!(
+                    offer,
+                    Offer::Rewrite {
+                        group: "Variable",
+                        ..
+                    }
+                )
+            })
+            .expect("pi variable interpretation");
         assert!(accept(&mut root, &mut cursor, &pi_query, &pi));
 
         root.extend(sym("theta"));
@@ -724,10 +775,13 @@ mod tests {
             .find(|offer| {
                 matches!(
                     offer,
-                    Offer::Named(Completion::Symbol { name: "theta", .. })
+                    Offer::Rewrite {
+                        group: "Variable",
+                        ..
+                    }
                 )
             })
-            .expect("theta completion");
+            .expect("theta variable interpretation");
         assert!(accept(&mut root, &mut cursor, &theta_query, &theta));
         assert_eq!(
             root,
@@ -771,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn constant_variants_deduplicate_the_variable_spellings() {
+    fn constant_variants_belong_to_the_preferred_constant() {
         let found = offers(&query("pi"));
         let variants: Vec<(&str, &str)> = found
             .offers
@@ -816,24 +870,24 @@ mod tests {
                 }]
             ));
 
-            if matches!(source, "f" | "g") {
-                assert!(found.offers.iter().any(|offer| {
-                    matches!(
-                        offer,
-                        Offer::Named(Completion::Symbol { name, .. }) if *name == source
-                    )
-                }));
-            } else {
-                assert!(found.offers.iter().any(|offer| {
-                    matches!(
-                        offer,
-                        Offer::Rewrite {
-                            group: "Variable",
-                            ..
-                        }
-                    )
-                }));
-            }
+            assert!(found.offers.iter().any(|offer| {
+                matches!(
+                    offer,
+                    Offer::Rewrite {
+                        group: "Variable",
+                        ..
+                    }
+                )
+            }));
+            assert!(found.offers.iter().any(|offer| {
+                matches!(
+                    offer,
+                    Offer::Rewrite {
+                        group: "Constant",
+                        ..
+                    }
+                )
+            }));
 
             let variants: Vec<&str> = found
                 .offers
@@ -845,6 +899,79 @@ mod tests {
                 .collect();
             assert!(!variants.is_empty());
             assert!(variants.iter().all(|group| *group == "Function"));
+        }
+    }
+
+    #[test]
+    fn x_offers_three_ranked_roles_and_accepts_each_as_persistent_identity() {
+        let query = query("x");
+        let found = offers(&query);
+        let role_rows: Vec<_> = found
+            .offers
+            .iter()
+            .filter_map(|offer| rewrite_role(offer).map(|role| (offer, role)))
+            .collect();
+
+        assert_eq!(
+            role_rows.iter().map(|(_, role)| *role).collect::<Vec<_>>(),
+            [
+                SymbolRole::Variable,
+                SymbolRole::Constant,
+                SymbolRole::Function
+            ]
+        );
+        for ((offer, role), (title, group)) in role_rows.iter().zip([
+            ("x as variable", "Variable"),
+            ("x as constant", "Constant"),
+            ("x as function", "Function"),
+        ]) {
+            assert!(matches!(
+                offer,
+                Offer::Rewrite {
+                    title: found_title,
+                    group: found_group,
+                    preview,
+                    ..
+                } if found_title == title && *found_group == group && preview == "x"
+            ));
+
+            let mut root = sym("x");
+            let mut cursor = at(1);
+            assert!(accept(&mut root, &mut cursor, &query, offer));
+            assert_eq!(
+                root,
+                vec![resolved("x", *role, "plain", sym("x"))],
+                "{group} choice must persist its role"
+            );
+            let notation = math_notation::print(&root);
+            assert_eq!(math_notation::parse(&notation), root);
+            assert_eq!(cursor, at(1));
+        }
+    }
+
+    #[test]
+    fn known_identity_replaces_only_its_generic_role_and_stays_first() {
+        for (source, expected) in [
+            (
+                "c",
+                [
+                    SymbolRole::Constant,
+                    SymbolRole::Variable,
+                    SymbolRole::Function,
+                ],
+            ),
+            (
+                "f",
+                [
+                    SymbolRole::Function,
+                    SymbolRole::Variable,
+                    SymbolRole::Constant,
+                ],
+            ),
+        ] {
+            let found = offers(&query(source));
+            let roles: Vec<_> = found.offers.iter().filter_map(rewrite_role).collect();
+            assert_eq!(roles, expected, "{source}");
         }
     }
 
