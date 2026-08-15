@@ -1,8 +1,8 @@
 # Work log
 
 State at handoff: `cargo fmt --check` clean, `cargo clippy --all-targets -D
-warnings` clean, 330 tests passing, and the tree committed as `4da46c2`
-(`Add the symbol table and the word under the math cursor`).
+warnings` clean, 448 tests passing, and the tree committed as `31f6162`
+(`feat(editor): add ctrl brush selection`).
 
 How the work is being done, since `AGENTS.md` is out of date on this: coding is
 delegated to the `opencode` CLI rather than to in-process subagents —
@@ -364,3 +364,33 @@ running app by injecting real key events through `/dev/uinput` and reading the
 saved Markdown back off disk — but the two mouse-driven paths (wheel overscroll
 and divider dragging) rest on unit tests only, because pointer injection could
 not be made to reach the app under this compositor.
+
+---
+
+## Session log — Ctrl brush selection
+
+**`src/shell/input.rs`, `src/shell/mod.rs`, `src/document/layout.rs`,
+`src/document/math_layout.rs`, `src/components/editor.rs`** — Ctrl+left-drag
+now keeps a persistent set of selected contextual nodes. The 18px radius is
+the single `editor::BRUSH_RADIUS` constant. It reuses `ContextHit`, rather than
+adding a second document selection model: words, badges, inline/fenced code,
+whole empty math atoms, and deepest math nodes all use their existing identity.
+
+The brush circle and its selection overlays are rendered from the current
+layout every frame, so scroll and resize cannot stale hit boxes. Circle/rect
+intersection is inclusive at tangency. Structural descendants win over their
+parents; colliding siblings are all selected in paint order.
+
+One brush stroke toggles a target only when it is entered. The pointer path is
+sampled at no more than one brush radius apart, so a fast drag cannot skip a
+node. The current circle alone defines the inside set, which permits a later
+leave/re-enter to toggle again. Ctrl-click retains unrelated selections; Esc
+clears the brush set and still reaches any open popup on that same keypress.
+Dialogs retain mouse priority. Code blocks are hit-tested across their full
+rendered slab, not merely their text width.
+
+Tests cover circle tangency, node precedence, mixed/deduplicated targets,
+full-width code blocks, entry/re-entry toggling, sweep sampling, and Esc reset.
+Final verification: fmt, warnings-denied Clippy, and 448 tests passed. Renderer
+smoke reached the expected headless Wayland `NoCompositor` boundary before any
+renderer work; the brush SVG ring has a parser test.
