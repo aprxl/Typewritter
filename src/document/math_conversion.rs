@@ -4,7 +4,10 @@
 //! buffer to desynchronise after movement or deletion. Rewrites are only
 //! suggestions: the tree changes solely through [`accept`].
 
-use super::math::{self, Completion, MathCursor, MathList, MathNode, Step};
+use super::{
+    math::{self, Completion, MathCursor, MathList, MathNode, Step, SymbolRole},
+    math_symbols,
+};
 
 /// The alphanumeric token immediately before a math cursor.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -22,9 +25,16 @@ pub enum Offer {
     Named(Completion),
     /// An explicit interpretation of a compact alphanumeric token.
     Rewrite {
-        title: &'static str,
+        title: String,
         group: &'static str,
-        preview: &'static str,
+        preview: String,
+        replacement: MathList,
+    },
+    /// One visual variant of an exact resolved symbol.
+    Variant {
+        name: &'static str,
+        group: &'static str,
+        preview: String,
         replacement: MathList,
     },
 }
@@ -43,7 +53,7 @@ pub fn query_before(root: &MathList, cursor: &MathCursor) -> Option<Query> {
     let list = math::list_at(root, &cursor.path)?;
     let end = cursor.index;
     let mut start = end;
-    while start > 0 && matches!(list[start - 1], MathNode::Sym(ch) if ch.is_alphanumeric()) {
+    while start > 0 && matches!(list[start - 1], MathNode::Sym(ch) if ch.is_ascii_alphanumeric()) {
         start -= 1;
     }
     if start == end {
@@ -58,27 +68,21 @@ pub fn query_before(root: &MathList, cursor: &MathCursor) -> Option<Query> {
     })
 }
 
-/// Returns named completions or the explicitly supported compact rewrites.
-///
-/// An explicit recipe owns the whole token and suppresses named suffix rows;
-/// otherwise the existing completion table receives the trailing letter run.
+/// Returns known identities, generic compact-script interpretations, then
+/// completions for the trailing named suffix.
 pub fn offers(query: &Query) -> OfferSet {
-    let rewrites = rewrites(&query.source);
-    if !rewrites.is_empty() {
-        return OfferSet {
-            named_query: None,
-            offers: rewrites,
-        };
-    }
-
     let named_query = trailing_letters(&query.source);
-    let offers = named_query
-        .as_deref()
-        .map(math::completions)
-        .unwrap_or_default()
-        .into_iter()
-        .map(Offer::Named)
-        .collect();
+    let mut offers = rewrites(&query.source);
+    let variants = variant_offers(named_query.as_deref(), &offers);
+    offers.extend(
+        named_query
+            .as_deref()
+            .map(math::completions)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Offer::Named),
+    );
+    offers.extend(variants);
     OfferSet {
         named_query,
         offers,
@@ -94,8 +98,21 @@ pub fn accept(root: &mut MathList, cursor: &mut MathCursor, query: &Query, offer
     }
 
     match offer {
-        Offer::Named(Completion::Symbol { glyph, .. }) => {
-            math::accept_symbol(root, cursor, *glyph);
+        Offer::Named(Completion::Symbol { name, glyph, .. }) => {
+            let suffix_len = trailing_letters(&query.source)
+                .expect("a named symbol offer must have a letter suffix")
+                .len();
+            let start = query.end - suffix_len;
+            let list = math::list_at_mut(root, &query.path)
+                .expect("a current conversion query path must resolve");
+            let replacement = math_symbols::exact(name)
+                .and_then(|symbol| symbol.role())
+                .map_or(MathNode::Sym(*glyph), |role| {
+                    resolved(name, role, "plain", sym(&glyph.to_string()))
+                });
+            list.splice(start..query.end, [replacement]);
+            cursor.path.clone_from(&query.path);
+            cursor.index = start + 1;
             true
         }
         Offer::Named(Completion::Structure { name, .. }) => {
@@ -107,6 +124,18 @@ pub fn accept(root: &mut MathList, cursor: &mut MathCursor, query: &Query, offer
             list.splice(query.start..query.end, replacement.clone());
             cursor.path.clone_from(&query.path);
             cursor.index = query.start + replacement.len();
+            true
+        }
+        Offer::Variant { replacement, .. } => {
+            let suffix_len = trailing_letters(&query.source)
+                .expect("a variant offer must have an exact letter suffix")
+                .len();
+            let start = query.end - suffix_len;
+            let list = math::list_at_mut(root, &query.path)
+                .expect("a current conversion query path must resolve");
+            list.splice(start..query.end, replacement.clone());
+            cursor.path.clone_from(&query.path);
+            cursor.index = start + replacement.len();
             true
         }
     }
@@ -138,7 +167,7 @@ fn trailing_letters(source: &str) -> Option<String> {
     let letters: String = source
         .chars()
         .rev()
-        .take_while(|ch| ch.is_alphabetic())
+        .take_while(|ch| ch.is_ascii_alphabetic())
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -147,71 +176,296 @@ fn trailing_letters(source: &str) -> Option<String> {
 }
 
 fn rewrites(source: &str) -> Vec<Offer> {
-    match source {
-        "e0" => vec![
-            rewrite(
-                "Vacuum permittivity",
-                "Constant",
-                "ε₀",
-                script("ε", None, Some("0"), ""),
-            ),
-            rewrite(
-                "e power 0",
-                "Interpretation",
-                "e⁰",
-                script("e", Some("0"), None, ""),
-            ),
-            rewrite(
-                "e index 0",
-                "Interpretation",
-                "e₀",
-                script("e", None, Some("0"), ""),
-            ),
-        ],
-        "e2x" => vec![
-            rewrite(
-                "e squared × x",
-                "Interpretation",
-                "e²x",
-                script("e", Some("2"), None, "x"),
-            ),
-            rewrite(
-                "e index 2 × x",
-                "Interpretation",
-                "e₂x",
-                script("e", None, Some("2"), "x"),
-            ),
-        ],
-        "x2" => vec![
-            rewrite(
-                "x squared",
-                "Interpretation",
-                "x²",
-                script("x", Some("2"), None, ""),
-            ),
-            rewrite(
-                "x index 2",
-                "Interpretation",
-                "x₂",
-                script("x", None, Some("2"), ""),
-            ),
-        ],
-        _ => Vec::new(),
+    let mut offers: Vec<Offer> = known_constant(source).into_iter().collect();
+    offers.extend(known_function(source));
+    offers.extend(function_variable(source));
+
+    if let Some((base, digits, tail)) = compact_script(source) {
+        offers.push(rewrite(
+            format!("{base} power {digits}"),
+            "Interpretation",
+            format!("{base}{}{tail}", raised(digits, true)),
+            script(base, Some(digits), None, tail),
+        ));
+        offers.push(rewrite(
+            format!("{base} index {digits}"),
+            "Interpretation",
+            format!("{base}{}{tail}", raised(digits, false)),
+            script(base, None, Some(digits), tail),
+        ));
+    }
+
+    offers
+}
+
+fn known_function(source: &str) -> Option<Offer> {
+    let (id, title) = function_name(source)?;
+    Some(rewrite(
+        title,
+        "Function",
+        source,
+        vec![resolved(id, SymbolRole::Function, "plain", sym(source))],
+    ))
+}
+
+fn function_name(source: &str) -> Option<(&'static str, &'static str)> {
+    Some(match source {
+        "f" => ("f", "Function f"),
+        "g" => ("g", "Function g"),
+        "sin" => ("sin", "Sine"),
+        "cos" => ("cos", "Cosine"),
+        "tan" => ("tan", "Tangent"),
+        "log" => ("log", "Logarithm"),
+        "ln" => ("ln", "Natural logarithm"),
+        "exp" => ("exp", "Exponential"),
+        _ => return None,
+    })
+}
+
+/// Multi-letter functions deliberately retain a Variable interpretation.
+/// `f` and `g` already receive that normal row from the alphabetic catalog.
+fn function_variable(source: &str) -> Option<Offer> {
+    if matches!(source, "f" | "g") || function_name(source).is_none() {
+        return None;
+    }
+    Some(rewrite(
+        format!("Variable {source}"),
+        "Variable",
+        source,
+        vec![resolved(source, SymbolRole::Variable, "plain", sym(source))],
+    ))
+}
+
+fn known_constant(source: &str) -> Option<Offer> {
+    let (id, title, preview, body) = match source {
+        "pi" => ("pi", "Pi", "π", sym("π")),
+        "tau" => ("tau", "Tau", "τ", sym("τ")),
+        "e" | "euler" => ("euler_number", "Euler's number", "e", sym("e")),
+        "i" | "iunit" => ("imaginary_unit", "Imaginary unit", "i", sym("i")),
+        "golden" | "goldenratio" => ("golden_ratio", "Golden ratio", "φ", sym("φ")),
+        "e0" | "eps0" | "epsilon0" => (
+            "vacuum_permittivity",
+            "Vacuum permittivity",
+            "ε₀",
+            script("ε", None, Some("0"), ""),
+        ),
+        "mu0" => (
+            "vacuum_permeability",
+            "Vacuum permeability",
+            "μ₀",
+            script("μ", None, Some("0"), ""),
+        ),
+        "hbar" => (
+            "reduced_planck_constant",
+            "Reduced Planck constant",
+            "ℏ",
+            sym("ℏ"),
+        ),
+        "kB" => (
+            "boltzmann_constant",
+            "Boltzmann constant",
+            "k_B",
+            script("k", None, Some("B"), ""),
+        ),
+        "NA" => (
+            "avogadro_constant",
+            "Avogadro constant",
+            "N_A",
+            script("N", None, Some("A"), ""),
+        ),
+        "qe" => (
+            "elementary_charge",
+            "Elementary charge",
+            "qₑ",
+            script("q", None, Some("e"), ""),
+        ),
+        "me" => (
+            "electron_mass",
+            "Electron mass",
+            "mₑ",
+            script("m", None, Some("e"), ""),
+        ),
+        "mp" => (
+            "proton_mass",
+            "Proton mass",
+            "mₚ",
+            script("m", None, Some("p"), ""),
+        ),
+        "mn" => (
+            "neutron_mass",
+            "Neutron mass",
+            "mₙ",
+            script("m", None, Some("n"), ""),
+        ),
+        "a0" => (
+            "bohr_radius",
+            "Bohr radius",
+            "a₀",
+            script("a", None, Some("0"), ""),
+        ),
+        "Rinf" => (
+            "rydberg_constant",
+            "Rydberg constant",
+            "R_∞",
+            script("R", None, Some("∞"), ""),
+        ),
+        "sigmaSB" => (
+            "stefan_boltzmann_constant",
+            "Stefan–Boltzmann constant",
+            "σ_SB",
+            script("σ", None, Some("SB"), ""),
+        ),
+        "lambdaC" => (
+            "compton_wavelength",
+            "Compton wavelength",
+            "λ_C",
+            script("λ", None, Some("C"), ""),
+        ),
+        "c" => ("speed_of_light", "Speed of light", "c", sym("c")),
+        "G" => (
+            "gravitational_constant",
+            "Gravitational constant",
+            "G",
+            sym("G"),
+        ),
+        "h" => ("planck_constant", "Planck constant", "h", sym("h")),
+        "R" => ("molar_gas_constant", "Molar gas constant", "R", sym("R")),
+        "F" => ("faraday_constant", "Faraday constant", "F", sym("F")),
+        _ => return None,
+    };
+    Some(rewrite(
+        title,
+        "Constant",
+        preview,
+        vec![resolved(id, SymbolRole::Constant, "plain", body)],
+    ))
+}
+
+fn variant_offers(named_query: Option<&str>, rewrites: &[Offer]) -> Vec<Offer> {
+    let Some(name) = named_query else {
+        return Vec::new();
+    };
+    let mut offers = Vec::new();
+
+    for rewrite in rewrites {
+        let Offer::Rewrite { replacement, .. } = rewrite else {
+            continue;
+        };
+        let [MathNode::Resolved { id, role, body, .. }] = replacement.as_slice() else {
+            continue;
+        };
+        offers.extend(variants(id, *role, body));
+    }
+
+    if let Some((symbol, role)) =
+        math_symbols::exact(name).and_then(|symbol| symbol.role().map(|role| (symbol, role)))
+    {
+        offers.extend(variants(name, role, &sym(&symbol.glyph.to_string())));
+    }
+
+    let mut seen = Vec::new();
+    offers.retain(|offer| match offer {
+        Offer::Variant { preview, .. } if !seen.contains(preview) => {
+            seen.push(preview.clone());
+            true
+        }
+        Offer::Variant { .. } => false,
+        Offer::Named(_) | Offer::Rewrite { .. } => {
+            unreachable!("only variant offers are built here")
+        }
+    });
+    offers
+}
+
+fn variants(id: &str, role: SymbolRole, body: &MathList) -> Vec<Offer> {
+    let glyphs: Vec<char> = body
+        .iter()
+        .map(|node| match node {
+            MathNode::Sym(glyph) => Some(*glyph),
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .unwrap_or_default();
+    let Some(&first) = glyphs.first() else {
+        return Vec::new();
+    };
+    math_symbols::variants(first)
+        .into_iter()
+        .filter_map(|variant| {
+            let body: MathList = glyphs
+                .iter()
+                .map(|glyph| {
+                    math_symbols::variants(*glyph)
+                        .into_iter()
+                        .find(|candidate| candidate.key == variant.key)
+                        .map(|candidate| MathNode::Sym(candidate.glyph))
+                })
+                .collect::<Option<_>>()?;
+            Some(Offer::Variant {
+                name: variant.name,
+                group: match role {
+                    SymbolRole::Variable => "Variable",
+                    SymbolRole::Constant => "Constant",
+                    SymbolRole::Function => "Function",
+                },
+                preview: symbols(&body).expect("a variant body contains symbols"),
+                replacement: vec![resolved(id, role, variant.key, body)],
+            })
+        })
+        .collect()
+}
+
+fn resolved(id: &str, role: SymbolRole, variant: &str, body: MathList) -> MathNode {
+    MathNode::Resolved {
+        id: id.to_owned(),
+        role,
+        variant: variant.to_owned(),
+        body,
     }
 }
 
 fn rewrite(
-    title: &'static str,
+    title: impl Into<String>,
     group: &'static str,
-    preview: &'static str,
+    preview: impl Into<String>,
     replacement: MathList,
 ) -> Offer {
     Offer::Rewrite {
-        title,
+        title: title.into(),
         group,
-        preview,
+        preview: preview.into(),
         replacement,
     }
+}
+
+fn compact_script(source: &str) -> Option<(&str, &str, &str)> {
+    let digit_start = source.find(|ch: char| ch.is_ascii_digit())?;
+    if digit_start == 0
+        || !source[..digit_start]
+            .chars()
+            .all(|ch| ch.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let digit_end = source[digit_start..]
+        .find(|ch: char| !ch.is_ascii_digit())
+        .map_or(source.len(), |offset| digit_start + offset);
+    let tail = &source[digit_end..];
+    tail.chars().all(|ch| ch.is_ascii_alphabetic()).then_some((
+        &source[..digit_start],
+        &source[digit_start..digit_end],
+        tail,
+    ))
+}
+
+fn raised(digits: &str, superscript: bool) -> String {
+    const SUP: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    const SUB: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
+    let alphabet = if superscript { &SUP } else { &SUB };
+    digits
+        .bytes()
+        .map(|digit| alphabet[(digit - b'0') as usize])
+        .collect()
 }
 
 fn script(base: &str, sup: Option<&str>, sub: Option<&str>, tail: &str) -> MathList {
@@ -249,9 +503,9 @@ mod tests {
         offers(&query(source))
             .offers
             .into_iter()
-            .map(|offer| match offer {
-                Offer::Rewrite { replacement, .. } => replacement,
-                Offer::Named(_) => panic!("recipe unexpectedly produced a named completion"),
+            .filter_map(|offer| match offer {
+                Offer::Rewrite { replacement, .. } => Some(replacement),
+                Offer::Named(_) | Offer::Variant { .. } => None,
             })
             .collect()
     }
@@ -312,8 +566,8 @@ mod tests {
             .offers
             .iter()
             .map(|offer| match offer {
-                Offer::Rewrite { title, .. } => *title,
-                Offer::Named(_) => panic!("expected rewrite"),
+                Offer::Rewrite { title, .. } => title.as_str(),
+                Offer::Named(_) | Offer::Variant { .. } => panic!("expected rewrite"),
             })
             .collect();
 
@@ -322,7 +576,12 @@ mod tests {
         assert_eq!(
             replacements("e0"),
             [
-                script("ε", None, Some("0"), ""),
+                vec![resolved(
+                    "vacuum_permittivity",
+                    SymbolRole::Constant,
+                    "plain",
+                    script("ε", None, Some("0"), ""),
+                )],
                 script("e", Some("0"), None, ""),
                 script("e", None, Some("0"), ""),
             ]
@@ -338,6 +597,19 @@ mod tests {
                 script("e", None, Some("2"), "x"),
             ]
         );
+    }
+
+    #[test]
+    fn any_single_letter_digit_run_gets_script_interpretations() {
+        assert_eq!(
+            replacements("alpha17beta"),
+            [
+                script("alpha", Some("17"), None, "beta"),
+                script("alpha", None, Some("17"), "beta"),
+            ]
+        );
+        assert!(replacements("2x").is_empty());
+        assert!(replacements("x2y3").is_empty());
     }
 
     #[test]
@@ -370,6 +642,30 @@ mod tests {
             frac.offers.first(),
             Some(Offer::Named(Completion::Structure { name: "frac", .. }))
         ));
+    }
+
+    #[test]
+    fn known_constants_rank_before_generic_interpretations() {
+        let found = offers(&query("mu0"));
+        let titles: Vec<&str> = found
+            .offers
+            .iter()
+            .filter_map(|offer| match offer {
+                Offer::Rewrite { title, .. } => Some(title.as_str()),
+                Offer::Named(_) | Offer::Variant { .. } => None,
+            })
+            .collect();
+
+        assert_eq!(titles, ["Vacuum permeability", "mu power 0", "mu index 0"]);
+        assert_eq!(
+            replacements("mu0")[0],
+            vec![resolved(
+                "vacuum_permeability",
+                SymbolRole::Constant,
+                "plain",
+                script("μ", None, Some("0"), ""),
+            )]
+        );
     }
 
     #[test]
@@ -407,8 +703,154 @@ mod tests {
     }
 
     #[test]
+    fn accepted_unicode_symbol_starts_a_fresh_adjacent_named_query() {
+        let mut root = sym("pi");
+        let mut cursor = at(2);
+        let pi_query = query_before(&root, &cursor).expect("pi query");
+        let pi = offers(&pi_query)
+            .offers
+            .into_iter()
+            .find(|offer| matches!(offer, Offer::Named(Completion::Symbol { name: "pi", .. })))
+            .expect("pi completion");
+        assert!(accept(&mut root, &mut cursor, &pi_query, &pi));
+
+        root.extend(sym("theta"));
+        cursor.index += 5;
+        let theta_query = query_before(&root, &cursor).expect("theta query");
+        assert_eq!(theta_query.source, "theta");
+        let theta = offers(&theta_query)
+            .offers
+            .into_iter()
+            .find(|offer| {
+                matches!(
+                    offer,
+                    Offer::Named(Completion::Symbol { name: "theta", .. })
+                )
+            })
+            .expect("theta completion");
+        assert!(accept(&mut root, &mut cursor, &theta_query, &theta));
+        assert_eq!(
+            root,
+            vec![
+                resolved("pi", SymbolRole::Variable, "plain", sym("π")),
+                resolved("theta", SymbolRole::Variable, "plain", sym("θ")),
+            ]
+        );
+        assert_eq!(cursor, at(2));
+    }
+
+    #[test]
+    fn variants_follow_normal_rows_and_accept_as_one_resolved_atom() {
+        let query = query("x");
+        let found = offers(&query);
+        let first_variant = found
+            .offers
+            .iter()
+            .position(|offer| matches!(offer, Offer::Variant { .. }))
+            .expect("variant rows");
+        assert!(
+            found.offers[..first_variant]
+                .iter()
+                .all(|offer| !matches!(offer, Offer::Variant { .. }))
+        );
+
+        let mut root = sym("x");
+        let mut cursor = at(1);
+        let offer = found.offers[first_variant].clone();
+        assert!(accept(&mut root, &mut cursor, &query, &offer));
+        assert!(matches!(
+            root.as_slice(),
+            [MathNode::Resolved {
+                id,
+                role: SymbolRole::Variable,
+                variant,
+                ..
+            }] if id == "x" && variant == "bold"
+        ));
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn constant_variants_deduplicate_the_variable_spellings() {
+        let found = offers(&query("pi"));
+        let variants: Vec<(&str, &str)> = found
+            .offers
+            .iter()
+            .filter_map(|offer| match offer {
+                Offer::Variant { group, preview, .. } => Some((*group, preview.as_str())),
+                Offer::Named(_) | Offer::Rewrite { .. } => None,
+            })
+            .collect();
+
+        assert_eq!(variants.len(), math_symbols::variants('π').len());
+        assert!(variants.iter().all(|(group, _)| *group == "Constant"));
+        for (index, (_, preview)) in variants.iter().enumerate() {
+            assert!(!variants[..index].iter().any(|(_, other)| other == preview));
+        }
+    }
+
+    #[test]
+    fn compact_function_interpretations_rank_before_variables_and_own_variants() {
+        for source in ["f", "g", "sin", "cos", "tan", "log", "ln", "exp"] {
+            let found = offers(&query(source));
+            assert!(matches!(
+                found.offers.first(),
+                Some(Offer::Rewrite {
+                    group: "Function",
+                    ..
+                })
+            ));
+            let mut root = sym(source);
+            let mut cursor = at(source.len());
+            assert!(accept(
+                &mut root,
+                &mut cursor,
+                &query(source),
+                &found.offers[0]
+            ));
+            assert!(matches!(
+                root.as_slice(),
+                [MathNode::Resolved {
+                    role: SymbolRole::Function,
+                    ..
+                }]
+            ));
+
+            if matches!(source, "f" | "g") {
+                assert!(found.offers.iter().any(|offer| {
+                    matches!(
+                        offer,
+                        Offer::Named(Completion::Symbol { name, .. }) if *name == source
+                    )
+                }));
+            } else {
+                assert!(found.offers.iter().any(|offer| {
+                    matches!(
+                        offer,
+                        Offer::Rewrite {
+                            group: "Variable",
+                            ..
+                        }
+                    )
+                }));
+            }
+
+            let variants: Vec<&str> = found
+                .offers
+                .iter()
+                .filter_map(|offer| match offer {
+                    Offer::Variant { group, .. } => Some(*group),
+                    Offer::Named(_) | Offer::Rewrite { .. } => None,
+                })
+                .collect();
+            assert!(!variants.is_empty());
+            assert!(variants.iter().all(|group| *group == "Function"));
+        }
+    }
+
+    #[test]
     fn every_rewrite_round_trips_through_canonical_notation() {
-        for source in ["e0", "e2x", "x2"] {
+        for source in ["e0", "e2x", "x2", "alpha17beta", "mu0", "sigmaSB"] {
             for replacement in replacements(source) {
                 let printed = math_notation::print(&replacement);
                 assert_eq!(

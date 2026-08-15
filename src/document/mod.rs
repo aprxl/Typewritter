@@ -2826,8 +2826,15 @@ mod tests {
         assert!(matches!(
             d.blocks[0].inlines()[0],
             Inline::Math(ref list)
-                if matches!(list.as_slice(), [math::MathNode::Script { sub: Some(sub), .. }]
-                    if sub == &vec![math::MathNode::Sym('0')])
+                if matches!(list.as_slice(), [math::MathNode::Resolved {
+                    id,
+                    role: math::SymbolRole::Constant,
+                    variant,
+                    body,
+                }] if id == "vacuum_permittivity"
+                    && variant == "plain"
+                    && matches!(body.as_slice(), [math::MathNode::Script { sub: Some(sub), .. }]
+                        if sub == &vec![math::MathNode::Sym('0')]))
         ));
     }
 

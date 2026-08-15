@@ -9,7 +9,7 @@
 //! Format change: notation that used `(` for invisible grouping now uses `{`,
 //! while `(` and `[` are visible bracket groups; no migration is provided.
 
-use super::math::{BigOp, MathList, MathNode, Slot, WORDS};
+use super::math::{BigOp, MathList, MathNode, Slot, SymbolRole, WORDS};
 
 /// The canonical linear form of `list`. Deterministic: equal trees print
 /// equal strings, and the parser reads this exact string back to an equal
@@ -25,7 +25,8 @@ fn print_list(list: &MathList, output: &mut String) {
         let needs_group = (index > 0
             && matches!(
                 node,
-                MathNode::Frac { .. }
+                MathNode::Resolved { .. }
+                    | MathNode::Frac { .. }
                     | MathNode::Script { .. }
                     | MathNode::Sqrt { .. }
                     | MathNode::Accent { .. }
@@ -49,12 +50,13 @@ fn print_list(list: &MathList, output: &mut String) {
 }
 
 fn escape_keyword_suffix(output: &mut String) {
-    if let Some(keyword) = WORDS
+    if WORDS
         .iter()
         .map(|(keyword, _)| *keyword)
-        .find(|keyword| output.ends_with(keyword))
+        .chain(std::iter::once("sym"))
+        .any(|keyword| output.ends_with(keyword))
     {
-        output.insert(output.len() - keyword.len() + keyword.len() - 1, '\\');
+        output.insert(output.len() - 1, '\\');
     }
 }
 
@@ -68,6 +70,22 @@ fn print_node(node: &MathNode, output: &mut String) {
                 output.push('\\');
             }
             output.push(*c);
+        }
+        MathNode::Resolved {
+            id,
+            role,
+            variant,
+            body,
+        } => {
+            output.push_str("sym{");
+            output.push_str(role.keyword());
+            output.push('|');
+            print_header(id, output);
+            output.push('|');
+            print_header(variant, output);
+            output.push_str("}{");
+            print_list(body, output);
+            output.push('}');
         }
         MathNode::Frac { num, den } => {
             print_operand(num, false, output);
@@ -123,7 +141,7 @@ fn print_node(node: &MathNode, output: &mut String) {
 
 fn print_operand(list: &MathList, symbol_only: bool, output: &mut String) {
     let bare = match list.as_slice() {
-        [MathNode::Sym(_)] => true,
+        [MathNode::Sym(_) | MathNode::Resolved { .. }] => true,
         [node] if !symbol_only && !matches!(node, MathNode::Script { .. }) => true,
         _ => false,
     };
@@ -133,6 +151,15 @@ fn print_operand(list: &MathList, symbol_only: bool, output: &mut String) {
         output.push('{');
         print_list(list, output);
         output.push('}');
+    }
+}
+
+fn print_header(value: &str, output: &mut String) {
+    for c in value.chars() {
+        if matches!(c, '\\' | '|' | '{' | '}') {
+            output.push('\\');
+        }
+        output.push(c);
     }
 }
 
@@ -242,6 +269,12 @@ impl Parser {
                     self.position += 1;
                 }
                 let word: String = self.chars[start..self.position].iter().collect();
+                if word == "sym"
+                    && self.chars.get(self.position) == Some(&'{')
+                    && let Some(node) = self.parse_resolved()
+                {
+                    return Some((vec![node], false));
+                }
                 let Some(build) = WORDS
                     .iter()
                     .find(|(keyword, _)| {
@@ -270,6 +303,54 @@ impl Parser {
                 Some((vec![MathNode::Sym(c)], false))
             }
         }
+    }
+
+    fn parse_resolved(&mut self) -> Option<MathNode> {
+        let checkpoint = self.position;
+        let Some(fields) = self.parse_header() else {
+            self.position = checkpoint;
+            return None;
+        };
+        let Some(role) = SymbolRole::from_keyword(&fields[0]) else {
+            self.position = checkpoint;
+            return None;
+        };
+        if self.chars.get(self.position) != Some(&'{') {
+            self.position = checkpoint;
+            return None;
+        }
+        self.position += 1;
+        let body = self.parse_list(Some('}'));
+        Some(MathNode::Resolved {
+            id: fields[1].clone(),
+            role,
+            variant: fields[2].clone(),
+            body,
+        })
+    }
+
+    fn parse_header(&mut self) -> Option<[String; 3]> {
+        if self.chars.get(self.position) != Some(&'{') {
+            return None;
+        }
+        self.position += 1;
+        let mut fields = [String::new(), String::new(), String::new()];
+        let mut field = 0;
+        while let Some(c) = self.chars.get(self.position).copied() {
+            self.position += 1;
+            match c {
+                '\\' => {
+                    let escaped = self.chars.get(self.position).copied()?;
+                    self.position += 1;
+                    fields[field].push(escaped);
+                }
+                '|' if field < 2 => field += 1,
+                '|' => return None,
+                '}' => return (field == 2).then_some(fields),
+                _ => fields[field].push(c),
+            }
+        }
+        None
     }
 }
 
@@ -335,12 +416,60 @@ mod tests {
         MathNode::BigOp { kind, lower, upper }
     }
 
+    fn resolved(id: &str, role: SymbolRole, variant: &str, body: MathList) -> MathNode {
+        MathNode::Resolved {
+            id: id.to_owned(),
+            role,
+            variant: variant.to_owned(),
+            body,
+        }
+    }
+
     #[test]
     fn a_flat_list_prints_as_its_chars() {
         let list = sym("1+x y");
 
         assert_eq!(print(&list), "1+x y");
         assert_eq!(parse("1+x y"), list);
+    }
+
+    #[test]
+    fn resolved_identity_and_variant_round_trip() {
+        let node = resolved(
+            "physics|vacuum\\permittivity",
+            SymbolRole::Constant,
+            "greek{small}",
+            vec![script(sym("ε"), None, Some(sym("0")))],
+        );
+        let printed = print(&vec![node.clone()]);
+
+        assert_eq!(parse(&printed), vec![node]);
+        assert_eq!(print(&parse(&printed)), printed);
+        assert!(printed.starts_with("sym{constant|"));
+    }
+
+    #[test]
+    fn a_resolved_symbol_after_literal_sym_stays_distinct() {
+        let node = resolved("math.pi", SymbolRole::Constant, "greek", sym("π"));
+        let mut list = sym("sym");
+        list.push(node);
+        let printed = print(&list);
+
+        assert_eq!(parse(&printed), list);
+        assert!(printed.starts_with("sy\\m{"));
+    }
+
+    #[test]
+    fn malformed_resolved_headers_parse_as_literal_input() {
+        for text in [
+            "sym",
+            "sym{unknown|id|variant}{x}",
+            "sym{constant|missing-variant}{x}",
+            "sym{constant|dangling\\",
+        ] {
+            let parsed = parse(text);
+            assert!(!parsed.is_empty(), "{text:?}");
+        }
     }
 
     #[test]
@@ -577,9 +706,9 @@ mod tests {
         (0..length)
             .flat_map(|_| {
                 let choice = if depth > 0 {
-                    generator.next() % 8
+                    generator.next() % 9
                 } else {
-                    6 + generator.next() % 2
+                    7 + generator.next() % 2
                 };
                 match choice {
                     0 => vec![frac(
@@ -639,6 +768,23 @@ mod tests {
                         vec![accent(kind, generated_list(generator, depth - 1))]
                     }
                     6 => {
+                        let role = match generator.next() % 3 {
+                            0 => SymbolRole::Variable,
+                            1 => SymbolRole::Constant,
+                            _ => SymbolRole::Function,
+                        };
+                        const IDS: &[&str] = &["math.pi", "physics|epsilon", "function\\sin"];
+                        const VARIANTS: &[&str] = &["default", "greek{small}", "blackboard"];
+                        let id = IDS[(generator.next() % IDS.len() as u64) as usize];
+                        let variant = VARIANTS[(generator.next() % VARIANTS.len() as u64) as usize];
+                        vec![resolved(
+                            id,
+                            role,
+                            variant,
+                            generated_list(generator, depth - 1),
+                        )]
+                    }
+                    7 => {
                         const KEYWORDS: &[&str] = &[
                             "sqrt", "vec", "dot", "ddot", "dddot", "sum", "prod", "int", "oint",
                             "lim",

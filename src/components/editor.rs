@@ -5,7 +5,7 @@
 use std::rc::Rc;
 
 use crate::document::layout::{self, DocLayout};
-use crate::document::math::MathCursor;
+use crate::document::math::{MathCursor, SymbolRole};
 use crate::document::math_layout::{self, BoxKind, MathBox, MathPrimitive};
 use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style};
 use crate::layout::Rect;
@@ -79,16 +79,21 @@ fn math_rect(box_: &MathBox, origin: (f32, f32)) -> Rect {
 }
 
 fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: bool) {
-    if box_.highlight && !covered {
+    if let Some(role) = box_.highlight.filter(|_| !covered) {
         let height = box_.ascent + box_.descent;
+        let color = match role {
+            SymbolRole::Variable => theme::VARIABLE,
+            SymbolRole::Constant => theme::CONSTANT,
+            SymbolRole::Function => theme::FUNCTION,
+        };
         layer.draw_rectangle(
             (origin.0, origin.1 - box_.ascent),
             (box_.width, height),
-            theme::VARIABLE,
+            color,
             Rounding::uniform(box_.width.min(height) * 0.45),
         );
     }
-    let covered = covered || box_.highlight;
+    let covered = covered || box_.highlight.is_some();
     match &box_.kind {
         BoxKind::Glyph {
             text,
@@ -914,7 +919,7 @@ mod tests {
             width: 42.0,
             ascent: 19.0,
             descent: 11.0,
-            highlight: false,
+            highlight: None,
             kind: BoxKind::Row { children: vec![] },
         };
         assert_eq!(

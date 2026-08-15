@@ -127,7 +127,7 @@ impl Shell {
         // ahead of the command table — Ctrl+N and Ctrl+1..4 are global
         // commands outside math. Only claimed while the card is actually
         // showing; every other key keeps its math meaning.
-        if self.math_menu.is_some() && self.handle_math_menu_input(input) {
+        if self.math_menu.is_some() && self.handle_math_menu_input(input, viewport) {
             return;
         }
 
@@ -1478,7 +1478,7 @@ impl Shell {
     /// claim `Tab`, which must keep walking slots, `←`/`→`, which move the
     /// math cursor, or any typed character, which keeps typing — the word
     /// changing is what closes and reopens the card.
-    fn handle_math_menu_input(&mut self, input: &Input) -> bool {
+    fn handle_math_menu_input(&mut self, input: &Input, viewport: Rect) -> bool {
         if input.is_key_pressed(KeyCode::Escape) {
             self.dismiss_math_menu();
             return true;
@@ -1518,6 +1518,37 @@ impl Shell {
             if input.is_key_typed(KeyCode::KeyP) {
                 self.move_math_menu(-1);
                 return true;
+            }
+        }
+
+        let Some(state) = &self.math_menu else {
+            return false;
+        };
+        let offers = math_conversion::offers(&state.query).offers;
+        let variant_start = math_menu_variant_start(&offers);
+        let card = math_menu::card_anchored(viewport, state.anchor, offers.len(), variant_start);
+        if input.is_cursor_in_window() {
+            let point = input.mouse_position();
+            if let Some(index) = math_menu::item_at(card, offers.len(), variant_start, point) {
+                let changed = self
+                    .math_menu
+                    .as_ref()
+                    .is_some_and(|state| state.selected != index);
+                if changed {
+                    if let Some(state) = &mut self.math_menu {
+                        state.selected = index;
+                    }
+                    self.refresh_math_menu();
+                }
+                if input.is_mouse_pressed(MouseButton::Left) {
+                    self.accept_math_menu_row(index);
+                    return true;
+                }
+            } else if input.is_mouse_pressed(MouseButton::Left) {
+                if card.contains(point) {
+                    return true;
+                }
+                self.dismiss_math_menu();
             }
         }
         false
@@ -1560,7 +1591,7 @@ impl Shell {
         if count == 0 {
             return;
         }
-        let next = ((state.selected as isize + delta).clamp(0, count as isize - 1)) as usize;
+        let next = moved_math_menu_selection(state.selected, count, delta);
         if next != state.selected {
             state.selected = next;
             self.refresh_math_menu();
@@ -1638,11 +1669,15 @@ impl Shell {
 
     fn refresh_math_menu(&mut self) {
         let menu = match &self.math_menu {
-            Some(state) => MathMenu::new(
-                math_menu_rows(&math_conversion::offers(&state.query).offers),
-                state.selected,
-                state.anchor,
-            ),
+            Some(state) => {
+                let offers = math_conversion::offers(&state.query).offers;
+                MathMenu::new(
+                    math_menu_rows(&offers),
+                    math_menu_variant_start(&offers),
+                    state.selected,
+                    state.anchor,
+                )
+            }
             None => MathMenu::closed(),
         };
         self.regions[self.math_menu_region].set_component(Box::new(menu));
@@ -2060,8 +2095,34 @@ fn math_menu_rows(offers: &[math_conversion::Offer]) -> Vec<math_menu::Row> {
                 group: group.to_string(),
                 preview: preview.to_string(),
             },
+            math_conversion::Offer::Variant {
+                name,
+                group,
+                preview,
+                ..
+            } => math_menu::Row {
+                name: (*name).to_owned(),
+                group: (*group).to_owned(),
+                preview: preview.clone(),
+            },
         })
         .collect()
+}
+
+/// First flat item drawn as a variant cell. Variant offers are appended by
+/// the conversion engine, so ordinary rows remain a contiguous prefix.
+fn math_menu_variant_start(offers: &[math_conversion::Offer]) -> usize {
+    offers
+        .iter()
+        .position(|offer| matches!(offer, math_conversion::Offer::Variant { .. }))
+        .unwrap_or(offers.len())
+}
+
+fn moved_math_menu_selection(selected: usize, count: usize, delta: isize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    ((selected as isize + delta).clamp(0, count as isize - 1)) as usize
 }
 
 fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
@@ -2089,7 +2150,10 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{delete_chars, delete_inside_math, math_menu_rows, move_inside_math};
+    use super::{
+        delete_chars, delete_inside_math, math_menu_rows, math_menu_variant_start,
+        move_inside_math, moved_math_menu_selection,
+    };
     use crate::document::{Document, Inline, math_conversion};
     use crate::tabs::Tabs;
     use crate::vim::Motion;
@@ -2217,5 +2281,34 @@ mod tests {
         };
         let rows = math_menu_rows(&math_conversion::offers(&sqrt).offers);
         assert!(rows.iter().any(|row| row.group == "Structure"));
+    }
+
+    #[test]
+    fn math_menu_selection_walks_one_flat_list() {
+        assert_eq!(moved_math_menu_selection(1, 8, 1), 2);
+        assert_eq!(moved_math_menu_selection(2, 8, 5), 7);
+        assert_eq!(moved_math_menu_selection(7, 8, 1), 7);
+        assert_eq!(moved_math_menu_selection(0, 8, -1), 0);
+    }
+
+    #[test]
+    fn exact_symbols_append_variant_cells_after_normal_rows() {
+        let query = math_conversion::Query {
+            path: Vec::new(),
+            start: 0,
+            end: 1,
+            source: "x".into(),
+        };
+        let offers = math_conversion::offers(&query).offers;
+        let variant_start = math_menu_variant_start(&offers);
+        let rows = math_menu_rows(&offers);
+
+        assert!(variant_start > 0);
+        assert!(variant_start < rows.len());
+        assert!(
+            rows[variant_start..]
+                .iter()
+                .all(|row| !row.preview.is_empty())
+        );
     }
 }

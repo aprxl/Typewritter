@@ -8,7 +8,9 @@
 //! Box origins are anchor-left. Every child tuple stores `(x, y, box)` with
 //! `y` positive upward; a denominator therefore has a negative y offset.
 
-use crate::document::math::{AccentKind, BigOp, MathCursor, MathList, MathNode, Slot, Step};
+use crate::document::math::{
+    AccentKind, BigOp, MathCursor, MathList, MathNode, Slot, Step, SymbolRole,
+};
 use crate::theme::{self, TextStyle};
 
 /// Math base size at script level 0. Matches body text so an inline expression
@@ -65,8 +67,8 @@ pub struct MathBox {
     pub ascent: f32,
     /// Depth below this box's anchor line.
     pub descent: f32,
-    /// Draw a rounded variable background behind this whole box.
-    pub highlight: bool,
+    /// Draw a rounded semantic-role background behind this whole box.
+    pub highlight: Option<SymbolRole>,
     pub kind: BoxKind,
 }
 
@@ -121,6 +123,15 @@ pub enum BoxKind {
 /// level `2+`. Scaling operands at the next level keeps nested fractions
 /// bounded without introducing a second layout representation.
 pub fn layout(list: &MathList, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
+    layout_inner(list, level, measure, true)
+}
+
+fn layout_inner(
+    list: &MathList,
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+    semantic_highlights: bool,
+) -> MathBox {
     if list.is_empty() {
         return slot_box(level);
     }
@@ -131,7 +142,7 @@ pub fn layout(list: &MathList, level: usize, measure: &dyn Fn(&str, &TextStyle) 
         if index > 0 && integral_family(&list[index - 1]) && integral_family(node) {
             x -= INTEGRAL_OVERLAP * scale(level);
         }
-        let child = layout_node(node, level, measure);
+        let child = layout_node(node, level, measure, semantic_highlights);
         children.push((x, 0.0, child));
         x += children.last().expect("child was pushed").2.width;
     }
@@ -156,25 +167,35 @@ fn integral_family(node: &MathNode) -> bool {
     )
 }
 
-fn glyph(ch: char, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
-    glyph_with_highlight(ch, level, measure, ch.is_alphabetic())
+fn glyph(
+    ch: char,
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+    semantic_highlights: bool,
+) -> MathBox {
+    glyph_with_highlight(
+        ch,
+        level,
+        measure,
+        (semantic_highlights && ch.is_alphabetic()).then_some(SymbolRole::Variable),
+    )
 }
 
 fn glyph_with_highlight(
     ch: char,
     level: usize,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
-    highlight: bool,
+    highlight: Option<SymbolRole>,
 ) -> MathBox {
     let size = size(level);
     let text = ch.to_string();
     let half = size * 0.5;
-    let pad_x = if highlight {
+    let pad_x = if highlight.is_some() {
         VARIABLE_PAD_X * scale(level)
     } else {
         0.0
     };
-    let pad_y = if highlight {
+    let pad_y = if highlight.is_some() {
         VARIABLE_PAD_Y * scale(level)
     } else {
         0.0
@@ -200,7 +221,7 @@ fn slot_box(level: usize) -> MathBox {
         width: SLOT_W * scale,
         ascent: half,
         descent: half,
-        highlight: false,
+        highlight: None,
         kind: BoxKind::Slot {
             size: height,
             visible: true,
@@ -233,15 +254,44 @@ fn layout_node(
     node: &MathNode,
     level: usize,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
+    semantic_highlights: bool,
 ) -> MathBox {
     match node {
-        MathNode::Sym(ch) => glyph(*ch, level, measure),
-        MathNode::Frac { num, den } => fraction(node, num, den, level, measure),
-        MathNode::Script { .. } => script(node, level, measure),
-        MathNode::Group { open, close, body } => group(node, *open, *close, body, level, measure),
-        MathNode::Sqrt { body } => radical(node, body, level, measure),
-        MathNode::Accent { kind, body } => accent(node, *kind, body, level, measure),
-        MathNode::BigOp { kind, lower, upper } => big_op(node, kind, lower, upper, level, measure),
+        MathNode::Sym(ch) => glyph(*ch, level, measure, semantic_highlights),
+        MathNode::Resolved { role, body, .. } => {
+            let body = layout_inner(body, level, measure, false);
+            if semantic_highlights {
+                padded_highlight(body, level, *role)
+            } else {
+                body
+            }
+        }
+        MathNode::Frac { num, den } => {
+            fraction(node, num, den, level, measure, semantic_highlights)
+        }
+        MathNode::Script { .. } => script(node, level, measure, semantic_highlights),
+        MathNode::Group { open, close, body } => group(
+            node,
+            *open,
+            *close,
+            body,
+            level,
+            measure,
+            semantic_highlights,
+        ),
+        MathNode::Sqrt { body } => radical(node, body, level, measure, semantic_highlights),
+        MathNode::Accent { kind, body } => {
+            accent(node, *kind, body, level, measure, semantic_highlights)
+        }
+        MathNode::BigOp { kind, lower, upper } => big_op(
+            node,
+            kind,
+            lower,
+            upper,
+            level,
+            measure,
+            semantic_highlights,
+        ),
     }
 }
 
@@ -251,7 +301,7 @@ fn text_glyph(text: &str, size: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) 
         width: measure(text, &TextStyle::math(size, theme::INK)),
         ascent: half,
         descent: half,
-        highlight: false,
+        highlight: None,
         kind: BoxKind::Glyph {
             text: text.to_owned(),
             size,
@@ -267,6 +317,7 @@ fn big_op(
     upper: &MathList,
     level: usize,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
+    semantic_highlights: bool,
 ) -> MathBox {
     let (operator_text, operator_size) = match kind {
         BigOp::Sum => ("∑", size(level) * BIGOP_SCALE),
@@ -280,7 +331,7 @@ fn big_op(
     let hide_empty_limits = matches!(kind, BigOp::Integral | BigOp::ContourIntegral);
     let lower_visible = !lower.is_empty() || !hide_empty_limits;
     let lower = if lower_visible {
-        layout(lower, operand_level, measure)
+        layout_inner(lower, operand_level, measure, semantic_highlights)
     } else {
         invisible_slot_box(operand_level)
     };
@@ -289,7 +340,12 @@ fn big_op(
     } else if upper.is_empty() && hide_empty_limits {
         Some(invisible_slot_box(operand_level))
     } else {
-        Some(layout(upper, operand_level, measure))
+        Some(layout_inner(
+            upper,
+            operand_level,
+            measure,
+            semantic_highlights,
+        ))
     };
     let width = operator
         .width
@@ -329,7 +385,7 @@ fn stroked_box(width: f32, ascent: f32, descent: f32, path: String, level: usize
         width,
         ascent,
         descent,
-        highlight: false,
+        highlight: None,
         kind: BoxKind::Primitive(MathPrimitive::Stroke {
             path,
             thickness: SHAPE_STROKE * scale(level),
@@ -367,8 +423,9 @@ fn group(
     body: &MathList,
     level: usize,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
+    semantic_highlights: bool,
 ) -> MathBox {
-    let body = layout(body, level, measure);
+    let body = layout_inner(body, level, measure, semantic_highlights);
     let delimiter_height = stretchy_size(&body, level);
     let opener = delimiter(open, delimiter_height, level);
     let closer = delimiter(close, delimiter_height, level);
@@ -392,8 +449,9 @@ fn radical(
     body: &MathList,
     level: usize,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
+    semantic_highlights: bool,
 ) -> MathBox {
-    let body = layout(body, level, measure);
+    let body = layout_inner(body, level, measure, semantic_highlights);
     let stroke = SHAPE_STROKE * scale(level);
     let body_x = size(level) * 0.48;
     let gap = size(level) * RADICAL_GAP;
@@ -435,8 +493,9 @@ fn accent(
     body: &MathList,
     level: usize,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
+    semantic_highlights: bool,
 ) -> MathBox {
-    let body = layout(body, level, measure);
+    let body = layout_inner(body, level, measure, semantic_highlights);
     let stroke = SHAPE_STROKE * scale(level);
     let height = size(level) * 0.22;
     let y = -height * 0.45;
@@ -477,7 +536,7 @@ fn accent(
         width: body.width,
         ascent: height,
         descent: 0.0,
-        highlight: false,
+        highlight: None,
         kind: BoxKind::Primitive(primitive),
     };
     let mark_y = body.ascent + size(level) * ACCENT_GAP;
@@ -494,7 +553,7 @@ fn accent(
 }
 
 fn clear_highlights(box_: &mut MathBox) {
-    box_.highlight = false;
+    box_.highlight = None;
     if let BoxKind::Row { children } = &mut box_.kind {
         for (_, _, child) in children {
             clear_highlights(child);
@@ -502,7 +561,7 @@ fn clear_highlights(box_: &mut MathBox) {
     }
 }
 
-fn padded_highlight(mut box_: MathBox, level: usize) -> MathBox {
+fn padded_highlight(mut box_: MathBox, level: usize, role: SymbolRole) -> MathBox {
     clear_highlights(&mut box_);
     let pad_x = VARIABLE_PAD_X * scale(level);
     let pad_y = VARIABLE_PAD_Y * scale(level);
@@ -514,39 +573,43 @@ fn padded_highlight(mut box_: MathBox, level: usize) -> MathBox {
     box_.width += pad_x * 2.0;
     box_.ascent += pad_y;
     box_.descent += pad_y;
-    box_.highlight = true;
+    box_.highlight = Some(role);
     box_
 }
 
-fn script(node: &MathNode, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
+fn script(
+    node: &MathNode,
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+    semantic_highlights: bool,
+) -> MathBox {
     let operand_level = (level + 1).min(2);
     let slots = node.slots();
     let mut children = (0..slots.len()).map(|_| None).collect::<Vec<_>>();
     let mut base_width = 0.0;
-    let variable_base = match node {
-        MathNode::Script { base, .. } => match base.as_slice() {
-            [MathNode::Sym(ch)] if ch.is_alphabetic() => Some(*ch),
+    let base_role = semantic_highlights
+        .then(|| match node {
+            MathNode::Script { base, .. } => match base.as_slice() {
+                [MathNode::Sym(ch)] if ch.is_alphabetic() => Some(SymbolRole::Variable),
+                [MathNode::Resolved { role, .. }] => Some(*role),
+                _ => None,
+            },
             _ => None,
-        },
-        _ => None,
-    };
+        })
+        .flatten();
 
     for slot in slots {
         let child_list = node.slot(slot).expect("script slots must resolve");
-        let child = if slot == Slot::Base {
-            variable_base.map_or_else(
-                || layout(child_list, level, measure),
-                |ch| {
-                    row_box(vec![(
-                        0.0,
-                        0.0,
-                        glyph_with_highlight(ch, level, measure, false),
-                    )])
-                },
-            )
-        } else {
-            layout(child_list, operand_level, measure)
-        };
+        let child = layout_inner(
+            child_list,
+            if slot == Slot::Base {
+                level
+            } else {
+                operand_level
+            },
+            measure,
+            semantic_highlights && base_role.is_none(),
+        );
         let (x, y) = match slot {
             Slot::Base => {
                 base_width = child.width;
@@ -570,8 +633,8 @@ fn script(node: &MathNode, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f
             .map(|child| child.expect("every script slot must be laid out"))
             .collect(),
     );
-    if variable_base.is_some() {
-        padded_highlight(box_, level)
+    if let Some(role) = base_role {
+        padded_highlight(box_, level, role)
     } else {
         box_
     }
@@ -583,10 +646,11 @@ fn fraction(
     den: &MathList,
     level: usize,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
+    semantic_highlights: bool,
 ) -> MathBox {
     let operand_level = (level + 1).min(2);
-    let numerator = layout(num, operand_level, measure);
-    let denominator = layout(den, operand_level, measure);
+    let numerator = layout_inner(num, operand_level, measure, semantic_highlights);
+    let denominator = layout_inner(den, operand_level, measure, semantic_highlights);
     let current_size = size(level);
     let gap = current_size * FRAC_GAP;
     let pad = FRAC_PAD * scale(level);
@@ -596,7 +660,7 @@ fn fraction(
         width,
         ascent: BAR * 0.5,
         descent: BAR * 0.5,
-        highlight: false,
+        highlight: None,
         kind: BoxKind::Bar { thickness: BAR },
     };
     // Anchor line is the inline prose middle, so placing the bar at zero
@@ -641,7 +705,7 @@ fn slot_child_index(node: &MathNode, slot: Slot) -> Option<usize> {
         MathNode::Sqrt { .. } | MathNode::Accent { .. } => 1,
         MathNode::BigOp { .. } => 1,
         MathNode::Frac { .. } => usize::from(slot_index > 0),
-        MathNode::Sym(_) | MathNode::Script { .. } => 0,
+        MathNode::Sym(_) | MathNode::Resolved { .. } | MathNode::Script { .. } => 0,
     };
     Some(slot_index + visual_offset)
 }
@@ -666,7 +730,7 @@ fn row_box(children: Vec<(f32, f32, MathBox)>) -> MathBox {
         width,
         ascent,
         descent,
-        highlight: false,
+        highlight: None,
         kind: BoxKind::Row { children },
     }
 }
@@ -905,8 +969,17 @@ mod tests {
         MathNode::BigOp { kind, lower, upper }
     }
 
+    fn resolved(role: SymbolRole, body: MathList) -> MathNode {
+        MathNode::Resolved {
+            id: "test.symbol".to_owned(),
+            role,
+            variant: "default".to_owned(),
+            body,
+        }
+    }
+
     fn highlight_count(box_: &MathBox) -> usize {
-        usize::from(box_.highlight)
+        usize::from(box_.highlight.is_some())
             + match &box_.kind {
                 BoxKind::Row { children } => children
                     .iter()
@@ -1526,10 +1599,10 @@ mod tests {
         let BoxKind::Row { children } = box_.kind else {
             panic!("list must produce row");
         };
-        assert!(children[0].2.highlight);
-        assert!(children[1].2.highlight);
-        assert!(children[2].2.highlight);
-        assert!(!children[3].2.highlight);
+        assert_eq!(children[0].2.highlight, Some(SymbolRole::Variable));
+        assert_eq!(children[1].2.highlight, Some(SymbolRole::Variable));
+        assert_eq!(children[2].2.highlight, Some(SymbolRole::Variable));
+        assert_eq!(children[3].2.highlight, None);
         assert_eq!(children[0].2.width, BASE_SIZE * 0.5 + VARIABLE_PAD_X * 2.0);
         assert_eq!(children[0].2.ascent, BASE_SIZE * 0.5 + VARIABLE_PAD_Y);
         assert_eq!(children[1].0, children[0].2.width);
@@ -1547,7 +1620,7 @@ mod tests {
             panic!("list must produce row");
         };
         let script = &children[0].2;
-        assert!(script.highlight);
+        assert_eq!(script.highlight, Some(SymbolRole::Variable));
         assert!(script.descent > BASE_SIZE * 0.5);
         assert!(script.width > BASE_SIZE * 0.5);
         assert_eq!(highlight_count(script), 1);
@@ -1555,6 +1628,43 @@ mod tests {
             panic!("script must produce row");
         };
         assert_eq!(children[0].0, VARIABLE_PAD_X);
+    }
+
+    #[test]
+    fn resolved_roles_color_one_pill_around_their_rendered_body() {
+        for role in [
+            SymbolRole::Variable,
+            SymbolRole::Constant,
+            SymbolRole::Function,
+        ] {
+            let list = layout(&vec![resolved(role, symbols("π"))], 0, &fake_measure);
+            let BoxKind::Row { children } = list.kind else {
+                panic!("list must produce row");
+            };
+            let symbol = &children[0].2;
+            assert_eq!(symbol.highlight, Some(role));
+            assert_eq!(highlight_count(symbol), 1);
+            assert_eq!(symbol.width, BASE_SIZE * 0.5 + VARIABLE_PAD_X * 2.0);
+        }
+    }
+
+    #[test]
+    fn an_external_script_joins_a_resolved_symbols_role_pill() {
+        let list = layout(
+            &vec![script(
+                vec![resolved(SymbolRole::Constant, symbols("ε"))],
+                None,
+                Some(symbols("0")),
+            )],
+            0,
+            &fake_measure,
+        );
+        let BoxKind::Row { children } = list.kind else {
+            panic!("list must produce row");
+        };
+        let symbol = &children[0].2;
+        assert_eq!(symbol.highlight, Some(SymbolRole::Constant));
+        assert_eq!(highlight_count(symbol), 1);
     }
 
     #[test]

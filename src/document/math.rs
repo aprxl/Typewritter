@@ -9,6 +9,15 @@
 pub enum MathNode {
     /// One typed character: a digit, letter, operator, comma...
     Sym(char),
+    /// A catalog symbol whose identity survives save/load and visual variant
+    /// changes. The body is presentation only: editing treats this wrapper as
+    /// one atom and never places the cursor inside it.
+    Resolved {
+        id: String,
+        role: SymbolRole,
+        variant: String,
+        body: MathList,
+    },
     /// A fraction. Slots may be empty; an incomplete expression is legal.
     Frac { num: MathList, den: MathList },
     /// A base with scripts attached. `None` means that script was not asked for;
@@ -38,6 +47,34 @@ pub enum MathNode {
 }
 
 pub type MathList = Vec<MathNode>;
+
+/// The semantic role of a resolved symbol. Roles drive the symbol pill color
+/// without changing the notation stored in its presentation body.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SymbolRole {
+    Variable,
+    Constant,
+    Function,
+}
+
+impl SymbolRole {
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Variable => "variable",
+            Self::Constant => "constant",
+            Self::Function => "function",
+        }
+    }
+
+    pub fn from_keyword(keyword: &str) -> Option<Self> {
+        match keyword {
+            "variable" => Some(Self::Variable),
+            "constant" => Some(Self::Constant),
+            "function" => Some(Self::Function),
+            _ => None,
+        }
+    }
+}
 
 /// Which accent is drawn above a node's body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -329,7 +366,7 @@ pub struct MathCursor {
 impl MathNode {
     pub fn slots(&self) -> Vec<Slot> {
         match self {
-            Self::Sym(_) => Vec::new(),
+            Self::Sym(_) | Self::Resolved { .. } => Vec::new(),
             Self::Frac { .. } => vec![Slot::Num, Slot::Den],
             Self::Script { sup, sub, .. } => {
                 let mut slots = vec![Slot::Base];
@@ -370,7 +407,7 @@ impl MathNode {
             (Self::Accent { body, .. }, Slot::Body) => Some(body),
             (Self::BigOp { lower, .. }, Slot::Lower) => Some(lower),
             (Self::BigOp { kind, upper, .. }, Slot::Upper) if *kind != BigOp::Limit => Some(upper),
-            (Self::Sym(_), _) => None,
+            (Self::Sym(_) | Self::Resolved { .. }, _) => None,
             (Self::Frac { .. }, _)
             | (Self::Script { .. }, _)
             | (Self::Group { .. }, _)
@@ -392,7 +429,7 @@ impl MathNode {
             (Self::Accent { body, .. }, Slot::Body) => Some(body),
             (Self::BigOp { lower, .. }, Slot::Lower) => Some(lower),
             (Self::BigOp { kind, upper, .. }, Slot::Upper) if *kind != BigOp::Limit => Some(upper),
-            (Self::Sym(_), _) => None,
+            (Self::Sym(_) | Self::Resolved { .. }, _) => None,
             (Self::Frac { .. }, _)
             | (Self::Script { .. }, _)
             | (Self::Group { .. }, _)
@@ -649,7 +686,9 @@ pub fn close_group(root: &mut MathList, cursor: &mut MathCursor, c: char) -> boo
 }
 
 fn capture_operand(list: &mut MathList, index: usize) -> (usize, MathList) {
-    let start = if index > 0 && list[index - 1].is_structural() {
+    let start = if index > 0
+        && (list[index - 1].is_structural() || matches!(list[index - 1], MathNode::Resolved { .. }))
+    {
         index - 1
     } else {
         let mut start = index;
@@ -776,7 +815,7 @@ pub fn insert_script(root: &mut MathList, cursor: &mut MathCursor, which: Slot) 
 /// returns the cursor position immediately after that trigger.
 fn flatten_structure(list: &mut MathList, position: usize) -> Option<usize> {
     let (replacement, trigger_offset) = match list.get(position)?.clone() {
-        MathNode::Sym(_) => return None,
+        MathNode::Sym(_) | MathNode::Resolved { .. } => return None,
         MathNode::Frac { num, den } => {
             let trigger_offset = num.len() + 1;
             let mut replacement = num;
@@ -1173,6 +1212,15 @@ mod tests {
         MathNode::BigOp { kind, lower, upper }
     }
 
+    fn resolved(id: &str, role: SymbolRole, variant: &str, body: MathList) -> MathNode {
+        MathNode::Resolved {
+            id: id.to_owned(),
+            role,
+            variant: variant.to_owned(),
+            body,
+        }
+    }
+
     fn at(index: usize) -> MathCursor {
         MathCursor {
             path: Vec::new(),
@@ -1282,6 +1330,45 @@ mod tests {
 
         assert_eq!(root, sym("α"));
         assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn a_resolved_symbol_is_one_editing_atom() {
+        let symbol = resolved(
+            "physics.vacuum-permittivity",
+            SymbolRole::Constant,
+            "greek",
+            vec![script(sym("ε"), None, Some(sym("0")))],
+        );
+        let mut root = vec![symbol.clone()];
+        let mut cursor = at(0);
+
+        assert!(move_right(&root, &mut cursor));
+        assert_eq!(cursor, at(1));
+        assert!(move_left(&root, &mut cursor));
+        assert_eq!(cursor, at(0));
+        assert_eq!(delete_forward(&mut root, &mut cursor), Removed::Edited);
+        assert!(root.is_empty());
+
+        root.push(symbol);
+        cursor = at(1);
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+        assert!(root.is_empty());
+    }
+
+    #[test]
+    fn resolved_symbols_are_captured_and_survive_structure_flattening() {
+        let symbol = resolved("math.pi", SymbolRole::Constant, "greek", sym("π"));
+        let mut root = vec![symbol.clone()];
+        let mut cursor = at(1);
+
+        insert_fraction(&mut root, &mut cursor);
+        assert_eq!(root, vec![frac(vec![symbol.clone()], Vec::new())]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Den)], 0));
+
+        assert_eq!(backspace(&mut root, &mut cursor), Removed::Edited);
+        assert_eq!(root, vec![symbol, MathNode::Sym('/')]);
+        assert_eq!(cursor, at(2));
     }
 
     #[test]
