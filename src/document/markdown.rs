@@ -22,7 +22,7 @@ use std::io;
 use std::path::Path;
 
 use super::math_notation;
-use super::{Block, Caret, Document, Inline, Style, Text};
+use super::{BadgeColor, Block, Caret, Document, Inline, Style, Text};
 
 /// Scan for the next unescaped occurrence of `marker` at or after `start`.
 /// The char immediately before a match must be non-whitespace. Escaped
@@ -228,10 +228,28 @@ fn parse_inline(s: &str) -> Vec<Inline> {
                 match closer.filter(|cl| *cl > after) {
                     Some(cl) => {
                         push_plain(&mut runs, &mut text_buf);
+                        let raw: String = chars[after..cl].iter().collect();
+                        let (badge_color, label) = if let Some(label) =
+                            raw.strip_prefix("blue|").filter(|label| !label.is_empty())
+                        {
+                            (BadgeColor::Blue, label)
+                        } else if let Some(label) =
+                            raw.strip_prefix("green|").filter(|label| !label.is_empty())
+                        {
+                            (BadgeColor::Green, label)
+                        } else if let Some(label) = raw
+                            .strip_prefix("purple|")
+                            .filter(|label| !label.is_empty())
+                        {
+                            (BadgeColor::Purple, label)
+                        } else {
+                            (BadgeColor::Orange, raw.as_str())
+                        };
                         runs.push(Inline::Text(Text {
-                            text: chars[after..cl].iter().collect(),
+                            text: label.to_string(),
                             style: Style {
                                 badge: true,
+                                badge_color,
                                 ..Style::PLAIN
                             },
                         }));
@@ -465,7 +483,12 @@ fn wrap_run(style: Style, escaped: &str) -> String {
     if style.code {
         format!("`{escaped}`")
     } else if style.badge {
-        format!("[[{escaped}]]")
+        match style.badge_color {
+            BadgeColor::Orange => format!("[[{escaped}]]"),
+            BadgeColor::Blue => format!("[[blue|{escaped}]]"),
+            BadgeColor::Green => format!("[[green|{escaped}]]"),
+            BadgeColor::Purple => format!("[[purple|{escaped}]]"),
+        }
     } else if style.bold && style.italic {
         format!("***{escaped}***")
     } else if style.bold {
@@ -936,6 +959,28 @@ mod tests {
         assert!(runs[0].style().badge);
         assert_eq!(runs[0].text(), "PS");
         assert!(runs[1].style().is_plain());
+        assert_eq!(serialize(&d), text);
+    }
+
+    #[test]
+    fn coloured_badges_round_trip_while_plain_markers_stay_orange() {
+        let text = "[[TODO]] [[blue|INFO]] [[green|DONE]] [[purple|IDEA]]\n";
+        let d = parse(Path::new("n.md"), text);
+        let colors: Vec<_> = d.blocks[0]
+            .inlines()
+            .iter()
+            .filter(|run| run.style().badge)
+            .map(|run| run.style().badge_color)
+            .collect();
+        assert_eq!(
+            colors,
+            vec![
+                BadgeColor::Orange,
+                BadgeColor::Blue,
+                BadgeColor::Green,
+                BadgeColor::Purple,
+            ]
+        );
         assert_eq!(serialize(&d), text);
     }
 

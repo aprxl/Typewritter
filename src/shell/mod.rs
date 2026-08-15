@@ -44,8 +44,8 @@ use crate::components::{
 };
 use crate::config::Config;
 use crate::document::Caret;
-use crate::document::layout::DocLayout;
-use crate::document::math::MathCursor;
+use crate::document::layout::{ContextHit, DocLayout, RangeKind};
+use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_conversion;
 use crate::document::outline;
 use crate::frame::FrameScheduler;
@@ -99,6 +99,7 @@ struct ContextMenuState {
     items: Vec<&'static commands::Command>,
     selected: usize,
     anchor: (f32, f32),
+    target: Option<ContextHit>,
 }
 
 /// The in-math completion card while it is showing: the precise tree query,
@@ -817,6 +818,73 @@ impl Shell {
         layout.hit_math(local_x, local_y, &measure)
     }
 
+    fn context_at(&mut self, rect: Rect, mouse: (f32, f32)) -> Option<ContextHit> {
+        let layout = self.current_layout(Editor::content_width(rect));
+        let (local_x, local_y) = self.editor_point(rect, mouse)?;
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+        layout.hit_context(local_x, local_y, &measure)
+    }
+
+    /// Temporary Normal-click highlight. It exists only as part of the open
+    /// context menu state, so closing the popup also clears the selection.
+    fn context_selection(
+        &self,
+    ) -> (
+        Option<crate::document::FlatRange>,
+        bool,
+        Option<(usize, usize, NodeAddress)>,
+    ) {
+        let target = self
+            .context_menu
+            .as_ref()
+            .and_then(|state| state.target.as_ref());
+        match target {
+            Some(ContextHit::Range { range, kind }) => {
+                (Some(*range), *kind == RangeKind::CodeBlock, None)
+            }
+            Some(ContextHit::Math {
+                block,
+                inline,
+                node: Some(node),
+            }) => (None, false, Some((*block, *inline, node.clone()))),
+            Some(ContextHit::Math {
+                block,
+                inline,
+                node: None,
+            }) => {
+                let range = self.docs.borrow().active().and_then(|tab| {
+                    let block_ref = tab.document.blocks.get(*block)?;
+                    matches!(
+                        block_ref.inlines().get(*inline),
+                        Some(crate::document::Inline::Math(_))
+                    )
+                    .then(|| {
+                        let offset = block_ref.inlines()[..*inline]
+                            .iter()
+                            .map(|run| match run {
+                                crate::document::Inline::Text(text) => text.text.chars().count(),
+                                crate::document::Inline::Math(_) => 1,
+                            })
+                            .sum();
+                        crate::document::FlatRange::new(
+                            crate::document::FlatPos {
+                                block: *block,
+                                offset,
+                            },
+                            crate::document::FlatPos {
+                                block: *block,
+                                offset: offset + 1,
+                            },
+                        )
+                    })
+                });
+                (range, false, None)
+            }
+            None => (None, false, None),
+        }
+    }
+
     /// The breadcrumb for the active tab: vault name, then the file's
     /// folders, then the file and the heading trail under the caret. Falls
     /// back to the vault name.
@@ -950,8 +1018,14 @@ impl Shell {
         let command = self.search.as_ref().map_or_else(String::new, |search| {
             format!("{}{}", if search.forward { "/" } else { "?" }, search.query)
         });
-        let selection = self.current_selection();
-        let line_selection = self.vim.visual_mode() == Some(VisualMode::Line);
+        let visual_selection = self.current_selection();
+        let (context_selection, context_line, math_selection) = self.context_selection();
+        let selection = visual_selection.or(context_selection);
+        let line_selection = if visual_selection.is_some() {
+            self.vim.visual_mode() == Some(VisualMode::Line)
+        } else {
+            context_line
+        };
 
         let (editor, status) = {
             // The layout cache is fresh from the top of this function; grab
@@ -974,6 +1048,7 @@ impl Shell {
                     (
                         Editor::new(layout, caret, scroll, block_caret, caret.style)
                             .with_math(math)
+                            .with_math_selection(math_selection)
                             .with_selection(selection, line_selection),
                         StatusLine::new(
                             mode_label,

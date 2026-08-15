@@ -66,6 +66,15 @@ pub struct Text {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BadgeColor {
+    #[default]
+    Orange,
+    Blue,
+    Green,
+    Purple,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Style {
     pub bold: bool,
     pub italic: bool,
@@ -74,6 +83,7 @@ pub struct Style {
     /// Exclusive with every other flag — a badge is a whole visual unit,
     /// not a weight applied to prose.
     pub badge: bool,
+    pub badge_color: BadgeColor,
     /// Marked text. Stacks with bold and italic; excluded by `code` and
     /// `badge`, which draw their own box and would fight it.
     pub highlight: bool,
@@ -136,6 +146,7 @@ impl Style {
         italic: false,
         code: false,
         badge: false,
+        badge_color: BadgeColor::Orange,
         highlight: false,
     };
 
@@ -458,7 +469,11 @@ impl Document {
                 };
                 for run in self.slice_runs(block, from, to) {
                     has_selected = true;
-                    all_boxed &= run.style() == boxed;
+                    all_boxed &= if boxed.badge {
+                        run.style().badge
+                    } else {
+                        run.style() == boxed
+                    };
                 }
             }
             if !has_selected {
@@ -558,6 +573,59 @@ impl Document {
         self.dirty = true;
         self.enforce();
         self.refresh_context();
+    }
+
+    /// Change the colour of badges covered by `range`, leaving prose and
+    /// other boxed runs untouched.
+    pub fn set_badge_color(&mut self, range: FlatRange, color: BadgeColor) {
+        let range = range.normalized();
+        let start = self.position(range.start.block, range.start.offset);
+        let end = self.position(range.end.block, range.end.offset);
+        if (start.block, start.offset) >= (end.block, end.offset) {
+            return;
+        }
+
+        let mut changed = false;
+        for block in start.block..=end.block {
+            let from = if block == start.block {
+                start.offset
+            } else {
+                0
+            };
+            let to = if block == end.block {
+                end.offset
+            } else {
+                self.block_len(block)
+            };
+            if from >= to {
+                continue;
+            }
+            let original = self.blocks[block].clone();
+            let mut selected = self.slice_runs(block, from, to);
+            let block_changed = selected.iter_mut().fold(false, |changed, run| {
+                let mut style = run.style();
+                if style.badge && style.badge_color != color {
+                    style.badge_color = color;
+                    run.set_style(style);
+                    true
+                } else {
+                    changed
+                }
+            });
+            if !block_changed {
+                continue;
+            }
+            let mut runs = self.slice_runs(block, 0, from);
+            runs.extend(selected);
+            runs.extend(self.slice_runs(block, to, self.block_len(block)));
+            self.blocks[block] = Self::block_with_runs(&original, runs);
+            changed = true;
+        }
+        if changed {
+            self.dirty = true;
+            self.enforce();
+            self.refresh_context();
+        }
     }
 
     pub fn yank_range(&self, range: FlatRange) -> String {
@@ -1556,6 +1624,41 @@ impl Document {
         self.enforce();
     }
 
+    /// Convert one exact block to/from a code line without moving the caret.
+    pub fn set_block_code_at(&mut self, block: usize, on: bool) -> bool {
+        let Some(current) = self.blocks.get(block) else {
+            return false;
+        };
+        if current.is_code() == on {
+            return false;
+        }
+
+        let mut inlines = std::mem::take(self.blocks[block].inlines_mut());
+        for run in &mut inlines {
+            if let Inline::Text(text) = run {
+                text.style = if on {
+                    Style {
+                        code: true,
+                        ..Style::PLAIN
+                    }
+                } else {
+                    Style::PLAIN
+                };
+            }
+        }
+        self.blocks[block] = if on {
+            Block::CodeLine {
+                content: inlines,
+                first: true,
+                lang: None,
+            }
+        } else {
+            Block::Paragraph(inlines)
+        };
+        self.dirty = true;
+        true
+    }
+
     /// Convert the caret's block: `Some(1..=4)` → Heading, `None` →
     /// Paragraph. Content runs preserved.
     pub fn set_heading(&mut self, level: Option<u8>) {
@@ -1592,6 +1695,40 @@ impl Document {
         }
         self.dirty = true;
         self.enforce();
+    }
+
+    /// Convert one exact block to Body or H1-H4 without moving the caret.
+    pub fn set_block_heading_at(&mut self, block: usize, level: Option<u8>) -> bool {
+        if level.is_some_and(|level| !(1..=4).contains(&level)) {
+            return false;
+        }
+        let Some(current) = self.blocks.get(block) else {
+            return false;
+        };
+        if matches!((current, level), (Block::Paragraph(_), None))
+            || matches!((current, level), (Block::Heading { level: current, .. }, Some(next)) if *current == next)
+        {
+            return false;
+        }
+
+        let was_code = current.is_code();
+        let mut inlines = std::mem::take(self.blocks[block].inlines_mut());
+        if was_code {
+            for run in &mut inlines {
+                if let Inline::Text(text) = run {
+                    text.style = Style::PLAIN;
+                }
+            }
+        }
+        self.blocks[block] = match level {
+            Some(level) => Block::Heading {
+                level,
+                content: inlines,
+            },
+            None => Block::Paragraph(inlines),
+        };
+        self.dirty = true;
+        true
     }
 
     /// Puts a rule below the caret's block and leaves the caret on a fresh
@@ -1759,6 +1896,93 @@ impl Document {
             self.dirty = true;
         }
         accepted
+    }
+
+    fn mutate_math_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        mutation: impl FnOnce(&mut math::MathList) -> bool,
+    ) -> bool {
+        let Some(Inline::Math(list)) = self
+            .blocks
+            .get_mut(block)
+            .and_then(|block| block.inlines_mut().get_mut(inline))
+        else {
+            return false;
+        };
+        let before = list.clone();
+        if !mutation(list) || *list == before {
+            *list = before;
+            return false;
+        }
+        self.dirty = true;
+        true
+    }
+
+    pub fn set_math_node_role_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        address: &math::NodeAddress,
+        role: math::SymbolRole,
+    ) -> bool {
+        self.mutate_math_at(block, inline, |list| {
+            math::set_node_role(list, address, role)
+        })
+    }
+
+    pub fn set_math_node_variant_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        address: &math::NodeAddress,
+        variant: &str,
+    ) -> bool {
+        self.mutate_math_at(block, inline, |list| {
+            if math::set_node_variant(list, address, variant) {
+                return true;
+            }
+            matches!(math::node_at(list, address), Some(math::MathNode::Sym(c)) if c.is_alphabetic())
+                && math::set_node_role(list, address, math::SymbolRole::Variable)
+                && math::set_node_variant(list, address, variant)
+        })
+    }
+
+    pub fn set_math_group_delimiter_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        address: &math::NodeAddress,
+        open: char,
+    ) -> bool {
+        self.mutate_math_at(block, inline, |list| {
+            math::set_group_delimiter(list, address, open)
+        })
+    }
+
+    pub fn set_math_accent_kind_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        address: &math::NodeAddress,
+        kind: math::AccentKind,
+    ) -> bool {
+        self.mutate_math_at(block, inline, |list| {
+            math::set_accent_kind(list, address, kind)
+        })
+    }
+
+    pub fn set_math_big_op_kind_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        address: &math::NodeAddress,
+        kind: math::BigOp,
+    ) -> bool {
+        self.mutate_math_at(block, inline, |list| {
+            math::set_big_op_kind(list, address, kind)
+        })
     }
 
     pub fn math_backspace(&mut self) -> Option<math::Removed> {
@@ -2839,6 +3063,156 @@ mod tests {
     }
 
     #[test]
+    fn exact_math_node_mutations_are_dirty_without_moving_the_caret() {
+        let mut d = doc();
+        d.blocks = vec![
+            Block::Paragraph(vec![
+                plain_run("before"),
+                Inline::Math(vec![
+                    math::MathNode::Sym('x'),
+                    math::MathNode::Group {
+                        open: '(',
+                        close: ')',
+                        body: vec![math::MathNode::Sym('y')],
+                    },
+                    math::MathNode::Accent {
+                        kind: math::AccentKind::Vector,
+                        body: vec![math::MathNode::Sym('z')],
+                    },
+                    math::MathNode::BigOp {
+                        kind: math::BigOp::Integral,
+                        lower: Vec::new(),
+                        upper: Vec::new(),
+                    },
+                    math::MathNode::Sym('q'),
+                ]),
+                plain_run("after"),
+            ]),
+            Block::Paragraph(vec![plain_run("caret")]),
+        ];
+        d.set_caret(1, 0, 2);
+        let caret = d.caret;
+        let at = |index| math::NodeAddress {
+            path: Vec::new(),
+            index,
+        };
+
+        assert!(d.set_math_node_variant_at(0, 1, &at(0), "bold"));
+        assert!(matches!(
+            &d.blocks[0].inlines()[1],
+            Inline::Math(list)
+                if matches!(&list[0], math::MathNode::Resolved {
+                    role: math::SymbolRole::Variable,
+                    variant,
+                    ..
+                } if variant == "bold")
+        ));
+        assert!(d.set_math_node_role_at(0, 1, &at(0), math::SymbolRole::Constant));
+        assert!(d.set_math_group_delimiter_at(0, 1, &at(1), '['));
+        assert!(d.set_math_accent_kind_at(0, 1, &at(2), math::AccentKind::Dot));
+        assert!(d.set_math_big_op_kind_at(0, 1, &at(3), math::BigOp::ContourIntegral));
+        assert!(d.is_dirty());
+        assert_eq!(d.caret, caret);
+        assert!(d.math.is_none());
+        assert!(matches!(
+            &d.blocks[0].inlines()[1],
+            Inline::Math(list)
+                if matches!(&list[0], math::MathNode::Resolved {
+                    role: math::SymbolRole::Constant,
+                    variant,
+                    ..
+                } if variant == "bold")
+                    && matches!(&list[1], math::MathNode::Group { open: '[', close: ']', .. })
+                    && matches!(&list[2], math::MathNode::Accent { kind: math::AccentKind::Dot, .. })
+                    && matches!(&list[3], math::MathNode::BigOp { kind: math::BigOp::ContourIntegral, .. })
+        ));
+
+        d.dirty = false;
+        assert!(!d.set_math_node_role_at(0, 1, &at(0), math::SymbolRole::Constant));
+        assert!(!d.set_math_node_variant_at(0, 1, &at(0), "bold"));
+        assert!(!d.set_math_group_delimiter_at(0, 1, &at(1), '['));
+        assert!(!d.set_math_accent_kind_at(0, 1, &at(2), math::AccentKind::Dot));
+        assert!(!d.set_math_big_op_kind_at(0, 1, &at(3), math::BigOp::ContourIntegral));
+        assert!(!d.set_math_node_variant_at(0, 1, &at(4), "missing"));
+        assert!(!d.set_math_node_role_at(9, 9, &at(0), math::SymbolRole::Variable));
+        assert!(!d.is_dirty());
+        assert_eq!(d.caret, caret);
+        assert!(matches!(
+            &d.blocks[0].inlines()[1],
+            Inline::Math(list) if matches!(list.get(4), Some(math::MathNode::Sym('q')))
+        ));
+    }
+
+    #[test]
+    fn a_raw_greek_letter_accepts_and_persists_a_variant() {
+        let mut d = doc();
+        d.blocks[0] = Block::Paragraph(vec![Inline::Math(vec![math::MathNode::Sym('α')])]);
+        let address = math::NodeAddress {
+            path: Vec::new(),
+            index: 0,
+        };
+
+        assert!(d.set_math_node_variant_at(0, 0, &address, "bold"));
+        let Inline::Math(list) = &d.blocks[0].inlines()[0] else {
+            panic!("the targeted inline stays math");
+        };
+        assert!(matches!(
+            list.as_slice(),
+            [math::MathNode::Resolved {
+                id,
+                role: math::SymbolRole::Variable,
+                variant,
+                body,
+            }] if id == "α"
+                && variant == "bold"
+                && body == &vec![math::MathNode::Sym('𝛂')]
+        ));
+        assert_eq!(
+            math_notation::parse(&math_notation::print(list)),
+            list.clone(),
+            "the promoted identity and variant survive canonical notation"
+        );
+    }
+
+    #[test]
+    fn exact_block_type_changes_preserve_runs_and_caret() {
+        let mut d = doc();
+        let content = vec![
+            plain_run("a"),
+            Inline::Math(vec![math::MathNode::Sym('x')]),
+            bold_run("b"),
+        ];
+        d.blocks = vec![
+            Block::Paragraph(content.clone()),
+            Block::Paragraph(vec![plain_run("caret")]),
+        ];
+        d.set_caret(1, 0, 3);
+        let caret = d.caret;
+
+        assert!(d.set_block_heading_at(0, Some(2)));
+        assert!(matches!(
+            &d.blocks[0],
+            Block::Heading { level: 2, content: actual } if actual == &content
+        ));
+        assert_eq!(d.caret, caret);
+
+        d.dirty = false;
+        assert!(!d.set_block_heading_at(0, Some(2)));
+        assert!(!d.is_dirty());
+        assert!(d.set_block_code_at(0, true));
+        assert!(matches!(
+            &d.blocks[0],
+            Block::CodeLine { content, first: true, lang: None }
+                if content.len() == 3 && matches!(content[1], Inline::Math(_))
+        ));
+        assert_eq!(d.caret, caret);
+
+        assert!(d.set_block_code_at(0, false));
+        assert!(matches!(&d.blocks[0], Block::Paragraph(content) if content.len() == 3));
+        assert_eq!(d.caret, caret);
+    }
+
+    #[test]
     fn enter_math_before_ignores_prose() {
         let mut d = doc();
         d.blocks[0] = Block::Paragraph(vec![plain_run("text")]);
@@ -3218,6 +3592,45 @@ mod tests {
                 .iter()
                 .all(|(_, style)| *style == Style::PLAIN)
         );
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn badge_color_changes_only_the_selected_badge() {
+        let badge = Style {
+            badge: true,
+            ..Style::PLAIN
+        };
+        let mut d = doc();
+        d.blocks[0] = Block::Paragraph(vec![
+            Inline::Text(Text {
+                text: "A".into(),
+                style: badge,
+            }),
+            Inline::Text(Text {
+                text: "B".into(),
+                style: badge,
+            }),
+        ]);
+        let first = FlatRange::new(
+            FlatPos {
+                block: 0,
+                offset: 0,
+            },
+            FlatPos {
+                block: 0,
+                offset: 1,
+            },
+        );
+
+        d.set_badge_color(first, BadgeColor::Blue);
+        let styled = runs(&d.blocks[0]);
+        assert_eq!(styled.len(), 2);
+        assert_eq!(styled[0].1.badge_color, BadgeColor::Blue);
+        assert_eq!(styled[1].1.badge_color, BadgeColor::Orange);
+
+        d.toggle_style_range(first, badge);
+        assert_eq!(runs(&d.blocks[0])[0].1, Style::PLAIN);
         assert_invariants(&d);
     }
 }

@@ -9,7 +9,7 @@
 //! `y` positive upward; a denominator therefore has a negative y offset.
 
 use crate::document::math::{
-    AccentKind, BigOp, MathCursor, MathList, MathNode, Slot, Step, SymbolRole,
+    AccentKind, BigOp, MathCursor, MathList, MathNode, NodeAddress, Slot, Step, SymbolRole,
 };
 use crate::theme::{self, TextStyle};
 
@@ -81,6 +81,16 @@ pub struct InteractionBounds {
     pub right: f32,
     pub ascent: f32,
     pub descent: f32,
+}
+
+/// Visual bounds of an addressed node, in the expression's coordinate space.
+/// Math layout uses an upward-positive y axis, so `top >= bottom`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodeBounds {
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
 }
 
 /// Renderer-independent geometry emitted by math layout.
@@ -859,6 +869,116 @@ pub fn hit(
     let mut cursor = MathCursor::default();
     hit_list(list, &box_, point, level, &mut cursor);
     cursor
+}
+
+/// Hit-test one complete math node for Normal-mode context selection.
+///
+/// Atomic symbols beat their structural ancestors. A structure wins on its
+/// own geometry, while empty space outside node boxes has no target.
+pub fn hit_node(
+    list: &MathList,
+    point: (f32, f32),
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> Option<NodeAddress> {
+    let box_ = layout(list, level, measure);
+    hit_node_in(list, &box_, point, &mut Vec::new())
+}
+
+fn hit_node_in(
+    list: &MathList,
+    box_: &MathBox,
+    point: (f32, f32),
+    path: &mut Vec<Step>,
+) -> Option<NodeAddress> {
+    let BoxKind::Row { children } = &box_.kind else {
+        return None;
+    };
+    // Later siblings paint on top of earlier ones when boxes overlap.
+    for (index, node) in list.iter().enumerate().rev() {
+        let (child_x, child_y, child) = children.get(index)?;
+        let local = (point.0 - child_x, point.1 - child_y);
+        if !contains(child, local) {
+            continue;
+        }
+        let address = NodeAddress {
+            path: path.clone(),
+            index,
+        };
+        if matches!(node, MathNode::Sym(_) | MathNode::Resolved { .. }) {
+            return Some(address);
+        }
+        for slot in node.slots().into_iter().rev() {
+            let Some((slot_list, slot_box, slot_x, slot_y)) = structural_slot(node, child, slot)
+            else {
+                continue;
+            };
+            let slot_point = (local.0 - slot_x, local.1 - slot_y);
+            if !contains(slot_box, slot_point) {
+                continue;
+            }
+            if slot_list.is_empty() {
+                return Some(address);
+            }
+            path.push(Step { index, slot });
+            let hit = hit_node_in(slot_list, slot_box, slot_point, path);
+            path.pop();
+            return hit;
+        }
+        return Some(address);
+    }
+    None
+}
+
+fn contains(box_: &MathBox, point: (f32, f32)) -> bool {
+    point.0 >= 0.0 && point.0 <= box_.width && point.1 >= -box_.descent && point.1 <= box_.ascent
+}
+
+/// Return the visual bounds of `address` in the expression's coordinate space.
+pub fn node_bounds(
+    list: &MathList,
+    address: &NodeAddress,
+    level: usize,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> Option<NodeBounds> {
+    let box_ = layout(list, level, measure);
+    node_bounds_in(list, &box_, address, 0.0, 0.0)
+}
+
+fn node_bounds_in(
+    list: &MathList,
+    box_: &MathBox,
+    address: &NodeAddress,
+    mut origin_x: f32,
+    mut origin_y: f32,
+) -> Option<NodeBounds> {
+    let mut list = list;
+    let mut box_ = box_;
+    for step in &address.path {
+        let BoxKind::Row { children } = &box_.kind else {
+            return None;
+        };
+        let node = list.get(step.index)?;
+        let (node_x, node_y, node_box) = children.get(step.index)?;
+        let (slot_list, slot_box, slot_x, slot_y) = structural_slot(node, node_box, step.slot)?;
+        origin_x += node_x + slot_x;
+        origin_y += node_y + slot_y;
+        list = slot_list;
+        box_ = slot_box;
+    }
+    let BoxKind::Row { children } = &box_.kind else {
+        return None;
+    };
+    list.get(address.index)?;
+    let (x, y, node) = children.get(address.index)?;
+    let anchor_x = origin_x + x;
+    let anchor_y = origin_y + y;
+    Some(NodeBounds {
+        left: anchor_x,
+        right: anchor_x + node.width,
+        top: anchor_y + node.ascent,
+        bottom: anchor_y - node.descent,
+    })
 }
 
 fn hit_list(
@@ -1923,5 +2043,153 @@ mod tests {
             let child = &sum[slot_child_index(&sum_list[0], slot).expect("sum slot index")];
             assert!(x > child.0 && x < child.0 + child.2.width);
         }
+    }
+
+    #[test]
+    fn normal_hit_prefers_the_deepest_symbol_then_structural_geometry() {
+        let source = vec![fraction(
+            vec![resolved(SymbolRole::Constant, symbols("π"))],
+            symbols("d"),
+        )];
+        let laid_out = layout(&source, 0, &fake_measure);
+        let BoxKind::Row { children } = &laid_out.kind else {
+            panic!("list must be a row");
+        };
+        let fraction = &children[0];
+        let BoxKind::Row {
+            children: fraction_children,
+        } = &fraction.2.kind
+        else {
+            panic!("fraction must be a row");
+        };
+        let numerator = &fraction_children[0];
+
+        assert_eq!(
+            hit_node(
+                &source,
+                (
+                    fraction.0 + numerator.0 + numerator.2.width * 0.5,
+                    fraction.1 + numerator.1,
+                ),
+                0,
+                &fake_measure,
+            ),
+            Some(NodeAddress {
+                path: vec![Step {
+                    index: 0,
+                    slot: Slot::Num,
+                }],
+                index: 0,
+            })
+        );
+        assert_eq!(
+            hit_node(
+                &source,
+                (fraction.0 + fraction.2.width * 0.5, fraction.1),
+                0,
+                &fake_measure,
+            ),
+            Some(NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn normal_hit_leaves_whitespace_untargeted_and_resolved_atomic() {
+        let source = vec![resolved(
+            SymbolRole::Variable,
+            vec![script(symbols("x"), Some(symbols("2")), None)],
+        )];
+        let laid_out = layout(&source, 0, &fake_measure);
+
+        assert_eq!(
+            hit_node(&source, (laid_out.width * 0.5, 0.0), 0, &fake_measure,),
+            Some(NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            })
+        );
+        assert_eq!(
+            hit_node(&source, (laid_out.width + 1.0, 0.0), 0, &fake_measure),
+            None
+        );
+    }
+
+    #[test]
+    fn normal_hit_uses_paint_order_for_overlapping_siblings() {
+        let source = vec![
+            big_op(BigOp::Integral, Vec::new(), Vec::new()),
+            big_op(BigOp::ContourIntegral, Vec::new(), Vec::new()),
+        ];
+        let laid_out = layout(&source, 0, &fake_measure);
+        let BoxKind::Row { children } = &laid_out.kind else {
+            panic!("list must be a row");
+        };
+        let overlap_x = children[1].0 + INTEGRAL_OVERLAP * 0.5;
+
+        assert_eq!(
+            hit_node(&source, (overlap_x, 0.0), 0, &fake_measure),
+            Some(NodeAddress {
+                path: Vec::new(),
+                index: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn addressed_bounds_follow_nested_layout_offsets() {
+        let source = vec![fraction(symbols("ab"), symbols("c"))];
+        let address = NodeAddress {
+            path: vec![Step {
+                index: 0,
+                slot: Slot::Num,
+            }],
+            index: 1,
+        };
+        let laid_out = layout(&source, 0, &fake_measure);
+        let BoxKind::Row { children } = &laid_out.kind else {
+            panic!("list must be a row");
+        };
+        let fraction = &children[0];
+        let BoxKind::Row {
+            children: fraction_children,
+        } = &fraction.2.kind
+        else {
+            panic!("fraction must be a row");
+        };
+        let numerator = &fraction_children[0];
+        let BoxKind::Row {
+            children: numerator_children,
+        } = &numerator.2.kind
+        else {
+            panic!("numerator must be a row");
+        };
+        let symbol = &numerator_children[1];
+        let expected_left = fraction.0 + numerator.0 + symbol.0;
+        let expected_anchor = fraction.1 + numerator.1 + symbol.1;
+
+        assert_eq!(
+            node_bounds(&source, &address, 0, &fake_measure),
+            Some(NodeBounds {
+                left: expected_left,
+                right: expected_left + symbol.2.width,
+                top: expected_anchor + symbol.2.ascent,
+                bottom: expected_anchor - symbol.2.descent,
+            })
+        );
+        assert_eq!(
+            node_bounds(
+                &source,
+                &NodeAddress {
+                    path: Vec::new(),
+                    index: 9,
+                },
+                0,
+                &fake_measure,
+            ),
+            None
+        );
     }
 }

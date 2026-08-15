@@ -11,8 +11,8 @@
 //! prose collapses whitespace and carries no source offsets, both fatal to
 //! caret mapping.
 
-use crate::document::math::MathCursor;
-use crate::document::{Block, Caret, Document, Inline, Style, math_layout};
+use crate::document::math::{MathCursor, NodeAddress};
+use crate::document::{Block, Caret, Document, FlatPos, FlatRange, Inline, Style, math_layout};
 use crate::theme::{self, TextStyle};
 
 /// Visual line heights, in logical pixels.
@@ -83,6 +83,27 @@ pub struct DocLayout {
     pub source: Vec<Block>,
 }
 
+/// The smallest editable document node under a Normal-mode click.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextHit {
+    /// A prose node represented by an ordinary flat-text range.
+    Range { range: FlatRange, kind: RangeKind },
+    /// A whole math atom, or its deepest structural child when `node` is set.
+    Math {
+        block: usize,
+        inline: usize,
+        node: Option<NodeAddress>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeKind {
+    Word,
+    Badge,
+    InlineCode,
+    CodeBlock,
+}
+
 /// The font a run renders with. Body is serif 17.5; headings are serif at
 /// 24/21/18.5 and always bold; a run's `bold`/`italic` stack on top.
 pub fn text_style(kind: &Block, style: Style) -> TextStyle {
@@ -93,7 +114,8 @@ pub fn text_style(kind: &Block, style: Style) -> TextStyle {
         // A chip is set far smaller than the prose it sits in, tracked out
         // the way the design's labels are — it reads as machinery, not as
         // a word in the sentence.
-        return TextStyle::mono(theme::BADGE_SIZE, theme::BADGE_INK).tracked(0.1);
+        return TextStyle::mono(theme::BADGE_SIZE, theme::badge_ink(style.badge_color))
+            .tracked(0.1);
     }
     let mut base = match kind {
         Block::Heading { level, .. } => TextStyle::serif(
@@ -614,6 +636,207 @@ impl DocLayout {
         caret_for_click(&self.source, layout_block, block_idx, line_idx, x, measure)
     }
 
+    /// The smallest contextual node under a Normal-mode click. Unlike
+    /// [`Self::hit`], whitespace deliberately has no target.
+    pub fn hit_context(
+        &self,
+        x: f32,
+        y: f32,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> Option<ContextHit> {
+        let block_idx = block_of_y(self, y);
+        let layout_block = &self.blocks[block_idx];
+        let line_idx = line_of_y(layout_block, y);
+        if let Some((block, inline, node)) =
+            self.hit_math_node_on_line(block_idx, line_idx, x, y, measure)
+        {
+            return Some(ContextHit::Math {
+                block,
+                inline,
+                node,
+            });
+        }
+
+        let line = &layout_block.lines[line_idx];
+        let block = &self.source[block_idx];
+
+        if block.is_code() {
+            let mut first = block_idx;
+            while first > 0
+                && matches!(
+                    self.source.get(first),
+                    Some(Block::CodeLine { first: false, .. })
+                )
+            {
+                first -= 1;
+            }
+            let mut last = block_idx;
+            while matches!(
+                self.source.get(last + 1),
+                Some(Block::CodeLine { first: false, .. })
+            ) {
+                last += 1;
+            }
+            return Some(ContextHit::Range {
+                range: FlatRange::new(
+                    FlatPos {
+                        block: first,
+                        offset: 0,
+                    },
+                    FlatPos {
+                        block: last,
+                        offset: block_flat_len(&self.source[last]),
+                    },
+                ),
+                kind: RangeKind::CodeBlock,
+            });
+        }
+
+        let mut advance_x = 0.0;
+        for segment in &line.segments {
+            let run = &block.inlines()[segment.inline];
+            let run_start: usize = block.inlines()[..segment.inline]
+                .iter()
+                .map(|run| run_text(run).chars().count())
+                .sum();
+            let text = segment_text(run, segment);
+            let width = advance(run, &text, block, segment.style, measure);
+            if x >= advance_x && x <= advance_x + width {
+                let run_len = run_text(run).chars().count();
+                let whole_run = FlatRange::new(
+                    FlatPos {
+                        block: block_idx,
+                        offset: run_start,
+                    },
+                    FlatPos {
+                        block: block_idx,
+                        offset: run_start + run_len,
+                    },
+                );
+                if segment.style.badge {
+                    return Some(ContextHit::Range {
+                        range: whole_run,
+                        kind: RangeKind::Badge,
+                    });
+                }
+                if segment.style.code {
+                    return Some(ContextHit::Range {
+                        range: whole_run,
+                        kind: RangeKind::InlineCode,
+                    });
+                }
+
+                let mut char_x = advance_x;
+                for (within_segment, ch) in text.chars().enumerate() {
+                    let char_width = measure(&ch.to_string(), &text_style(block, segment.style));
+                    if x < char_x + char_width || within_segment + 1 == segment.len {
+                        if !ch.is_alphanumeric() && ch != '_' {
+                            return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
+                        }
+                        let clicked = run_start + segment.start + within_segment;
+                        let chars: Vec<char> = block
+                            .inlines()
+                            .iter()
+                            .flat_map(|run| run_text(run).chars())
+                            .collect();
+                        let mut start = clicked;
+                        while start > 0
+                            && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_')
+                        {
+                            start -= 1;
+                        }
+                        let mut end = clicked + 1;
+                        while end < chars.len()
+                            && (chars[end].is_alphanumeric() || chars[end] == '_')
+                        {
+                            end += 1;
+                        }
+                        return Some(ContextHit::Range {
+                            range: FlatRange::new(
+                                FlatPos {
+                                    block: block_idx,
+                                    offset: start,
+                                },
+                                FlatPos {
+                                    block: block_idx,
+                                    offset: end,
+                                },
+                            ),
+                            kind: RangeKind::Word,
+                        });
+                    }
+                    char_x += char_width;
+                }
+                return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
+            }
+            advance_x += width;
+        }
+        self.hit_hidden_math_node(block_idx, line_idx, x, y, measure)
+    }
+
+    fn hit_hidden_math_node(
+        &self,
+        current_block: usize,
+        current_line: usize,
+        x: f32,
+        y: f32,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> Option<ContextHit> {
+        for (other_block, layout_block) in self.blocks.iter().enumerate() {
+            for other_line in 0..layout_block.lines.len() {
+                if (other_block, other_line) == (current_block, current_line) {
+                    continue;
+                }
+                if let Some(hit) =
+                    self.hit_math_node_on_line(other_block, other_line, x, y, measure)
+                {
+                    return Some(ContextHit::Math {
+                        block: hit.0,
+                        inline: hit.1,
+                        node: hit.2,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn hit_math_node_on_line(
+        &self,
+        block_idx: usize,
+        line_idx: usize,
+        x: f32,
+        y: f32,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> Option<(usize, usize, Option<NodeAddress>)> {
+        let line = &self.blocks[block_idx].lines[line_idx];
+        let block = &self.source[block_idx];
+        let mut advance_x = 0.0;
+        for segment in &line.segments {
+            let run = &block.inlines()[segment.inline];
+            let text = segment_text(run, segment);
+            let width = advance(run, &text, block, segment.style, measure);
+            if let Inline::Math(list) = run {
+                let local = (x - advance_x, line.y + line.height / 2.0 - y);
+                let expression = math_layout::layout(list, 0, measure);
+                let bounds = math_layout::interaction_bounds(&expression);
+                if local.0 >= bounds.left
+                    && local.0 <= bounds.right
+                    && local.1 >= -bounds.descent
+                    && local.1 <= bounds.ascent
+                {
+                    return Some((
+                        block_idx,
+                        segment.inline,
+                        math_layout::hit_node(list, local, 0, measure),
+                    ));
+                }
+            }
+            advance_x += width;
+        }
+        None
+    }
+
     /// The atom a point landed inside, with the cursor seated where the
     /// point falls in it. `None` when the point is not inside an atom's box.
     pub fn hit_math(
@@ -660,9 +883,6 @@ impl DocLayout {
         for segment in &line.segments {
             let run = &block.inlines()[segment.inline];
             let text = segment_text(run, segment);
-            if segment.style.badge {
-                advance_x += theme::BADGE_PAD;
-            }
             let width = advance(run, &text, block, segment.style, measure);
             if let Inline::Math(list) = run {
                 let local_x = x - advance_x;
@@ -683,9 +903,6 @@ impl DocLayout {
                 }
             }
             advance_x += width;
-            if segment.style.badge {
-                advance_x += theme::BADGE_PAD;
-            }
         }
         None
     }
@@ -1111,10 +1328,7 @@ mod tests {
                 text: "PS".into(),
                 style: badge,
             }),
-            Inline::Text(Text {
-                text: "x".into(),
-                style: Style::PLAIN,
-            }),
+            Inline::Math(vec![MathNode::Sym('x')]),
         ]);
         // The box counts: bare glyphs would put `x` under the chip.
         let bare = fake_measure("PS", &text_style(&block, badge));
@@ -1152,6 +1366,16 @@ mod tests {
         assert_eq!(at(0, 0), theme::BADGE_PAD);
         assert_eq!(at(0, 1), theme::BADGE_PAD + 10.0, "inside the label");
         assert_eq!(at(1, 0), bare + theme::BADGE_PAD * 2.0, "past the box");
+
+        let line = &laid.blocks[0].lines[0];
+        let hit = laid
+            .hit_math(
+                bare + theme::BADGE_PAD * 2.0 + 5.0,
+                line.y + line.height * 0.5,
+                &fake_measure,
+            )
+            .expect("math immediately after a badge remains hittable");
+        assert_eq!((hit.0, hit.1), (0, 1));
     }
 
     fn code_line_run(text: &str, first: bool) -> Block {
@@ -1329,6 +1553,101 @@ mod tests {
             }]
         );
         assert_eq!(cursor.index, 3);
+    }
+
+    #[test]
+    fn normal_context_click_selects_words_and_leaves_whitespace_empty() {
+        let d = doc_with(vec![para("hello world")]);
+        let laid = layout(&d, 300.0, &fake_measure);
+        let y = laid.blocks[0].lines[0].height * 0.5;
+        assert_eq!(
+            laid.hit_context(5.0, y, &fake_measure),
+            Some(ContextHit::Range {
+                range: FlatRange::new(
+                    FlatPos {
+                        block: 0,
+                        offset: 0
+                    },
+                    FlatPos {
+                        block: 0,
+                        offset: 5
+                    }
+                ),
+                kind: RangeKind::Word,
+            })
+        );
+        assert_eq!(laid.hit_context(55.0, y, &fake_measure), None);
+    }
+
+    #[test]
+    fn normal_context_click_prefers_a_whole_badge_run() {
+        let badge = Style {
+            badge: true,
+            ..Style::PLAIN
+        };
+        let d = doc_with(vec![Block::Paragraph(vec![
+            Inline::Text(Text {
+                text: "TAG".into(),
+                style: badge,
+            }),
+            Inline::Text(Text {
+                text: " word".into(),
+                style: Style::PLAIN,
+            }),
+        ])]);
+        let laid = layout(&d, 300.0, &fake_measure);
+        let y = laid.blocks[0].lines[0].height * 0.5;
+        assert_eq!(
+            laid.hit_context(theme::BADGE_PAD * 0.5, y, &fake_measure),
+            Some(ContextHit::Range {
+                range: FlatRange::new(
+                    FlatPos {
+                        block: 0,
+                        offset: 0
+                    },
+                    FlatPos {
+                        block: 0,
+                        offset: 3
+                    }
+                ),
+                kind: RangeKind::Badge,
+            })
+        );
+    }
+
+    #[test]
+    fn normal_context_click_prefers_a_deep_math_symbol() {
+        let list = vec![MathNode::Frac {
+            num: vec![MathNode::Sym('n')],
+            den: vec![MathNode::Sym('d')],
+        }];
+        let d = doc_with(vec![Block::Paragraph(vec![Inline::Math(list.clone())])]);
+        let laid = layout(&d, 300.0, &fake_measure);
+        let expression = math_layout::layout(&list, 0, &fake_measure);
+        let BoxKind::Row { children } = &expression.kind else {
+            panic!("expression must be a row");
+        };
+        let BoxKind::Row { children: fraction } = &children[0].2.kind else {
+            panic!("fraction must be a row");
+        };
+        let numerator = &fraction[0];
+        let x = children[0].0 + numerator.0 + numerator.2.width * 0.5;
+        let baseline = laid.blocks[0].lines[0].height * 0.5;
+        let y = baseline - children[0].1 - numerator.1;
+        assert_eq!(
+            laid.hit_context(x, y, &fake_measure),
+            Some(ContextHit::Math {
+                block: 0,
+                inline: 0,
+                node: Some(NodeAddress {
+                    path: vec![Step {
+                        index: 0,
+                        slot: Slot::Num,
+                    }],
+                    index: 0,
+                }),
+            })
+        );
     }
 
     #[test]

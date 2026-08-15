@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::document::{Document, FlatRange, Style, math, math_conversion};
+use crate::document::{BadgeColor, Document, FlatRange, Style, math, math_conversion};
 
 pub struct Tab {
     pub document: Document,
@@ -340,6 +340,10 @@ impl Tabs {
         self.edit(|doc| doc.toggle_style_range(range, mask));
     }
 
+    pub fn set_badge_color(&mut self, range: FlatRange, color: BadgeColor) {
+        self.edit(|doc| doc.set_badge_color(range, color));
+    }
+
     pub fn open_change(&mut self, range: FlatRange) {
         self.delete_range(range);
     }
@@ -416,6 +420,18 @@ impl Tabs {
         self.edit(|doc| doc.set_heading(level));
     }
 
+    pub fn set_block_heading_at(&mut self, block: usize, level: Option<u8>) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.set_block_heading_at(block, level));
+        changed
+    }
+
+    pub fn set_block_code_at(&mut self, block: usize, on: bool) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.set_block_code_at(block, on));
+        changed
+    }
+
     pub fn insert_divider(&mut self) {
         self.edit(|doc| doc.insert_divider());
     }
@@ -471,6 +487,76 @@ impl Tabs {
         let mut accepted = false;
         self.edit(|doc| accepted = doc.math_accept_conversion(query, offer));
         accepted
+    }
+
+    pub fn set_math_node_role_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        address: &math::NodeAddress,
+        role: math::SymbolRole,
+    ) -> bool {
+        let mut changed = false;
+        self.edit(|doc| {
+            changed = doc.set_math_node_role_at(block, inline, address, role);
+        });
+        changed
+    }
+
+    pub fn set_math_node_variant_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        address: &math::NodeAddress,
+        variant: &str,
+    ) -> bool {
+        let mut changed = false;
+        self.edit(|doc| {
+            changed = doc.set_math_node_variant_at(block, inline, address, variant);
+        });
+        changed
+    }
+
+    pub fn set_math_group_delimiter_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        address: &math::NodeAddress,
+        open: char,
+    ) -> bool {
+        let mut changed = false;
+        self.edit(|doc| {
+            changed = doc.set_math_group_delimiter_at(block, inline, address, open);
+        });
+        changed
+    }
+
+    pub fn set_math_accent_kind_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        address: &math::NodeAddress,
+        kind: math::AccentKind,
+    ) -> bool {
+        let mut changed = false;
+        self.edit(|doc| {
+            changed = doc.set_math_accent_kind_at(block, inline, address, kind);
+        });
+        changed
+    }
+
+    pub fn set_math_big_op_kind_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        address: &math::NodeAddress,
+        kind: math::BigOp,
+    ) -> bool {
+        let mut changed = false;
+        self.edit(|doc| {
+            changed = doc.set_math_big_op_kind_at(block, inline, address, kind);
+        });
+        changed
     }
 
     pub fn math_backspace(&mut self) -> Option<math::Removed> {
@@ -853,6 +939,67 @@ mod tests {
             tabs.active().unwrap().document.word_count()
         );
         assert!(on_disk.contains("**bold**"));
+    }
+
+    #[test]
+    fn changing_a_badge_color_is_saved_and_reloaded() {
+        let path = temp_file("badge-color", "[[TODO]]");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        tabs.set_badge_color(
+            FlatRange::new(
+                crate::document::FlatPos {
+                    block: 0,
+                    offset: 0,
+                },
+                crate::document::FlatPos {
+                    block: 0,
+                    offset: 4,
+                },
+            ),
+            BadgeColor::Blue,
+        );
+        assert!(tabs.active().unwrap().document.is_dirty());
+
+        tabs.save_active().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[[blue|TODO]]\n");
+        let reopened = Document::load(&path).unwrap();
+        assert!(matches!(
+            &reopened.blocks[0].inlines()[0],
+            crate::document::Inline::Text(text)
+                if text.style.badge_color == BadgeColor::Blue
+        ));
+    }
+
+    #[test]
+    fn exact_math_node_action_is_saved_and_reloaded() {
+        let path = temp_file("math-node-action", "$x$");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        let caret = tabs.active().unwrap().document.caret;
+
+        assert!(tabs.set_math_node_role_at(
+            0,
+            0,
+            &math::NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            },
+            math::SymbolRole::Constant,
+        ));
+        assert!(tabs.active().unwrap().document.is_dirty());
+        assert_eq!(tabs.active().unwrap().document.caret, caret);
+
+        tabs.save_active().unwrap();
+        let reopened = Document::load(&path).unwrap();
+        assert!(matches!(
+            &reopened.blocks[0].inlines()[0],
+            crate::document::Inline::Math(list)
+                if matches!(&list[0], math::MathNode::Resolved {
+                    role: math::SymbolRole::Constant,
+                    ..
+                })
+        ));
     }
 
     #[test]

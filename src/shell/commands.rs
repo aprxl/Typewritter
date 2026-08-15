@@ -15,6 +15,8 @@ use winit::keyboard::{KeyCode, ModifiersState};
 use super::Shell;
 use crate::components::dialog::Prompt;
 use crate::components::palette;
+use crate::document::BadgeColor;
+use crate::document::math::{AccentKind, BigOp, SymbolRole};
 use crate::input::Input;
 
 #[derive(Clone, Copy)]
@@ -360,6 +362,230 @@ pub const COMMANDS: &[Command] = &[
         chord: None,
         run: |shell| shell.docs.borrow_mut().toggle_highlight(),
     },
+    Command {
+        id: "context.bold",
+        title: "Bold",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.context_toggle_bold(),
+    },
+    Command {
+        id: "context.italic",
+        title: "Italic",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.context_toggle_italic(),
+    },
+    Command {
+        id: "context.highlight",
+        title: "Highlight",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.context_toggle_highlight(),
+    },
+    Command {
+        id: "context.inline_code",
+        title: "Inline code",
+        group: "Type",
+        chord: None,
+        run: |shell| shell.context_toggle_inline_code(),
+    },
+    Command {
+        id: "context.badge",
+        title: "Badge",
+        group: "Type",
+        chord: None,
+        run: |shell| shell.context_toggle_badge(),
+    },
+    Command {
+        id: "context.body",
+        title: "Body text",
+        group: "Type",
+        chord: None,
+        run: |shell| shell.context_set_heading(None),
+    },
+    Command {
+        id: "context.badge.orange",
+        title: "Orange",
+        group: "Color",
+        chord: None,
+        run: |shell| shell.context_set_badge_color(BadgeColor::Orange),
+    },
+    Command {
+        id: "context.badge.blue",
+        title: "Blue",
+        group: "Color",
+        chord: None,
+        run: |shell| shell.context_set_badge_color(BadgeColor::Blue),
+    },
+    Command {
+        id: "context.badge.green",
+        title: "Green",
+        group: "Color",
+        chord: None,
+        run: |shell| shell.context_set_badge_color(BadgeColor::Green),
+    },
+    Command {
+        id: "context.badge.purple",
+        title: "Purple",
+        group: "Color",
+        chord: None,
+        run: |shell| shell.context_set_badge_color(BadgeColor::Purple),
+    },
+    Command {
+        id: "context.symbol.variable",
+        title: "Variable",
+        group: "Role",
+        chord: None,
+        run: |shell| shell.context_set_math_role(SymbolRole::Variable),
+    },
+    Command {
+        id: "context.symbol.constant",
+        title: "Constant",
+        group: "Role",
+        chord: None,
+        run: |shell| shell.context_set_math_role(SymbolRole::Constant),
+    },
+    Command {
+        id: "context.symbol.function",
+        title: "Function",
+        group: "Role",
+        chord: None,
+        run: |shell| shell.context_set_math_role(SymbolRole::Function),
+    },
+    Command {
+        id: "context.variant.plain",
+        title: "Plain",
+        group: "Variant",
+        chord: None,
+        run: |shell| shell.context_set_math_variant("plain"),
+    },
+    Command {
+        id: "context.variant.bold",
+        title: "Bold",
+        group: "Variant",
+        chord: None,
+        run: |shell| shell.context_set_math_variant("bold"),
+    },
+    Command {
+        id: "context.variant.italic",
+        title: "Italic",
+        group: "Variant",
+        chord: None,
+        run: |shell| shell.context_set_math_variant("italic"),
+    },
+    Command {
+        id: "context.variant.bold_italic",
+        title: "Bold italic",
+        group: "Variant",
+        chord: None,
+        run: |shell| shell.context_set_math_variant("bold_italic"),
+    },
+    Command {
+        id: "context.variant.sans",
+        title: "Sans serif",
+        group: "Variant",
+        chord: None,
+        run: |shell| shell.context_set_math_variant("sans"),
+    },
+    Command {
+        id: "context.variant.sans_bold",
+        title: "Sans bold",
+        group: "Variant",
+        chord: None,
+        run: |shell| shell.context_set_math_variant("sans_bold"),
+    },
+    Command {
+        id: "context.variant.sans_italic",
+        title: "Sans italic",
+        group: "Variant",
+        chord: None,
+        run: |shell| shell.context_set_math_variant("sans_italic"),
+    },
+    Command {
+        id: "context.variant.sans_bold_italic",
+        title: "Sans bold italic",
+        group: "Variant",
+        chord: None,
+        run: |shell| shell.context_set_math_variant("sans_bold_italic"),
+    },
+    Command {
+        id: "context.variant.monospace",
+        title: "Monospace",
+        group: "Variant",
+        chord: None,
+        run: |shell| shell.context_set_math_variant("monospace"),
+    },
+    Command {
+        id: "context.group.parentheses",
+        title: "Parentheses",
+        group: "Delimiter",
+        chord: None,
+        run: |shell| shell.context_set_math_delimiter('('),
+    },
+    Command {
+        id: "context.group.brackets",
+        title: "Square brackets",
+        group: "Delimiter",
+        chord: None,
+        run: |shell| shell.context_set_math_delimiter('['),
+    },
+    Command {
+        id: "context.accent.vector",
+        title: "Vector arrow",
+        group: "Accent",
+        chord: None,
+        run: |shell| shell.context_set_math_accent(AccentKind::Vector),
+    },
+    Command {
+        id: "context.accent.dot",
+        title: "Dot",
+        group: "Accent",
+        chord: None,
+        run: |shell| shell.context_set_math_accent(AccentKind::Dot),
+    },
+    Command {
+        id: "context.accent.ddot",
+        title: "Double dot",
+        group: "Accent",
+        chord: None,
+        run: |shell| shell.context_set_math_accent(AccentKind::DoubleDot),
+    },
+    Command {
+        id: "context.op.sum",
+        title: "Sum",
+        group: "Operator",
+        chord: None,
+        run: |shell| shell.context_set_math_big_op(BigOp::Sum),
+    },
+    Command {
+        id: "context.op.product",
+        title: "Product",
+        group: "Operator",
+        chord: None,
+        run: |shell| shell.context_set_math_big_op(BigOp::Prod),
+    },
+    Command {
+        id: "context.op.integral",
+        title: "Integral",
+        group: "Operator",
+        chord: None,
+        run: |shell| shell.context_set_math_big_op(BigOp::Integral),
+    },
+    Command {
+        id: "context.op.ring_integral",
+        title: "Ring integral",
+        group: "Operator",
+        chord: None,
+        run: |shell| shell.context_set_math_big_op(BigOp::ContourIntegral),
+    },
+    Command {
+        id: "context.op.limit",
+        title: "Limit",
+        group: "Operator",
+        chord: None,
+        run: |shell| shell.context_set_math_big_op(BigOp::Limit),
+    },
 ];
 
 /// The command whose chord `input` just matched, if any.
@@ -374,8 +600,15 @@ pub fn matching(input: &Input) -> Option<&'static Command> {
 /// The palette's rows, in table order. The shell uses this same function
 /// both to draw the list and to resolve a selection back to a `Command`, so
 /// a filtered index can never point at the wrong entry.
-pub fn entries() -> Vec<palette::Entry> {
+pub fn palette_commands() -> Vec<&'static Command> {
     COMMANDS
+        .iter()
+        .filter(|command| !command.id.starts_with("context."))
+        .collect()
+}
+
+pub fn entries() -> Vec<palette::Entry> {
+    palette_commands()
         .iter()
         .map(|command| palette::Entry {
             title: command.title.to_string(),
@@ -391,7 +624,10 @@ pub fn entries() -> Vec<palette::Entry> {
 /// filtered, so a selection index still resolves back to the right
 /// `Command` via `editor_commands()[i]`.
 pub fn editor_commands() -> Vec<&'static Command> {
-    COMMANDS.iter().filter(|c| c.group == "Format").collect()
+    palette_commands()
+        .into_iter()
+        .filter(|c| c.group == "Format")
+        .collect()
 }
 
 /// Palette-style entries for the slash menu, mirroring how `entries()`
@@ -411,6 +647,48 @@ pub fn editor_entries() -> Vec<palette::Entry> {
 /// second table: a menu row and its chord then cannot describe different
 /// behaviour from the palette entry with the same name.
 pub const EDITOR_MENU: &[&str] = &["edit.cut", "edit.copy", "edit.paste"];
+
+pub const WORD_MENU: &[&str] = &[
+    "context.bold",
+    "context.italic",
+    "context.highlight",
+    "context.inline_code",
+    "context.badge",
+];
+
+pub const BADGE_MENU: &[&str] = &[
+    "context.badge.orange",
+    "context.badge.blue",
+    "context.badge.green",
+    "context.badge.purple",
+    "context.badge",
+];
+
+pub const INLINE_CODE_MENU: &[&str] = &["context.inline_code", "context.badge"];
+
+pub const CODE_BLOCK_MENU: &[&str] = &["context.body"];
+
+pub const SYMBOL_ROLE_MENU: &[&str] = &[
+    "context.symbol.variable",
+    "context.symbol.constant",
+    "context.symbol.function",
+];
+
+pub const GROUP_MENU: &[&str] = &["context.group.parentheses", "context.group.brackets"];
+
+pub const ACCENT_MENU: &[&str] = &[
+    "context.accent.vector",
+    "context.accent.dot",
+    "context.accent.ddot",
+];
+
+pub const BIG_OP_MENU: &[&str] = &[
+    "context.op.sum",
+    "context.op.product",
+    "context.op.integral",
+    "context.op.ring_integral",
+    "context.op.limit",
+];
 
 /// The file tree's context menu.
 pub const TREE_MENU: &[&str] = &["file.new", "folder.new", "file.delete"];
@@ -484,15 +762,20 @@ mod tests {
     #[test]
     fn entries_stay_in_table_order_so_a_filtered_index_is_never_off_by_one() {
         let entries = entries();
-        assert_eq!(entries.len(), COMMANDS.len());
-        for (entry, command) in entries.iter().zip(COMMANDS) {
+        let commands = palette_commands();
+        assert_eq!(entries.len(), commands.len());
+        for (entry, command) in entries.iter().zip(commands) {
             assert_eq!(entry.title, command.title);
         }
+        assert!(!entries.iter().any(|entry| entry.group == "Role"));
     }
 
     #[test]
     fn editor_commands_are_only_format_entries_in_table_order() {
-        let in_table: Vec<&Command> = COMMANDS.iter().filter(|c| c.group == "Format").collect();
+        let in_table: Vec<&Command> = palette_commands()
+            .into_iter()
+            .filter(|c| c.group == "Format")
+            .collect();
         let editor = editor_commands();
         assert_eq!(editor.len(), in_table.len());
         for (e, t) in editor.iter().zip(in_table.iter()) {
@@ -515,8 +798,20 @@ mod tests {
 
     #[test]
     fn every_menu_id_names_a_real_command() {
-        assert_eq!(menu(EDITOR_MENU).len(), EDITOR_MENU.len());
-        assert_eq!(menu(TREE_MENU).len(), TREE_MENU.len());
-        assert_eq!(menu(TREE_ROOT_MENU).len(), TREE_ROOT_MENU.len());
+        for ids in [
+            EDITOR_MENU,
+            WORD_MENU,
+            BADGE_MENU,
+            INLINE_CODE_MENU,
+            CODE_BLOCK_MENU,
+            SYMBOL_ROLE_MENU,
+            GROUP_MENU,
+            ACCENT_MENU,
+            BIG_OP_MENU,
+            TREE_MENU,
+            TREE_ROOT_MENU,
+        ] {
+            assert_eq!(menu(ids).len(), ids.len());
+        }
     }
 }

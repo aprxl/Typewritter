@@ -19,8 +19,11 @@ use crate::components::{
     context_menu, file_finder, file_tree, math_menu, onboarding, title_bar,
 };
 use crate::config::Config;
-use crate::document::math::{self, Slot};
-use crate::document::{FlatPos, FlatRange, Style, math_conversion, math_layout};
+use crate::document::layout::{ContextHit, RangeKind};
+use crate::document::math::{self, AccentKind, BigOp, MathNode, NodeAddress, Slot, SymbolRole};
+use crate::document::{
+    BadgeColor, FlatPos, FlatRange, Inline, Style, math_conversion, math_layout,
+};
 use crate::input::Input;
 use crate::layout::Rect;
 use crate::tabs::Tabs;
@@ -60,8 +63,7 @@ impl Shell {
             return;
         }
         // The context menu swallows input while it is open.
-        if self.context_menu.is_some() {
-            self.handle_context_menu_input(input, viewport);
+        if self.context_menu.is_some() && self.handle_context_menu_input(input, viewport) {
             return;
         }
         // A dialog swallows everything else until it resolves.
@@ -172,7 +174,12 @@ impl Shell {
         }
 
         if has_tab && input.is_mouse_pressed(MouseButton::Left) && over_editor {
-            if let Some((block, inline, cursor)) = self.math_at(rect, mouse) {
+            if self.vim.current_mode() == VimMode::Normal {
+                if let Some(target) = self.context_at(rect, mouse) {
+                    let ids = self.context_ids(&target);
+                    self.open_context_target(&ids, mouse, Some(target));
+                }
+            } else if let Some((block, inline, cursor)) = self.math_at(rect, mouse) {
                 self.goal_x = None;
                 self.docs.borrow_mut().enter_math_at(block, inline, cursor);
                 self.apply(ExtendedAction::Enter(Mode::Insert));
@@ -1158,10 +1165,9 @@ impl Shell {
     fn run_selected_palette_command(&mut self) {
         let Some(state) = &self.palette else { return };
         let entries = commands::entries();
+        let commands = commands::palette_commands();
         let visible = palette::filter(&entries, &state.query);
-        let command = visible
-            .get(state.selected)
-            .and_then(|&i| commands::COMMANDS.get(i));
+        let command = visible.get(state.selected).and_then(|&i| commands.get(i));
         self.close_palette();
         if let Some(command) = command {
             (command.run)(self);
@@ -1273,7 +1279,192 @@ impl Shell {
 
     // ---- context menu ----------------------------------------------------
 
+    fn context_ids(&self, target: &ContextHit) -> Vec<&'static str> {
+        match target {
+            ContextHit::Range { kind, .. } => match kind {
+                RangeKind::Word => commands::WORD_MENU.to_vec(),
+                RangeKind::Badge => commands::BADGE_MENU.to_vec(),
+                RangeKind::InlineCode => commands::INLINE_CODE_MENU.to_vec(),
+                RangeKind::CodeBlock => commands::CODE_BLOCK_MENU.to_vec(),
+            },
+            ContextHit::Math {
+                block,
+                inline,
+                node: Some(address),
+            } => {
+                let docs = self.docs.borrow();
+                let node = docs
+                    .active()
+                    .and_then(|tab| tab.document.blocks.get(*block))
+                    .and_then(|block| block.inlines().get(*inline))
+                    .and_then(|run| match run {
+                        Inline::Math(list) => math::node_at(list, address),
+                        Inline::Text(_) => None,
+                    });
+                match node {
+                    Some(MathNode::Sym(ch)) if ch.is_alphabetic() => {
+                        symbol_context_ids(*ch, "plain")
+                    }
+                    Some(MathNode::Resolved { variant, body, .. }) => {
+                        symbol_base_glyph(body, variant)
+                            .map(|glyph| symbol_context_ids(glyph, variant))
+                            .unwrap_or_else(|| commands::SYMBOL_ROLE_MENU.to_vec())
+                    }
+                    Some(MathNode::Group { .. }) => commands::GROUP_MENU.to_vec(),
+                    Some(MathNode::Accent { .. }) => commands::ACCENT_MENU.to_vec(),
+                    Some(MathNode::BigOp { .. }) => commands::BIG_OP_MENU.to_vec(),
+                    _ => Vec::new(),
+                }
+            }
+            ContextHit::Math { node: None, .. } => Vec::new(),
+        }
+    }
+
+    fn context_range(&self) -> Option<FlatRange> {
+        match self.context_menu.as_ref()?.target.as_ref()? {
+            ContextHit::Range { range, .. } => Some(*range),
+            ContextHit::Math { .. } => None,
+        }
+    }
+
+    fn context_math_target(&self) -> Option<(usize, usize, NodeAddress)> {
+        match self.context_menu.as_ref()?.target.as_ref()? {
+            ContextHit::Math {
+                block,
+                inline,
+                node: Some(address),
+            } => Some((*block, *inline, address.clone())),
+            _ => None,
+        }
+    }
+
+    pub(super) fn context_toggle_bold(&mut self) {
+        if let Some(range) = self.context_range() {
+            self.docs.borrow_mut().toggle_style_range(
+                range,
+                Style {
+                    bold: true,
+                    ..Style::PLAIN
+                },
+            );
+        }
+    }
+
+    pub(super) fn context_toggle_italic(&mut self) {
+        if let Some(range) = self.context_range() {
+            self.docs.borrow_mut().toggle_style_range(
+                range,
+                Style {
+                    italic: true,
+                    ..Style::PLAIN
+                },
+            );
+        }
+    }
+
+    pub(super) fn context_toggle_highlight(&mut self) {
+        if let Some(range) = self.context_range() {
+            self.docs.borrow_mut().toggle_style_range(
+                range,
+                Style {
+                    highlight: true,
+                    ..Style::PLAIN
+                },
+            );
+        }
+    }
+
+    pub(super) fn context_toggle_inline_code(&mut self) {
+        if let Some(range) = self.context_range() {
+            self.docs.borrow_mut().toggle_style_range(
+                range,
+                Style {
+                    code: true,
+                    ..Style::PLAIN
+                },
+            );
+        }
+    }
+
+    pub(super) fn context_toggle_badge(&mut self) {
+        if let Some(range) = self.context_range() {
+            self.docs.borrow_mut().toggle_style_range(
+                range,
+                Style {
+                    badge: true,
+                    ..Style::PLAIN
+                },
+            );
+        }
+    }
+
+    pub(super) fn context_set_badge_color(&mut self, color: BadgeColor) {
+        if let Some(range) = self.context_range() {
+            self.docs.borrow_mut().set_badge_color(range, color);
+        }
+    }
+
+    pub(super) fn context_set_heading(&mut self, level: Option<u8>) {
+        if let Some(range) = self.context_range() {
+            let range = range.normalized();
+            self.docs.borrow_mut().transaction(|docs| {
+                for block in range.start.block..=range.end.block {
+                    docs.set_block_heading_at(block, level);
+                }
+            });
+        }
+    }
+
+    pub(super) fn context_set_math_role(&mut self, role: SymbolRole) {
+        if let Some((block, inline, address)) = self.context_math_target() {
+            self.docs
+                .borrow_mut()
+                .set_math_node_role_at(block, inline, &address, role);
+        }
+    }
+
+    pub(super) fn context_set_math_variant(&mut self, variant: &str) {
+        if let Some((block, inline, address)) = self.context_math_target() {
+            self.docs
+                .borrow_mut()
+                .set_math_node_variant_at(block, inline, &address, variant);
+        }
+    }
+
+    pub(super) fn context_set_math_delimiter(&mut self, open: char) {
+        if let Some((block, inline, address)) = self.context_math_target() {
+            self.docs
+                .borrow_mut()
+                .set_math_group_delimiter_at(block, inline, &address, open);
+        }
+    }
+
+    pub(super) fn context_set_math_accent(&mut self, kind: AccentKind) {
+        if let Some((block, inline, address)) = self.context_math_target() {
+            self.docs
+                .borrow_mut()
+                .set_math_accent_kind_at(block, inline, &address, kind);
+        }
+    }
+
+    pub(super) fn context_set_math_big_op(&mut self, kind: BigOp) {
+        if let Some((block, inline, address)) = self.context_math_target() {
+            self.docs
+                .borrow_mut()
+                .set_math_big_op_kind_at(block, inline, &address, kind);
+        }
+    }
+
     fn open_context_menu(&mut self, ids: &[&str], anchor: (f32, f32)) {
+        self.open_context_target(ids, anchor, None);
+    }
+
+    fn open_context_target(
+        &mut self,
+        ids: &[&str],
+        anchor: (f32, f32),
+        target: Option<crate::document::layout::ContextHit>,
+    ) {
         let items = commands::menu(ids);
         if items.is_empty() {
             return;
@@ -1282,8 +1473,10 @@ impl Shell {
             items,
             selected: 0,
             anchor,
+            target,
         });
         self.refresh_context_menu();
+        self.rebuild_views();
     }
 
     fn refresh_context_menu(&mut self) {
@@ -1300,12 +1493,15 @@ impl Shell {
     fn close_context_menu(&mut self) {
         self.context_menu = None;
         self.refresh_context_menu();
+        self.rebuild_views();
     }
 
-    fn handle_context_menu_input(&mut self, input: &Input, viewport: Rect) {
+    /// `false` means an outside left click closed the popup and should keep
+    /// routing so Normal mode can immediately target what was clicked.
+    fn handle_context_menu_input(&mut self, input: &Input, viewport: Rect) -> bool {
         if input.is_key_pressed(KeyCode::Escape) {
             self.close_context_menu();
-            return;
+            return true;
         }
         if input.is_key_typed(KeyCode::ArrowDown) {
             let changed = if let Some(state) = &mut self.context_menu {
@@ -1335,11 +1531,11 @@ impl Shell {
         }
         if input.is_key_pressed(KeyCode::Enter) {
             self.run_selected_menu_command();
-            return;
+            return true;
         }
 
         let Some(state) = &self.context_menu else {
-            return;
+            return true;
         };
         let card = context_menu::card_anchored(viewport, state.anchor, state.items.len());
         let point = input.mouse_position();
@@ -1360,8 +1556,10 @@ impl Shell {
                 }
             } else if input.is_mouse_pressed(MouseButton::Left) && !card.contains(point) {
                 self.close_context_menu();
+                return false;
             }
         }
+        true
     }
 
     fn run_selected_menu_command(&mut self) {
@@ -1370,10 +1568,10 @@ impl Shell {
             .as_ref()
             .and_then(|state| state.items.get(state.selected))
             .copied();
-        self.close_context_menu();
         if let Some(command) = command {
             (command.run)(self);
         }
+        self.close_context_menu();
     }
 
     fn handle_slash_menu_input(&mut self, input: &Input) {
@@ -2118,6 +2316,63 @@ fn math_menu_variant_start(offers: &[math_conversion::Offer]) -> usize {
         .unwrap_or(offers.len())
 }
 
+fn symbol_context_ids(glyph: char, current_variant: &str) -> Vec<&'static str> {
+    let mut ids = commands::SYMBOL_ROLE_MENU.to_vec();
+    if current_variant != "plain" {
+        ids.push("context.variant.plain");
+    }
+    ids.extend(
+        crate::document::math_symbols::variants(glyph)
+            .into_iter()
+            .filter(|variant| variant.key != current_variant)
+            .filter_map(|variant| match variant.key {
+                "bold" => Some("context.variant.bold"),
+                "italic" => Some("context.variant.italic"),
+                "bold_italic" => Some("context.variant.bold_italic"),
+                "sans" => Some("context.variant.sans"),
+                "sans_bold" => Some("context.variant.sans_bold"),
+                "sans_italic" => Some("context.variant.sans_italic"),
+                "sans_bold_italic" => Some("context.variant.sans_bold_italic"),
+                "monospace" => Some("context.variant.monospace"),
+                _ => None,
+            }),
+    );
+    ids
+}
+
+fn symbol_base_glyph(list: &[MathNode], current_variant: &str) -> Option<char> {
+    for node in list {
+        if let MathNode::Sym(glyph) = node {
+            if current_variant == "plain"
+                && !crate::document::math_symbols::variants(*glyph).is_empty()
+            {
+                return Some(*glyph);
+            }
+            if let Some(base) = crate::document::math_symbols::SYMBOLS
+                .iter()
+                .find_map(|symbol| {
+                    crate::document::math_symbols::variants(symbol.glyph)
+                        .into_iter()
+                        .any(|variant| variant.key == current_variant && variant.glyph == *glyph)
+                        .then_some(symbol.glyph)
+                })
+            {
+                return Some(base);
+            }
+        }
+        for slot in node.slots() {
+            if let Some(base) = symbol_base_glyph(
+                node.slot(slot)
+                    .expect("a node's reported slots must resolve"),
+                current_variant,
+            ) {
+                return Some(base);
+            }
+        }
+    }
+    None
+}
+
 fn moved_math_menu_selection(selected: usize, count: usize, delta: isize) -> usize {
     if count == 0 {
         return 0;
@@ -2152,10 +2407,32 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
 mod tests {
     use super::{
         delete_chars, delete_inside_math, math_menu_rows, math_menu_variant_start,
-        move_inside_math, moved_math_menu_selection,
+        move_inside_math, moved_math_menu_selection, symbol_base_glyph, symbol_context_ids,
     };
-    use crate::document::{Document, Inline, math_conversion};
+    use crate::document::math::MathNode;
+    use crate::document::{Document, Inline, math_conversion, math_symbols};
     use crate::tabs::Tabs;
+
+    #[test]
+    fn symbol_context_keeps_roles_first_and_offers_only_valid_variants() {
+        let latin = symbol_context_ids('x', "plain");
+        assert_eq!(&latin[..3], super::commands::SYMBOL_ROLE_MENU);
+        assert!(latin.contains(&"context.variant.bold"));
+        assert!(!latin.contains(&"context.variant.plain"));
+
+        let italic_alpha = math_symbols::variants('α')
+            .into_iter()
+            .find(|variant| variant.key == "italic")
+            .unwrap()
+            .glyph;
+        assert_eq!(
+            symbol_base_glyph(&[MathNode::Sym(italic_alpha)], "italic"),
+            Some('α')
+        );
+        let greek = symbol_context_ids('α', "italic");
+        assert!(greek.contains(&"context.variant.plain"));
+        assert!(!greek.contains(&"context.variant.sans"));
+    }
     use crate::vim::Motion;
     use std::fs;
     use std::path::{Path, PathBuf};

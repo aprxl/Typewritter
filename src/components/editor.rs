@@ -5,9 +5,9 @@
 use std::rc::Rc;
 
 use crate::document::layout::{self, DocLayout};
-use crate::document::math::{MathCursor, SymbolRole};
+use crate::document::math::{MathCursor, NodeAddress, SymbolRole};
 use crate::document::math_layout::{self, BoxKind, MathBox, MathPrimitive};
-use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style};
+use crate::document::{ATOM, BadgeColor, Block, Caret, FlatRange, Inline, Style};
 use crate::layout::Rect;
 use crate::renderer::{Layer, LineCap, LineJoin, PathPaint, Rounding, Stroke};
 use crate::theme::{self, TextStyle};
@@ -35,6 +35,7 @@ const BLOCK_PAD: (f32, f32) = (10.0, 6.0);
 const INLINE_PAD: (f32, f32) = (3.0, 1.0);
 const CODE_ROUNDING: Rounding = Rounding::uniform(6.0);
 const INLINE_MATH_ROUNDING: Rounding = Rounding::uniform(5.0);
+const MATH_SELECTION_ROUNDING: Rounding = Rounding::uniform(4.0);
 /// The highlight bar: an underline, not a wash, so the glyphs keep the
 /// page's own contrast. `DROP` is measured down from the line's centre.
 const HIGHLIGHT_DROP: f32 = 8.0;
@@ -178,6 +179,28 @@ fn spans(pieces: &[Painted], pred: impl Fn(&Painted) -> bool) -> Vec<(f32, f32)>
     out
 }
 
+fn badge_spans(pieces: &[Painted]) -> Vec<(f32, f32, BadgeColor)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < pieces.len() {
+        if !pieces[i].1.badge {
+            i += 1;
+            continue;
+        }
+        let color = pieces[i].1.badge_color;
+        let mut end = i;
+        while pieces
+            .get(end + 1)
+            .is_some_and(|piece| piece.1.badge && piece.1.badge_color == color)
+        {
+            end += 1;
+        }
+        out.push((pieces[i].2, pieces[end].2 + pieces[end].3, color));
+        i = end + 1;
+    }
+    out
+}
+
 pub struct Editor {
     layout: Rc<DocLayout>,
     /// Model caret — its position is resolved against the layout at draw.
@@ -209,6 +232,7 @@ pub struct Editor {
     /// document caret — two blinking bars would be two claims about where
     /// typing goes.
     math: Option<MathCursor>,
+    math_selection: Option<(usize, usize, NodeAddress)>,
     dirty: Dirty,
 }
 
@@ -235,6 +259,7 @@ impl Editor {
             selection: None,
             line_selection: false,
             math: None,
+            math_selection: None,
             caret_on: true,
             glow: None,
             dirty: Dirty::new(),
@@ -243,6 +268,11 @@ impl Editor {
 
     pub fn with_math(mut self, math: Option<MathCursor>) -> Self {
         self.math = math;
+        self
+    }
+
+    pub fn with_math_selection(mut self, selection: Option<(usize, usize, NodeAddress)>) -> Self {
+        self.math_selection = selection;
         self
     }
 
@@ -275,6 +305,7 @@ impl Editor {
             selection: None,
             line_selection: false,
             math: None,
+            math_selection: None,
             caret_on: true,
             glow: None,
             dirty: Dirty::new(),
@@ -478,13 +509,19 @@ impl Component for Editor {
                     let width = layout::advance(run, &text, kind, segment.style, &|text, style| {
                         theme::width(layer, text, style)
                     });
-                    // A badge's label starts inside its box, and the box is
-                    // part of the advance — same arithmetic the caret does
-                    // in `layout::advance`, so the two cannot drift.
-                    if segment.style.badge {
-                        cursor += theme::BADGE_PAD;
-                    }
-                    pieces.push((text, segment.style, cursor, width));
+                    let label_x = cursor
+                        + if segment.style.badge {
+                            theme::BADGE_PAD
+                        } else {
+                            0.0
+                        };
+                    let painted_width = width
+                        - if segment.style.badge {
+                            theme::BADGE_PAD * 2.0
+                        } else {
+                            0.0
+                        };
+                    pieces.push((text, segment.style, label_x, painted_width));
                     if is_math {
                         let Inline::Math(list) = run else {
                             unreachable!("math flag must match math run")
@@ -499,6 +536,24 @@ impl Component for Editor {
                                 rect.size(),
                                 theme::INLINE_MATH,
                                 INLINE_MATH_ROUNDING,
+                            );
+                        }
+                        if let Some((selected_block, selected_inline, address)) =
+                            &self.math_selection
+                            && *selected_block == bi
+                            && *selected_inline == segment.inline
+                            && let Some(bounds) =
+                                math_layout::node_bounds(list, address, 0, &measure)
+                        {
+                            const PAD: f32 = 2.0;
+                            layer.draw_rectangle(
+                                (cursor + bounds.left - PAD, baseline - bounds.top - PAD),
+                                (
+                                    bounds.right - bounds.left + PAD * 2.0,
+                                    bounds.top - bounds.bottom + PAD * 2.0,
+                                ),
+                                theme::SELECTION,
+                                MATH_SELECTION_ROUNDING,
                             );
                         }
                         draw_math(layer, &box_, (cursor, baseline));
@@ -520,9 +575,6 @@ impl Component for Editor {
                         }
                     }
                     cursor += width;
-                    if segment.style.badge {
-                        cursor += theme::BADGE_PAD;
-                    }
                 }
                 // A run inside a fenced block already sits on the slab drawn
                 // above; only a code span in prose needs its own box.
@@ -540,7 +592,7 @@ impl Component for Editor {
                 // A chip's box is centred on the line rather than sized to
                 // it: the label is 9pt, and a box grown to the leading
                 // would read as a code block, not as a tag.
-                for (start, end) in spans(&pieces, |p| p.1.badge) {
+                for (start, end, color) in badge_spans(&pieces) {
                     theme::outline(
                         layer,
                         Rect {
@@ -549,7 +601,7 @@ impl Component for Editor {
                             width: end - start + theme::BADGE_PAD * 2.0,
                             height: theme::BADGE_HEIGHT,
                         },
-                        theme::BADGE_INK,
+                        theme::badge_ink(color),
                     );
                 }
                 // The bar goes on this layer crisp; the glow layer takes a
@@ -817,6 +869,31 @@ mod tests {
             vec![(10.0, 45.0), (50.0, 58.0)]
         );
         assert!(spans(&pieces, |p| p.1.code).is_empty());
+    }
+
+    #[test]
+    fn badge_outlines_split_when_their_colors_differ() {
+        let orange = Style {
+            badge: true,
+            ..Style::PLAIN
+        };
+        let blue = Style {
+            badge: true,
+            badge_color: BadgeColor::Blue,
+            ..Style::PLAIN
+        };
+        let pieces = vec![
+            ("A".into(), orange, 4.0, 10.0),
+            ("B".into(), orange, 22.0, 10.0),
+            ("C".into(), blue, 40.0, 10.0),
+        ];
+        assert_eq!(
+            badge_spans(&pieces),
+            vec![
+                (4.0, 32.0, BadgeColor::Orange),
+                (40.0, 50.0, BadgeColor::Blue),
+            ]
+        );
     }
 
     #[test]

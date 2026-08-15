@@ -4,6 +4,7 @@
 //! that document's, so a value here can be checked against it directly.
 //! Nothing else in the app names a colour or a font family.
 
+use crate::document::BadgeColor;
 use crate::layout::Rect;
 use crate::renderer::{
     Alignment, Color, Font, FontParameters, HorizontalAlign, Layer, LineCap, LineJoin, PathPaint,
@@ -41,6 +42,18 @@ pub const BADGE_SIZE: f32 = 9.0;
 /// A badge's label and its outline share one colour, as in the design —
 /// the box is a hairline, not a filled tag.
 pub const BADGE_INK: Color = STRUCTURE;
+pub const BADGE_BLUE: Color = Color::rgb(0x1F, 0x70, 0xA0);
+pub const BADGE_GREEN: Color = Color::rgb(0x3E, 0x7D, 0x59);
+pub const BADGE_PURPLE: Color = Color::rgb(0x7B, 0x52, 0xA0);
+
+pub fn badge_ink(color: BadgeColor) -> Color {
+    match color {
+        BadgeColor::Orange => BADGE_INK,
+        BadgeColor::Blue => BADGE_BLUE,
+        BadgeColor::Green => BADGE_GREEN,
+        BadgeColor::Purple => BADGE_PURPLE,
+    }
+}
 /// Space between a badge's label and its box, each side. Part of the run's
 /// advance (see `document::layout::advance`), not just of the drawing —
 /// a chip that flows as if it were only its label overlaps whatever comes

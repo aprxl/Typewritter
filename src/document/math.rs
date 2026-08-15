@@ -363,6 +363,14 @@ pub struct MathCursor {
     pub index: usize,
 }
 
+/// One addressable math node. `path` names its containing list and `index`
+/// names the node within that list.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NodeAddress {
+    pub path: Vec<Step>,
+    pub index: usize,
+}
+
 impl MathNode {
     pub fn slots(&self) -> Vec<Slot> {
         match self {
@@ -455,6 +463,153 @@ pub fn list_at_mut<'a>(root: &'a mut MathList, path: &[Step]) -> Option<&'a mut 
         list = list.get_mut(step.index)?.slot_mut(step.slot)?;
     }
     Some(list)
+}
+
+/// The node at `address`, or `None` when the tree no longer matches it.
+pub fn node_at<'a>(root: &'a MathList, address: &NodeAddress) -> Option<&'a MathNode> {
+    list_at(root, &address.path)?.get(address.index)
+}
+
+fn node_at_mut<'a>(root: &'a mut MathList, address: &NodeAddress) -> Option<&'a mut MathNode> {
+    list_at_mut(root, &address.path)?.get_mut(address.index)
+}
+
+/// Assign a semantic role to a symbol without changing what it displays.
+/// Plain alphabetic atoms become resolved symbols so the choice persists.
+pub fn set_node_role(root: &mut MathList, address: &NodeAddress, role: SymbolRole) -> bool {
+    let Some(node) = node_at_mut(root, address) else {
+        return false;
+    };
+    match node {
+        MathNode::Resolved {
+            role: current_role, ..
+        } => *current_role = role,
+        MathNode::Sym(ch) if ch.is_alphabetic() => {
+            let ch = *ch;
+            *node = MathNode::Resolved {
+                id: ch.to_string(),
+                role,
+                variant: "plain".to_owned(),
+                body: vec![MathNode::Sym(ch)],
+            };
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Switch a resolved symbol's mathematical-alphanumeric spelling while
+/// keeping its identity and role. Changes are all-or-nothing.
+pub fn set_node_variant(root: &mut MathList, address: &NodeAddress, variant_key: &str) -> bool {
+    let Some(MathNode::Resolved { variant, body, .. }) = node_at_mut(root, address) else {
+        return false;
+    };
+    let mut replacement = body.clone();
+    let mut changed = false;
+    if !remap_variant(&mut replacement, variant, variant_key, &mut changed) || !changed {
+        return false;
+    }
+    *body = replacement;
+    *variant = variant_key.to_owned();
+    true
+}
+
+fn remap_variant(
+    list: &mut MathList,
+    current_key: &str,
+    target_key: &str,
+    changed: &mut bool,
+) -> bool {
+    for node in list {
+        if let MathNode::Sym(glyph) = node {
+            let Some(base) = base_glyph(*glyph, current_key) else {
+                continue;
+            };
+            let replacement = if target_key == "plain" {
+                Some(base)
+            } else {
+                crate::document::math_symbols::variants(base)
+                    .into_iter()
+                    .find(|variant| variant.key == target_key)
+                    .map(|variant| variant.glyph)
+            };
+            let Some(replacement) = replacement else {
+                return false;
+            };
+            *glyph = replacement;
+            *changed = true;
+            continue;
+        }
+        for slot in node.slots() {
+            if !remap_variant(
+                node.slot_mut(slot)
+                    .expect("a node's reported slots must resolve"),
+                current_key,
+                target_key,
+                changed,
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn base_glyph(glyph: char, current_key: &str) -> Option<char> {
+    if current_key == "plain" {
+        return (!crate::document::math_symbols::variants(glyph).is_empty()).then_some(glyph);
+    }
+    crate::document::math_symbols::SYMBOLS
+        .iter()
+        .find_map(|symbol| {
+            crate::document::math_symbols::variants(symbol.glyph)
+                .into_iter()
+                .any(|variant| variant.key == current_key && variant.glyph == glyph)
+                .then_some(symbol.glyph)
+        })
+}
+
+/// Switch a group's paired delimiters while preserving its body.
+pub fn set_group_delimiter(root: &mut MathList, address: &NodeAddress, open: char) -> bool {
+    let Some(&(_, new_close)) = PAIRS.iter().find(|&&(candidate, _)| candidate == open) else {
+        return false;
+    };
+    let Some(MathNode::Group {
+        open: current_open,
+        close: current_close,
+        ..
+    }) = node_at_mut(root, address)
+    else {
+        return false;
+    };
+    *current_open = open;
+    *current_close = new_close;
+    true
+}
+
+/// Switch an accent while preserving its body.
+pub fn set_accent_kind(root: &mut MathList, address: &NodeAddress, kind: AccentKind) -> bool {
+    let Some(MathNode::Accent {
+        kind: current_kind, ..
+    }) = node_at_mut(root, address)
+    else {
+        return false;
+    };
+    *current_kind = kind;
+    true
+}
+
+/// Switch a large operator while preserving both limit lists. A limit simply
+/// hides the retained upper list until another two-slot operator is chosen.
+pub fn set_big_op_kind(root: &mut MathList, address: &NodeAddress, kind: BigOp) -> bool {
+    let Some(MathNode::BigOp {
+        kind: current_kind, ..
+    }) = node_at_mut(root, address)
+    else {
+        return false;
+    };
+    *current_kind = kind;
+    true
 }
 
 /// Clamps a cursor onto `root`, dropping the stale suffix of its path and
@@ -2076,6 +2231,155 @@ mod tests {
 
         clamp(&root, &mut cursor);
         assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn addressed_context_mutations_preserve_node_contents() {
+        let mut root = vec![
+            MathNode::Sym('x'),
+            group('(', ')', sym("body")),
+            accent(AccentKind::Vector, sym("velocity")),
+            big_op(BigOp::Sum, sym("i=0"), sym("n")),
+        ];
+
+        assert!(set_node_role(
+            &mut root,
+            &NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            },
+            SymbolRole::Constant,
+        ));
+        assert_eq!(
+            root[0],
+            resolved("x", SymbolRole::Constant, "plain", sym("x"))
+        );
+
+        let group_address = NodeAddress {
+            path: Vec::new(),
+            index: 1,
+        };
+        assert!(set_group_delimiter(&mut root, &group_address, '['));
+        assert_eq!(root[1], group('[', ']', sym("body")));
+        assert!(!set_group_delimiter(&mut root, &group_address, '{'));
+        assert_eq!(root[1], group('[', ']', sym("body")));
+
+        assert!(set_accent_kind(
+            &mut root,
+            &NodeAddress {
+                path: Vec::new(),
+                index: 2,
+            },
+            AccentKind::DoubleDot,
+        ));
+        assert_eq!(root[2], accent(AccentKind::DoubleDot, sym("velocity")));
+
+        assert!(set_big_op_kind(
+            &mut root,
+            &NodeAddress {
+                path: Vec::new(),
+                index: 3,
+            },
+            BigOp::Limit,
+        ));
+        assert_eq!(root[3], big_op(BigOp::Limit, sym("i=0"), sym("n")));
+        assert!(set_big_op_kind(
+            &mut root,
+            &NodeAddress {
+                path: Vec::new(),
+                index: 3,
+            },
+            BigOp::Prod,
+        ));
+        assert_eq!(root[3], big_op(BigOp::Prod, sym("i=0"), sym("n")));
+    }
+
+    #[test]
+    fn addressed_role_change_rejects_non_symbols_and_stale_paths() {
+        let mut root = vec![frac(sym("a"), sym("b")), MathNode::Sym('+')];
+
+        assert!(!set_node_role(
+            &mut root,
+            &NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            },
+            SymbolRole::Function,
+        ));
+        assert!(!set_node_role(
+            &mut root,
+            &NodeAddress {
+                path: vec![Step {
+                    index: 9,
+                    slot: Slot::Num,
+                }],
+                index: 0,
+            },
+            SymbolRole::Function,
+        ));
+        assert!(!set_node_role(
+            &mut root,
+            &NodeAddress {
+                path: Vec::new(),
+                index: 1,
+            },
+            SymbolRole::Function,
+        ));
+    }
+
+    #[test]
+    fn addressed_variant_change_keeps_identity_role_and_structure() {
+        let address = NodeAddress {
+            path: Vec::new(),
+            index: 0,
+        };
+        let mut root = vec![resolved(
+            "physics.vacuum-permittivity",
+            SymbolRole::Constant,
+            "plain",
+            vec![script(sym("ε"), None, Some(sym("0")))],
+        )];
+
+        assert!(set_node_variant(&mut root, &address, "bold"));
+        let bold_epsilon = crate::document::math_symbols::variants('ε')
+            .into_iter()
+            .find(|variant| variant.key == "bold")
+            .expect("epsilon has a bold variant")
+            .glyph;
+        assert_eq!(
+            root[0],
+            resolved(
+                "physics.vacuum-permittivity",
+                SymbolRole::Constant,
+                "bold",
+                vec![script(
+                    vec![MathNode::Sym(bold_epsilon)],
+                    None,
+                    Some(sym("0"))
+                )]
+            )
+        );
+
+        assert!(set_node_variant(&mut root, &address, "plain"));
+        assert_eq!(
+            root[0],
+            resolved(
+                "physics.vacuum-permittivity",
+                SymbolRole::Constant,
+                "plain",
+                vec![script(sym("ε"), None, Some(sym("0")))]
+            )
+        );
+        assert!(!set_node_variant(&mut root, &address, "sans"));
+        assert_eq!(
+            root[0],
+            resolved(
+                "physics.vacuum-permittivity",
+                SymbolRole::Constant,
+                "plain",
+                vec![script(sym("ε"), None, Some(sym("0")))]
+            )
+        );
     }
 
     #[test]
