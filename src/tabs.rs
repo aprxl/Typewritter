@@ -265,7 +265,8 @@ impl Tabs {
         if let Some(tab) = self.active_mut() {
             f(&mut tab.document);
         }
-        let changed = self.tabs[index].document.blocks != before.blocks;
+        let changed = self.tabs[index].document.blocks != before.blocks
+            || self.tabs[index].document.notes != before.notes;
         if changed && self.transaction.is_none() {
             self.tabs[index].undo.push(before);
             self.tabs[index].redo.clear();
@@ -290,7 +291,9 @@ impl Tabs {
         let Some(index) = self.active else {
             return;
         };
-        if self.tabs[index].document.blocks != before.blocks {
+        if self.tabs[index].document.blocks != before.blocks
+            || self.tabs[index].document.notes != before.notes
+        {
             self.tabs[index].undo.push(before);
             self.tabs[index].redo.clear();
         }
@@ -472,7 +475,7 @@ impl Tabs {
     /// A content change, so it goes through `edit` and promotes a preview.
     pub fn insert_sidenote(&mut self) {
         self.edit(|doc| {
-            doc.insert_sidenote();
+            let _ = doc.insert_sidenote();
         });
     }
 
@@ -1219,5 +1222,31 @@ mod tests {
         tabs.paste(false, 1);
         assert_eq!(tabs.active().unwrap().document.block_text(0), "ab");
         assert_eq!(tabs.active().unwrap().document.block_text(1), "b");
+    }
+
+    #[test]
+    fn an_undo_after_an_edit_inside_a_note_restores_the_notes_previous_text() {
+        let path = temp_file("note-undo", "text[^1]\n\n[^1]: original\n");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        tabs.active_mut().unwrap().document.focus = crate::document::Focus::Note(0);
+        tabs.type_text("extra");
+        assert_eq!(note_text(&tabs), "extraoriginal");
+        tabs.undo();
+        assert_eq!(note_text(&tabs), "original");
+    }
+
+    fn note_text(tabs: &Tabs) -> String {
+        let mut out = String::new();
+        if let Some(tab) = tabs.active() {
+            for block in tab.document.notes.iter().flat_map(|note| note.body.iter()) {
+                for run in block.inlines() {
+                    if let crate::document::Inline::Text(text) = run {
+                        out.push_str(&text.text);
+                    }
+                }
+            }
+        }
+        out
     }
 }

@@ -24,14 +24,29 @@ pub const ATOM: char = '\u{FFFC}';
 #[derive(Clone, PartialEq, Debug)]
 pub struct Sidenote {
     pub label: String,
-    /// The note's body: the same inline runs prose uses, so a note can hold
-    /// emphasis, code and an inline expression.
-    pub body: Vec<Inline>,
+    /// The note's own block list, carrying the same invariant the document's
+    /// blocks carry: never empty, every block holds at least one run. Today a
+    /// note is exactly one `Block::Paragraph`; the type is `Vec<Block>`
+    /// because that is what the editing primitives take, and multi-paragraph
+    /// notes are the natural next step.
+    pub body: Vec<Block>,
     /// Whether an anchor for this label exists in the prose. A note loaded
     /// from disk with no anchor is `false` and is left alone by `prune_runs`;
     /// only a note the reader's edit actually orphaned (an anchor they once
     /// had and then deleted) is dropped.
     pub anchored: bool,
+}
+
+/// Where the caret lives: in the document body, or inside one note's body.
+/// Every editing primitive operates on whichever scope is focused, so the
+/// keymap and the shell never have to know notes exist.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Focus {
+    /// The document's own blocks.
+    #[default]
+    Body,
+    /// Index into [`Document::notes`].
+    Note(usize),
 }
 
 /// A document: an ordered list of blocks with a caret.
@@ -48,6 +63,8 @@ pub struct Document {
     /// beside the blocks rather than in them, because a note belongs to a
     /// position in the prose and not to the flow of it.
     pub notes: Vec<Sidenote>,
+    /// Which scope the caret is in: the document body, or one note's body.
+    pub focus: Focus,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -316,6 +333,54 @@ fn math_block() -> Block {
     Block::Math(vec![Inline::Math(Vec::new())])
 }
 
+/// Repair one block's runs: drop empty runs, demote a rule or display atom
+/// that gained prose, and turn an emptied block into a placeholder of its
+/// own kind. Shared by the document's blocks and every note body, so the
+/// invariants hold in every scope rather than only where the caret is.
+fn prune_block(block: &mut Block) {
+    block.inlines_mut().retain(|r| !r.text().is_empty());
+    // A rule holds no text. Typing on one turns it into prose — enforced
+    // centrally here, so every edit path gets it without a special case of
+    // its own.
+    if block.is_divider() && block.inlines().iter().any(|r| !r.text().is_empty()) {
+        *block = Block::Paragraph(std::mem::take(block.inlines_mut()));
+    }
+    if block.is_math() {
+        if block.inlines().is_empty() {
+            *block = math_block();
+        } else if !matches!(block.inlines(), [Inline::Math(_)]) {
+            // Prose in a display atom means this is prose now; keep the
+            // atom inline rather than discarding its tree.
+            *block = Block::Paragraph(std::mem::take(block.inlines_mut()));
+        }
+    }
+    if block.inlines().is_empty() {
+        *block = match block {
+            Block::Heading { level, .. } => Block::Heading {
+                level: *level,
+                content: vec![Inline::Text(Text {
+                    text: String::new(),
+                    style: Style::PLAIN,
+                })],
+            },
+            Block::CodeLine { first, lang, .. } => Block::CodeLine {
+                content: vec![Inline::Text(Text {
+                    text: String::new(),
+                    style: Style {
+                        code: true,
+                        ..Style::PLAIN
+                    },
+                })],
+                first: *first,
+                lang: lang.clone(),
+            },
+            Block::Divider(_) => divider_block(),
+            Block::Math(_) => math_block(),
+            Block::Paragraph(_) => empty_block(),
+        };
+    }
+}
+
 /// Inserts `s` at character offset `char_idx` of `text`.
 fn insert_str(text: &mut String, char_idx: usize, s: &str) {
     let byte = text
@@ -486,11 +551,31 @@ impl Document {
             },
             math: None,
             notes: Vec::new(),
+            focus: Focus::Body,
         }
     }
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// The block list the caret lives in: the document's own blocks, or one
+    /// note's body. Every caret-relative read resolves through this.
+    fn focused(&self) -> &[Block] {
+        match self.focus {
+            Focus::Body => &self.blocks,
+            Focus::Note(i) => &self.notes[i].body,
+        }
+    }
+
+    /// The mutable block list the caret lives in. Every caret-relative edit
+    /// resolves through this, so it lands in the note body when a note is
+    /// focused and in the prose when it is not.
+    fn focused_mut(&mut self) -> &mut Vec<Block> {
+        match self.focus {
+            Focus::Body => &mut self.blocks,
+            Focus::Note(i) => &mut self.notes[i].body,
+        }
     }
 
     /// Whitespace-split over all runs.
@@ -1093,12 +1178,12 @@ impl Document {
     // ---- internal geometry helpers --------------------------------------
 
     fn block_flat_len(&self, block: usize) -> usize {
-        self.blocks[block].inlines().iter().map(run_len).sum()
+        self.focused()[block].inlines().iter().map(run_len).sum()
     }
 
     /// The caret's flat position within its block, clamped.
     fn caret_flat(&self, block: usize) -> usize {
-        let runs = self.blocks[block].inlines();
+        let runs = self.focused()[block].inlines();
         let inline = self.caret.inline.min(runs.len().saturating_sub(1));
         let prefix: usize = runs[..inline].iter().map(run_len).sum();
         let offset = if runs.is_empty() {
@@ -1111,7 +1196,7 @@ impl Document {
 
     /// `(inline, offset)` for a flat position, clamped to the block's end.
     fn flat_to_pos(&self, block: usize, flat: usize) -> (usize, usize) {
-        let runs = self.blocks[block].inlines();
+        let runs = self.focused()[block].inlines();
         let mut pos = 0;
         for (i, run) in runs.iter().enumerate() {
             let len = run_len(run);
@@ -1126,7 +1211,7 @@ impl Document {
 
     /// Style of the character at `flat`, or `None` at the end of the block.
     fn style_at(&self, block: usize, flat: usize) -> Option<Style> {
-        let runs = self.blocks[block].inlines();
+        let runs = self.focused()[block].inlines();
         let mut pos = 0;
         for run in runs {
             let len = run_len(run);
@@ -1147,19 +1232,35 @@ impl Document {
         }
     }
 
-    /// Repairs the caret into valid bounds. `blocks` is never empty.
+    /// Repairs the caret into valid bounds. `blocks` is never empty. When
+    /// focus names a note that no longer exists — its anchor was deleted, so
+    /// `prune_runs` dropped the note — focus falls back to the body and the
+    /// caret is clamped there, because a caret pointing into a dropped note
+    /// must never be reachable.
     fn clamp_caret(&mut self) {
         if self.blocks.is_empty() {
             self.blocks.push(empty_block());
         }
-        let block = self.caret.block.min(self.blocks.len() - 1);
+        if let Focus::Note(i) = self.focus
+            && i >= self.notes.len()
+        {
+            self.focus = Focus::Body;
+        }
+        let block = self.caret.block.min(self.focused().len() - 1);
         self.caret.block = block;
-        let runs = self.blocks[block].inlines();
-        let inline = self.caret.inline.min(runs.len().saturating_sub(1));
+        // Read the clamped inline/offset and whether the run is math before
+        // mutating: the `focused` borrow would otherwise outlive `self.math`.
+        let (inline, offset, is_math) = {
+            let runs = self.focused()[block].inlines();
+            let inline = self.caret.inline.min(runs.len().saturating_sub(1));
+            let len = run_len(&runs[inline]);
+            let offset = self.caret.offset.min(len);
+            let is_math = matches!(runs[inline], Inline::Math(_));
+            (inline, offset, is_math)
+        };
         self.caret.inline = inline;
-        let len = run_len(&runs[inline]);
-        self.caret.offset = self.caret.offset.min(len);
-        if !matches!(runs[inline], Inline::Math(_)) {
+        self.caret.offset = offset;
+        if !is_math {
             self.math = None;
         }
     }
@@ -1177,47 +1278,15 @@ impl Document {
     /// survives and can be typed into — the invariant that an empty document
     /// is one empty Paragraph is only about `Document::new`).
     fn prune_runs(&mut self) {
+        // The invariant holds in *every* scope, not just where the caret
+        // happens to be: a note body left with an empty run would be an
+        // invariant only until focus moved elsewhere.
         for block in &mut self.blocks {
-            block.inlines_mut().retain(|r| !r.text().is_empty());
-            // A rule holds no text. Typing on one turns it into prose —
-            // enforced centrally here, so every edit path gets it without
-            // a special case of its own.
-            if block.is_divider() && block.inlines().iter().any(|r| !r.text().is_empty()) {
-                *block = Block::Paragraph(std::mem::take(block.inlines_mut()));
-            }
-            if block.is_math() {
-                if block.inlines().is_empty() {
-                    *block = math_block();
-                } else if !matches!(block.inlines(), [Inline::Math(_)]) {
-                    // Prose in a display atom means this is prose now; keep
-                    // the atom inline rather than discarding its tree.
-                    *block = Block::Paragraph(std::mem::take(block.inlines_mut()));
-                }
-            }
-            if block.inlines().is_empty() {
-                *block = match block {
-                    Block::Heading { level, .. } => Block::Heading {
-                        level: *level,
-                        content: vec![Inline::Text(Text {
-                            text: String::new(),
-                            style: Style::PLAIN,
-                        })],
-                    },
-                    Block::CodeLine { first, lang, .. } => Block::CodeLine {
-                        content: vec![Inline::Text(Text {
-                            text: String::new(),
-                            style: Style {
-                                code: true,
-                                ..Style::PLAIN
-                            },
-                        })],
-                        first: *first,
-                        lang: lang.clone(),
-                    },
-                    Block::Divider(_) => divider_block(),
-                    Block::Math(_) => math_block(),
-                    Block::Paragraph(_) => empty_block(),
-                };
+            prune_block(block);
+        }
+        for note in &mut self.notes {
+            for block in &mut note.body {
+                prune_block(block);
             }
         }
 
@@ -1242,7 +1311,11 @@ impl Document {
         if self.blocks.is_empty() {
             return false;
         }
-        for block in &self.blocks {
+        for block in self
+            .blocks
+            .iter()
+            .chain(self.notes.iter().flat_map(|note| note.body.iter()))
+        {
             if block.inlines().is_empty() {
                 return false;
             }
@@ -1252,7 +1325,12 @@ impl Document {
                 }
             }
         }
-        let block = &self.blocks[self.caret.block];
+        for note in &self.notes {
+            if note.body.is_empty() {
+                return false;
+            }
+        }
+        let block = &self.focused()[self.caret.block];
         if self.caret.inline >= block.inlines().len() {
             return false;
         }
@@ -1265,9 +1343,9 @@ impl Document {
     /// style-before rule (§3).
     pub fn set_caret(&mut self, block: usize, inline: usize, offset: usize) {
         self.clamp_caret();
-        let b = block.min(self.blocks.len() - 1);
+        let b = block.min(self.focused().len() - 1);
         self.caret.block = b;
-        let runs = self.blocks[b].inlines();
+        let runs = self.focused()[b].inlines();
         let i = inline.min(runs.len().saturating_sub(1));
         let len = run_len(&runs[i]);
         self.caret.inline = i;
@@ -1286,7 +1364,7 @@ impl Document {
         // there is a stray context (e.g. an armed-but-unused toggle) with
         // no boundary to pop — it must not swallow the keypress.
         let o = self.caret.offset;
-        let run_len_i = run_len(&self.blocks[b].inlines()[self.caret.inline]);
+        let run_len_i = run_len(&self.focused()[b].inlines()[self.caret.inline]);
         let at_seam = o == 0 || o == run_len_i;
         let after = self.style_at(b, self.caret_flat(b));
         let target = after.unwrap_or(Style::PLAIN);
@@ -1302,7 +1380,7 @@ impl Document {
             self.caret.style = self
                 .style_before(b, self.caret_flat(b))
                 .unwrap_or(Style::PLAIN);
-        } else if b + 1 < self.blocks.len() {
+        } else if b + 1 < self.focused().len() {
             self.caret.block = b + 1;
             self.caret.inline = 0;
             self.caret.offset = 0;
@@ -1315,7 +1393,7 @@ impl Document {
         let b = self.caret.block;
         // Mirrors move_right: only pop at a genuine run/block seam.
         let o = self.caret.offset;
-        let run_len_i = run_len(&self.blocks[b].inlines()[self.caret.inline]);
+        let run_len_i = run_len(&self.focused()[b].inlines()[self.caret.inline]);
         let at_seam = o == 0 || o == run_len_i;
         let before = self.style_before(b, self.caret_flat(b));
         let target = before.unwrap_or(Style::PLAIN);
@@ -1378,7 +1456,7 @@ impl Document {
         let flat = self.caret_flat(b);
 
         let len = text.chars().count();
-        let runs = self.blocks[b].inlines();
+        let runs = self.focused()[b].inlines();
         let placeholder = runs.len() == 1 && runs[0].text().is_empty();
         let li = run_len(&runs[i]);
         let left_style = if o > 0 {
@@ -1397,14 +1475,14 @@ impl Document {
         };
 
         if placeholder {
-            let runs = self.blocks[b].inlines_mut();
+            let runs = self.focused_mut()[b].inlines_mut();
             runs[0]
                 .text_mut()
                 .expect("placeholder is always a text run")
                 .push_str(text);
             runs[0].set_style(s);
         } else if left_style == Some(s) {
-            let runs = self.blocks[b].inlines_mut();
+            let runs = self.focused_mut()[b].inlines_mut();
             if o > 0 {
                 insert_str(
                     runs[i]
@@ -1420,7 +1498,7 @@ impl Document {
                     .push_str(text);
             }
         } else if right_style == Some(s) {
-            let runs = self.blocks[b].inlines_mut();
+            let runs = self.focused_mut()[b].inlines_mut();
             if o < li {
                 insert_str(
                     runs[i]
@@ -1440,12 +1518,12 @@ impl Document {
             }
         } else {
             // Splice a new run at the caret, splitting the current run.
-            let (prefix, suffix) = split_run(self.blocks[b].inlines_mut().remove(i), o);
+            let (prefix, suffix) = split_run(self.focused_mut()[b].inlines_mut().remove(i), o);
             let new_run = Inline::Text(Text {
                 text: text.to_string(),
                 style: s,
             });
-            let runs = self.blocks[b].inlines_mut();
+            let runs = self.focused_mut()[b].inlines_mut();
             runs.splice(i..i, [prefix, new_run, suffix]);
         }
 
@@ -1480,11 +1558,11 @@ impl Document {
 
         let parsed = inline_runs(text, s);
         let inserted: usize = parsed.iter().map(run_len).sum();
-        let (prefix, suffix) = split_run(self.blocks[b].inlines_mut().remove(i), o);
+        let (prefix, suffix) = split_run(self.focused_mut()[b].inlines_mut().remove(i), o);
         let mut runs = vec![prefix];
         runs.extend(parsed);
         runs.push(suffix);
-        self.blocks[b].inlines_mut().splice(i..i, runs);
+        self.focused_mut()[b].inlines_mut().splice(i..i, runs);
         let target = flat + inserted;
         self.dirty = true;
         self.enforce();
@@ -1499,20 +1577,20 @@ impl Document {
         let i = self.caret.inline;
         let o = self.caret.offset;
         let before = self.caret_flat(b);
-        let math_inline = if o > 0 && matches!(self.blocks[b].inlines()[i], Inline::Math(_)) {
+        let math_inline = if o > 0 && matches!(self.focused()[b].inlines()[i], Inline::Math(_)) {
             Some(i)
-        } else if o == 0 && i > 0 && matches!(self.blocks[b].inlines()[i - 1], Inline::Math(_)) {
+        } else if o == 0 && i > 0 && matches!(self.focused()[b].inlines()[i - 1], Inline::Math(_)) {
             Some(i - 1)
         } else {
             None
         };
         if let Some(inline) = math_inline {
-            let len = match &self.blocks[b].inlines()[inline] {
+            let len = match &self.focused()[b].inlines()[inline] {
                 Inline::Math(list) => list.len(),
                 Inline::Text(_) => unreachable!("math target was checked above"),
                 Inline::Note(_) => unreachable!("math target was checked above"),
             };
-            if len > 0 || self.blocks[b].is_math() {
+            if len > 0 || self.focused()[b].is_math() {
                 self.set_caret(b, inline, 0);
                 self.math = Some(math::MathCursor {
                     path: Vec::new(),
@@ -1523,14 +1601,14 @@ impl Document {
             }
         }
         if o > 0 {
-            let runs = self.blocks[b].inlines_mut();
+            let runs = self.focused_mut()[b].inlines_mut();
             if is_opaque(&runs[i]) {
                 runs.remove(i);
             } else {
                 remove_char_at(runs[i].text_mut().expect("non-math run is text"), o - 1);
             }
         } else if i > 0 {
-            let runs = self.blocks[b].inlines_mut();
+            let runs = self.focused_mut()[b].inlines_mut();
             if is_opaque(&runs[i - 1]) {
                 runs.remove(i - 1);
             } else {
@@ -1540,9 +1618,9 @@ impl Document {
                     prev_len - 1,
                 );
             }
-        } else if b > 0 && self.blocks[b - 1].is_math() {
+        } else if b > 0 && self.focused()[b - 1].is_math() {
             let previous = b - 1;
-            let len = match self.blocks[previous].inlines() {
+            let len = match self.focused()[previous].inlines() {
                 [Inline::Math(list)] => list.len(),
                 _ => unreachable!("display math must contain exactly one math atom"),
             };
@@ -1553,7 +1631,7 @@ impl Document {
             });
             let _ = self.math_backspace();
             return;
-        } else if b > 0 && self.blocks[b].is_math() {
+        } else if b > 0 && self.focused()[b].is_math() {
             self.set_caret(b, 0, 0);
             self.math = Some(math::MathCursor::default());
             return;
@@ -1583,11 +1661,11 @@ impl Document {
         let prev = b - 1;
         let junction = self.block_flat_len(prev);
         let mut taken = {
-            let runs = self.blocks[b].inlines_mut();
+            let runs = self.focused_mut()[b].inlines_mut();
             std::mem::take(runs)
         };
-        self.blocks.remove(b);
-        self.blocks[prev].inlines_mut().append(&mut taken);
+        self.focused_mut().remove(b);
+        self.focused_mut()[prev].inlines_mut().append(&mut taken);
         self.caret.block = prev;
         let (i, o) = self.flat_to_pos(prev, junction);
         self.caret.inline = i;
@@ -1599,7 +1677,7 @@ impl Document {
         let b = self.caret.block;
         let i = self.caret.inline;
         let o = self.caret.offset;
-        let runs = self.blocks[b].inlines();
+        let runs = self.focused()[b].inlines();
         let li = run_len(&runs[i]);
         let math_inline = if o < li && matches!(runs[i], Inline::Math(_)) {
             Some(i)
@@ -1609,12 +1687,12 @@ impl Document {
             None
         };
         if let Some(inline) = math_inline {
-            let empty = match &self.blocks[b].inlines()[inline] {
+            let empty = match &self.focused()[b].inlines()[inline] {
                 Inline::Math(list) => list.is_empty(),
                 Inline::Text(_) => unreachable!("math target was checked above"),
                 Inline::Note(_) => unreachable!("math target was checked above"),
             };
-            if !empty || self.blocks[b].is_math() {
+            if !empty || self.focused()[b].is_math() {
                 self.set_caret(b, inline, 0);
                 self.math = Some(math::MathCursor::default());
                 let _ = self.math_delete_forward();
@@ -1622,28 +1700,28 @@ impl Document {
             }
         }
         if o < li {
-            let runs = self.blocks[b].inlines_mut();
+            let runs = self.focused_mut()[b].inlines_mut();
             if is_opaque(&runs[i]) {
                 runs.remove(i);
             } else {
                 remove_char_at(runs[i].text_mut().expect("non-math run is text"), o);
             }
         } else if i + 1 < runs.len() {
-            let runs = self.blocks[b].inlines_mut();
+            let runs = self.focused_mut()[b].inlines_mut();
             if is_opaque(&runs[i + 1]) {
                 runs.remove(i + 1);
             } else {
                 remove_char_at(runs[i + 1].text_mut().expect("non-math run is text"), 0);
             }
-        } else if b + 1 < self.blocks.len() && self.blocks[b].is_math() {
+        } else if b + 1 < self.focused().len() && self.focused()[b].is_math() {
             return;
-        } else if b + 1 < self.blocks.len() && self.blocks[b + 1].is_math() {
+        } else if b + 1 < self.focused().len() && self.focused()[b + 1].is_math() {
             let next = b + 1;
             self.set_caret(next, 0, 0);
             self.math = Some(math::MathCursor::default());
             let _ = self.math_delete_forward();
             return;
-        } else if b + 1 < self.blocks.len() {
+        } else if b + 1 < self.focused().len() {
             self.merge_block_into_next();
         } else {
             return; // end of document
@@ -1659,22 +1737,30 @@ impl Document {
         let b = self.caret.block;
         let next = b + 1;
         let mut taken = {
-            let runs = self.blocks[next].inlines_mut();
+            let runs = self.focused_mut()[next].inlines_mut();
             std::mem::take(runs)
         };
-        self.blocks.remove(next);
-        self.blocks[b].inlines_mut().append(&mut taken);
+        self.focused_mut().remove(next);
+        self.focused_mut()[b].inlines_mut().append(&mut taken);
     }
 
     pub fn newline(&mut self) {
         self.clamp_caret();
+        // ponytail: a note is one paragraph, so splitting its block is a
+        // no-op — the caret stays put and the body keeps its single
+        // paragraph, which is all the one-line footnote definition on disk
+        // can hold. Multi-paragraph notes would need indented continuation
+        // lines in the Markdown, which the format has no room for yet.
+        if matches!(self.focus, Focus::Note(_)) {
+            return;
+        }
         let b = self.caret.block;
         let i = self.caret.inline;
         let o = self.caret.offset;
-        let is_code = self.blocks[b].is_code();
-        let (prefix, suffix) = split_run(self.blocks[b].inlines_mut().remove(i), o);
+        let is_code = self.focused()[b].is_code();
+        let (prefix, suffix) = split_run(self.focused_mut()[b].inlines_mut().remove(i), o);
         let mut taken = Vec::new();
-        let runs = self.blocks[b].inlines_mut();
+        let runs = self.focused_mut()[b].inlines_mut();
         taken.extend(runs.drain(i..));
         runs.push(prefix);
 
@@ -1689,7 +1775,7 @@ impl Document {
         } else {
             Block::Paragraph(new_content)
         };
-        self.blocks.insert(b + 1, new_block);
+        self.focused_mut().insert(b + 1, new_block);
 
         self.dirty = true;
         self.caret.block = b + 1;
@@ -1711,15 +1797,15 @@ impl Document {
             return;
         }
         let (i, o) = self.flat_to_pos(b, flat);
-        if let Inline::Math(list) = &self.blocks[b].inlines()[i]
-            && (!list.is_empty() || self.blocks[b].is_math())
+        if let Inline::Math(list) = &self.focused()[b].inlines()[i]
+            && (!list.is_empty() || self.focused()[b].is_math())
         {
             self.set_caret(b, i, 0);
             self.math = Some(math::MathCursor::default());
             let _ = self.math_delete_forward();
             return;
         }
-        let runs = self.blocks[b].inlines_mut();
+        let runs = self.focused_mut()[b].inlines_mut();
         if is_opaque(&runs[i]) {
             runs.remove(i);
         } else {
@@ -1736,19 +1822,19 @@ impl Document {
     pub fn delete_line(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
-        if self.blocks.len() == 1 {
-            self.blocks[0] = empty_block();
+        if self.focused().len() == 1 {
+            self.focused_mut()[0] = empty_block();
             self.caret.block = 0;
             self.caret.inline = 0;
             self.caret.offset = 0;
         } else {
-            self.blocks.remove(b);
-            let landing = b.min(self.blocks.len() - 1);
+            self.focused_mut().remove(b);
+            let landing = b.min(self.focused().len() - 1);
             self.caret.block = landing;
             self.caret.inline = 0;
             self.caret.offset = 0;
             let mut prefix = 0;
-            for run in self.blocks[landing].inlines() {
+            for run in self.focused()[landing].inlines() {
                 let lead = run.text().chars().take_while(|c| c.is_whitespace()).count();
                 if lead < run_len(run) {
                     let (i, o) = self.flat_to_pos(landing, prefix + lead);
@@ -1768,7 +1854,7 @@ impl Document {
     pub fn open_below(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
-        self.blocks.insert(b + 1, empty_block());
+        self.focused_mut().insert(b + 1, empty_block());
         self.caret.block = b + 1;
         self.caret.inline = 0;
         self.caret.offset = 0;
@@ -1781,7 +1867,7 @@ impl Document {
     pub fn open_above(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
-        self.blocks.insert(b, empty_block());
+        self.focused_mut().insert(b, empty_block());
         self.caret.block = b;
         self.caret.inline = 0;
         self.caret.offset = 0;
@@ -1841,7 +1927,11 @@ impl Document {
     pub fn set_code(&mut self, on: bool) {
         self.clamp_caret();
         let b = self.caret.block;
-        let flat_text: String = self.blocks[b].inlines().iter().map(Inline::text).collect();
+        let flat_text: String = self.focused()[b]
+            .inlines()
+            .iter()
+            .map(Inline::text)
+            .collect();
         let style = if on {
             Style {
                 code: true,
@@ -1854,7 +1944,7 @@ impl Document {
             text: flat_text,
             style,
         });
-        self.blocks[b] = if on {
+        self.focused_mut()[b] = if on {
             Block::CodeLine {
                 content: vec![run],
                 first: true,
@@ -1911,8 +2001,8 @@ impl Document {
             if !(1..=4).contains(&level) {
                 return;
             }
-            let mut inlines = std::mem::take(self.blocks[b].inlines_mut());
-            if self.blocks[b].is_code() {
+            let mut inlines = std::mem::take(self.focused_mut()[b].inlines_mut());
+            if self.focused()[b].is_code() {
                 for run in &mut inlines {
                     run.set_style(Style {
                         code: false,
@@ -1920,13 +2010,13 @@ impl Document {
                     });
                 }
             }
-            self.blocks[b] = Block::Heading {
+            self.focused_mut()[b] = Block::Heading {
                 level,
                 content: inlines,
             };
         } else {
-            let mut inlines = std::mem::take(self.blocks[b].inlines_mut());
-            if self.blocks[b].is_code() {
+            let mut inlines = std::mem::take(self.focused_mut()[b].inlines_mut());
+            if self.focused()[b].is_code() {
                 for run in &mut inlines {
                     run.set_style(Style {
                         code: false,
@@ -1934,7 +2024,7 @@ impl Document {
                     });
                 }
             }
-            self.blocks[b] = Block::Paragraph(inlines);
+            self.focused_mut()[b] = Block::Paragraph(inlines);
         }
         self.dirty = true;
         self.enforce();
@@ -1982,14 +2072,14 @@ impl Document {
     pub fn insert_divider(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
-        let at = if self.block_len(b) == 0 {
-            self.blocks[b] = divider_block();
+        let at = if self.block_flat_len(b) == 0 {
+            self.focused_mut()[b] = divider_block();
             b
         } else {
-            self.blocks.insert(b + 1, divider_block());
+            self.focused_mut().insert(b + 1, divider_block());
             b + 1
         };
-        self.blocks.insert(at + 1, empty_block());
+        self.focused_mut().insert(at + 1, empty_block());
         self.set_caret(at + 1, 0, 0);
         self.dirty = true;
         self.enforce();
@@ -2002,8 +2092,8 @@ impl Document {
         let i = self.caret.inline;
         let o = self.caret.offset;
         let flat = self.caret_flat(b);
-        let (prefix, suffix) = split_run(self.blocks[b].inlines_mut().remove(i), o);
-        self.blocks[b]
+        let (prefix, suffix) = split_run(self.focused_mut()[b].inlines_mut().remove(i), o);
+        self.focused_mut()[b]
             .inlines_mut()
             .splice(i..i, [prefix, Inline::Math(Vec::new()), suffix]);
         self.dirty = true;
@@ -2014,29 +2104,35 @@ impl Document {
     }
 
     /// Puts an anchor at the caret and opens an empty note for it, choosing
-    /// the lowest label not already in use. Returns the label so a caller
-    /// can put the caret in the new note.
-    pub fn insert_sidenote(&mut self) -> String {
+    /// the lowest label not already in use. Returns the new note's label, or
+    /// `None` when no anchor was placed.
+    pub fn insert_sidenote(&mut self) -> Option<String> {
         self.clamp_caret();
+        // No note inside a note: the anchor would sit in the note's body but
+        // the definition lives in the file's block stream, so there is
+        // nowhere honest to place it. `None` reports "did not insert".
+        if matches!(self.focus, Focus::Note(_)) {
+            return None;
+        }
         let label = self.next_free_label();
         let b = self.caret.block;
         let i = self.caret.inline;
         let o = self.caret.offset;
         let flat = self.caret_flat(b);
-        let (prefix, suffix) = split_run(self.blocks[b].inlines_mut().remove(i), o);
-        self.blocks[b]
+        let (prefix, suffix) = split_run(self.focused_mut()[b].inlines_mut().remove(i), o);
+        self.focused_mut()[b]
             .inlines_mut()
             .splice(i..i, [prefix, Inline::Note(label.clone()), suffix]);
         self.notes.push(Sidenote {
             label: label.clone(),
-            body: Vec::new(),
+            body: vec![empty_block()],
             anchored: true,
         });
         self.dirty = true;
         self.enforce();
         let (inline, offset) = self.flat_to_pos(b, (flat + 1).min(self.block_flat_len(b)));
         self.set_caret(b, inline, offset);
-        label
+        Some(label)
     }
 
     /// The lowest integer label not already carried by an anchor or a note.
@@ -2061,11 +2157,11 @@ impl Document {
     pub fn insert_math_block(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
-        let at = if self.block_len(b) == 0 {
-            self.blocks[b] = math_block();
+        let at = if self.block_flat_len(b) == 0 {
+            self.focused_mut()[b] = math_block();
             b
         } else {
-            self.blocks.insert(b + 1, math_block());
+            self.focused_mut().insert(b + 1, math_block());
             b + 1
         };
         self.set_caret(at, 0, 0);
@@ -2079,18 +2175,25 @@ impl Document {
         self.clamp_caret();
         let block = self.caret.block;
         let inline = self.caret.inline;
-        if !matches!(
-            self.blocks[block].inlines().get(inline),
-            Some(Inline::Math(_))
-        ) {
-            self.math = None;
-            return None;
-        }
-        let cursor = self.math.as_mut()?;
-        let list = match self.blocks[block].inlines_mut().get_mut(inline) {
-            Some(Inline::Math(list)) => list,
-            _ => unreachable!("math focus was checked above"),
+        // Borrow the atom and the cursor from disjoint fields: `focused_mut`
+        // holds all of `self`, so the cursor borrow would not fit alongside.
+        let list = match self.focus {
+            Focus::Body => match self.blocks[block].inlines_mut().get_mut(inline) {
+                Some(Inline::Math(list)) => list,
+                _ => {
+                    self.math = None;
+                    return None;
+                }
+            },
+            Focus::Note(i) => match self.notes[i].body[block].inlines_mut().get_mut(inline) {
+                Some(Inline::Math(list)) => list,
+                _ => {
+                    self.math = None;
+                    return None;
+                }
+            },
         };
+        let cursor = self.math.as_mut()?;
         Some((list, cursor))
     }
 
@@ -2154,7 +2257,7 @@ impl Document {
     /// geometry and completion queries.
     pub fn focused_math_view(&self) -> Option<(&math::MathList, &math::MathCursor)> {
         let cursor = self.math.as_ref()?;
-        let list = match self.blocks[self.caret.block]
+        let list = match self.focused()[self.caret.block]
             .inlines()
             .get(self.caret.inline)
         {
@@ -2329,7 +2432,7 @@ impl Document {
             return false;
         }
         let (inline, _) = self.flat_to_pos(block, flat - 1);
-        let list_len = match self.blocks[block].inlines().get(inline) {
+        let list_len = match self.focused()[block].inlines().get(inline) {
             Some(Inline::Math(list)) => list.len(),
             _ => return false,
         };
@@ -2352,7 +2455,7 @@ impl Document {
         }
         let (inline, _) = self.flat_to_pos(block, flat);
         if !matches!(
-            self.blocks[block].inlines().get(inline),
+            self.focused()[block].inlines().get(inline),
             Some(Inline::Math(_))
         ) {
             return false;
@@ -2391,7 +2494,7 @@ impl Document {
         let block = self.caret.block;
         let inline = self.caret.inline;
         if !matches!(
-            self.blocks[block].inlines().get(inline),
+            self.focused()[block].inlines().get(inline),
             Some(Inline::Math(_))
         ) {
             self.math = None;
@@ -2478,17 +2581,26 @@ mod tests {
     }
 
     /// The §2 invariants: blocks never empty, every block has ≥1 run, no
-    /// empty run outside the placeholder, caret in bounds.
+    /// empty run outside the placeholder, caret in bounds. Checked over the
+    /// document's blocks and every note body, with the caret read against
+    /// whichever scope is focused.
     fn assert_invariants(d: &Document) {
         assert!(!d.blocks.is_empty());
-        for block in &d.blocks {
+        for block in d
+            .blocks
+            .iter()
+            .chain(d.notes.iter().flat_map(|note| note.body.iter()))
+        {
             assert!(!block.inlines().is_empty());
             for (i, run) in block.inlines().iter().enumerate() {
                 assert!(!(run.text().is_empty() && (block.inlines().len() > 1 || i != 0)));
             }
         }
-        assert!(d.caret.block < d.blocks.len());
-        let block_runs = d.blocks[d.caret.block].inlines();
+        for note in &d.notes {
+            assert!(!note.body.is_empty());
+        }
+        assert!(d.caret.block < d.focused().len());
+        let block_runs = d.focused()[d.caret.block].inlines();
         assert!(d.caret.inline < block_runs.len());
         assert!(d.caret.offset <= run_len(&block_runs[d.caret.inline]));
     }
@@ -4043,9 +4155,9 @@ mod tests {
     #[test]
     fn inserting_a_sidenote_picks_the_lowest_free_label() {
         let mut d = doc();
-        assert_eq!(d.insert_sidenote(), "1");
-        assert_eq!(d.insert_sidenote(), "2");
-        assert_eq!(d.insert_sidenote(), "3");
+        assert_eq!(d.insert_sidenote(), Some("1".into()));
+        assert_eq!(d.insert_sidenote(), Some("2".into()));
+        assert_eq!(d.insert_sidenote(), Some("3".into()));
         assert_eq!(
             d.notes.iter().map(|n| n.label.as_str()).collect::<Vec<_>>(),
             vec!["1", "2", "3"]
@@ -4055,7 +4167,7 @@ mod tests {
         // "1" is free again and the next insert reclaims it.
         d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
         assert_eq!(d.notes.len(), 2);
-        assert_eq!(d.insert_sidenote(), "1");
+        assert_eq!(d.insert_sidenote(), Some("1".into()));
     }
 
     #[test]
@@ -4063,7 +4175,7 @@ mod tests {
         let mut d = doc();
         d.insert_text("note");
         d.set_caret(0, 0, 0);
-        d.insert_sidenote();
+        let _ = d.insert_sidenote();
         assert_eq!(d.notes.len(), 1);
         assert_eq!(d.block_text(0), format!("{ATOM}note"));
 
@@ -4077,13 +4189,97 @@ mod tests {
         let mut d = doc();
         d.notes.push(Sidenote {
             label: "1".into(),
-            body: vec![plain_run("orphan")],
+            body: vec![Block::Paragraph(vec![plain_run("orphan")])],
             anchored: false,
         });
         d.insert_text("hello");
         d.enforce();
         assert_eq!(d.notes.len(), 1, "a stray note is not an edit's to drop");
         assert_eq!(d.notes[0].label, "1");
-        assert_eq!(d.notes[0].body, vec![plain_run("orphan")]);
+        assert_eq!(
+            d.notes[0].body,
+            vec![Block::Paragraph(vec![plain_run("orphan")])]
+        );
+    }
+
+    #[test]
+    fn typing_into_a_focused_note_edits_that_notes_body_and_leaves_the_documents_blocks_untouched()
+    {
+        let mut d = doc();
+        d.insert_text("body");
+        d.set_caret(0, 0, 0);
+        let _ = d.insert_sidenote();
+        let blocks_before = d.blocks.clone();
+        d.focus = Focus::Note(0);
+        d.insert_text("a note");
+        assert_eq!(
+            d.notes[0].body,
+            vec![Block::Paragraph(vec![plain_run("a note")])]
+        );
+        assert_eq!(d.blocks, blocks_before, "the body is untouched");
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn typing_into_the_body_with_focus_on_body_leaves_every_note_untouched() {
+        let mut d = doc();
+        d.insert_text("body");
+        d.set_caret(0, 0, 0);
+        let _ = d.insert_sidenote();
+        let notes_before = d.notes.clone();
+        d.insert_text("more ");
+        assert_eq!(d.notes, notes_before, "no note changes");
+        assert_eq!(d.block_text(0), format!("{ATOM}more body"));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn deleting_the_anchor_of_the_focused_note_drops_the_note_resets_focus_to_body_and_leaves_the_caret_in_bounds()
+     {
+        let mut d = doc();
+        d.insert_text("note");
+        d.set_caret(0, 0, 0);
+        let _ = d.insert_sidenote();
+        d.focus = Focus::Note(0);
+        // Remove the anchor from the body; the next enforce drops the note
+        // and the clamp must walk focus back to the body.
+        d.blocks[0]
+            .inlines_mut()
+            .retain(|run| !matches!(run, Inline::Note(_)));
+        d.enforce();
+        assert!(d.notes.is_empty(), "dropping the anchor drops the note");
+        assert_eq!(d.focus, Focus::Body, "focus falls back to the body");
+        assert!(d.caret.block < d.blocks.len(), "caret stays in bounds");
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn pressing_enter_inside_a_note_leaves_the_body_at_one_paragraph() {
+        let mut d = doc();
+        d.insert_text("body");
+        d.set_caret(0, 0, 0);
+        let _ = d.insert_sidenote();
+        d.focus = Focus::Note(0);
+        d.insert_text("note text");
+        d.set_caret(0, 0, 4);
+        d.newline();
+        assert_eq!(d.notes[0].body.len(), 1, "a note stays one paragraph");
+        assert_eq!(
+            runs(&d.notes[0].body[0]),
+            vec![("note text".into(), Style::PLAIN)]
+        );
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn insert_sidenote_while_focused_in_a_note_inserts_nothing() {
+        let mut d = doc();
+        d.insert_text("body");
+        d.set_caret(0, 0, 0);
+        let _ = d.insert_sidenote();
+        d.focus = Focus::Note(0);
+        assert_eq!(d.insert_sidenote(), None);
+        assert_eq!(d.notes.len(), 1, "no note inside a note");
+        assert_eq!(d.block_text(0), format!("{ATOM}body"));
     }
 }

@@ -22,7 +22,7 @@ use std::io;
 use std::path::Path;
 
 use super::math_notation;
-use super::{BadgeColor, Block, Caret, Document, Inline, Sidenote, Style, Text};
+use super::{BadgeColor, Block, Caret, Document, Focus, Inline, Sidenote, Style, Text};
 
 /// Scan for the next unescaped occurrence of `marker` at or after `start`.
 /// The char immediately before a match must be non-whitespace. Escaped
@@ -337,6 +337,19 @@ fn parse_definition(line: &str) -> Option<(&str, &str)> {
     Some((label, body))
 }
 
+/// A footnote definition body as one paragraph block. A definition with no
+/// text still yields one empty run, because every block must hold one.
+fn note_block(body: &str) -> Block {
+    let mut runs = parse_inline(body);
+    if runs.is_empty() {
+        runs.push(Inline::Text(Text {
+            text: String::new(),
+            style: Style::PLAIN,
+        }));
+    }
+    Block::Paragraph(runs)
+}
+
 /// Build a `Document` from Markdown text. `path` only seeds `Document`'s
 /// `path`/`name` fields. Pure — no IO.
 pub fn parse(path: &Path, text: &str) -> Document {
@@ -348,7 +361,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
     let mut fence_lang: Option<String> = None;
     let mut fence_math = false;
     let mut math_body = String::new();
-    let mut definitions: Vec<(String, Vec<Inline>)> = Vec::new();
+    let mut definitions: Vec<(String, Block)> = Vec::new();
 
     let flush_para = |blocks: &mut Vec<Block>, para: &mut Vec<String>| {
         if !para.is_empty() {
@@ -435,7 +448,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
         // document's notes, so it is never a stray paragraph mid-prose.
         if let Some((label, body)) = parse_definition(line) {
             flush_para(&mut blocks, &mut para);
-            definitions.push((label.to_string(), parse_inline(body)));
+            definitions.push((label.to_string(), note_block(body)));
             continue;
         }
         if let Some((level, content)) = parse_heading(line) {
@@ -496,7 +509,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
         .map(|(label, body)| Sidenote {
             anchored: anchored_labels.contains(&label.as_str()),
             label,
-            body,
+            body: vec![body],
         })
         .collect();
 
@@ -513,6 +526,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
         },
         math: None,
         notes,
+        focus: Focus::Body,
     }
 }
 
@@ -731,7 +745,7 @@ pub fn serialize(doc: &Document) -> String {
             out.push_str("[^");
             out.push_str(&note.label);
             out.push_str("]: ");
-            out.push_str(&serialize_runs(&note.body));
+            out.push_str(&serialize_runs(note.body[0].inlines()));
             out.push('\n');
         }
     }
@@ -1431,7 +1445,7 @@ mod tests {
         assert!(d.notes[0].anchored);
         assert_eq!(
             d.notes[0].body,
-            vec![plain("measured 10.94 at 1 kHz, bench rig B")]
+            vec![para(vec![plain("measured 10.94 at 1 kHz, bench rig B")])]
         );
         assert_eq!(serialize(&d), text);
     }
@@ -1448,12 +1462,12 @@ mod tests {
         d.notes = vec![
             Sidenote {
                 label: "1".into(),
-                body: vec![plain("one")],
+                body: vec![para(vec![plain("one")])],
                 anchored: true,
             },
             Sidenote {
                 label: "2".into(),
-                body: vec![plain("two")],
+                body: vec![para(vec![plain("two")])],
                 anchored: true,
             },
         ];
@@ -1484,7 +1498,7 @@ mod tests {
         assert_eq!(d.notes.len(), 1);
         assert!(!d.notes[0].anchored);
         assert_eq!(d.notes[0].label, "1");
-        assert_eq!(d.notes[0].body, vec![plain("a stray note")]);
+        assert_eq!(d.notes[0].body, vec![para(vec![plain("a stray note")])]);
         let out = serialize(&d);
         assert_eq!(out, text);
         let back = parse(Path::new("n.md"), &out);
@@ -1498,13 +1512,13 @@ mod tests {
         let d = parse(Path::new("n.md"), text);
         assert_eq!(
             d.notes[0].body,
-            vec![
+            vec![para(vec![
                 plain("the "),
                 bold("gain"),
                 plain(" is "),
                 math("a/b"),
                 plain(" here"),
-            ]
+            ])]
         );
         assert_eq!(serialize(&d), text);
     }

@@ -1038,7 +1038,7 @@ impl Shell {
             .iter()
             .map(|anchor| (anchor.label.clone(), anchor.number.clone(), anchor.y))
             .collect();
-        let bodies: Vec<Vec<crate::document::Inline>> = {
+        let bodies: Vec<Vec<crate::document::Block>> = {
             let docs = self.docs.borrow();
             match docs.active() {
                 Some(tab) => anchored
@@ -1060,7 +1060,7 @@ impl Shell {
         let body_width = sidenotes::WIDTH - 46.0;
         let mut wanted = Vec::with_capacity(anchored.len());
         for (body, (_, _, y)) in bodies.iter().zip(&anchored) {
-            let runs = sidenotes::runs_of(body);
+            let runs = sidenotes::runs_of(body[0].inlines());
             wanted.push((*y, sidenotes::body_height(&runs, body_width, &measure)));
         }
         let ys = sidenotes::stack(&wanted, sidenotes::GAP);
@@ -1069,7 +1069,9 @@ impl Shell {
             .iter()
             .zip(&bodies)
             .zip(&ys)
-            .map(|(((_, number, _), body), &y)| Note::new(number, sidenotes::runs_of(body), y))
+            .map(|(((_, number, _), body), &y)| {
+                Note::new(number, sidenotes::runs_of(body[0].inlines()), y)
+            })
             .collect()
     }
 
