@@ -130,41 +130,54 @@ pub enum BoxKind {
 }
 
 /// Lay out `list` at display level `0`, script level `1`, or scriptscript
-/// level `2+`. Scaling operands at the next level keeps nested fractions
-/// bounded without introducing a second layout representation.
-pub fn layout(list: &MathList, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
-    layout_inner(list, level, measure, true)
+/// level `2+`, multiplied by `document_scale`. Scaling operands at the next
+/// level keeps nested fractions bounded without conflating nesting with the
+/// size of the whole expression.
+pub fn layout(
+    list: &MathList,
+    level: usize,
+    document_scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> MathBox {
+    layout_inner(list, level, document_scale, measure, true)
 }
 
 fn layout_inner(
     list: &MathList,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
     semantic_highlights: bool,
 ) -> MathBox {
     if list.is_empty() {
-        return slot_box(level);
+        return slot_box(level, document_scale);
     }
 
     let mut children = Vec::with_capacity(list.len());
     let mut x = 0.0;
     for (index, node) in list.iter().enumerate() {
         if index > 0 && integral_family(&list[index - 1]) && integral_family(node) {
-            x -= INTEGRAL_OVERLAP * scale(level);
+            x -= INTEGRAL_OVERLAP * scale(level, document_scale);
         }
-        let child = layout_node(node, level, measure, semantic_highlights);
+        let child = layout_node(node, level, document_scale, measure, semantic_highlights);
         children.push((x, 0.0, child));
         x += children.last().expect("child was pushed").2.width;
     }
     row_box(children)
 }
 
-fn scale(level: usize) -> f32 {
-    LEVEL_SCALE[level.min(LEVEL_SCALE.len() - 1)]
+#[derive(Clone, Copy)]
+struct LayoutOptions {
+    document_scale: f32,
+    semantic_highlights: bool,
 }
 
-fn size(level: usize) -> f32 {
-    BASE_SIZE * scale(level)
+fn scale(level: usize, document_scale: f32) -> f32 {
+    LEVEL_SCALE[level.min(LEVEL_SCALE.len() - 1)] * document_scale
+}
+
+fn size(level: usize, document_scale: f32) -> f32 {
+    BASE_SIZE * scale(level, document_scale)
 }
 
 fn integral_family(node: &MathNode) -> bool {
@@ -180,12 +193,14 @@ fn integral_family(node: &MathNode) -> bool {
 fn glyph(
     ch: char,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
     semantic_highlights: bool,
 ) -> MathBox {
     glyph_with_highlight(
         ch,
         level,
+        document_scale,
         measure,
         (semantic_highlights && ch.is_alphabetic()).then_some(SymbolRole::Variable),
     )
@@ -194,19 +209,20 @@ fn glyph(
 fn glyph_with_highlight(
     ch: char,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
     highlight: Option<SymbolRole>,
 ) -> MathBox {
-    let size = size(level);
+    let size = size(level, document_scale);
     let text = ch.to_string();
     let half = size * 0.5;
     let pad_x = if highlight.is_some() {
-        VARIABLE_PAD_X * scale(level)
+        VARIABLE_PAD_X * scale(level, document_scale)
     } else {
         0.0
     };
     let pad_y = if highlight.is_some() {
-        VARIABLE_PAD_Y * scale(level)
+        VARIABLE_PAD_Y * scale(level, document_scale)
     } else {
         0.0
     };
@@ -223,8 +239,8 @@ fn glyph_with_highlight(
     }
 }
 
-fn slot_box(level: usize) -> MathBox {
-    let scale = scale(level);
+fn slot_box(level: usize, document_scale: f32) -> MathBox {
+    let scale = scale(level, document_scale);
     let height = SLOT_H * scale;
     let half = height * 0.5;
     MathBox {
@@ -239,8 +255,8 @@ fn slot_box(level: usize) -> MathBox {
     }
 }
 
-fn invisible_slot_box(level: usize) -> MathBox {
-    let mut box_ = slot_box(level);
+fn invisible_slot_box(level: usize, document_scale: f32) -> MathBox {
+    let mut box_ = slot_box(level, document_scale);
     let BoxKind::Slot { visible, .. } = &mut box_.kind else {
         unreachable!("slot_box must produce a slot");
     };
@@ -263,23 +279,32 @@ fn measured_width(box_: &MathBox) -> f32 {
 fn layout_node(
     node: &MathNode,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
     semantic_highlights: bool,
 ) -> MathBox {
     match node {
-        MathNode::Sym(ch) => glyph(*ch, level, measure, semantic_highlights),
+        MathNode::Sym(ch) => glyph(*ch, level, document_scale, measure, semantic_highlights),
         MathNode::Resolved { role, body, .. } => {
-            let body = layout_inner(body, level, measure, false);
+            let body = layout_inner(body, level, document_scale, measure, false);
             if semantic_highlights {
-                padded_highlight(body, level, *role)
+                padded_highlight(body, level, document_scale, *role)
             } else {
                 body
             }
         }
-        MathNode::Frac { num, den } => {
-            fraction(node, num, den, level, measure, semantic_highlights)
+        MathNode::Frac { num, den } => fraction(
+            node,
+            num,
+            den,
+            level,
+            document_scale,
+            measure,
+            semantic_highlights,
+        ),
+        MathNode::Script { .. } => {
+            script(node, level, document_scale, measure, semantic_highlights)
         }
-        MathNode::Script { .. } => script(node, level, measure, semantic_highlights),
         MathNode::Group { open, close, body } => group(
             node,
             *open,
@@ -287,12 +312,28 @@ fn layout_node(
             body,
             level,
             measure,
+            LayoutOptions {
+                document_scale,
+                semantic_highlights,
+            },
+        ),
+        MathNode::Sqrt { body } => radical(
+            node,
+            body,
+            level,
+            document_scale,
+            measure,
             semantic_highlights,
         ),
-        MathNode::Sqrt { body } => radical(node, body, level, measure, semantic_highlights),
-        MathNode::Accent { kind, body } => {
-            accent(node, *kind, body, level, measure, semantic_highlights)
-        }
+        MathNode::Accent { kind, body } => accent(
+            node,
+            *kind,
+            body,
+            level,
+            document_scale,
+            measure,
+            semantic_highlights,
+        ),
         MathNode::BigOp { kind, lower, upper } => big_op(
             node,
             kind,
@@ -300,7 +341,10 @@ fn layout_node(
             upper,
             level,
             measure,
-            semantic_highlights,
+            LayoutOptions {
+                document_scale,
+                semantic_highlights,
+            },
         ),
     }
 }
@@ -327,32 +371,41 @@ fn big_op(
     upper: &MathList,
     level: usize,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
-    semantic_highlights: bool,
+    options: LayoutOptions,
 ) -> MathBox {
+    let document_scale = options.document_scale;
+    let semantic_highlights = options.semantic_highlights;
     let (operator_text, operator_size) = match kind {
-        BigOp::Sum => ("∑", size(level) * BIGOP_SCALE),
-        BigOp::Prod => ("∏", size(level) * BIGOP_SCALE),
-        BigOp::Integral => ("∫", size(level) * BIGOP_SCALE),
-        BigOp::ContourIntegral => ("∮", size(level) * BIGOP_SCALE),
-        BigOp::Limit => ("lim", size(level)),
+        BigOp::Sum => ("∑", size(level, document_scale) * BIGOP_SCALE),
+        BigOp::Prod => ("∏", size(level, document_scale) * BIGOP_SCALE),
+        BigOp::Integral => ("∫", size(level, document_scale) * BIGOP_SCALE),
+        BigOp::ContourIntegral => ("∮", size(level, document_scale) * BIGOP_SCALE),
+        BigOp::Limit => ("lim", size(level, document_scale)),
     };
     let operator = text_glyph(operator_text, operator_size, measure);
     let operand_level = (level + 1).min(2);
     let hide_empty_limits = matches!(kind, BigOp::Integral | BigOp::ContourIntegral);
     let lower_visible = !lower.is_empty() || !hide_empty_limits;
     let lower = if lower_visible {
-        layout_inner(lower, operand_level, measure, semantic_highlights)
+        layout_inner(
+            lower,
+            operand_level,
+            document_scale,
+            measure,
+            semantic_highlights,
+        )
     } else {
-        invisible_slot_box(operand_level)
+        invisible_slot_box(operand_level, document_scale)
     };
     let upper = if *kind == BigOp::Limit {
         None
     } else if upper.is_empty() && hide_empty_limits {
-        Some(invisible_slot_box(operand_level))
+        Some(invisible_slot_box(operand_level, document_scale))
     } else {
         Some(layout_inner(
             upper,
             operand_level,
+            document_scale,
             measure,
             semantic_highlights,
         ))
@@ -361,7 +414,7 @@ fn big_op(
         .width
         .max(measured_width(&lower))
         .max(upper.as_ref().map_or(0.0, measured_width));
-    let gap = size(level) * BIGOP_GAP;
+    let gap = size(level, document_scale) * BIGOP_GAP;
     let operator_ascent = operator.ascent;
     let operator_descent = operator.descent;
     let lower_y = -(operator_descent + gap + lower.ascent);
@@ -386,11 +439,18 @@ fn big_op(
     )
 }
 
-fn stretchy_size(body: &MathBox, level: usize) -> f32 {
-    size(level).max((body.ascent + body.descent) * DELIM_FILL)
+fn stretchy_size(body: &MathBox, level: usize, document_scale: f32) -> f32 {
+    size(level, document_scale).max((body.ascent + body.descent) * DELIM_FILL)
 }
 
-fn stroked_box(width: f32, ascent: f32, descent: f32, path: String, level: usize) -> MathBox {
+fn stroked_box(
+    width: f32,
+    ascent: f32,
+    descent: f32,
+    path: String,
+    level: usize,
+    document_scale: f32,
+) -> MathBox {
     MathBox {
         width,
         ascent,
@@ -398,14 +458,14 @@ fn stroked_box(width: f32, ascent: f32, descent: f32, path: String, level: usize
         highlight: None,
         kind: BoxKind::Primitive(MathPrimitive::Stroke {
             path,
-            thickness: SHAPE_STROKE * scale(level),
+            thickness: SHAPE_STROKE * scale(level, document_scale),
         }),
     }
 }
 
-fn delimiter(ch: char, height: f32, level: usize) -> MathBox {
-    let width = size(level) * 0.34;
-    let stroke = SHAPE_STROKE * scale(level);
+fn delimiter(ch: char, height: f32, level: usize, document_scale: f32) -> MathBox {
+    let width = size(level, document_scale) * 0.34;
+    let stroke = SHAPE_STROKE * scale(level, document_scale);
     let top = -height * 0.5 + stroke * 0.5;
     let bottom = height * 0.5 - stroke * 0.5;
     let path = match ch {
@@ -423,7 +483,14 @@ fn delimiter(ch: char, height: f32, level: usize) -> MathBox {
         ']' => format!("M 0 {top} H {width} V {bottom} H 0"),
         _ => format!("M {} {top} V {bottom}", width * 0.5),
     };
-    stroked_box(width, height * 0.5, height * 0.5, path, level)
+    stroked_box(
+        width,
+        height * 0.5,
+        height * 0.5,
+        path,
+        level,
+        document_scale,
+    )
 }
 
 fn group(
@@ -433,12 +500,14 @@ fn group(
     body: &MathList,
     level: usize,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
-    semantic_highlights: bool,
+    options: LayoutOptions,
 ) -> MathBox {
-    let body = layout_inner(body, level, measure, semantic_highlights);
-    let delimiter_height = stretchy_size(&body, level);
-    let opener = delimiter(open, delimiter_height, level);
-    let closer = delimiter(close, delimiter_height, level);
+    let document_scale = options.document_scale;
+    let semantic_highlights = options.semantic_highlights;
+    let body = layout_inner(body, level, document_scale, measure, semantic_highlights);
+    let delimiter_height = stretchy_size(&body, level, document_scale);
+    let opener = delimiter(open, delimiter_height, level, document_scale);
+    let closer = delimiter(close, delimiter_height, level, document_scale);
     let body_x = opener.width;
     let closer_x = body_x + body.width;
     let mut children = (0..3).map(|_| None).collect::<Vec<_>>();
@@ -458,13 +527,14 @@ fn radical(
     node: &MathNode,
     body: &MathList,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
     semantic_highlights: bool,
 ) -> MathBox {
-    let body = layout_inner(body, level, measure, semantic_highlights);
-    let stroke = SHAPE_STROKE * scale(level);
-    let body_x = size(level) * 0.48;
-    let gap = size(level) * RADICAL_GAP;
+    let body = layout_inner(body, level, document_scale, measure, semantic_highlights);
+    let stroke = SHAPE_STROKE * scale(level, document_scale);
+    let body_x = size(level, document_scale) * 0.48;
+    let gap = size(level, document_scale) * RADICAL_GAP;
     let top = -(body.ascent + gap + stroke * 0.5);
     let valley = body.descent * 0.65;
     let width = body_x + body.width;
@@ -484,6 +554,7 @@ fn radical(
         valley + stroke * 0.5,
         path,
         level,
+        document_scale,
     );
     let mut children = (0..2).map(|_| None).collect::<Vec<_>>();
     children[0] = Some((0.0, 0.0, sign));
@@ -502,12 +573,13 @@ fn accent(
     kind: AccentKind,
     body: &MathList,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
     semantic_highlights: bool,
 ) -> MathBox {
-    let body = layout_inner(body, level, measure, semantic_highlights);
-    let stroke = SHAPE_STROKE * scale(level);
-    let height = size(level) * 0.22;
+    let body = layout_inner(body, level, document_scale, measure, semantic_highlights);
+    let stroke = SHAPE_STROKE * scale(level, document_scale);
+    let height = size(level, document_scale) * 0.22;
     let y = -height * 0.45;
     let primitive = match kind {
         AccentKind::Vector => {
@@ -549,7 +621,7 @@ fn accent(
         highlight: None,
         kind: BoxKind::Primitive(primitive),
     };
-    let mark_y = body.ascent + size(level) * ACCENT_GAP;
+    let mark_y = body.ascent + size(level, document_scale) * ACCENT_GAP;
     let mut children = vec![None, None];
     children[0] = Some((0.0, mark_y, mark));
     children[slot_child_index(node, Slot::Body).expect("accent body slot index")] =
@@ -571,10 +643,15 @@ fn clear_highlights(box_: &mut MathBox) {
     }
 }
 
-fn padded_highlight(mut box_: MathBox, level: usize, role: SymbolRole) -> MathBox {
+fn padded_highlight(
+    mut box_: MathBox,
+    level: usize,
+    document_scale: f32,
+    role: SymbolRole,
+) -> MathBox {
     clear_highlights(&mut box_);
-    let pad_x = VARIABLE_PAD_X * scale(level);
-    let pad_y = VARIABLE_PAD_Y * scale(level);
+    let pad_x = VARIABLE_PAD_X * scale(level, document_scale);
+    let pad_y = VARIABLE_PAD_Y * scale(level, document_scale);
     if let BoxKind::Row { children } = &mut box_.kind {
         for (x, _, _) in children {
             *x += pad_x;
@@ -590,6 +667,7 @@ fn padded_highlight(mut box_: MathBox, level: usize, role: SymbolRole) -> MathBo
 fn script(
     node: &MathNode,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
     semantic_highlights: bool,
 ) -> MathBox {
@@ -617,6 +695,7 @@ fn script(
             } else {
                 operand_level
             },
+            document_scale,
             measure,
             semantic_highlights && base_role.is_none(),
         );
@@ -625,8 +704,14 @@ fn script(
                 base_width = child.width;
                 (0.0, 0.0)
             }
-            Slot::Sup => (base_width, size(level) * SCRIPT_RISE + child.descent),
-            Slot::Sub => (base_width, -(size(level) * SCRIPT_DROP + child.ascent)),
+            Slot::Sup => (
+                base_width,
+                size(level, document_scale) * SCRIPT_RISE + child.descent,
+            ),
+            Slot::Sub => (
+                base_width,
+                -(size(level, document_scale) * SCRIPT_DROP + child.ascent),
+            ),
             Slot::Num | Slot::Den | Slot::Body | Slot::Lower | Slot::Upper => {
                 unreachable!("fraction slots cannot be scripts")
             }
@@ -644,7 +729,7 @@ fn script(
             .collect(),
     );
     if let Some(role) = base_role {
-        padded_highlight(box_, level, role)
+        padded_highlight(box_, level, document_scale, role)
     } else {
         box_
     }
@@ -655,30 +740,46 @@ fn fraction(
     num: &MathList,
     den: &MathList,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
     semantic_highlights: bool,
 ) -> MathBox {
     let operand_level = (level + 1).min(2);
-    let numerator = layout_inner(num, operand_level, measure, semantic_highlights);
-    let denominator = layout_inner(den, operand_level, measure, semantic_highlights);
-    let current_size = size(level);
+    let numerator = layout_inner(
+        num,
+        operand_level,
+        document_scale,
+        measure,
+        semantic_highlights,
+    );
+    let denominator = layout_inner(
+        den,
+        operand_level,
+        document_scale,
+        measure,
+        semantic_highlights,
+    );
+    let current_size = size(level, document_scale);
     let gap = current_size * FRAC_GAP;
-    let pad = FRAC_PAD * scale(level);
+    let pad = FRAC_PAD * scale(level, document_scale);
+    let bar_size = BAR * scale(level, document_scale);
     let width = numerator.width.max(denominator.width) + pad * 2.0;
 
     let bar = MathBox {
         width,
-        ascent: BAR * 0.5,
-        descent: BAR * 0.5,
+        ascent: bar_size * 0.5,
+        descent: bar_size * 0.5,
         highlight: None,
-        kind: BoxKind::Bar { thickness: BAR },
+        kind: BoxKind::Bar {
+            thickness: bar_size,
+        },
     };
     // Anchor line is the inline prose middle, so placing the bar at zero
     // aligns it with the math axis instead of lifting the whole fraction.
     let bar_y = 0.0;
     // Like scripts, place each operand by the edge facing the bar so lopsided
     // boxes keep the requested clearance.
-    let clearance = BAR * 0.5 + gap;
+    let clearance = bar_size * 0.5 + gap;
     let numerator_offset = clearance + numerator.descent;
     let denominator_offset = clearance + denominator.ascent;
     let numerator_y = numerator_offset;
@@ -775,10 +876,11 @@ pub fn cursor_pos(
     list: &MathList,
     cursor: &MathCursor,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> (f32, f32, f32) {
-    let box_ = layout(list, level, measure);
-    cursor_in(list, &box_, cursor, 0, level, 0.0, 0.0)
+    let box_ = layout(list, level, document_scale, measure);
+    cursor_in(list, &box_, cursor, 0, level, document_scale, (0.0, 0.0))
 }
 
 fn cursor_in(
@@ -787,34 +889,50 @@ fn cursor_in(
     cursor: &MathCursor,
     path_index: usize,
     level: usize,
-    origin_x: f32,
-    origin_y: f32,
+    document_scale: f32,
+    origin: (f32, f32),
 ) -> (f32, f32, f32) {
     let BoxKind::Row { children } = &box_.kind else {
-        return (origin_x, origin_y, cursor_height(list, level));
+        return (
+            origin.0,
+            origin.1,
+            cursor_height(list, level, document_scale),
+        );
     };
     let index = cursor.index.min(list.len()).min(children.len());
     if path_index == cursor.path.len() {
         let x = children
             .get(index)
             .map_or(box_.width, |(child_x, _, _)| *child_x);
-        return (origin_x + x, origin_y, cursor_height(list, level));
+        return (
+            origin.0 + x,
+            origin.1,
+            cursor_height(list, level, document_scale),
+        );
     }
 
     let step = cursor.path[path_index];
     let Some(node) = list.get(step.index) else {
         return (
-            origin_x + children.get(index).map_or(box_.width, |(x, _, _)| *x),
-            origin_y,
-            cursor_height(list, level),
+            origin.0 + children.get(index).map_or(box_.width, |(x, _, _)| *x),
+            origin.1,
+            cursor_height(list, level, document_scale),
         );
     };
     let Some((_, _, parent)) = children.get(step.index) else {
-        return (origin_x + box_.width, origin_y, cursor_height(list, level));
+        return (
+            origin.0 + box_.width,
+            origin.1,
+            cursor_height(list, level, document_scale),
+        );
     };
     let Some((slot_list, slot_box, slot_x, slot_y)) = structural_slot(node, parent, step.slot)
     else {
-        return (origin_x + box_.width, origin_y, cursor_height(list, level));
+        return (
+            origin.0 + box_.width,
+            origin.1,
+            cursor_height(list, level, document_scale),
+        );
     };
     cursor_in(
         slot_list,
@@ -822,13 +940,16 @@ fn cursor_in(
         cursor,
         path_index + 1,
         child_level(node, step.slot, level),
-        origin_x + children[step.index].0 + slot_x,
-        origin_y + children[step.index].1 + slot_y,
+        document_scale,
+        (
+            origin.0 + children[step.index].0 + slot_x,
+            origin.1 + children[step.index].1 + slot_y,
+        ),
     )
 }
 
-fn cursor_height(_list: &MathList, level: usize) -> f32 {
-    size(level)
+fn cursor_height(_list: &MathList, level: usize, document_scale: f32) -> f32 {
+    size(level, document_scale)
 }
 
 fn structural_slot<'a>(
@@ -863,9 +984,10 @@ pub fn hit(
     list: &MathList,
     point: (f32, f32),
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> MathCursor {
-    let box_ = layout(list, level, measure);
+    let box_ = layout(list, level, document_scale, measure);
     let mut cursor = MathCursor::default();
     hit_list(list, &box_, point, level, &mut cursor);
     cursor
@@ -879,9 +1001,10 @@ pub fn hit_node(
     list: &MathList,
     point: (f32, f32),
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> Option<NodeAddress> {
-    let box_ = layout(list, level, measure);
+    let box_ = layout(list, level, document_scale, measure);
     hit_node_in(list, &box_, point, &mut Vec::new())
 }
 
@@ -895,9 +1018,10 @@ pub fn hit_nodes_in_circle(
     point: (f32, f32),
     radius: f32,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> Vec<NodeAddress> {
-    let box_ = layout(list, level, measure);
+    let box_ = layout(list, level, document_scale, measure);
     let mut hits = Vec::new();
     hit_nodes_in_circle_in(
         list,
@@ -1021,9 +1145,10 @@ pub fn node_bounds(
     list: &MathList,
     address: &NodeAddress,
     level: usize,
+    document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> Option<NodeBounds> {
-    let box_ = layout(list, level, measure);
+    let box_ = layout(list, level, document_scale, measure);
     node_bounds_in(list, &box_, address, 0.0, 0.0)
 }
 
@@ -1135,12 +1260,110 @@ mod tests {
         text.chars().count() as f32 * style.size * 0.5
     }
 
+    fn layout(list: &MathList, level: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
+        super::layout(list, level, 1.0, measure)
+    }
+
+    fn cursor_pos(
+        list: &MathList,
+        cursor: &MathCursor,
+        level: usize,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> (f32, f32, f32) {
+        super::cursor_pos(list, cursor, level, 1.0, measure)
+    }
+
+    fn hit(
+        list: &MathList,
+        point: (f32, f32),
+        level: usize,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> MathCursor {
+        super::hit(list, point, level, 1.0, measure)
+    }
+
+    fn hit_node(
+        list: &MathList,
+        point: (f32, f32),
+        level: usize,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> Option<NodeAddress> {
+        super::hit_node(list, point, level, 1.0, measure)
+    }
+
+    fn hit_nodes_in_circle(
+        list: &MathList,
+        point: (f32, f32),
+        radius: f32,
+        level: usize,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> Vec<NodeAddress> {
+        super::hit_nodes_in_circle(list, point, radius, level, 1.0, measure)
+    }
+
+    fn node_bounds(
+        list: &MathList,
+        address: &NodeAddress,
+        level: usize,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> Option<NodeBounds> {
+        super::node_bounds(list, address, level, 1.0, measure)
+    }
+
     fn symbols(text: &str) -> MathList {
         text.chars().map(MathNode::Sym).collect()
     }
 
     fn variable_width(level: usize) -> f32 {
-        (BASE_SIZE * 0.5 + VARIABLE_PAD_X * 2.0) * scale(level)
+        (BASE_SIZE * 0.5 + VARIABLE_PAD_X * 2.0) * super::scale(level, 1.0)
+    }
+
+    #[test]
+    fn document_scale_shrinks_math_width_and_height_by_same_factor() {
+        let list = vec![fraction(symbols("xy"), symbols("z"))];
+        let full = super::layout(&list, 0, 1.0, &fake_measure);
+        let small = super::layout(&list, 0, 0.6, &fake_measure);
+
+        assert!((small.width - full.width * 0.6).abs() < 0.0001);
+        assert!((small.ascent - full.ascent * 0.6).abs() < 0.0001);
+        assert!((small.descent - full.descent * 0.6).abs() < 0.0001);
+    }
+
+    #[test]
+    fn fraction_operands_keep_level_ratio_at_document_scale() {
+        let list = vec![fraction(symbols("x"), symbols("y"))];
+        let box_ = super::layout(&list, 0, 0.6, &fake_measure);
+        let root = super::layout(&symbols("x"), 0, 0.6, &fake_measure);
+        let BoxKind::Row { children } = box_.kind else {
+            panic!("fraction expression must produce row");
+        };
+        let BoxKind::Row { children: fraction } = &children[0].2.kind else {
+            panic!("fraction must produce row");
+        };
+        let BoxKind::Row {
+            children: numerator,
+        } = &fraction[0].2.kind
+        else {
+            panic!("numerator must produce row");
+        };
+        let BoxKind::Glyph {
+            size: numerator_size,
+            ..
+        } = numerator[0].2.kind
+        else {
+            panic!("numerator must contain glyph");
+        };
+        let BoxKind::Row { children: root_row } = root.kind else {
+            panic!("root expression must produce row");
+        };
+        let BoxKind::Glyph {
+            size: root_size, ..
+        } = root_row[0].2.kind
+        else {
+            panic!("root must contain glyph");
+        };
+
+        assert!((numerator_size / root_size - LEVEL_SCALE[1]).abs() < 0.0001);
     }
 
     fn fraction(num: MathList, den: MathList) -> MathNode {

@@ -124,11 +124,12 @@ fn draw_math_selection(
     address: Option<&NodeAddress>,
     box_: &MathBox,
     origin: (f32, f32),
+    scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) {
     const PAD: f32 = 2.0;
     let rect = if let Some(address) = address {
-        let Some(bounds) = math_layout::node_bounds(list, address, 0, measure) else {
+        let Some(bounds) = math_layout::node_bounds(list, address, 0, scale, measure) else {
             return;
         };
         Rect {
@@ -691,13 +692,13 @@ impl Component for Editor {
                     }
                     let label_x = cursor
                         + if segment.style.badge {
-                            theme::BADGE_PAD
+                            theme::BADGE_PAD * self.layout.scale
                         } else {
                             0.0
                         };
                     let painted_width = width
                         - if segment.style.badge {
-                            theme::BADGE_PAD * 2.0
+                            theme::BADGE_PAD * 2.0 * self.layout.scale
                         } else {
                             0.0
                         };
@@ -708,7 +709,7 @@ impl Component for Editor {
                         };
                         let measure =
                             |text: &str, style: &TextStyle| theme::width(layer, text, style);
-                        let box_ = math_layout::layout(list, 0, &measure);
+                        let box_ = math_layout::layout(list, 0, self.layout.scale, &measure);
                         if !kind.is_math() {
                             let rect = math_rect(&box_, (cursor, baseline));
                             layer.draw_rectangle(
@@ -729,6 +730,7 @@ impl Component for Editor {
                                 Some(address),
                                 &box_,
                                 (cursor, baseline),
+                                self.layout.scale,
                                 &measure,
                             );
                         }
@@ -747,6 +749,7 @@ impl Component for Editor {
                                     node.as_ref(),
                                     &box_,
                                     (cursor, baseline),
+                                    self.layout.scale,
                                     &measure,
                                 );
                             }
@@ -756,8 +759,13 @@ impl Component for Editor {
                             && bi == caret.block
                             && segment.inline == caret.inline
                         {
-                            let (cursor_x, cursor_y, cursor_height) =
-                                math_layout::cursor_pos(list, math_cursor, 0, &measure);
+                            let (cursor_x, cursor_y, cursor_height) = math_layout::cursor_pos(
+                                list,
+                                math_cursor,
+                                0,
+                                self.layout.scale,
+                                &measure,
+                            );
                             layer.draw_rectangle(
                                 (
                                     cursor + cursor_x,
@@ -791,9 +799,9 @@ impl Component for Editor {
                     theme::outline(
                         layer,
                         Rect {
-                            x: start - theme::BADGE_PAD,
+                            x: start - theme::BADGE_PAD * self.layout.scale,
                             y: baseline - theme::BADGE_HEIGHT * 0.5,
-                            width: end - start + theme::BADGE_PAD * 2.0,
+                            width: end - start + theme::BADGE_PAD * 2.0 * self.layout.scale,
                             height: theme::BADGE_HEIGHT,
                         },
                         theme::badge_ink(color),
@@ -1032,7 +1040,7 @@ impl Editor {
             } else {
                 let count = flat.saturating_sub(cursor);
                 if segment.style.badge {
-                    x += theme::BADGE_PAD;
+                    x += theme::BADGE_PAD * scale;
                 }
                 let prefix: String = text.chars().take(count).collect();
                 x += theme::width(
@@ -1261,7 +1269,7 @@ mod tests {
             |text: &str, style: &TextStyle| text.chars().count() as f32 * style.size * 0.5;
         let width = layout::advance(&run, &atom, &block, Style::PLAIN, None, 1.0, &measure);
         let box_width = match &run {
-            Inline::Math(list) => math_layout::layout(list, 0, &measure).width,
+            Inline::Math(list) => math_layout::layout(list, 0, 1.0, &measure).width,
             Inline::Text(_) => unreachable!(),
             Inline::Note(_) => unreachable!(),
         };

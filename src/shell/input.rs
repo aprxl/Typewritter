@@ -2067,7 +2067,7 @@ impl Shell {
             let Some((list, cursor)) = doc.focused_math_view() else {
                 return (rect.x, rect.y);
             };
-            let (ox, oy, _) = math_layout::cursor_pos(list, cursor, 0, &measure);
+            let (ox, oy, _) = math_layout::cursor_pos(list, cursor, 0, layout.scale, &measure);
             (cx, cy, docs.editor_scroll, ox, oy)
         };
         let screen_x = rect.x + crate::components::editor::INSET + base_x + offset_x;

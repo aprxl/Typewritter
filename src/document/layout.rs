@@ -225,7 +225,7 @@ pub fn advance(
         Inline::Math(list) => {
             // Atom placement is always body level; level is for its nested
             // fraction operands, not for making the atom itself larger.
-            math_layout::layout(list, 0, measure).width
+            math_layout::layout(list, 0, scale, measure).width
         }
         Inline::Text(_) => measure(text, &text_style(block, style, scale)),
         // An anchor reserves the width of the number it actually draws, so
@@ -237,7 +237,7 @@ pub fn advance(
         Inline::Note(_) => measure(number.unwrap_or("0"), &anchor_style()),
     };
     let box_pad = if style.badge {
-        theme::BADGE_PAD * 2.0
+        theme::BADGE_PAD * 2.0 * scale
     } else {
         0.0
     };
@@ -433,7 +433,7 @@ pub fn layout_blocks(
                 let Inline::Math(list) = &runs[0] else {
                     unreachable!("math block must contain one math atom")
                 };
-                let expression = math_layout::layout(list, 0, measure);
+                let expression = math_layout::layout(list, 0, scale, measure);
                 expression.ascent + expression.descent + MATH_PAD * 2.0 * scale
             }
             Block::Heading { .. } | Block::Paragraph(_) | Block::CodeLine { .. } => {
@@ -452,7 +452,7 @@ pub fn layout_blocks(
                     .filter_map(
                         |&piece_index| match &block.inlines()[pieces[piece_index].inline] {
                             Inline::Math(list) => {
-                                let expression = math_layout::layout(list, 0, measure);
+                                let expression = math_layout::layout(list, 0, scale, measure);
                                 Some(expression.ascent + expression.descent + MATH_LEADING * scale)
                             }
                             Inline::Text(_) | Inline::Note(_) => None,
@@ -1023,7 +1023,7 @@ impl DocLayout {
 
                     if let Inline::Math(list) = run {
                         let local = (x - advance_x, baseline - y);
-                        let expression = math_layout::layout(list, 0, measure);
+                        let expression = math_layout::layout(list, 0, self.scale, measure);
                         let bounds = math_layout::interaction_bounds(&expression);
                         if circle_intersects_rect(
                             local,
@@ -1044,7 +1044,7 @@ impl DocLayout {
                                 );
                             } else {
                                 for node in math_layout::hit_nodes_in_circle(
-                                    list, local, radius, 0, measure,
+                                    list, local, radius, 0, self.scale, measure,
                                 ) {
                                     push_unique(
                                         &mut hits,
@@ -1245,7 +1245,7 @@ impl DocLayout {
             );
             if let Inline::Math(list) = run {
                 let local = (x - advance_x, line.y + line.height / 2.0 - y);
-                let expression = math_layout::layout(list, 0, measure);
+                let expression = math_layout::layout(list, 0, self.scale, measure);
                 let bounds = math_layout::interaction_bounds(&expression);
                 if local.0 >= bounds.left
                     && local.0 <= bounds.right
@@ -1255,7 +1255,7 @@ impl DocLayout {
                     return Some((
                         block_idx,
                         segment.inline,
-                        math_layout::hit_node(list, local, 0, measure),
+                        math_layout::hit_node(list, local, 0, self.scale, measure),
                     ));
                 }
             }
@@ -1323,7 +1323,7 @@ impl DocLayout {
                 let local_x = x - advance_x;
                 // Math boxes use positive-up y; the line baseline is its centre.
                 let local_y = line.y + line.height / 2.0 - y;
-                let expression = math_layout::layout(list, 0, measure);
+                let expression = math_layout::layout(list, 0, self.scale, measure);
                 let bounds = math_layout::interaction_bounds(&expression);
                 if local_x >= bounds.left
                     && local_x <= bounds.right
@@ -1333,7 +1333,7 @@ impl DocLayout {
                     return Some((
                         block_idx,
                         segment.inline,
-                        math_layout::hit(list, (local_x, local_y), 0, measure),
+                        math_layout::hit(list, (local_x, local_y), 0, self.scale, measure),
                     ));
                 }
             }
@@ -1530,6 +1530,24 @@ mod tests {
         let half_x = at_end(&layout_blocks(&one, 1000.0, 0.5, &measure));
         assert!(half_x < full_x);
         assert!((half_x - full_x * 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn scaled_math_fits_the_sidenote_column() {
+        let measure =
+            |text: &str, style: &TextStyle| text.chars().count() as f32 * style.size * 0.5;
+        let list: Vec<MathNode> = "abcdefghijkl".chars().map(MathNode::Sym).collect();
+        let blocks = vec![Block::Paragraph(vec![Inline::Math(list.clone())])];
+        let width = crate::components::sidenotes::NOTE_WIDTH;
+        let scale = crate::components::sidenotes::SCALE;
+        let full = math_layout::layout(&list, 0, 1.0, &measure);
+        let note = layout_blocks(&blocks, width, scale, &measure);
+        let small = math_layout::layout(&list, 0, scale, &measure);
+
+        assert!(full.width > width);
+        assert!(small.width <= width);
+        assert_eq!(note.blocks[0].lines.len(), 1);
+        assert_eq!(note.scale, scale);
     }
 
     #[test]
@@ -2294,7 +2312,7 @@ mod tests {
         }];
         let d = doc_with(vec![Block::Paragraph(vec![Inline::Math(list.clone())])]);
         let laid = layout(&d, 300.0, &fake_measure);
-        let expression = math_layout::layout(&list, 0, &fake_measure);
+        let expression = math_layout::layout(&list, 0, 1.0, &fake_measure);
         let BoxKind::Row { children } = &expression.kind else {
             panic!("expression must be a row");
         };
@@ -2387,7 +2405,7 @@ mod tests {
         }];
         let d = doc_with(vec![Block::Paragraph(vec![Inline::Math(list.clone())])]);
         let laid = layout(&d, 300.0, &fake_measure);
-        let expression = math_layout::layout(&list, 0, &fake_measure);
+        let expression = math_layout::layout(&list, 0, 1.0, &fake_measure);
         let BoxKind::Row { children } = &expression.kind else {
             panic!("expression must be a row");
         };
@@ -2537,7 +2555,7 @@ mod tests {
         let laid = layout(&d, 20.0, &fake_measure);
         assert_eq!(laid.blocks[0].lines.len(), 2);
         let line = &laid.blocks[0].lines[0];
-        let expression = math_layout::layout(&list, 0, &fake_measure);
+        let expression = math_layout::layout(&list, 0, 1.0, &fake_measure);
         assert_eq!(
             line.height,
             LINE_BODY.max(expression.ascent + expression.descent + MATH_LEADING)
