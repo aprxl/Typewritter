@@ -1,22 +1,111 @@
 # Work log
 
 State at handoff: `cargo fmt --check` clean, `cargo clippy --all-targets -D
-warnings` clean, 448 tests passing, and the tree committed as `31f6162`
-(`feat(editor): add ctrl brush selection`).
+warnings` clean, 483 tests passing, and the tree committed as `67b91e6`
+(`Reserve two digits for a two-digit sidenote anchor`).
 
 How the work is being done, since `AGENTS.md` is out of date on this: coding is
-delegated to the `opencode` CLI rather than to in-process subagents —
-`openrouter/openai/gpt-5.6-luna --variant high` for design-carrying work,
-`openrouter/~deepseek/deepseek-v4-flash-latest --variant high` for mechanical
-work. Each task spec names the exact files that run owns, and no two runs in a
-wave own the same file; waves run one at a time, because parallel `cargo` builds
-contend. A spec must say *do the work yourself, do not delegate it further* —
-runs that delegate have stalled and produced nothing. Delegated runs never
-commit; whoever is driving verifies `cargo fmt --check`, `cargo clippy
---all-targets -- -D warnings` and `cargo test` and commits the wave. When
+delegated to the `opencode` CLI rather than to in-process subagents. The last
+session used `openrouter/deepseek/deepseek-v4-pro-0813 --variant high` for
+everything and it carried design-level work well. Each task spec names the
+exact files that run owns, and no two runs in a wave own the same file; waves
+run one at a time, because parallel `cargo` builds contend. A spec must say *do
+the work yourself, do not delegate it further* — runs that delegate have
+stalled and produced nothing. Runs now make their own commits, and whoever is
+driving still verifies `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings` and `cargo test` afterwards rather than trusting the report. When
 judging whether a run has stalled, look at the **child** `opencode` process's
 CPU time, not the log size — the parent shell buffers, and an empty log on its
 own has already caused one wrong diagnosis.
+
+**Read the diff, not the report.** Three of the eight waves below landed green,
+passed every check, and still shipped a defect that only reading the code
+found: an autosave that retried every frame, a paste that mangled prices, and
+an anchor that reserved less width than it drew. Each was caught by reading the
+diff and fixed in a follow-up wave. A green `cargo test` says the tests agree
+with the code, not that the code is right.
+
+---
+
+## Session log — readiness pass
+
+The four highest items from the readiness report, done as eight waves.
+
+**`src/shell/input.rs`, `src/components/editor.rs`** — the tree was red. The
+brush is additive now, so `toggle_brush_hits` became `add_brush_hits` and three
+tests were re-aimed at the invariant that actually survives: a stroke only ever
+grows the selection and never holds a duplicate. `BRUSH_RING` and the test that
+validated its path data went with the ring itself.
+
+**`src/main.rs`, `src/tabs.rs`, `src/shell/mod.rs`** — nothing was ever written
+to disk unless the reader asked. `CloseRequested` ran `event_loop.exit()` and
+that was all. `Tabs::save_all` writes every dirty tab with a path, skips the
+pathless ones, and returns the failures so one bad write cannot mask the rest.
+The shell debounces off the revision counter `Tabs` already bumps, and folds
+the pending deadline into `wake_at` beside the animations — without that the
+save fires while typing and never once typing stops, which is exactly backwards.
+Close saves unconditionally: a dialog between a student and their closing
+laptop loses work rather than protecting it.
+
+The follow-up wave matters more than it looks. The clock restarted only when
+the revision moved, not when a save was *attempted*, so any tab still dirty
+afterwards left the deadline permanently in the past — `about_to_wait` turned
+that into an immediate redraw, and the loop spun at full rate with a file write
+and an `eprintln!` every frame. Two ways in, both real: a failing write, and a
+dirty tab with no path that `save_all` correctly skips. The field is now
+`autosave_last_attempt`, because a name describing half of what a value means
+is what hid the bug.
+
+**`src/document/mod.rs`, `src/shell/input.rs`** — copying an expression put
+U+FFFC on the clipboard, so a copy and paste destroyed the maths. `range_text`
+writes the `$…$` form instead. Entering Insert mode also opened an undo
+transaction on the `i`/`a`/`o` path but not on `Enter(Mode::Insert)`, which is
+how a click into an expression gets there — so the same typing undid one
+keystroke at a time or all at once depending on how you arrived. Both routes go
+through one `start_insert` now.
+
+The follow-up: reading `$…$` back out of *any* inserted text meant a pasted
+`costs $40 and $12` became an expression, and so did `$PATH` and `$HOME` in a
+pasted shell line. Notation is now read back only from text this app produced —
+`Shell::exported_yank` already held the exact published string and `import_yank`
+already compared against it, so the provenance test was written and simply not
+being used for this. `insert_text` is literal and takes every keystroke;
+`insert_notation` interprets and only ever sees our own bytes. Copy escapes a
+literal `$` as `\$`, so a copied range is byte-identical to what the file holds.
+
+**`src/document/mod.rs`, `src/document/markdown.rs`** — sidenotes stopped being
+`mock_notes()`. The format is Markdown's own footnote syntax, `[^1]` inline and
+`[^1]: body` on its own line, chosen over anything invented because every other
+tool already reads it and it stays greppable. Definitions are lifted out of the
+block stream into `Document::notes` so they cannot be edited as stray
+paragraphs, and written back at the end in anchor order. Labels round-trip
+verbatim — renumbering on save would give auto-commit a phantom diff on every
+open. An anchor with no definition and a definition with no anchor both survive,
+because files get edited by hand and by other tools. The anchor is opaque
+exactly like a math atom, so every motion, selection and offset kept working
+untouched; adding the variant needed one-line arms in four more files than
+expected (`outline.rs`, `shell/input.rs`, `shell/mod.rs`, `vim/motion.rs`).
+
+**`src/components/sidenotes.rs`, `src/document/layout.rs`,
+`src/components/editor.rs`, `src/shell/`, `src/tabs.rs`** — and into the
+margin. Anchors draw as position-derived raised numbers, never stored, the same
+decision the heading outline made and for the same reason. `DocLayout` reports
+each anchor's y; `stack` is a pure one-pass resolver that pushes a crowded note
+down and never up, so a moved note still sits beside the sentence that anchored
+it. It runs in `rebuild_views`, off the typing path per §12, and jumps rather
+than animating — a note sliding into place while you type is worse than one
+that jumps. `format.sidenote` is in the `/` menu.
+
+The follow-up here was the one the wave itself flagged: `advance` measured an
+anchor as one digit while drawing the real number, so from the tenth note on it
+overlapped the next character — the same advance-versus-draw drift the badge
+work exists to prevent. The ordinal is now stamped on the piece and segment the
+layout already builds, and `advance` measures the number actually drawn. The
+editor's separate anchors map went away; the segment is the single source.
+
+**Sidenotes are read-only in the margin.** Creating a note and seeing it beside
+its anchor is what shipped. Editing a note's text in place is the next piece and
+was deliberately not started, because half an editor is worse than none.
 
 ---
 
@@ -134,30 +223,60 @@ elsewhere all just change the answer and there is no state to fall out of step.
 `take_word` exists so accepting a structure completion can remove the letters
 before firing the trigger — otherwise a fraction captures them as its numerator.
 
-**Next for math**, in priority order:
+---
 
-1. **The completion palette** — the card itself and its keystrokes; the only
-   piece of the in-math palette still missing. It has no open/closed state of
-   its own: it shows whenever `math::word_before` reports a word with matches,
-   so backspace, an arrow and a click elsewhere need no handling and it cannot
-   disagree with the document. Its only state is the selected row and whether
-   the reader dismissed it for the word they are on. It offers symbols first and structures second (`frac`, `sqrt`,
-   `sum`, `prod`, `int`, `lim`, `sup`, `sub`, `paren`, `brack`), claims only
-   keys that would otherwise do nothing (`Enter`, `Ctrl+1`–`Ctrl+9`,
-   `Ctrl+N`/`Ctrl+P`, `Esc`), and deliberately does **not** claim `Tab`, which
-   must keep walking slots. Build it as a sibling of `src/components/slash_menu.rs`
-   on the detached-overlay pattern.
-2. **Copy and paste of an expression** — `range_text` yields the U+FFFC atom, so
-   a copied expression pastes as a placeholder character and the maths is lost.
-3. **Undo inside an expression** — `edit_frame_math` opens no transaction, so
-   undo is per keystroke rather than per edit.
-4. **A display block should look like one** — centred, at display size, rather
-   than inline-sized text on a slab.
-5. **Typed identifiers** — variables, constants and functions distinguished, and
-   scalars from vectors. This is what the reader asked for in the original brief
-   and it is the last piece of that brief not started.
-6. **A raw text node** — explicitly deferred by the reader as not a problem yet.
-7. **Matrices and cases**, once the above settles.
+## What is left
+
+In priority order, as of `67b91e6`. Everything above this line is done.
+
+1. **Full-text search.** `file_finder.rs` is fuzzy *filename* matching only.
+   SPEC §7.3 calls search the whole retrieval story and asks for three things,
+   none of which exist: math searchable, results readable without opening the
+   note with the maths **rendered as maths**, and fuzzy tolerance because the
+   notes are rough. The data side is already right — `tw-math v1` fences and
+   `$…$` inline are both greppable — so what is missing is the panel. Biggest
+   remaining feature by a distance, and the one that makes keeping notes in the
+   app worth doing.
+
+2. **Frontmatter `created`, and the tree sort that needs it.** No frontmatter
+   parsing exists. `vault.rs` sorts by name, which SPEC §7.2 rules out in as
+   many words: a folder of hand-named lecture notes sorts into nonsense.
+   Default should be created-date descending with a toggle. Small, and stated.
+
+3. **Editing a sidenote in place.** The margin renders and `format.sidenote`
+   creates, but a note's text cannot be changed once written. Deliberately left
+   out of the wave that built the margin.
+
+4. **External-change detection.** Nothing watches the vault. Edit a note on the
+   other machine, save here, and the other version is overwritten silently.
+   Currently survivable; becomes a data-loss bug the day sync lands, so it
+   belongs *before* git sync rather than after.
+
+5. **Git sync (§8)** — auto-commit on idle and on close, conflict detection on
+   open, in-app side-by-side resolution, and keep-both-as-separate-notes when
+   resolution fails. Never drop a student into `git mergetool` before a lecture.
+
+6. **PDF export (§10)** — one layout engine for screen and page, which is the
+   most constraining line in the spec and is still honoured: `math_layout` is
+   pure and headless. Pages, keep-together rules and sidenote repagination do
+   not exist yet.
+
+7. **Peek is not separate from open (§7.1).** `tabs.rs` treats preview and peek
+   as the same thing; the spec wants peek to never create a tab, which is the
+   entire reason both exist. No pinning either.
+
+8. **A display math block should look like one** — centred and at display size,
+   rather than inline-sized text on a tinted slab.
+
+9. **Matrices and cases.** **A raw math text node**, deferred by the reader as
+   not a problem yet.
+
+Two loose ends that are not features. `code.zip` is tracked in the repo — 243 KB
+of binary committed by accident in `44c1251`, wants `git rm --cached` and a
+`.gitignore` line. And the §11 performance budget has never been measured;
+keystroke-to-glyph under 16 ms and one-frame reflow are the two that would show
+at lecture speed, and the brush and sidenote work both added per-frame layout
+walks worth timing.
 
 ---
 
