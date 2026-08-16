@@ -336,12 +336,31 @@ fn math_block() -> Block {
     Block::Math(vec![Inline::Math(Vec::new())])
 }
 
-/// Repair one block's runs: drop empty runs, demote a rule or display atom
-/// that gained prose, and turn an emptied block into a placeholder of its
-/// own kind. Shared by the document's blocks and every note body, so the
-/// invariants hold in every scope rather than only where the caret is.
-fn prune_block(block: &mut Block) {
-    block.inlines_mut().retain(|r| !r.text().is_empty());
+/// Repair one block's runs: drop empty runs, merge equal adjacent prose runs,
+/// demote a rule or display atom that gained prose, and turn an emptied block
+/// into a placeholder of its own kind. Shared by the document's blocks and
+/// every note body, so invariants hold in every scope rather than only where
+/// the caret is.
+fn prune_block(block: &mut Block, preserve_boundary: Option<usize>) {
+    let runs = std::mem::take(block.inlines_mut());
+    let mut merged = Vec::with_capacity(runs.len());
+    let mut flat = 0;
+    for run in runs {
+        if run.text().is_empty() {
+            continue;
+        }
+        let run_start = flat;
+        flat += run_len(&run);
+        match (merged.last_mut(), run) {
+            (Some(Inline::Text(previous)), Inline::Text(current))
+                if previous.style == current.style && preserve_boundary != Some(run_start) =>
+            {
+                previous.text.push_str(&current.text);
+            }
+            (_, run) => merged.push(run),
+        }
+    }
+    *block.inlines_mut() = merged;
     // A rule holds no text. Typing on one turns it into prose — enforced
     // centrally here, so every edit path gets it without a special case of
     // its own.
@@ -1292,15 +1311,25 @@ impl Document {
     /// survives and can be typed into — the invariant that an empty document
     /// is one empty Paragraph is only about `Document::new`).
     fn prune_runs(&mut self) {
+        let focus = self.focus;
+        let caret_block = self.caret.block.min(self.scope().len().saturating_sub(1));
+        let caret_offset = self.caret_flat(caret_block);
         // The invariant holds in *every* scope, not just where the caret
         // happens to be: a note body left with an empty run would be an
         // invariant only until focus moved elsewhere.
-        for block in &mut self.body {
-            prune_block(block);
+        for (index, block) in self.body.iter_mut().enumerate() {
+            prune_block(
+                block,
+                (focus == Focus::Body && caret_block == index).then_some(caret_offset),
+            );
         }
-        for note in &mut self.notes {
-            for block in &mut note.body {
-                prune_block(block);
+        for (note_index, note) in self.notes.iter_mut().enumerate() {
+            for (block_index, block) in note.body.iter_mut().enumerate() {
+                prune_block(
+                    block,
+                    (focus == Focus::Note(note_index) && caret_block == block_index)
+                        .then_some(caret_offset),
+                );
             }
         }
 
@@ -3963,6 +3992,35 @@ mod tests {
             runs(&d.body()[0])
                 .iter()
                 .all(|(_, style)| *style == Style::PLAIN)
+        );
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn toggling_italic_off_merges_adjacent_plain_runs_again() {
+        let mut d = doc();
+        d.body_mut()[0] = Block::Paragraph(vec![plain_run("hello world")]);
+        let range = FlatRange::new(
+            FlatPos {
+                block: 0,
+                offset: 0,
+            },
+            FlatPos {
+                block: 0,
+                offset: 5,
+            },
+        );
+        let italic = Style {
+            italic: true,
+            ..Style::PLAIN
+        };
+
+        d.toggle_style_range(range, italic);
+        d.toggle_style_range(range, italic);
+
+        assert_eq!(
+            runs(&d.body()[0]),
+            vec![("hello world".into(), Style::PLAIN)]
         );
         assert_invariants(&d);
     }

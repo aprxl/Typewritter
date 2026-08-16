@@ -624,7 +624,7 @@ fn x_of_flat(
             let up_to = flat - seg_flat;
             let prefix: String = text.chars().take(up_to).collect();
             if segment.style.badge {
-                x += theme::BADGE_PAD;
+                x += theme::BADGE_PAD * scale;
             }
             x += measure(&prefix, &text_style(block, segment.style, scale));
             break;
@@ -677,6 +677,22 @@ fn line_flat_start(layout_block: &BlockLayout, line_idx: usize) -> usize {
     flat
 }
 
+/// Shaped x-boundaries for each character in a text segment. Prefixes preserve
+/// kerning and tracking, while the final boundary is the same width drawing
+/// uses for the whole segment.
+fn char_boundaries(
+    text: &str,
+    style: &TextStyle,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> Vec<f32> {
+    let mut boundaries = vec![0.0];
+    for (start, ch) in text.char_indices() {
+        let end = start + ch.len_utf8();
+        boundaries.push(measure(&text[..end], style));
+    }
+    boundaries
+}
+
 /// A caret for a click at (x, y) on a specific visual line, per the
 /// style-before rule (§4.2) — split at each char's midpoint.
 ///
@@ -703,40 +719,41 @@ fn caret_for_click(
     'segments: for segment in &line.segments {
         let run = &block.inlines()[segment.inline];
         let text = segment_text(run, segment);
+        let width = advance(
+            run,
+            &text,
+            block,
+            segment.style,
+            segment.number.as_deref(),
+            scale,
+            measure,
+        );
         // The label sits inside its box; skip the left edge so a click
         // lands on the character the user aimed at.
-        if segment.style.badge {
-            cum += theme::BADGE_PAD;
-        }
         if matches!(run, Inline::Math(_) | Inline::Note(_)) {
-            let w = advance(
-                run,
-                &text,
-                block,
-                segment.style,
-                segment.number.as_deref(),
-                scale,
-                measure,
-            );
-            if x <= cum + w / 2.0 {
+            if x <= cum + width / 2.0 {
                 pos = seg_flat;
                 break 'segments;
             }
-            cum += w;
-            seg_flat += segment.len;
-            continue;
-        }
-        for (ci, ch) in text.chars().enumerate() {
-            let w = measure(&ch.to_string(), &text_style(block, segment.style, scale));
-            if x <= cum + w / 2.0 {
-                pos = seg_flat + ci;
-                break 'segments;
+        } else {
+            let style = text_style(block, segment.style, scale);
+            let boundaries = char_boundaries(&text, &style, measure);
+            let text_x = cum
+                + if segment.style.badge {
+                    theme::BADGE_PAD * scale
+                } else {
+                    0.0
+                };
+            for ci in 0..segment.len {
+                let start = text_x + boundaries[ci];
+                let end = text_x + boundaries[ci + 1];
+                if x <= start + (end - start) / 2.0 {
+                    pos = seg_flat + ci;
+                    break 'segments;
+                }
             }
-            cum += w;
         }
-        if segment.style.badge {
-            cum += theme::BADGE_PAD;
-        }
+        cum += width;
         seg_flat += segment.len;
     }
 
@@ -908,17 +925,26 @@ impl DocLayout {
                     });
                 }
 
-                let mut char_x = advance_x;
-                for (within_segment, ch) in text.chars().enumerate() {
-                    let char_width = measure(
-                        &ch.to_string(),
-                        &text_style(block, segment.style, self.scale),
-                    );
-                    if x < char_x + char_width || within_segment + 1 == segment.len {
+                let style = text_style(block, segment.style, self.scale);
+                let boundaries = char_boundaries(&text, &style, measure);
+                let text_x = advance_x
+                    + if segment.style.badge {
+                        theme::BADGE_PAD * self.scale
+                    } else {
+                        0.0
+                    };
+                for within_segment in 0..segment.len {
+                    if x < text_x + boundaries[within_segment + 1]
+                        || within_segment + 1 == segment.len
+                    {
+                        let clicked = run_start + segment.start + within_segment;
+                        let ch = text
+                            .chars()
+                            .nth(within_segment)
+                            .expect("segment length matches segment text");
                         if !ch.is_alphanumeric() && ch != '_' {
                             return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
                         }
-                        let clicked = run_start + segment.start + within_segment;
                         let chars: Vec<char> = block
                             .inlines()
                             .iter()
@@ -950,7 +976,6 @@ impl DocLayout {
                             kind: RangeKind::Word,
                         });
                     }
-                    char_x += char_width;
                 }
                 return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
             }
@@ -1460,6 +1485,16 @@ mod tests {
     fn fake_measure(text: &str, style: &TextStyle) -> f32 {
         let _ = style;
         text.chars().count() as f32 * 10.0
+    }
+
+    fn shaped_measure(text: &str, style: &TextStyle) -> f32 {
+        let _ = style;
+        let chars = text.chars().count() as f32;
+        if chars > 1.0 {
+            chars * 10.0 - (chars - 1.0) * 2.0
+        } else {
+            chars * 10.0
+        }
     }
 
     fn doc_with(blocks: Vec<Block>) -> Document {
@@ -2359,6 +2394,79 @@ mod tests {
             })
         );
         assert_eq!(laid.hit_context(55.0, y, &fake_measure), None);
+    }
+
+    #[test]
+    fn a_word_italicised_un_italicised_and_italicised_again_through_same_click_position_ends_up_italic()
+     {
+        let mut d = doc_with(vec![para("left target right")]);
+        let italic = Style {
+            italic: true,
+            ..Style::PLAIN
+        };
+        let y = LINE_BODY / 2.0;
+        let x = 43.0;
+
+        for expected in [true, false, true] {
+            let laid = layout(&d, 300.0, &shaped_measure);
+            let ContextHit::Range { range, kind } = laid
+                .hit_context(x, y, &shaped_measure)
+                .expect("click on target must find a word")
+            else {
+                panic!("click on target must find a prose range")
+            };
+            assert_eq!(kind, RangeKind::Word);
+            assert_eq!(
+                range,
+                FlatRange::new(
+                    FlatPos {
+                        block: 0,
+                        offset: 5
+                    },
+                    FlatPos {
+                        block: 0,
+                        offset: 11
+                    }
+                )
+            );
+            d.toggle_style_range(range, italic);
+            assert_eq!(
+                style_at(d.body(), 0, 6)
+                    .expect("target must remain present")
+                    .italic,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_at_the_x_of_a_word_returns_exactly_that_word_with_shaped_text() {
+        let d = doc_with(vec![para("left target right")]);
+        let y = LINE_BODY / 2.0;
+        assert_eq!(d.body()[0].inlines()[0].text(), "left target right");
+        assert_eq!(
+            layout(&d, 300.0, &shaped_measure).hit_context(x_of_target(), y, &shaped_measure),
+            Some(ContextHit::Range {
+                range: FlatRange::new(
+                    FlatPos {
+                        block: 0,
+                        offset: 5,
+                    },
+                    FlatPos {
+                        block: 0,
+                        offset: 11,
+                    },
+                ),
+                kind: RangeKind::Word,
+            })
+        );
+
+        fn x_of_target() -> f32 {
+            shaped_measure(
+                "left ",
+                &text_style(&Block::Paragraph(vec![]), Style::PLAIN, 1.0),
+            ) + 1.0
+        }
     }
 
     #[test]
