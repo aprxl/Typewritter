@@ -83,6 +83,8 @@ pub enum AccentKind {
     Dot,
     DoubleDot,
     TripleDot,
+    Hat,
+    Bar,
 }
 
 impl AccentKind {
@@ -92,6 +94,8 @@ impl AccentKind {
             Self::Dot => "dot",
             Self::DoubleDot => "ddot",
             Self::TripleDot => "dddot",
+            Self::Hat => "hat",
+            Self::Bar => "bar",
         }
     }
 }
@@ -136,6 +140,14 @@ fn empty_ddot() -> MathNode {
 
 fn empty_dddot() -> MathNode {
     empty_accent(AccentKind::TripleDot)
+}
+
+fn empty_hat() -> MathNode {
+    empty_accent(AccentKind::Hat)
+}
+
+fn empty_bar() -> MathNode {
+    empty_accent(AccentKind::Bar)
 }
 
 fn empty_accent(kind: AccentKind) -> MathNode {
@@ -194,6 +206,8 @@ pub(crate) const WORDS: &[Word] = &[
     (AccentKind::Dot.keyword(), empty_dot),
     (AccentKind::DoubleDot.keyword(), empty_ddot),
     (AccentKind::TripleDot.keyword(), empty_dddot),
+    (AccentKind::Hat.keyword(), empty_hat),
+    (AccentKind::Bar.keyword(), empty_bar),
     (BigOp::Sum.keyword(), empty_sum),
     (BigOp::Prod.keyword(), empty_prod),
     (BigOp::Integral.keyword(), empty_integral),
@@ -236,6 +250,14 @@ pub const STRUCTURES: &[Structure] = &[
         preview: "x⃛",
     },
     Structure {
+        name: "hat",
+        preview: "x̂",
+    },
+    Structure {
+        name: "bar",
+        preview: "x̄",
+    },
+    Structure {
         name: "sum",
         preview: "∑",
     },
@@ -270,6 +292,18 @@ pub const STRUCTURES: &[Structure] = &[
     Structure {
         name: "brack",
         preview: "[ ]",
+    },
+    Structure {
+        name: "abs",
+        preview: "| |",
+    },
+    Structure {
+        name: "norm",
+        preview: "‖ ‖",
+    },
+    Structure {
+        name: "angle",
+        preview: "⟨ ⟩",
     },
 ];
 
@@ -704,11 +738,22 @@ pub fn insert_structure(root: &mut MathList, cursor: &mut MathCursor, name: &str
         "brack" => {
             insert_group(root, cursor, '[');
         }
+        "abs" => {
+            insert_group(root, cursor, '|');
+        }
+        "norm" => {
+            insert_group(root, cursor, '‖');
+        }
+        "angle" => {
+            insert_group(root, cursor, '⟨');
+        }
         "sqrt" => insert_node(root, cursor, empty_sqrt()),
         "vec" => insert_node(root, cursor, empty_vec()),
         "dot" => insert_node(root, cursor, empty_dot()),
         "ddot" => insert_node(root, cursor, empty_ddot()),
         "dddot" => insert_node(root, cursor, empty_dddot()),
+        "hat" => insert_node(root, cursor, empty_hat()),
+        "bar" => insert_node(root, cursor, empty_bar()),
         "sum" => insert_node(root, cursor, empty_sum()),
         "prod" => insert_node(root, cursor, empty_prod()),
         "int" => insert_node(root, cursor, empty_integral()),
@@ -783,7 +828,7 @@ pub fn take_word(root: &mut MathList, cursor: &mut MathCursor) {
 /// absent: `{` and `}` are the notation's invisible grouping (see
 /// `math_notation`), and the brace people actually write in notation is the
 /// one a `cases` block draws, which is a structure of its own.
-pub const PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']')];
+pub const PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('|', '|'), ('‖', '‖'), ('⟨', '⟩')];
 
 /// Opens a bracket group at the cursor and enters it, if `c` is an opener.
 /// Auto-paired: the closer is part of the node, so it can never be left
@@ -1434,6 +1479,8 @@ mod tests {
             ("dot", AccentKind::Dot),
             ("ddot", AccentKind::DoubleDot),
             ("dddot", AccentKind::TripleDot),
+            ("hat", AccentKind::Hat),
+            ("bar", AccentKind::Bar),
         ] {
             let mut root = sym(word);
             let mut cursor = at(word.chars().count());
@@ -1611,6 +1658,19 @@ mod tests {
     }
 
     #[test]
+    fn the_palette_builds_abs_norm_and_angle_as_groups() {
+        for (name, open, close) in [("abs", '|', '|'), ("norm", '‖', '‖'), ("angle", '⟨', '⟩')]
+        {
+            let mut root = sym(name);
+            let mut cursor = at(name.chars().count());
+
+            assert!(insert_structure(&mut root, &mut cursor, name));
+            assert_eq!(root, vec![group(open, close, Vec::new())]);
+            assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
+        }
+    }
+
+    #[test]
     fn frac_captures_the_operand_before_the_word() {
         let mut root = sym("1frac");
         let mut cursor = at(5);
@@ -1701,6 +1761,30 @@ mod tests {
 
         assert_eq!(root, vec![group('(', ')', sym("x"))]);
         assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn typing_a_bar_inside_a_bar_group_closes_it_instead_of_opening_another() {
+        let mut root = vec![group('|', '|', sym("x"))];
+        let mut cursor = at_path(&[(0, Slot::Body)], 1);
+
+        let closed = close_group(&mut root, &mut cursor, '|');
+        let opened = !closed && insert_group(&mut root, &mut cursor, '|');
+        assert!(closed);
+        assert!(!opened);
+        assert_eq!(root, vec![group('|', '|', sym("x"))]);
+        assert_eq!(cursor, at(1));
+    }
+
+    #[test]
+    fn typing_a_bar_outside_any_bar_group_opens_one() {
+        let mut root = Vec::new();
+        let mut cursor = MathCursor::default();
+
+        assert!(!close_group(&mut root, &mut cursor, '|'));
+        assert!(insert_group(&mut root, &mut cursor, '|'));
+        assert_eq!(root, vec![group('|', '|', Vec::new())]);
+        assert_eq!(cursor, at_path(&[(0, Slot::Body)], 0));
     }
 
     #[test]
@@ -2379,6 +2463,20 @@ mod tests {
             BigOp::Prod,
         ));
         assert_eq!(root[3], big_op(BigOp::Prod, sym("i=0"), sym("n")));
+    }
+
+    #[test]
+    fn switching_a_group_delimiter_to_each_new_opener_keeps_its_body() {
+        for &(open, close) in &PAIRS[2..] {
+            let mut root = vec![group('(', ')', sym("body"))];
+            let address = NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            };
+
+            assert!(set_group_delimiter(&mut root, &address, open));
+            assert_eq!(root, vec![group(open, close, sym("body"))]);
+        }
     }
 
     #[test]

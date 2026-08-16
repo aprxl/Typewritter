@@ -464,7 +464,12 @@ fn stroked_box(
 }
 
 fn delimiter(ch: char, height: f32, level: usize, document_scale: f32) -> MathBox {
-    let width = size(level, document_scale) * 0.34;
+    let width = size(level, document_scale)
+        * match ch {
+            '|' => 0.20,
+            '‖' => 0.30,
+            _ => 0.34,
+        };
     let stroke = SHAPE_STROKE * scale(level, document_scale);
     let top = -height * 0.5 + stroke * 0.5;
     let bottom = height * 0.5 - stroke * 0.5;
@@ -481,6 +486,14 @@ fn delimiter(ch: char, height: f32, level: usize, document_scale: f32) -> MathBo
         ),
         '[' => format!("M {width} {top} H 0 V {bottom} H {width}"),
         ']' => format!("M 0 {top} H {width} V {bottom} H 0"),
+        '|' => format!("M {} {top} V {bottom}", width * 0.5),
+        '‖' => format!(
+            "M {} {top} V {bottom} M {} {top} V {bottom}",
+            width * 0.3,
+            width * 0.7,
+        ),
+        '⟨' => format!("M {width} {top} L {} 0 L {width} {bottom}", stroke * 0.5,),
+        '⟩' => format!("M 0 {top} L {} 0 L 0 {bottom}", width - stroke * 0.5,),
         _ => format!("M {} {top} V {bottom}", width * 0.5),
     };
     stroked_box(
@@ -597,12 +610,36 @@ fn accent(
                 thickness: stroke,
             }
         }
+        AccentKind::Bar | AccentKind::Hat => {
+            let path = match kind {
+                AccentKind::Bar => {
+                    format!("M {} {y} H {}", stroke * 0.5, body.width - stroke * 0.5,)
+                }
+                AccentKind::Hat => format!(
+                    "M {} {} L {} {} L {} {}",
+                    stroke * 0.5,
+                    y + height * 0.35,
+                    body.width * 0.5,
+                    y - height * 0.45,
+                    body.width - stroke * 0.5,
+                    y + height * 0.35,
+                ),
+                AccentKind::Vector
+                | AccentKind::Dot
+                | AccentKind::DoubleDot
+                | AccentKind::TripleDot => unreachable!(),
+            };
+            MathPrimitive::Stroke {
+                path,
+                thickness: stroke,
+            }
+        }
         AccentKind::Dot | AccentKind::DoubleDot | AccentKind::TripleDot => {
             let count = match kind {
                 AccentKind::Dot => 1,
                 AccentKind::DoubleDot => 2,
                 AccentKind::TripleDot => 3,
-                AccentKind::Vector => unreachable!(),
+                AccentKind::Vector | AccentKind::Hat | AccentKind::Bar => unreachable!(),
             };
             let spacing = stroke * 2.5;
             let start = body.width * 0.5 - spacing * (count as f32 - 1.0) * 0.5;
@@ -1965,6 +2002,25 @@ mod tests {
     }
 
     #[test]
+    fn new_delimiters_use_their_measured_widths_and_stroked_paths() {
+        for (ch, factor, path_parts) in [
+            ('|', 0.20, (1, 0)),
+            ('‖', 0.30, (2, 0)),
+            ('⟨', 0.34, (1, 2)),
+            ('⟩', 0.34, (1, 2)),
+        ] {
+            let box_ = delimiter(ch, BASE_SIZE, 0, 1.0);
+            assert_eq!(box_.width, BASE_SIZE * factor);
+            let BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }) = box_.kind else {
+                panic!("delimiter must be stroked geometry");
+            };
+            assert_eq!(thickness, SHAPE_STROKE);
+            assert_eq!(path.matches('M').count(), path_parts.0);
+            assert_eq!(path.matches('L').count(), path_parts.1);
+        }
+    }
+
+    #[test]
     fn a_radical_covers_its_body() {
         let list = layout(&vec![radical(symbols("xy"))], 0, &fake_measure);
         let BoxKind::Row { children } = list.kind else {
@@ -1993,6 +2049,8 @@ mod tests {
             AccentKind::Dot,
             AccentKind::DoubleDot,
             AccentKind::TripleDot,
+            AccentKind::Hat,
+            AccentKind::Bar,
         ] {
             let list = layout(&vec![accent(kind, symbols("xy"))], 0, &fake_measure);
             let BoxKind::Row { children } = list.kind else {
@@ -2006,6 +2064,28 @@ mod tests {
             assert_eq!(mark.2.width, body.2.width);
             assert!(mark.1 - mark.2.descent > body.1 + body.2.ascent);
             assert_eq!(body.2.width, variable_width(0) * 2.0);
+        }
+    }
+
+    #[test]
+    fn hat_and_bar_accents_use_stroked_paths_over_their_body() {
+        for (kind, line_count) in [(AccentKind::Hat, 2), (AccentKind::Bar, 0)] {
+            let list = layout(&vec![accent(kind, symbols("xy"))], 0, &fake_measure);
+            let BoxKind::Row { children } = list.kind else {
+                panic!("accent list must produce row");
+            };
+            let BoxKind::Row { children: accent } = &children[0].2.kind else {
+                panic!("accent must produce row");
+            };
+            let BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }) = &accent[0].2.kind
+            else {
+                panic!("accent must be stroked geometry");
+            };
+            assert_eq!(*thickness, SHAPE_STROKE);
+            assert_eq!(path.matches('L').count(), line_count);
+            if kind == AccentKind::Bar {
+                assert!(path.contains(" H "));
+            }
         }
     }
 

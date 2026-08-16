@@ -559,13 +559,22 @@ impl Shell {
     fn edit_frame_math(&mut self, input: &Input) {
         for c in input.text().chars() {
             match c {
-                c if math::PAIRS.iter().any(|&(open, _)| open == c) => {
-                    self.docs.borrow_mut().math_open_group(c);
-                }
-                c if math::PAIRS.iter().any(|&(_, close)| close == c) => {
-                    let closed = self.docs.borrow_mut().math_close_group(c);
+                c if math::PAIRS
+                    .iter()
+                    .any(|&(open, close)| open == c || close == c) =>
+                {
+                    let closed = {
+                        let mut docs = self.docs.borrow_mut();
+                        docs.math_close_group(c)
+                    };
                     if !closed {
-                        self.docs.borrow_mut().math_type(c);
+                        let opened = {
+                            let mut docs = self.docs.borrow_mut();
+                            docs.math_open_group(c)
+                        };
+                        if !opened {
+                            self.docs.borrow_mut().math_type(c);
+                        }
                     }
                 }
                 ' ' => {
@@ -1661,6 +1670,11 @@ impl Shell {
                         *open == '('
                     }
                     ("context.group.brackets", Some(MathNode::Group { open, .. })) => *open == '[',
+                    ("context.group.bars", Some(MathNode::Group { open, .. })) => *open == '|',
+                    ("context.group.double_bars", Some(MathNode::Group { open, .. })) => {
+                        *open == '‖'
+                    }
+                    ("context.group.angles", Some(MathNode::Group { open, .. })) => *open == '⟨',
                     ("context.accent.vector", Some(MathNode::Accent { kind, .. })) => {
                         *kind == AccentKind::Vector
                     }
@@ -1669,6 +1683,15 @@ impl Shell {
                     }
                     ("context.accent.ddot", Some(MathNode::Accent { kind, .. })) => {
                         *kind == AccentKind::DoubleDot
+                    }
+                    ("context.accent.dddot", Some(MathNode::Accent { kind, .. })) => {
+                        *kind == AccentKind::TripleDot
+                    }
+                    ("context.accent.hat", Some(MathNode::Accent { kind, .. })) => {
+                        *kind == AccentKind::Hat
+                    }
+                    ("context.accent.bar", Some(MathNode::Accent { kind, .. })) => {
+                        *kind == AccentKind::Bar
                     }
                     ("context.op.sum", Some(MathNode::BigOp { kind, .. })) => *kind == BigOp::Sum,
                     ("context.op.product", Some(MathNode::BigOp { kind, .. })) => {
@@ -2991,7 +3014,7 @@ mod tests {
         symbol_base_glyph, symbol_context_ids,
     };
     use crate::document::layout::{ContextHit, RangeKind};
-    use crate::document::math::{MathNode, NodeAddress, SymbolRole};
+    use crate::document::math::{AccentKind, MathNode, NodeAddress, SymbolRole};
     use crate::document::{
         Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, Style, Text, math_conversion,
         math_symbols,
@@ -3045,6 +3068,57 @@ mod tests {
 
         for (index, id) in super::commands::SYMBOL_ROLE_MENU.iter().enumerate() {
             assert_eq!(checked[index], *id == "context.symbol.constant");
+        }
+    }
+
+    #[test]
+    fn an_accent_menu_opened_on_a_hat_shows_the_hat_row_checked_and_the_others_unchecked() {
+        let mut document = Document::new(Path::new("test-context-hat.md"));
+        document.body_mut()[0] = Block::Paragraph(vec![Inline::Math(vec![MathNode::Accent {
+            kind: AccentKind::Hat,
+            body: vec![MathNode::Sym('x')],
+        }])]);
+        let target = ContextHit::Math {
+            block: 0,
+            inline: 0,
+            node: Some(NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            }),
+        };
+        let checked: Vec<bool> = super::commands::ACCENT_MENU
+            .iter()
+            .map(|id| Shell::context_command_checked_for(&document, target.clone(), id))
+            .collect();
+
+        for (index, id) in super::commands::ACCENT_MENU.iter().enumerate() {
+            assert_eq!(checked[index], *id == "context.accent.hat");
+        }
+    }
+
+    #[test]
+    fn a_group_menu_opened_on_a_bar_group_shows_the_bar_row_checked() {
+        let mut document = Document::new(Path::new("test-context-bars.md"));
+        document.body_mut()[0] = Block::Paragraph(vec![Inline::Math(vec![MathNode::Group {
+            open: '|',
+            close: '|',
+            body: vec![MathNode::Sym('x')],
+        }])]);
+        let target = ContextHit::Math {
+            block: 0,
+            inline: 0,
+            node: Some(NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            }),
+        };
+        let checked: Vec<bool> = super::commands::GROUP_MENU
+            .iter()
+            .map(|id| Shell::context_command_checked_for(&document, target.clone(), id))
+            .collect();
+
+        for (index, id) in super::commands::GROUP_MENU.iter().enumerate() {
+            assert_eq!(checked[index], *id == "context.group.bars");
         }
     }
 

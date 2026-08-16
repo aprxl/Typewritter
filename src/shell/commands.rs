@@ -548,6 +548,27 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.context_set_math_delimiter('['),
     },
     Command {
+        id: "context.group.bars",
+        title: "Absolute value",
+        group: "Delimiter",
+        chord: None,
+        run: |shell| shell.context_set_math_delimiter('|'),
+    },
+    Command {
+        id: "context.group.double_bars",
+        title: "Norm",
+        group: "Delimiter",
+        chord: None,
+        run: |shell| shell.context_set_math_delimiter('‖'),
+    },
+    Command {
+        id: "context.group.angles",
+        title: "Angle brackets",
+        group: "Delimiter",
+        chord: None,
+        run: |shell| shell.context_set_math_delimiter('⟨'),
+    },
+    Command {
         id: "context.accent.vector",
         title: "Vector arrow",
         group: "Accent",
@@ -567,6 +588,27 @@ pub const COMMANDS: &[Command] = &[
         group: "Accent",
         chord: None,
         run: |shell| shell.context_set_math_accent(AccentKind::DoubleDot),
+    },
+    Command {
+        id: "context.accent.dddot",
+        title: "Triple dot",
+        group: "Accent",
+        chord: None,
+        run: |shell| shell.context_set_math_accent(AccentKind::TripleDot),
+    },
+    Command {
+        id: "context.accent.hat",
+        title: "Hat",
+        group: "Accent",
+        chord: None,
+        run: |shell| shell.context_set_math_accent(AccentKind::Hat),
+    },
+    Command {
+        id: "context.accent.bar",
+        title: "Bar",
+        group: "Accent",
+        chord: None,
+        run: |shell| shell.context_set_math_accent(AccentKind::Bar),
     },
     Command {
         id: "context.op.sum",
@@ -691,12 +733,21 @@ pub const SYMBOL_ROLE_MENU: &[&str] = &[
     "context.symbol.function",
 ];
 
-pub const GROUP_MENU: &[&str] = &["context.group.parentheses", "context.group.brackets"];
+pub const GROUP_MENU: &[&str] = &[
+    "context.group.parentheses",
+    "context.group.brackets",
+    "context.group.bars",
+    "context.group.double_bars",
+    "context.group.angles",
+];
 
 pub const ACCENT_MENU: &[&str] = &[
     "context.accent.vector",
     "context.accent.dot",
     "context.accent.ddot",
+    "context.accent.dddot",
+    "context.accent.hat",
+    "context.accent.bar",
 ];
 
 pub const BIG_OP_MENU: &[&str] = &[

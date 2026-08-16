@@ -9,7 +9,7 @@
 //! Format change: notation that used `(` for invisible grouping now uses `{`,
 //! while `(` and `[` are visible bracket groups; no migration is provided.
 
-use super::math::{BigOp, MathList, MathNode, Slot, SymbolRole, WORDS};
+use super::math::{BigOp, MathList, MathNode, PAIRS, Slot, SymbolRole, WORDS};
 
 /// The canonical linear form of `list`. Deterministic: equal trees print
 /// equal strings, and the parser reads this exact string back to an equal
@@ -22,6 +22,7 @@ pub fn print(list: &MathList) -> String {
 
 fn print_list(list: &MathList, output: &mut String) {
     for (index, node) in list.iter().enumerate() {
+        let self_paired = self_paired_delimiter(node);
         let needs_group = (index > 0
             && matches!(
                 node,
@@ -37,7 +38,10 @@ fn print_list(list: &MathList, output: &mut String) {
                 && matches!(
                     list.get(index + 1),
                     Some(MathNode::Sym(c)) if c.is_alphabetic()
-                ));
+                ))
+            || self_paired.is_some_and(|delimiter| {
+                index > 0 && self_paired_delimiter(&list[index - 1]) == Some(delimiter)
+            });
         if needs_group {
             escape_keyword_suffix(output);
             output.push('{');
@@ -47,6 +51,27 @@ fn print_list(list: &MathList, output: &mut String) {
             print_node(node, output);
         }
     }
+}
+
+fn self_paired_delimiter(node: &MathNode) -> Option<char> {
+    match node {
+        MathNode::Group { open, close, .. } if open == close => Some(*open),
+        _ => None,
+    }
+}
+
+fn contains_unescaped(text: &str, target: char) -> bool {
+    let mut escaped = false;
+    for c in text.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == target {
+            return true;
+        }
+    }
+    false
 }
 
 fn escape_keyword_suffix(output: &mut String) {
@@ -63,10 +88,9 @@ fn escape_keyword_suffix(output: &mut String) {
 fn print_node(node: &MathNode, output: &mut String) {
     match node {
         MathNode::Sym(c) => {
-            if matches!(
-                c,
-                '/' | '(' | ')' | '[' | ']' | '{' | '}' | '\\' | '^' | '_'
-            ) {
+            if PAIRS.iter().any(|&(open, close)| *c == open || *c == close)
+                || matches!(c, '/' | '{' | '}' | '\\' | '^' | '_')
+            {
                 output.push('\\');
             }
             output.push(*c);
@@ -105,7 +129,15 @@ fn print_node(node: &MathNode, output: &mut String) {
         }
         MathNode::Group { open, close, body } => {
             output.push(*open);
-            print_list(body, output);
+            let mut body_output = String::new();
+            print_list(body, &mut body_output);
+            if open == close && contains_unescaped(&body_output, *open) {
+                output.push('{');
+                output.push_str(&body_output);
+                output.push('}');
+            } else {
+                output.push_str(&body_output);
+            }
             output.push(*close);
         }
         MathNode::Sqrt { body } => {
@@ -234,9 +266,13 @@ impl Parser {
                 self.position += 1;
                 Some((self.parse_list(Some('}')), true))
             }
-            '(' | '[' => {
-                let open = current;
-                let close = if open == '(' { ')' } else { ']' };
+            c if PAIRS.iter().any(|&(open, _)| open == c) => {
+                let open = c;
+                let close = PAIRS
+                    .iter()
+                    .find(|&&(candidate, _)| candidate == open)
+                    .map(|&(_, close)| close)
+                    .expect("pair opener must have a closer");
                 self.position += 1;
                 Some((
                     vec![MathNode::Group {
@@ -545,6 +581,25 @@ mod tests {
     }
 
     #[test]
+    fn a_bar_typed_as_a_symbol_survives_a_print_and_parse_round_trip() {
+        let tree = sym("P(A|B)");
+
+        let printed = print(&tree);
+        assert_eq!(printed, "P\\(A\\|B\\)");
+        assert_eq!(parse(&printed), tree);
+    }
+
+    #[test]
+    fn each_new_delimiter_pair_round_trips_through_print_and_parse() {
+        for &(open, close) in &PAIRS[2..] {
+            let tree = vec![group(open, close, sym("x+1"))];
+            let printed = print(&tree);
+
+            assert_eq!(parse(&printed), tree);
+        }
+    }
+
+    #[test]
     fn empty_slots_print_as_empty_invisible_groups() {
         let list = vec![frac(Vec::new(), Vec::new())];
 
@@ -567,6 +622,8 @@ mod tests {
             (AccentKind::Dot, "dot{x_1}"),
             (AccentKind::DoubleDot, "ddot{x_1}"),
             (AccentKind::TripleDot, "dddot{x_1}"),
+            (AccentKind::Hat, "hat{x_1}"),
+            (AccentKind::Bar, "bar{x_1}"),
         ] {
             let tree = vec![accent(kind, vec![script(sym("x"), None, Some(sym("1")))])];
 
@@ -678,7 +735,10 @@ mod tests {
 
     #[test]
     fn generated_trees_round_trip_both_ways() {
-        let mut generator = Generator(0x5eed_1234_5678_9abc);
+        let mut generator = Generator {
+            state: 0x5eed_1234_5678_9abc,
+            pair_index: 0,
+        };
 
         for _ in 0..500 {
             let tree = generated_list(&mut generator, 4);
@@ -687,17 +747,47 @@ mod tests {
             assert_eq!(parse(&printed), tree, "printed: {printed:?}");
             assert_eq!(print(&parse(&printed)), printed, "printed: {printed:?}");
         }
+
+        let mut pair_generator = Generator {
+            state: 0,
+            pair_index: 0,
+        };
+        let mut body_generator = Generator {
+            state: 0x1234_5678_9abc_def0,
+            pair_index: 0,
+        };
+        let mut generated_pairs = Vec::new();
+        for _ in PAIRS {
+            let pair = pair_generator.next_pair();
+            generated_pairs.push(pair);
+            let (open, close) = pair;
+            let tree = vec![group(open, close, generated_list(&mut body_generator, 2))];
+            let printed = print(&tree);
+
+            assert_eq!(parse(&printed), tree, "printed: {printed:?}");
+            assert_eq!(print(&parse(&printed)), printed, "printed: {printed:?}");
+        }
+        assert_eq!(generated_pairs.as_slice(), PAIRS);
     }
 
-    struct Generator(u64);
+    struct Generator {
+        state: u64,
+        pair_index: usize,
+    }
 
     impl Generator {
         fn next(&mut self) -> u64 {
-            self.0 = self
-                .0
+            self.state = self
+                .state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            self.0
+            self.state
+        }
+
+        fn next_pair(&mut self) -> (char, char) {
+            let pair = PAIRS[self.pair_index % PAIRS.len()];
+            self.pair_index += 1;
+            pair
         }
     }
 
@@ -734,11 +824,7 @@ mod tests {
                         vec![script(generated_list(generator, depth - 1), sup, sub)]
                     }
                     2 => {
-                        let (open, close) = if generator.next().is_multiple_of(2) {
-                            ('(', ')')
-                        } else {
-                            ('[', ']')
-                        };
+                        let (open, close) = generator.next_pair();
                         vec![group(open, close, generated_list(generator, depth - 1))]
                     }
                     3 => vec![sqrt(generated_list(generator, depth - 1))],
@@ -759,11 +845,13 @@ mod tests {
                         vec![big_op(kind, lower, upper)]
                     }
                     5 => {
-                        let kind = match generator.next() % 4 {
+                        let kind = match generator.next() % 6 {
                             0 => AccentKind::Vector,
                             1 => AccentKind::Dot,
                             2 => AccentKind::DoubleDot,
-                            _ => AccentKind::TripleDot,
+                            3 => AccentKind::TripleDot,
+                            4 => AccentKind::Hat,
+                            _ => AccentKind::Bar,
                         };
                         vec![accent(kind, generated_list(generator, depth - 1))]
                     }
@@ -786,8 +874,8 @@ mod tests {
                     }
                     7 => {
                         const KEYWORDS: &[&str] = &[
-                            "sqrt", "vec", "dot", "ddot", "dddot", "sum", "prod", "int", "oint",
-                            "lim",
+                            "sqrt", "vec", "dot", "ddot", "dddot", "hat", "bar", "sum", "prod",
+                            "int", "oint", "lim",
                         ];
                         KEYWORDS[(generator.next() % KEYWORDS.len() as u64) as usize]
                             .chars()
@@ -797,7 +885,7 @@ mod tests {
                     _ => {
                         const SYMBOLS: &[char] = &[
                             'a', 'Z', '0', '9', '+', '-', '=', '.', ' ', '/', '(', ')', '[', ']',
-                            '{', '}', '\\', '^', '_',
+                            '|', '‖', '⟨', '⟩', '{', '}', '\\', '^', '_',
                         ];
                         vec![MathNode::Sym(
                             SYMBOLS[(generator.next() % SYMBOLS.len() as u64) as usize],
