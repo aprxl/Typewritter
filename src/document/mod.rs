@@ -18,6 +18,22 @@ pub mod outline;
 /// Flat-text stand-in for one opaque math atom.
 pub const ATOM: char = '\u{FFFC}';
 
+/// A margin note body, keyed by the label its anchor carries. Held beside the
+/// blocks rather than in them, because a note belongs to a position in the
+/// prose and not to the flow of it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Sidenote {
+    pub label: String,
+    /// The note's body: the same inline runs prose uses, so a note can hold
+    /// emphasis, code and an inline expression.
+    pub body: Vec<Inline>,
+    /// Whether an anchor for this label exists in the prose. A note loaded
+    /// from disk with no anchor is `false` and is left alone by `prune_runs`;
+    /// only a note the reader's edit actually orphaned (an anchor they once
+    /// had and then deleted) is dropped.
+    pub anchored: bool,
+}
+
 /// A document: an ordered list of blocks with a caret.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Document {
@@ -28,6 +44,10 @@ pub struct Document {
     pub caret: Caret,
     /// Cursor inside the math atom named by `caret`, or prose focus when None.
     pub math: Option<math::MathCursor>,
+    /// Margin note bodies, keyed by the label their anchors carry. Held
+    /// beside the blocks rather than in them, because a note belongs to a
+    /// position in the prose and not to the flow of it.
+    pub notes: Vec<Sidenote>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -57,6 +77,10 @@ pub enum Inline {
     Text(Text),
     /// One opaque math expression; flat prose coordinates count it as one.
     Math(math::MathList),
+    /// An anchor for a margin note. Opaque like an expression: flat prose
+    /// coordinates count it as exactly one position, so every motion,
+    /// selection and offset in the document keeps working unchanged.
+    Note(String),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -209,6 +233,7 @@ impl Inline {
             Inline::Text(t) => &t.text,
             // U+FFFC gives every flat-text consumer exactly one position.
             Inline::Math(_) => "\u{FFFC}",
+            Inline::Note(_) => "\u{FFFC}",
         }
     }
 
@@ -217,6 +242,9 @@ impl Inline {
             Inline::Text(t) => Some(&mut t.text),
             // Math is edited through its tree, never as prose.
             Inline::Math(_) => None,
+            // An anchor's label is fixed by the note it points at; the
+            // reader edits the note body, not the anchor.
+            Inline::Note(_) => None,
         }
     }
 
@@ -224,6 +252,7 @@ impl Inline {
         match self {
             Inline::Text(t) => t.style,
             Inline::Math(_) => Style::PLAIN,
+            Inline::Note(_) => Style::PLAIN,
         }
     }
 
@@ -231,6 +260,7 @@ impl Inline {
         match self {
             Inline::Text(t) => t.style = style,
             Inline::Math(_) => {}
+            Inline::Note(_) => {}
         }
     }
 }
@@ -240,6 +270,7 @@ fn run_len(run: &Inline) -> usize {
         Inline::Text(t) => t.text.chars().count(),
         // Opaque math always costs one flat position.
         Inline::Math(_) => 1,
+        Inline::Note(_) => 1,
     }
 }
 
@@ -248,7 +279,14 @@ fn merge_style(run: &Inline) -> Option<Style> {
         Inline::Text(t) => Some(t.style),
         // An atom is never a prose merge target.
         Inline::Math(_) => None,
+        Inline::Note(_) => None,
     }
+}
+
+/// Whether a run is opaque — costs one flat position and is deleted as a
+/// whole rather than char by char. Math atoms and sidenote anchors both are.
+fn is_opaque(run: &Inline) -> bool {
+    matches!(run, Inline::Math(_) | Inline::Note(_))
 }
 
 fn style_matches(style: Style, mask: Style) -> bool {
@@ -331,6 +369,26 @@ fn split_run(run: Inline, at: usize) -> (Inline, Inline) {
             } else {
                 (
                     Inline::Math(list),
+                    Inline::Text(Text {
+                        text: String::new(),
+                        style: Style::PLAIN,
+                    }),
+                )
+            }
+        }
+        Inline::Note(label) => {
+            // An anchor cannot split either; the empty side is pruned.
+            if at == 0 {
+                (
+                    Inline::Text(Text {
+                        text: String::new(),
+                        style: Style::PLAIN,
+                    }),
+                    Inline::Note(label),
+                )
+            } else {
+                (
+                    Inline::Note(label),
                     Inline::Text(Text {
                         text: String::new(),
                         style: Style::PLAIN,
@@ -427,6 +485,7 @@ impl Document {
                 style: Style::PLAIN,
             },
             math: None,
+            notes: Vec::new(),
         }
     }
 
@@ -538,6 +597,11 @@ impl Document {
                         out.push('$');
                         out.push_str(&math_notation::print(list));
                         out.push('$');
+                    }
+                    Inline::Note(label) => {
+                        out.push_str("[^");
+                        out.push_str(label);
+                        out.push(']');
                     }
                 }
             }
@@ -789,6 +853,7 @@ impl Document {
                     }
                     // Slices cover the whole opaque atom or none of it.
                     Inline::Math(_) => result.push(run.clone()),
+                    Inline::Note(_) => result.push(run.clone()),
                 }
             }
             cursor = run_end;
@@ -1155,6 +1220,22 @@ impl Document {
                 };
             }
         }
+
+        // An anchor the reader deleted leaves its note unreachable — a body
+        // nothing points at cannot be seen or reached, so keep it only for
+        // notes that never had an anchor to begin with (loaded from disk as
+        // a stray definition), which an edit is not allowed to discard.
+        let anchored: Vec<&str> = self
+            .blocks
+            .iter()
+            .flat_map(Block::inlines)
+            .filter_map(|run| match run {
+                Inline::Note(label) => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        self.notes
+            .retain(|note| !note.anchored || anchored.contains(&note.label.as_str()));
     }
 
     fn invariants_hold(&self) -> bool {
@@ -1429,6 +1510,7 @@ impl Document {
             let len = match &self.blocks[b].inlines()[inline] {
                 Inline::Math(list) => list.len(),
                 Inline::Text(_) => unreachable!("math target was checked above"),
+                Inline::Note(_) => unreachable!("math target was checked above"),
             };
             if len > 0 || self.blocks[b].is_math() {
                 self.set_caret(b, inline, 0);
@@ -1442,14 +1524,14 @@ impl Document {
         }
         if o > 0 {
             let runs = self.blocks[b].inlines_mut();
-            if matches!(runs[i], Inline::Math(_)) {
+            if is_opaque(&runs[i]) {
                 runs.remove(i);
             } else {
                 remove_char_at(runs[i].text_mut().expect("non-math run is text"), o - 1);
             }
         } else if i > 0 {
             let runs = self.blocks[b].inlines_mut();
-            if matches!(runs[i - 1], Inline::Math(_)) {
+            if is_opaque(&runs[i - 1]) {
                 runs.remove(i - 1);
             } else {
                 let prev_len = run_len(&runs[i - 1]);
@@ -1530,6 +1612,7 @@ impl Document {
             let empty = match &self.blocks[b].inlines()[inline] {
                 Inline::Math(list) => list.is_empty(),
                 Inline::Text(_) => unreachable!("math target was checked above"),
+                Inline::Note(_) => unreachable!("math target was checked above"),
             };
             if !empty || self.blocks[b].is_math() {
                 self.set_caret(b, inline, 0);
@@ -1540,14 +1623,14 @@ impl Document {
         }
         if o < li {
             let runs = self.blocks[b].inlines_mut();
-            if matches!(runs[i], Inline::Math(_)) {
+            if is_opaque(&runs[i]) {
                 runs.remove(i);
             } else {
                 remove_char_at(runs[i].text_mut().expect("non-math run is text"), o);
             }
         } else if i + 1 < runs.len() {
             let runs = self.blocks[b].inlines_mut();
-            if matches!(runs[i + 1], Inline::Math(_)) {
+            if is_opaque(&runs[i + 1]) {
                 runs.remove(i + 1);
             } else {
                 remove_char_at(runs[i + 1].text_mut().expect("non-math run is text"), 0);
@@ -1637,7 +1720,7 @@ impl Document {
             return;
         }
         let runs = self.blocks[b].inlines_mut();
-        if matches!(runs[i], Inline::Math(_)) {
+        if is_opaque(&runs[i]) {
             runs.remove(i);
         } else {
             remove_char_at(runs[i].text_mut().expect("non-math run is text"), o);
@@ -1928,6 +2011,50 @@ impl Document {
         let (inline, offset) = self.flat_to_pos(b, flat);
         self.set_caret(b, inline, offset);
         self.math = Some(math::MathCursor::default());
+    }
+
+    /// Puts an anchor at the caret and opens an empty note for it, choosing
+    /// the lowest label not already in use. Returns the label so a caller
+    /// can put the caret in the new note.
+    pub fn insert_sidenote(&mut self) -> String {
+        self.clamp_caret();
+        let label = self.next_free_label();
+        let b = self.caret.block;
+        let i = self.caret.inline;
+        let o = self.caret.offset;
+        let flat = self.caret_flat(b);
+        let (prefix, suffix) = split_run(self.blocks[b].inlines_mut().remove(i), o);
+        self.blocks[b]
+            .inlines_mut()
+            .splice(i..i, [prefix, Inline::Note(label.clone()), suffix]);
+        self.notes.push(Sidenote {
+            label: label.clone(),
+            body: Vec::new(),
+            anchored: true,
+        });
+        self.dirty = true;
+        self.enforce();
+        let (inline, offset) = self.flat_to_pos(b, (flat + 1).min(self.block_flat_len(b)));
+        self.set_caret(b, inline, offset);
+        label
+    }
+
+    /// The lowest integer label not already carried by an anchor or a note.
+    fn next_free_label(&self) -> String {
+        let mut n = 1usize;
+        loop {
+            let candidate = n.to_string();
+            let used = self.notes.iter().any(|note| note.label == candidate)
+                || self
+                    .blocks
+                    .iter()
+                    .flat_map(Block::inlines)
+                    .any(|run| matches!(run, Inline::Note(label) if label == &candidate));
+            if !used {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 
     /// Inserts a focused display math block, replacing an empty block.
@@ -3889,5 +4016,74 @@ mod tests {
             vec![("costs $40 and $12".into(), Style::PLAIN)]
         );
         assert!(!block.inlines().iter().any(|r| matches!(r, Inline::Math(_))));
+    }
+
+    // ---- sidenote tests ------------------------------------------------
+
+    #[test]
+    fn an_anchor_costs_one_flat_position() {
+        let mut d = doc();
+        d.blocks[0] = Block::Paragraph(vec![
+            plain_run("ab"),
+            Inline::Note("1".into()),
+            plain_run("cd"),
+        ]);
+        assert_eq!(d.block_len(0), 5);
+        assert_eq!(d.block_text(0), format!("ab{ATOM}cd"));
+        d.set_caret(0, 0, 2);
+        d.move_right();
+        assert_eq!(d.caret_position().offset, 3);
+        d.move_left();
+        assert!(matches!(
+            d.blocks[0].inlines()[d.caret.inline],
+            Inline::Note(_)
+        ));
+    }
+
+    #[test]
+    fn inserting_a_sidenote_picks_the_lowest_free_label() {
+        let mut d = doc();
+        assert_eq!(d.insert_sidenote(), "1");
+        assert_eq!(d.insert_sidenote(), "2");
+        assert_eq!(d.insert_sidenote(), "3");
+        assert_eq!(
+            d.notes.iter().map(|n| n.label.as_str()).collect::<Vec<_>>(),
+            vec!["1", "2", "3"]
+        );
+
+        // Delete the anchor labelled "1" — its note is dropped with it, so
+        // "1" is free again and the next insert reclaims it.
+        d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
+        assert_eq!(d.notes.len(), 2);
+        assert_eq!(d.insert_sidenote(), "1");
+    }
+
+    #[test]
+    fn deleting_an_anchor_drops_its_note() {
+        let mut d = doc();
+        d.insert_text("note");
+        d.set_caret(0, 0, 0);
+        d.insert_sidenote();
+        assert_eq!(d.notes.len(), 1);
+        assert_eq!(d.block_text(0), format!("{ATOM}note"));
+
+        d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
+        assert!(d.notes.is_empty(), "deleting the anchor drops the note");
+        assert_eq!(d.block_text(0), "note");
+    }
+
+    #[test]
+    fn a_note_that_never_had_an_anchor_is_left_alone() {
+        let mut d = doc();
+        d.notes.push(Sidenote {
+            label: "1".into(),
+            body: vec![plain_run("orphan")],
+            anchored: false,
+        });
+        d.insert_text("hello");
+        d.enforce();
+        assert_eq!(d.notes.len(), 1, "a stray note is not an edit's to drop");
+        assert_eq!(d.notes[0].label, "1");
+        assert_eq!(d.notes[0].body, vec![plain_run("orphan")]);
     }
 }

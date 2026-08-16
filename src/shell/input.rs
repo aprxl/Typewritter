@@ -691,6 +691,7 @@ impl Shell {
                         .map(|run| match run {
                             crate::document::Inline::Text(text) => text.text.as_str(),
                             crate::document::Inline::Math(_) => "\u{FFFC}",
+                            crate::document::Inline::Note(_) => "\u{FFFC}",
                         })
                         .collect::<String>()
                         .chars()
@@ -1394,6 +1395,7 @@ impl Shell {
                     .and_then(|run| match run {
                         Inline::Math(list) => math::node_at(list, address),
                         Inline::Text(_) => None,
+                        Inline::Note(_) => None,
                     });
                 match node {
                     Some(MathNode::Sym(ch)) if ch.is_alphabetic() => {

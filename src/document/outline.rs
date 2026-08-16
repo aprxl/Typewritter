@@ -53,6 +53,7 @@ pub fn outline(blocks: &[Block]) -> Vec<Node> {
                 Inline::Text(text) => text.text.as_str(),
                 // Math is opaque and contributes no heading prose.
                 Inline::Math(_) => "",
+                Inline::Note(_) => "",
             })
             .collect();
 

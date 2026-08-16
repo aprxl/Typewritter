@@ -575,6 +575,9 @@ impl Component for Editor {
                             .take(segment.len.min(VIEW_CAP))
                             .collect(),
                         Inline::Math(_) => ATOM.to_string(),
+                        // Real presentation lands in the next task; for now
+                        // an anchor is drawn as its own number.
+                        Inline::Note(label) => label.clone(),
                     };
                     let width = layout::advance(run, &text, kind, segment.style, &|text, style| {
                         theme::width(layer, text, style)
@@ -738,6 +741,7 @@ impl Component for Editor {
             .and_then(|run| match run {
                 Inline::Text(t) => t.text.chars().nth(self.caret.offset),
                 Inline::Math(_) => Some(ATOM),
+                Inline::Note(_) => Some(ATOM),
             });
         let screen_x = x + caret_x;
         let screen_y = content + caret_baseline - self.scroll;
@@ -889,6 +893,7 @@ impl Editor {
                     .take(segment.len)
                     .collect(),
                 Inline::Math(_) => ATOM.to_string(),
+                Inline::Note(_) => ATOM.to_string(),
             };
             if flat >= cursor + segment.len {
                 x += layout::advance(run, &text, block, segment.style, &|text, style| {
@@ -1116,6 +1121,7 @@ mod tests {
         let box_width = match &run {
             Inline::Math(list) => math_layout::layout(list, 0, &measure).width,
             Inline::Text(_) => unreachable!(),
+            Inline::Note(_) => unreachable!(),
         };
         assert_eq!(width, box_width);
         assert!(width > measure(&atom, &TextStyle::serif(17.5, theme::INK)));

@@ -22,7 +22,7 @@ use std::io;
 use std::path::Path;
 
 use super::math_notation;
-use super::{BadgeColor, Block, Caret, Document, Inline, Style, Text};
+use super::{BadgeColor, Block, Caret, Document, Inline, Sidenote, Style, Text};
 
 /// Scan for the next unescaped occurrence of `marker` at or after `start`.
 /// The char immediately before a match must be non-whitespace. Escaped
@@ -207,12 +207,35 @@ fn parse_inline(s: &str) -> Vec<Inline> {
                                     runs.push(Inline::Text(t));
                                 }
                                 Inline::Math(list) => runs.push(Inline::Math(list)),
+                                Inline::Note(label) => runs.push(Inline::Note(label)),
                             }
                         }
                         i = cl + 2;
                     }
                     None => {
                         text_buf.push_str("==");
+                        i += 2;
+                    }
+                }
+            }
+            '[' if chars.get(i + 1) == Some(&'^') => {
+                // A footnote anchor: `[^label]`. The label is the author's
+                // and is carried verbatim into `Inline::Note`. No closing
+                // bracket means it is ordinary prose.
+                let after = i + 2;
+                match chars[after..].iter().position(|&c| c == ']') {
+                    Some(cl) => {
+                        let label: String = chars[after..after + cl].iter().collect();
+                        if label.is_empty() {
+                            text_buf.push_str("[^]");
+                        } else {
+                            push_plain(&mut runs, &mut text_buf);
+                            runs.push(Inline::Note(label));
+                        }
+                        i = after + cl + 1;
+                    }
+                    None => {
+                        text_buf.push_str("[^");
                         i += 2;
                     }
                 }
@@ -303,6 +326,17 @@ fn parse_heading(line: &str) -> Option<(u8, &str)> {
     Some((count as u8, rest))
 }
 
+/// A footnote definition line `[^label]: body`. Returns `(label, body)` where
+/// `body` is the text after the marker, trimmed of leading whitespace. The
+/// label is the author's, read verbatim.
+fn parse_definition(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("[^")?;
+    let close = rest.find("]:")?;
+    let label = &rest[..close];
+    let body = rest[close + 2..].trim_start();
+    Some((label, body))
+}
+
 /// Build a `Document` from Markdown text. `path` only seeds `Document`'s
 /// `path`/`name` fields. Pure — no IO.
 pub fn parse(path: &Path, text: &str) -> Document {
@@ -314,6 +348,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
     let mut fence_lang: Option<String> = None;
     let mut fence_math = false;
     let mut math_body = String::new();
+    let mut definitions: Vec<(String, Vec<Inline>)> = Vec::new();
 
     let flush_para = |blocks: &mut Vec<Block>, para: &mut Vec<String>| {
         if !para.is_empty() {
@@ -396,6 +431,13 @@ pub fn parse(path: &Path, text: &str) -> Document {
             })]));
             continue;
         }
+        // A definition is collected out of the block stream into the
+        // document's notes, so it is never a stray paragraph mid-prose.
+        if let Some((label, body)) = parse_definition(line) {
+            flush_para(&mut blocks, &mut para);
+            definitions.push((label.to_string(), parse_inline(body)));
+            continue;
+        }
         if let Some((level, content)) = parse_heading(line) {
             flush_para(&mut blocks, &mut para);
             let mut inlines = parse_inline(content);
@@ -438,6 +480,26 @@ pub fn parse(path: &Path, text: &str) -> Document {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
+    // A note is "anchored" only when its label actually occurs in the prose.
+    // A definition with no anchor is still kept — it arrived from disk and
+    // must survive — but it is flagged so `prune_runs` leaves it alone.
+    let anchored_labels: Vec<&str> = blocks
+        .iter()
+        .flat_map(Block::inlines)
+        .filter_map(|run| match run {
+            Inline::Note(label) => Some(label.as_str()),
+            _ => None,
+        })
+        .collect();
+    let notes = definitions
+        .into_iter()
+        .map(|(label, body)| Sidenote {
+            anchored: anchored_labels.contains(&label.as_str()),
+            label,
+            body,
+        })
+        .collect();
+
     Document {
         blocks,
         path: path.to_path_buf(),
@@ -450,6 +512,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
             style: Style::PLAIN,
         },
         math: None,
+        notes,
     }
 }
 
@@ -470,6 +533,11 @@ fn escape_run_text(t: &str) -> String {
             c @ ('=' | '[') if chars.get(i + 1) == Some(&c) => {
                 out.push('\\');
                 out.push(c);
+            }
+            // `[^` opens a footnote anchor; escape the bracket so a literal
+            // `[^note]` in prose re-reads as text, not as an anchor.
+            '[' if chars.get(i + 1) == Some(&'^') => {
+                out.push_str("\\[");
             }
             c => out.push(c),
         }
@@ -518,6 +586,7 @@ fn serialize_runs(runs: &[Inline]) -> String {
             }
         }
         Inline::Math(list) => format!("${}$", math_notation::print(list)),
+        Inline::Note(label) => format!("[^{label}]"),
     };
     let mut out = String::new();
     let mut i = 0;
@@ -556,7 +625,7 @@ pub fn serialize(doc: &Document) -> String {
         let runs = doc.blocks[0].inlines();
         runs.len() == 1 && matches!(runs[0], Inline::Text(Text { ref text, .. }) if text.is_empty())
     };
-    if empty {
+    if empty && doc.notes.is_empty() {
         return String::new();
     }
 
@@ -626,7 +695,46 @@ pub fn serialize(doc: &Document) -> String {
             }
         }
     }
-    out.push('\n');
+
+    if doc.notes.is_empty() {
+        out.push('\n');
+    } else {
+        // Definitions go at the end of the file, in the order their anchors
+        // appear in the prose; a definition nothing anchors (a stray one
+        // from disk) follows, in its own stored order, so both kinds survive
+        // a round trip unchanged.
+        let mut anchored: Vec<&str> = Vec::new();
+        for block in &doc.blocks {
+            for run in block.inlines() {
+                if let Inline::Note(label) = run
+                    && !anchored.contains(&label.as_str())
+                {
+                    anchored.push(label);
+                }
+            }
+        }
+        let mut order: Vec<&Sidenote> = Vec::new();
+        for label in &anchored {
+            if let Some(note) = doc.notes.iter().find(|note| note.label == *label) {
+                order.push(note);
+            }
+        }
+        for note in &doc.notes {
+            if !anchored.contains(&note.label.as_str()) {
+                order.push(note);
+            }
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        for note in order {
+            out.push_str("[^");
+            out.push_str(&note.label);
+            out.push_str("]: ");
+            out.push_str(&serialize_runs(&note.body));
+            out.push('\n');
+        }
+    }
     out
 }
 
@@ -1308,5 +1416,112 @@ mod tests {
         assert_eq!(text_of_block(&d, 1), "b");
         let back = serialize(&d);
         assert_eq!(back, text);
+    }
+
+    // ---- sidenote (footnote) tests --------------------------------------
+
+    #[test]
+    fn a_sidenote_round_trips_through_its_footnote_syntax() {
+        let text = "The gain is stable[^1] across the band.\n\n[^1]: measured 10.94 at 1 kHz, bench rig B\n";
+        let d = parse(Path::new("n.md"), text);
+        let runs = d.blocks[0].inlines();
+        assert!(matches!(runs[1], Inline::Note(ref l) if l == "1"));
+        assert_eq!(d.notes.len(), 1);
+        assert_eq!(d.notes[0].label, "1");
+        assert!(d.notes[0].anchored);
+        assert_eq!(
+            d.notes[0].body,
+            vec![plain("measured 10.94 at 1 kHz, bench rig B")]
+        );
+        assert_eq!(serialize(&d), text);
+    }
+
+    #[test]
+    fn definitions_are_written_in_anchor_order() {
+        let mut d = doc_with(vec![para(vec![
+            plain("first "),
+            Inline::Note("2".into()),
+            plain(" then "),
+            Inline::Note("1".into()),
+            plain(" done"),
+        ])]);
+        d.notes = vec![
+            Sidenote {
+                label: "1".into(),
+                body: vec![plain("one")],
+                anchored: true,
+            },
+            Sidenote {
+                label: "2".into(),
+                body: vec![plain("two")],
+                anchored: true,
+            },
+        ];
+        // The anchors appear "2" then "1" in the prose, so the definitions
+        // are written in that order, not the notes' stored order.
+        assert_eq!(
+            serialize(&d),
+            "first [^2] then [^1] done\n\n[^2]: two\n[^1]: one\n"
+        );
+    }
+
+    #[test]
+    fn an_anchor_with_no_definition_survives_a_round_trip() {
+        let text = "A note[^1] with no body\n";
+        let d = parse(Path::new("n.md"), text);
+        assert!(matches!(d.blocks[0].inlines()[1], Inline::Note(ref l) if l == "1"));
+        assert!(d.notes.is_empty());
+        let out = serialize(&d);
+        assert_eq!(out, text);
+        let back = parse(Path::new("n.md"), &out);
+        assert!(matches!(back.blocks[0].inlines()[1], Inline::Note(ref l) if l == "1"));
+    }
+
+    #[test]
+    fn a_definition_with_no_anchor_survives_a_round_trip() {
+        let text = "body\n\n[^1]: a stray note\n";
+        let d = parse(Path::new("n.md"), text);
+        assert_eq!(d.notes.len(), 1);
+        assert!(!d.notes[0].anchored);
+        assert_eq!(d.notes[0].label, "1");
+        assert_eq!(d.notes[0].body, vec![plain("a stray note")]);
+        let out = serialize(&d);
+        assert_eq!(out, text);
+        let back = parse(Path::new("n.md"), &out);
+        assert_eq!(back.notes.len(), 1);
+        assert!(!back.notes[0].anchored);
+    }
+
+    #[test]
+    fn a_note_body_keeps_its_emphasis_and_its_expression() {
+        let text = "text[^1]\n\n[^1]: the **gain** is $a/b$ here\n";
+        let d = parse(Path::new("n.md"), text);
+        assert_eq!(
+            d.notes[0].body,
+            vec![
+                plain("the "),
+                bold("gain"),
+                plain(" is "),
+                math("a/b"),
+                plain(" here"),
+            ]
+        );
+        assert_eq!(serialize(&d), text);
+    }
+
+    #[test]
+    fn a_bracket_that_is_not_a_footnote_is_ordinary_text() {
+        // `[^` with no closing bracket is ordinary text.
+        let d = parse(Path::new("n.md"), "see [^ the thing\n");
+        assert_eq!(d.blocks, vec![para(vec![plain("see [^ the thing")])]);
+        // A plain `[link]` is text, not a footnote.
+        let d = parse(Path::new("n.md"), "a [link] here\n");
+        assert_eq!(d.blocks, vec![para(vec![plain("a [link] here")])]);
+        // A literal `[^1]` in prose is escaped on the way out so it re-reads
+        // as text rather than as an anchor.
+        let d = doc_with(vec![para(vec![plain("see [^1] done")])]);
+        let out = serialize(&d);
+        assert_eq!(out, "see \\[^1] done\n");
+        assert_eq!(parse(Path::new("n.md"), &out).blocks, d.blocks);
     }
 }

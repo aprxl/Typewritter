@@ -949,6 +949,7 @@ impl Shell {
                             .map(|run| match run {
                                 crate::document::Inline::Text(text) => text.text.chars().count(),
                                 crate::document::Inline::Math(_) => 1,
+                                crate::document::Inline::Note(_) => 1,
                             })
                             .sum();
                         crate::document::FlatRange::new(

@@ -178,6 +178,10 @@ pub fn advance(
             math_layout::layout(list, 0, measure).width
         }
         Inline::Text(_) => measure(text, &text_style(block, style)),
+        // Real presentation lands in the next task; until then an anchor
+        // measures as a narrow fixed width so it stays one clickable
+        // position without claiming a glyph's width from the font.
+        Inline::Note(_) => 10.0,
     };
     let box_pad = if style.badge {
         theme::BADGE_PAD * 2.0
@@ -339,7 +343,7 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
                                 let expression = math_layout::layout(list, 0, measure);
                                 Some(expression.ascent + expression.descent + MATH_LEADING)
                             }
-                            Inline::Text(_) => None,
+                            Inline::Text(_) | Inline::Note(_) => None,
                         },
                     )
                     .fold(0.0, f32::max);
@@ -387,6 +391,7 @@ fn run_text(run: &Inline) -> &str {
     match run {
         Inline::Text(t) => &t.text,
         Inline::Math(_) => "\u{FFFC}",
+        Inline::Note(_) => "\u{FFFC}",
     }
 }
 
@@ -394,6 +399,7 @@ fn run_style(run: &Inline) -> Style {
     match run {
         Inline::Text(t) => t.style,
         Inline::Math(_) => Style::PLAIN,
+        Inline::Note(_) => Style::PLAIN,
     }
 }
 
