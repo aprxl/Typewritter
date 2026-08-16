@@ -34,7 +34,7 @@ pub const BRUSH_RADIUS: f32 = 9.0;
 /// an inline span the tight one, so a `` `run` `` mid-sentence doesn't push
 /// the line apart.
 const BLOCK_PAD: (f32, f32) = (10.0, 6.0);
-const INLINE_PAD: (f32, f32) = (3.0, 1.0);
+const INLINE_PAD: (f32, f32) = (8.0, 4.0);
 const CODE_ROUNDING: Rounding = Rounding::uniform(6.0);
 const INLINE_MATH_ROUNDING: Rounding = Rounding::uniform(5.0);
 const MATH_SELECTION_ROUNDING: Rounding = Rounding::uniform(4.0);
