@@ -632,8 +632,7 @@ impl Shell {
             }
             ExtendedAction::Paste { before, count } => {
                 self.repeat = Some(super::RepeatOp::Paste { before, count });
-                self.import_yank();
-                self.docs.borrow_mut().paste(before, count);
+                self.paste(before, count);
                 self.goal_x = None;
             }
         }
@@ -1020,8 +1019,22 @@ impl Shell {
 
     /// Pastes the OS clipboard at the caret.
     pub(super) fn paste_clipboard(&mut self) {
+        self.paste(false, 1);
+    }
+
+    /// Pastes the yank register at the caret. The register holds either text
+    /// this app itself published — identical to `exported_yank`, so it is
+    /// re-read as notation — or text from another application, which is
+    /// inserted exactly as it arrived. The provenance decision lives here:
+    /// the document methods never guess where a string came from.
+    fn paste(&mut self, before: bool, count: usize) {
         self.import_yank();
-        self.docs.borrow_mut().paste(false, 1);
+        paste(
+            &mut self.docs.borrow_mut(),
+            before,
+            count,
+            &self.exported_yank,
+        );
     }
 
     fn exit_visual(&mut self) {
@@ -1116,8 +1129,7 @@ impl Shell {
                 self.start_insert();
             }
             super::RepeatOp::Paste { before, count } => {
-                self.import_yank();
-                self.docs.borrow_mut().paste(before, count);
+                self.paste(before, count);
             }
             super::RepeatOp::Insert(events) => {
                 self.docs.borrow_mut().transaction(|docs| {
@@ -2288,6 +2300,43 @@ fn delete_chars(docs: &mut Tabs, count: usize) {
     });
 }
 
+/// Pastes the yank register at the caret, `count` times. `exported_yank` is
+/// the string this app last published to the OS clipboard, so a register that
+/// equals it is our own notation: it is re-read through `insert_notation`,
+/// where `$…$` is an expression and `\$` a literal dollar. Anything else
+/// arrived from elsewhere and is inserted byte-for-byte through `insert_text`.
+/// The provenance decision is made here, once, rather than guessed at by the
+/// document.
+fn paste(docs: &mut Tabs, before: bool, count: usize, exported_yank: &str) {
+    let text = docs.yank().unwrap_or_default().to_string();
+    if text.is_empty() {
+        return;
+    }
+    let notation = text == exported_yank;
+    docs.transaction(|docs| {
+        let was_preview = docs.active().map(|tab| tab.preview).unwrap_or(false);
+        docs.touch(|doc| {
+            if !before {
+                let position = doc.caret_position();
+                let offset = (position.offset + 1).min(doc.block_len(position.block));
+                doc.set_flat_position(doc.position(position.block, offset));
+            }
+            for _ in 0..count.max(1) {
+                if notation {
+                    doc.insert_notation(&text);
+                } else {
+                    doc.insert_text(&text);
+                }
+            }
+        });
+        // Editing a preview makes it permanent (spec §7.1); `touch` never
+        // promotes, so promote here exactly as `Tabs::edit` would.
+        if was_preview && let Some(tab) = docs.active_mut() {
+            tab.preview = false;
+        }
+    });
+}
+
 /// Enter Insert mode, opening the undo transaction that groups the whole
 /// insert session into one step. This is the one place every path into
 /// Insert mode funnels through — `i`/`a`/`I`/`A`, the click that lands in a
@@ -2543,7 +2592,7 @@ mod tests {
     use super::{
         add_brush_hits, brush_sweep_samples, delete_chars, delete_inside_math, enter_insert,
         math_menu_rows, math_menu_variant_start, move_inside_math, moved_math_menu_selection,
-        reset_brush_selection, symbol_base_glyph, symbol_context_ids,
+        paste, reset_brush_selection, symbol_base_glyph, symbol_context_ids,
     };
     use crate::document::layout::{ContextHit, RangeKind};
     use crate::document::math::MathNode;
@@ -2929,5 +2978,29 @@ mod tests {
                 .iter()
                 .all(|row| !row.preview.is_empty())
         );
+    }
+
+    #[test]
+    fn our_own_clipboard_text_pastes_as_notation() {
+        let mut tabs = insert_tabs("own", "");
+        tabs.set_yank("costs $a/b$ today".to_string());
+        paste(&mut tabs, false, 1, "costs $a/b$ today");
+        let runs = tabs.active().unwrap().document.blocks[0].inlines();
+        assert!(matches!(runs[0], Inline::Text(ref t) if t.text == "costs "));
+        assert!(matches!(runs[1], Inline::Math(_)));
+        assert!(matches!(runs[2], Inline::Text(ref t) if t.text == " today"));
+    }
+
+    #[test]
+    fn foreign_clipboard_text_pastes_literally() {
+        let mut tabs = insert_tabs("foreign", "");
+        tabs.set_yank("the board costs $40 and the meter $12".to_string());
+        paste(&mut tabs, false, 1, "");
+        let runs = tabs.active().unwrap().document.blocks[0].inlines();
+        assert_eq!(runs.len(), 1);
+        assert!(matches!(
+            runs[0],
+            Inline::Text(ref t) if t.text == "the board costs $40 and the meter $12"
+        ));
     }
 }

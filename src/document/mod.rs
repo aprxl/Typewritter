@@ -477,10 +477,10 @@ impl Document {
     }
 
     /// Returns text in a range, inserting logical newlines between blocks.
-    /// A math atom is written as its `$…$` notation — the same bytes
-    /// `markdown::serialize` writes to disk — so copy, cut, and the yank
-    /// register all carry the expression rather than an object-replacement
-    /// character, and pasting back reads the expression again.
+    /// A math atom is written as its `$…$` notation and a literal `$` in
+    /// prose is escaped as `\$` — the same bytes `markdown::serialize` writes
+    /// to disk — so copy, cut, and the yank register all carry a re-readable
+    /// form of the block, and pasting it back reconstructs the same content.
     pub fn range_text(&self, range: FlatRange) -> String {
         let range = range.normalized();
         let start = self.position(range.start.block, range.start.offset);
@@ -511,7 +511,10 @@ impl Document {
     /// Flat-text form of `[from, to)` within one block. A math atom costs
     /// exactly one flat position, so it is either wholly inside the range or
     /// wholly outside it; the `$…$` form is emitted whole, never sliced, so
-    /// `from`/`to` stay aligned with every other flat offset.
+    /// `from`/`to` stay aligned with every other flat offset. Prose is escaped
+    /// so the result is the same notation `markdown::serialize` writes to
+    /// disk: a literal `$` becomes `\$`, which cannot reopen math on the way
+    /// back in.
     fn block_range_text(&self, block: usize, from: usize, to: usize) -> String {
         let mut out = String::new();
         let mut cursor = 0;
@@ -522,12 +525,15 @@ impl Document {
             let slice_to = to.min(run_end);
             if slice_from < slice_to {
                 match run {
-                    Inline::Text(t) => out.extend(
-                        t.text
+                    Inline::Text(t) => {
+                        let slice: String = t
+                            .text
                             .chars()
                             .skip(slice_from - run_start)
-                            .take(slice_to - slice_from),
-                    ),
+                            .take(slice_to - slice_from)
+                            .collect();
+                        out.push_str(&Self::escape_prose(&slice));
+                    }
                     Inline::Math(list) => {
                         out.push('$');
                         out.push_str(&math_notation::print(list));
@@ -536,6 +542,22 @@ impl Document {
                 }
             }
             cursor = run_end;
+        }
+        out
+    }
+
+    /// Escape the prose characters `insert_notation` would otherwise read as
+    /// notation, exactly as `markdown::serialize_runs` does: a literal `$`
+    /// becomes `\$` (so it cannot open math on the way back) and a literal
+    /// `\` becomes `\\` (so it cannot collapse onto the next character).
+    fn escape_prose(text: &str) -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '$' => out.push_str("\\$"),
+                c => out.push(c),
+            }
         }
         out
     }
@@ -1258,6 +1280,11 @@ impl Document {
 
     // ---- edits (content changes set `dirty`) ----------------------------
 
+    /// Inserts `text` exactly as given. Every keystroke and every paste from
+    /// another application arrives here, so nothing in it is interpreted: a
+    /// `$` is a dollar sign, a `\` is a backslash. Only text this app itself
+    /// produced takes [`Self::insert_notation`], where `$…$` and `\$` carry
+    /// meaning.
     pub fn insert_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -1268,28 +1295,6 @@ impl Document {
         let i = self.caret.inline;
         let o = self.caret.offset;
         let flat = self.caret_flat(b);
-
-        // Pasting copied notation must reconstruct the expression, so `$…$`
-        // reads as math here exactly as `markdown` reads it on load. Plain
-        // text — the common case, and every single keystroke — never forms a
-        // `$…$` pair, so it keeps the style-merging path below unchanged.
-        if let Some(parsed) = text.contains('$').then(|| inline_runs(text, s))
-            && !matches!(parsed.as_slice(), [Inline::Text(_)])
-        {
-            let inserted: usize = parsed.iter().map(run_len).sum();
-            let (prefix, suffix) = split_run(self.blocks[b].inlines_mut().remove(i), o);
-            let mut runs = vec![prefix];
-            runs.extend(parsed);
-            runs.push(suffix);
-            self.blocks[b].inlines_mut().splice(i..i, runs);
-            let target = flat + inserted;
-            self.dirty = true;
-            self.enforce();
-            let (ni, no) = self.flat_to_pos(b, target.min(self.block_flat_len(b)));
-            self.caret.inline = ni;
-            self.caret.offset = no;
-            return;
-        }
 
         let len = text.chars().count();
         let runs = self.blocks[b].inlines();
@@ -1369,6 +1374,37 @@ impl Document {
         // insert at a run edge leaves a zero-length trash run whose position
         // would otherwise corrupt the caret).
         let target = flat + len;
+        self.dirty = true;
+        self.enforce();
+        let (ni, no) = self.flat_to_pos(b, target.min(self.block_flat_len(b)));
+        self.caret.inline = ni;
+        self.caret.offset = no;
+    }
+
+    /// Inserts inline Markdown that this app produced, reading `$…$` back as
+    /// an expression and `\$` as a literal dollar — the same notation
+    /// `block_range_text` writes on copy and `markdown::serialize` writes on
+    /// save. Only ever called with text Typewritter itself wrote; foreign
+    /// text goes through [`Self::insert_text`], which never interprets it.
+    pub fn insert_notation(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.clamp_caret();
+        let s = self.caret.style;
+        let b = self.caret.block;
+        let i = self.caret.inline;
+        let o = self.caret.offset;
+        let flat = self.caret_flat(b);
+
+        let parsed = inline_runs(text, s);
+        let inserted: usize = parsed.iter().map(run_len).sum();
+        let (prefix, suffix) = split_run(self.blocks[b].inlines_mut().remove(i), o);
+        let mut runs = vec![prefix];
+        runs.extend(parsed);
+        runs.push(suffix);
+        self.blocks[b].inlines_mut().splice(i..i, runs);
+        let target = flat + inserted;
         self.dirty = true;
         self.enforce();
         let (ni, no) = self.flat_to_pos(b, target.min(self.block_flat_len(b)));
@@ -3784,10 +3820,11 @@ mod tests {
         let copied = source.range_text(source.line_range(0, 0));
         assert_eq!(copied, "before $a/b$ after");
 
-        // Paste back the way the app does: `insert_text` reads `$…$` as math
-        // again, so the copied notation comes back as an expression.
+        // Paste back the way the shell does for text this app itself produced:
+        // `insert_notation` reads `$…$` as math again, so the copied notation
+        // comes back as an expression.
         let mut target = doc();
-        target.insert_text(&copied);
+        target.insert_notation(&copied);
         assert_eq!(
             target.blocks[0].inlines(),
             &[
@@ -3816,5 +3853,41 @@ mod tests {
         // range ending at offset 3 must not pull it in.
         let copied = d.range_text(FlatRange::new(d.position(0, 0), d.position(0, 3)));
         assert_eq!(copied, "abc");
+    }
+
+    #[test]
+    fn copying_prose_escapes_a_literal_dollar() {
+        let mut d = doc();
+        d.blocks = vec![Block::Paragraph(vec![plain_run("costs $40 and $12")])];
+        let copied = d.range_text(d.line_range(0, 0));
+        // A literal `$` must not look like math on the way back, so it is
+        // escaped exactly as `markdown::serialize` writes it to disk.
+        assert_eq!(copied, "costs \\$40 and \\$12");
+    }
+
+    #[test]
+    fn pasting_a_price_list_stays_literal() {
+        let mut d = doc();
+        d.insert_text("costs $40 and $12");
+        // Foreign text is inserted byte-for-byte: one text run, no expression.
+        let block = &d.blocks[0];
+        assert_eq!(
+            runs(block),
+            vec![("costs $40 and $12".into(), Style::PLAIN)]
+        );
+        assert!(!block.inlines().iter().any(|r| matches!(r, Inline::Math(_))));
+    }
+
+    #[test]
+    fn notation_reads_an_escaped_dollar_as_a_dollar() {
+        let mut d = doc();
+        d.insert_notation("costs \\$40 and \\$12");
+        // `\$` collapses to `$` with no expression and no backslash left over.
+        let block = &d.blocks[0];
+        assert_eq!(
+            runs(block),
+            vec![("costs $40 and $12".into(), Style::PLAIN)]
+        );
+        assert!(!block.inlines().iter().any(|r| matches!(r, Inline::Math(_))));
     }
 }
