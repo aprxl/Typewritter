@@ -265,7 +265,7 @@ impl Tabs {
         if let Some(tab) = self.active_mut() {
             f(&mut tab.document);
         }
-        let changed = self.tabs[index].document.blocks != before.blocks
+        let changed = self.tabs[index].document.body() != before.body()
             || self.tabs[index].document.notes != before.notes;
         if changed && self.transaction.is_none() {
             self.tabs[index].undo.push(before);
@@ -291,7 +291,7 @@ impl Tabs {
         let Some(index) = self.active else {
             return;
         };
-        if self.tabs[index].document.blocks != before.blocks
+        if self.tabs[index].document.body() != before.body()
             || self.tabs[index].document.notes != before.notes
         {
             self.tabs[index].undo.push(before);
@@ -884,7 +884,7 @@ mod tests {
 
         assert!(tabs.math_accept_conversion(&query, &offer));
         assert!(matches!(
-            tabs.active().unwrap().document.blocks[0].inlines()[0],
+            tabs.active().unwrap().document.body()[0].inlines()[0],
             crate::document::Inline::Math(ref list)
                 if matches!(list.as_slice(), [math::MathNode::Script { sub: Some(_), .. }])
         ));
@@ -994,12 +994,12 @@ mod tests {
         assert_eq!(fs::read_to_string(&b).unwrap(), "b");
         // The edited tabs round-trip exactly to their in-memory contents.
         assert_eq!(
-            Document::load(&a).unwrap().blocks,
-            tabs.tabs[0].document.blocks
+            Document::load(&a).unwrap().body(),
+            tabs.tabs[0].document.body()
         );
         assert_eq!(
-            Document::load(&c).unwrap().blocks,
-            tabs.tabs[2].document.blocks
+            Document::load(&c).unwrap().body(),
+            tabs.tabs[2].document.body()
         );
     }
 
@@ -1030,8 +1030,8 @@ mod tests {
         // The good tab is written and clean.
         assert!(!tabs.tabs[0].document.is_dirty());
         assert_eq!(
-            Document::load(&good).unwrap().blocks,
-            tabs.tabs[0].document.blocks
+            Document::load(&good).unwrap().body(),
+            tabs.tabs[0].document.body()
         );
         // The bad tab comes back in the list, still dirty.
         assert_eq!(failed.len(), 1);
@@ -1100,7 +1100,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "[[blue|TODO]]\n");
         let reopened = Document::load(&path).unwrap();
         assert!(matches!(
-            &reopened.blocks[0].inlines()[0],
+            &reopened.body()[0].inlines()[0],
             crate::document::Inline::Text(text)
                 if text.style.badge_color == BadgeColor::Blue
         ));
@@ -1128,7 +1128,7 @@ mod tests {
         tabs.save_active().unwrap();
         let reopened = Document::load(&path).unwrap();
         assert!(matches!(
-            &reopened.blocks[0].inlines()[0],
+            &reopened.body()[0].inlines()[0],
             crate::document::Inline::Math(list)
                 if matches!(&list[0], math::MathNode::Resolved {
                     role: math::SymbolRole::Constant,
@@ -1248,5 +1248,70 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A tab whose document is `"body text[^1]\n\n[^1]: note text\n"`, focused
+    /// into note 0. The body and the note hold different text so a change that
+    /// lands in the wrong scope is visible.
+    fn focused_note_tabs(tag: &str) -> (Tabs, Vec<crate::document::Block>) {
+        let path = temp_file(tag, "body text[^1]\n\n[^1]: note text\n");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        let body_before = tabs.active().unwrap().document.body().to_vec();
+        tabs.active_mut().unwrap().document.focus = crate::document::Focus::Note(0);
+        (tabs, body_before)
+    }
+
+    #[test]
+    fn normal_mode_delete_char_in_a_note_changes_the_note_and_leaves_the_body_identical() {
+        let (mut tabs, body_before) = focused_note_tabs("note-delete-char");
+        tabs.delete_char();
+        assert_eq!(note_text(&tabs), "ote text");
+        assert_eq!(
+            tabs.active().unwrap().document.body(),
+            body_before.as_slice(),
+            "the body is byte-for-byte identical"
+        );
+    }
+
+    #[test]
+    fn visual_range_delete_in_a_note_deletes_from_the_note_not_the_body() {
+        let (mut tabs, body_before) = focused_note_tabs("note-visual-delete");
+        tabs.delete_range(crate::document::FlatRange::new(
+            crate::document::FlatPos {
+                block: 0,
+                offset: 0,
+            },
+            crate::document::FlatPos {
+                block: 0,
+                offset: 4,
+            },
+        ));
+        assert_eq!(note_text(&tabs), " text");
+        assert_eq!(
+            tabs.active().unwrap().document.body(),
+            body_before.as_slice(),
+            "the body is byte-for-byte identical"
+        );
+    }
+
+    #[test]
+    fn text_object_inner_word_in_a_note_resolves_inside_the_note() {
+        let (mut tabs, body_before) = focused_note_tabs("note-iw");
+        tabs.move_caret_to(0, 0, 2);
+        let range = tabs
+            .active()
+            .unwrap()
+            .document
+            .text_object_range(crate::document::TextObject::InnerWord)
+            .unwrap();
+        assert_eq!((range.start.offset, range.end.offset), (0, 4));
+        tabs.delete_range(range);
+        assert_eq!(note_text(&tabs), " text");
+        assert_eq!(
+            tabs.active().unwrap().document.body(),
+            body_before.as_slice(),
+            "the body is byte-for-byte identical"
+        );
     }
 }

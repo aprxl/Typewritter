@@ -1080,7 +1080,7 @@ mod tests {
             },
         ];
         let mut document = Document::new(Path::new("notes/test.md"));
-        document.blocks = blocks;
+        *document.body_mut() = blocks;
         let layout = layout::layout(&document, 1000.0, &|value, _| {
             value.chars().count() as f32 * 10.0
         });
@@ -1106,7 +1106,7 @@ mod tests {
     #[test]
     fn editor_keeps_brush_targets_and_pointer_together() {
         let mut document = Document::new(Path::new("notes/test.md"));
-        document.blocks = vec![Block::Paragraph(vec![Inline::Text(Text {
+        *document.body_mut() = vec![Block::Paragraph(vec![Inline::Text(Text {
             text: "x".into(),
             style: Style::PLAIN,
         })])];

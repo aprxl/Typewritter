@@ -941,7 +941,7 @@ impl Shell {
                 node: None,
             }) => {
                 let range = self.docs.borrow().active().and_then(|tab| {
-                    let block_ref = tab.document.blocks.get(*block)?;
+                    let block_ref = tab.document.body().get(*block)?;
                     matches!(
                         block_ref.inlines().get(*inline),
                         Some(crate::document::Inline::Math(_))
@@ -1018,7 +1018,7 @@ impl Shell {
         self.docs
             .borrow()
             .active()
-            .map(|tab| outline::outline(&tab.document.blocks))
+            .map(|tab| outline::outline(tab.document.body()))
             .unwrap_or_default()
     }
 

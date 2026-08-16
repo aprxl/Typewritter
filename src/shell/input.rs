@@ -682,7 +682,7 @@ impl Shell {
             let Some(tab) = docs.active() else { return };
             let blocks = tab
                 .document
-                .blocks
+                .body()
                 .iter()
                 .map(|block| {
                     block
@@ -1390,7 +1390,7 @@ impl Shell {
                 let docs = self.docs.borrow();
                 let node = docs
                     .active()
-                    .and_then(|tab| tab.document.blocks.get(*block))
+                    .and_then(|tab| tab.document.body().get(*block))
                     .and_then(|block| block.inlines().get(*inline))
                     .and_then(|run| match run {
                         Inline::Math(list) => math::node_at(list, address),
@@ -2900,7 +2900,7 @@ mod tests {
 
         assert!(tabs.in_math());
         assert!(matches!(
-            tabs.active().unwrap().document.blocks[0].inlines()[0],
+            tabs.active().unwrap().document.body()[0].inlines()[0],
             Inline::Math(ref list) if list.is_empty()
         ));
     }
@@ -2917,9 +2917,9 @@ mod tests {
 
         let doc = &tabs.active().unwrap().document;
         assert!(!tabs.in_math());
-        assert!(matches!(doc.blocks[0].inlines()[0], Inline::Math(ref list) if list.is_empty()));
+        assert!(matches!(doc.body()[0].inlines()[0], Inline::Math(ref list) if list.is_empty()));
         assert!(matches!(
-            doc.blocks[0].inlines()[1],
+            doc.body()[0].inlines()[1],
             Inline::Text(ref text) if text.text == "bc"
         ));
     }
@@ -2987,7 +2987,7 @@ mod tests {
         let mut tabs = insert_tabs("own", "");
         tabs.set_yank("costs $a/b$ today".to_string());
         paste(&mut tabs, false, 1, "costs $a/b$ today");
-        let runs = tabs.active().unwrap().document.blocks[0].inlines();
+        let runs = tabs.active().unwrap().document.body()[0].inlines();
         assert!(matches!(runs[0], Inline::Text(ref t) if t.text == "costs "));
         assert!(matches!(runs[1], Inline::Math(_)));
         assert!(matches!(runs[2], Inline::Text(ref t) if t.text == " today"));
@@ -2998,7 +2998,7 @@ mod tests {
         let mut tabs = insert_tabs("foreign", "");
         tabs.set_yank("the board costs $40 and the meter $12".to_string());
         paste(&mut tabs, false, 1, "");
-        let runs = tabs.active().unwrap().document.blocks[0].inlines();
+        let runs = tabs.active().unwrap().document.body()[0].inlines();
         assert_eq!(runs.len(), 1);
         assert!(matches!(
             runs[0],

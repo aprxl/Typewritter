@@ -356,7 +356,7 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
     let mut anchors = Vec::new();
     let mut number_of = HashMap::new();
     let mut number = 0usize;
-    for (block, source) in doc.blocks.iter().enumerate() {
+    for (block, source) in doc.body().iter().enumerate() {
         for (inline, run) in source.inlines().iter().enumerate() {
             if let Inline::Note(label) = run {
                 number += 1;
@@ -373,11 +373,11 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
         }
     }
 
-    let mut blocks = Vec::with_capacity(doc.blocks.len());
+    let mut blocks = Vec::with_capacity(doc.body().len());
     let mut y = 0.0f32;
     let mut first_block = true;
 
-    for (source_index, block) in doc.blocks.iter().enumerate() {
+    for (source_index, block) in doc.body().iter().enumerate() {
         let gap_above = if first_block {
             0.0
         } else if block.is_heading() {
@@ -441,7 +441,7 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
 
         let gap_after = if block.is_code()
             && matches!(
-                doc.blocks.get(source_index + 1),
+                doc.body().get(source_index + 1),
                 Some(Block::CodeLine { first: false, .. })
             ) {
             0.0
@@ -463,7 +463,7 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
 
     DocLayout {
         blocks,
-        source: doc.blocks.clone(),
+        source: doc.body().to_vec(),
         height: y,
         anchors,
     }
@@ -1391,7 +1391,7 @@ mod tests {
     use super::*;
     use crate::document::math::{BigOp, MathNode, Slot, Step};
     use crate::document::math_layout::BoxKind;
-    use crate::document::{Inline, Text};
+    use crate::document::{Focus, Inline, Sidenote, Text};
 
     /// Every glyph 10 wide, so line breaks are countable by hand.
     fn fake_measure(text: &str, style: &TextStyle) -> f32 {
@@ -1401,7 +1401,7 @@ mod tests {
 
     fn doc_with(blocks: Vec<Block>) -> Document {
         let mut d = Document::new(std::path::Path::new("notes/t.md"));
-        d.blocks = blocks;
+        *d.body_mut() = blocks;
         d
     }
 
@@ -1418,15 +1418,55 @@ mod tests {
     };
 
     #[test]
+    fn layout_and_outline_are_unchanged_by_which_scope_is_focused() {
+        let mut d = doc_with(vec![
+            Block::Heading {
+                level: 1,
+                content: vec![Inline::Text(Text {
+                    text: "Title".into(),
+                    style: Style::PLAIN,
+                })],
+            },
+            Block::Paragraph(vec![
+                Inline::Text(Text {
+                    text: "body ".into(),
+                    style: Style::PLAIN,
+                }),
+                Inline::Note("1".into()),
+                Inline::Text(Text {
+                    text: " tail".into(),
+                    style: Style::PLAIN,
+                }),
+            ]),
+        ]);
+        d.notes.push(Sidenote {
+            label: "1".into(),
+            body: vec![para("note text")],
+            anchored: true,
+        });
+
+        let laid = layout(&d, 300.0, &fake_measure);
+        let nodes = crate::document::outline::outline(d.body());
+
+        d.focus = Focus::Note(0);
+
+        // Both describe the file, not the caret, so focusing a note must not
+        // move a single block or heading.
+        assert_eq!(layout(&d, 300.0, &fake_measure).source, laid.source);
+        assert_eq!(crate::document::outline::outline(d.body()), nodes);
+    }
+
+    #[test]
     fn greedy_wrap_breaks_exactly_and_reecovers_source() {
         let d = doc_with(vec![para("aaa bbb ccc ddd eee")]);
         let laid = layout(&d, 140.0, &fake_measure);
+        // "aaa bbb" = 70, + "ccc" = 110 <= 140, + " ddd" = 150 > 140.
         // "aaa bbb" = 70, + "ccc" = 110 <= 140, + " ddd" = 150 > 140.
         // The space before "ddd" belongs to line 0 ("aaa bbb ccc ").
         // Line 1: "ddd eee".
         assert_eq!(laid.blocks[0].lines.len(), 2);
 
-        let block = &d.blocks[0];
+        let block = &d.body()[0];
         let all_text: String = laid.blocks[0]
             .lines
             .iter()
@@ -1444,7 +1484,7 @@ mod tests {
         // unbroken line.
         assert_eq!(laid.blocks[0].lines.len(), 2);
         let last = laid.blocks[0].lines.last().unwrap();
-        let block = &d.blocks[0];
+        let block = &d.body()[0];
         assert_eq!(
             segment_text(&block.inlines()[last.segments[0].inline], &last.segments[0]),
             "supercalifragilistic"
@@ -1478,7 +1518,7 @@ mod tests {
         let laid = layout(&d, 100.0, &fake_measure);
         assert_eq!(laid.blocks[0].lines.len(), 2);
 
-        let block = &d.blocks[0];
+        let block = &d.body()[0];
         let line0 = &laid.blocks[0].lines[0];
         // "aaa " from run 0, "bbb" from run 1 (bold), then the space from
         // run 2 that hangs at the line's right edge (invisible, clipped).
@@ -1524,7 +1564,7 @@ mod tests {
         // right after that space, the caret sits on line 1 at x = 0.
         assert_eq!(
             flat_of_caret(
-                &d.blocks,
+                d.body(),
                 Caret {
                     block: 0,
                     inline: 0,
@@ -1574,7 +1614,7 @@ mod tests {
                 &fake_measure,
             );
             let hit = laid.hit(x, y, &fake_measure);
-            let hit_flat = flat_of_caret(&d.blocks, hit);
+            let hit_flat = flat_of_caret(d.body(), hit);
             assert_eq!(hit_flat, offset, "flat {offset} -> x {x}");
         }
     }
@@ -1665,7 +1705,7 @@ mod tests {
         layout(&d, 300.0, &check);
         assert_eq!(seen.get(), Some(24.0), "H1 text is measured at size 24");
         // The heading weight should be bold.
-        let h1_style = text_style(&d.blocks[0], Style::PLAIN);
+        let h1_style = text_style(&d.body()[0], Style::PLAIN);
         assert!(h1_style.weight > 0.0, "headings are always bold");
 
         // H4 matches body size (17.5) — bold is what distinguishes it.
@@ -1830,9 +1870,9 @@ mod tests {
         let laid = layout(&d, 1000.0, &fake_measure);
         let number = laid.anchors[0].number.clone();
         let anchor_width = advance(
-            &d.blocks[0].inlines()[0],
+            &d.body()[0].inlines()[0],
             "\u{FFFC}",
-            &d.blocks[0],
+            &d.body()[0],
             Style::PLAIN,
             Some(&number),
             &fake_measure,
@@ -1864,11 +1904,11 @@ mod tests {
         let laid = layout(&d, 1000.0, &fake_measure);
         assert_eq!(laid.anchors.len(), 11);
         for anchor in &laid.anchors {
-            let run = &d.blocks[anchor.block].inlines()[anchor.inline];
+            let run = &d.body()[anchor.block].inlines()[anchor.inline];
             let width = advance(
                 run,
                 "\u{FFFC}",
-                &d.blocks[anchor.block],
+                &d.body()[anchor.block],
                 Style::PLAIN,
                 Some(&anchor.number),
                 &fake_measure,
@@ -1881,17 +1921,17 @@ mod tests {
             );
         }
         let first = advance(
-            &d.blocks[0].inlines()[0],
+            &d.body()[0].inlines()[0],
             "\u{FFFC}",
-            &d.blocks[0],
+            &d.body()[0],
             Style::PLAIN,
             Some(&laid.anchors[0].number),
             &fake_measure,
         );
         let eleventh = advance(
-            &d.blocks[10].inlines()[0],
+            &d.body()[10].inlines()[0],
             "\u{FFFC}",
-            &d.blocks[10],
+            &d.body()[10],
             Style::PLAIN,
             Some(&laid.anchors[10].number),
             &fake_measure,
@@ -1905,9 +1945,9 @@ mod tests {
         let laid = layout(&d, 1000.0, &fake_measure);
         let number = laid.anchors[0].number.clone();
         let width = advance(
-            &d.blocks[0].inlines()[0],
+            &d.body()[0].inlines()[0],
             "\u{FFFC}",
-            &d.blocks[0],
+            &d.body()[0],
             Style::PLAIN,
             Some(&number),
             &fake_measure,
@@ -2007,19 +2047,19 @@ mod tests {
         let d = doc_with(vec![block]);
         let laid = layout(&d, 300.0, &fake_measure);
         let atom_width = advance(
-            &d.blocks[0].inlines()[0],
+            &d.body()[0].inlines()[0],
             "\u{FFFC}",
-            &d.blocks[0],
+            &d.body()[0],
             Style::PLAIN,
             None,
             &fake_measure,
         );
 
         let past = laid.hit(atom_width + 1.0, LINE_BODY / 2.0, &fake_measure);
-        assert_eq!(flat_of_caret(&d.blocks, past), 1);
+        assert_eq!(flat_of_caret(d.body(), past), 1);
 
         let inside_left = laid.hit(atom_width / 4.0, LINE_BODY / 2.0, &fake_measure);
-        assert_eq!(flat_of_caret(&d.blocks, inside_left), 0);
+        assert_eq!(flat_of_caret(d.body(), inside_left), 0);
     }
 
     #[test]
@@ -2041,9 +2081,9 @@ mod tests {
         let d = doc_with(vec![block]);
         let laid = layout(&d, 300.0, &fake_measure);
         let atom_width = advance(
-            &d.blocks[0].inlines()[1],
+            &d.body()[0].inlines()[1],
             "\u{FFFC}",
-            &d.blocks[0],
+            &d.body()[0],
             Style::PLAIN,
             None,
             &fake_measure,
@@ -2351,7 +2391,7 @@ mod tests {
         let first_width = advance(
             &first,
             "\u{FFFC}",
-            &d.blocks[0],
+            &d.body()[0],
             Style::PLAIN,
             None,
             &fake_measure,

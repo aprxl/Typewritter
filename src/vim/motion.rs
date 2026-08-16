@@ -77,7 +77,7 @@ fn block_len(block: &Block) -> usize {
 /// is what lets the word motions cross a block boundary without
 /// special-casing it at every call site.
 fn class_at(doc: &Document, block: usize, flat: usize) -> Option<CharClass> {
-    block_text(&doc.blocks[block])
+    block_text(&doc.scope()[block])
         .chars()
         .nth(flat)
         .and_then(class)
@@ -86,7 +86,7 @@ fn class_at(doc: &Document, block: usize, flat: usize) -> Option<CharClass> {
 /// The caret as a `(block, flat)` pair, clamped into bounds.
 fn caret_pos(doc: &Document) -> (usize, usize) {
     let caret = doc.caret;
-    let block = &doc.blocks[caret.block];
+    let block = &doc.scope()[caret.block];
     let runs = block.inlines();
     let inline = caret.inline.min(runs.len().saturating_sub(1));
     let prefix: usize = runs[..inline]
@@ -106,13 +106,13 @@ fn caret_pos(doc: &Document) -> (usize, usize) {
 /// clamping and the style-before context rule. `flat` past the block's end
 /// clamps to it (the block always has ≥1 run).
 fn set_pos(doc: &mut Document, block: usize, flat: usize) {
-    let len = block_len(&doc.blocks[block]);
+    let len = block_len(&doc.scope()[block]);
     if len == 0 {
         doc.set_caret(block, 0, 0);
         return;
     }
     let flat = flat.min(len);
-    let runs = doc.blocks[block].inlines();
+    let runs = doc.scope()[block].inlines();
     let mut acc = 0;
     for (i, run) in runs.iter().enumerate() {
         let run_len = match run {
@@ -139,9 +139,9 @@ fn set_pos(doc: &mut Document, block: usize, flat: usize) {
 /// One character forward, stepping onto the next block when the current one
 /// runs out. `None` at the end of the document.
 fn step_forward(doc: &Document, block: usize, flat: usize) -> Option<(usize, usize)> {
-    if flat < block_len(&doc.blocks[block]) {
+    if flat < block_len(&doc.scope()[block]) {
         Some((block, flat + 1))
-    } else if block + 1 < doc.blocks.len() {
+    } else if block + 1 < doc.scope().len() {
         Some((block + 1, 0))
     } else {
         None
@@ -154,7 +154,7 @@ fn step_back(doc: &Document, block: usize, flat: usize) -> Option<(usize, usize)
     if flat > 0 {
         Some((block, flat - 1))
     } else if block > 0 {
-        Some((block - 1, block_len(&doc.blocks[block - 1])))
+        Some((block - 1, block_len(&doc.scope()[block - 1])))
     } else {
         None
     }
@@ -176,7 +176,7 @@ fn word_forward(doc: &Document, start: (usize, usize)) -> (usize, usize) {
         }
     }
     loop {
-        if block_text(&doc.blocks[pos.0]).is_empty() && pos.1 == 0 && pos != start {
+        if block_text(&doc.scope()[pos.0]).is_empty() && pos.1 == 0 && pos != start {
             return pos;
         }
         if class_at(doc, pos.0, pos.1).is_some() {
@@ -198,7 +198,7 @@ fn word_back(doc: &Document, start: (usize, usize)) -> (usize, usize) {
         None => return start,
     };
     loop {
-        if block_text(&doc.blocks[pos.0]).is_empty() {
+        if block_text(&doc.scope()[pos.0]).is_empty() {
             return pos;
         }
         if class_at(doc, pos.0, pos.1).is_some() {
@@ -270,7 +270,7 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
             set_pos(
                 doc,
                 block,
-                flat.saturating_add(1).min(block_len(&doc.blocks[block])),
+                flat.saturating_add(1).min(block_len(&doc.scope()[block])),
             );
         }
         Motion::Up | Motion::Down => {}
@@ -298,7 +298,7 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
         Motion::LineStart => doc.move_home(),
         Motion::FirstNonBlank => {
             let (block, _) = caret_pos(doc);
-            let text = block_text(&doc.blocks[block]);
+            let text = block_text(&doc.scope()[block]);
             let col = text.chars().take_while(|c| c.is_whitespace()).count();
             set_pos(doc, block, col);
         }
@@ -306,14 +306,14 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
         // A count picks the block (1-based, vim style); plain `gg`/`G` go to
         // the first/last block.
         Motion::FirstLine => {
-            let block = count.saturating_sub(1).min(doc.blocks.len() - 1);
+            let block = count.saturating_sub(1).min(doc.scope().len() - 1);
             set_pos(doc, block, 0);
         }
         Motion::LastLine => {
             let block = if count > 1 {
-                count.saturating_sub(1).min(doc.blocks.len() - 1)
+                count.saturating_sub(1).min(doc.scope().len() - 1)
             } else {
-                doc.blocks.len() - 1
+                doc.scope().len() - 1
             };
             set_pos(doc, block, 0);
         }
@@ -322,13 +322,13 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
             set_pos(doc, block, 0);
         }
         Motion::ParagraphForward => {
-            let block = (doc.caret.block + count).min(doc.blocks.len() - 1);
+            let block = (doc.caret.block + count).min(doc.scope().len() - 1);
             set_pos(doc, block, 0);
         }
         Motion::FindForward(target) => {
             let mut pos = caret_pos(doc);
             for _ in 0..count {
-                let text = block_text(&doc.blocks[pos.0]);
+                let text = block_text(&doc.scope()[pos.0]);
                 let found = text
                     .chars()
                     .enumerate()
@@ -343,7 +343,7 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
         Motion::TillForward(target) => {
             let mut pos = caret_pos(doc);
             for _ in 0..count {
-                let text = block_text(&doc.blocks[pos.0]);
+                let text = block_text(&doc.scope()[pos.0]);
                 let found = text
                     .chars()
                     .enumerate()
@@ -358,7 +358,7 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
         Motion::FindBack(target) => {
             let mut pos = caret_pos(doc);
             for _ in 0..count {
-                let text: Vec<char> = block_text(&doc.blocks[pos.0]).chars().collect();
+                let text: Vec<char> = block_text(&doc.scope()[pos.0]).chars().collect();
                 let found = text[..pos.1.min(text.len())]
                     .iter()
                     .enumerate()
@@ -373,14 +373,14 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
         Motion::TillBack(target) => {
             let mut pos = caret_pos(doc);
             for _ in 0..count {
-                let text: Vec<char> = block_text(&doc.blocks[pos.0]).chars().collect();
+                let text: Vec<char> = block_text(&doc.scope()[pos.0]).chars().collect();
                 let found = text[..pos.1.min(text.len())]
                     .iter()
                     .enumerate()
                     .rev()
                     .find(|(_, c)| **c == target);
                 if let Some((offset, _)) = found {
-                    pos = (pos.0, (offset + 1).min(block_len(&doc.blocks[pos.0])));
+                    pos = (pos.0, (offset + 1).min(block_len(&doc.scope()[pos.0])));
                 }
             }
             set_pos(doc, pos.0, pos.1);
@@ -391,13 +391,12 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::{Focus, Sidenote};
     use std::path::Path;
 
     fn doc(blocks: Vec<Block>) -> Document {
         let mut d = Document::new(Path::new("notes/t.md"));
-        // Build a source-like flat text so `parse` produces the blocks we
-        // hand it. Simpler: set blocks directly (they are `pub`).
-        d.blocks = blocks;
+        *d.body_mut() = blocks;
         d
     }
 
@@ -527,5 +526,24 @@ mod tests {
         d.set_caret(0, 0, 0);
         apply(&mut d, Motion::Append, 1);
         assert_eq!(pos(&d), (0, 1), "a mid-line moves right by one char");
+    }
+
+    #[test]
+    fn word_forward_stops_at_the_note_own_word_boundaries_when_a_note_is_focused() {
+        let mut d = doc(vec![flat("aa bb")]);
+        d.notes.push(Sidenote {
+            label: "1".into(),
+            body: vec![flat("ccc ddd")],
+            anchored: true,
+        });
+        d.focus = Focus::Note(0);
+        d.set_caret(0, 0, 0);
+
+        apply(&mut d, Motion::WordForward, 1);
+
+        // The note's own gap after "ccc" is offset 4; the body's after "aa"
+        // is offset 3 — landing on 4 proves the motion read the note, not the
+        // body, even though both live at block 0.
+        assert_eq!(pos(&d), (0, 4));
     }
 }

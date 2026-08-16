@@ -514,7 +514,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
         .collect();
 
     Document {
-        blocks,
+        body: blocks,
         path: path.to_path_buf(),
         name,
         dirty: false,
@@ -635,8 +635,8 @@ pub fn serialize(doc: &Document) -> String {
     // Empty document (one empty paragraph) serializes to ""; "" parses
     // back to one empty paragraph, so "" is the fixpoint. An empty
     // Heading must NOT take this path — it would lose its heading-ness.
-    let empty = doc.blocks.len() == 1 && matches!(doc.blocks[0], Block::Paragraph(_)) && {
-        let runs = doc.blocks[0].inlines();
+    let empty = doc.body().len() == 1 && matches!(doc.body()[0], Block::Paragraph(_)) && {
+        let runs = doc.body()[0].inlines();
         runs.len() == 1 && matches!(runs[0], Inline::Text(Text { ref text, .. }) if text.is_empty())
     };
     if empty && doc.notes.is_empty() {
@@ -646,12 +646,12 @@ pub fn serialize(doc: &Document) -> String {
     let mut out = String::new();
     let mut i = 0;
     let mut first = true;
-    while i < doc.blocks.len() {
+    while i < doc.body().len() {
         if !first {
             out.push_str("\n\n");
         }
         first = false;
-        match &doc.blocks[i] {
+        match &doc.body()[i] {
             Block::CodeLine { lang, .. } => {
                 let opener = match lang {
                     Some(l) => format!("```{l}\n"),
@@ -660,11 +660,11 @@ pub fn serialize(doc: &Document) -> String {
                 out.push_str(&opener);
                 let mut j = i;
                 loop {
-                    let line: String = doc.blocks[j].inlines().iter().map(Inline::text).collect();
+                    let line: String = doc.body()[j].inlines().iter().map(Inline::text).collect();
                     out.push_str(&line);
                     out.push('\n');
                     j += 1;
-                    match doc.blocks.get(j) {
+                    match doc.body().get(j) {
                         Some(Block::CodeLine { first: false, .. }) => continue,
                         _ => break,
                     }
@@ -718,7 +718,7 @@ pub fn serialize(doc: &Document) -> String {
         // from disk) follows, in its own stored order, so both kinds survive
         // a round trip unchanged.
         let mut anchored: Vec<&str> = Vec::new();
-        for block in &doc.blocks {
+        for block in doc.body() {
             for run in block.inlines() {
                 if let Inline::Note(label) = run
                     && !anchored.contains(&label.as_str())
@@ -779,7 +779,7 @@ mod tests {
 
     fn doc_with(blocks: Vec<Block>) -> Document {
         let mut d = Document::new(Path::new("notes/test.md"));
-        d.blocks = blocks;
+        *d.body_mut() = blocks;
         d
     }
 
@@ -874,7 +874,7 @@ mod tests {
         for d in fixtures {
             let text = serialize(&d);
             let back = parse(Path::new("notes/test.md"), &text);
-            assert_eq!(back.blocks, d.blocks, "round-trip failed for: {text:?}");
+            assert_eq!(back.body(), d.body(), "round-trip failed for: {text:?}");
         }
     }
 
@@ -904,16 +904,16 @@ mod tests {
     #[test]
     fn a_rule_round_trips() {
         let d = parse(Path::new("x"), "before\n\n---\n\nafter\n");
-        assert!(d.blocks[1].is_divider());
+        assert!(d.body()[1].is_divider());
         assert_eq!(serialize(&d), "before\n\n---\n\nafter\n");
-        assert_eq!(parse(Path::new("x"), &serialize(&d)).blocks, d.blocks);
+        assert_eq!(parse(Path::new("x"), &serialize(&d)).body(), d.body());
     }
 
     #[test]
     fn a_math_block_round_trips_through_its_fence() {
         let d = doc_with(vec![Block::Math(vec![math("1/2")])]);
         assert_eq!(serialize(&d), "```tw-math v1\n1/2\n```\n");
-        assert_eq!(parse(Path::new("x"), &serialize(&d)).blocks, d.blocks);
+        assert_eq!(parse(Path::new("x"), &serialize(&d)).body(), d.body());
     }
 
     #[test]
@@ -925,27 +925,27 @@ mod tests {
         ])]);
         let text = serialize(&d);
         assert_eq!(text, "before $a/b$ after\n");
-        assert_eq!(parse(Path::new("x"), &text).blocks, d.blocks);
+        assert_eq!(parse(Path::new("x"), &text).body(), d.body());
     }
 
     #[test]
     fn a_prose_dollar_is_escaped_not_parsed() {
         let d = doc_with(vec![para(vec![plain("price $5")])]);
         assert_eq!(serialize(&d), "price \\$5\n");
-        assert_eq!(parse(Path::new("x"), &serialize(&d)).blocks, d.blocks);
+        assert_eq!(parse(Path::new("x"), &serialize(&d)).body(), d.body());
     }
 
     #[test]
     fn an_unknown_tw_math_version_stays_a_code_block() {
         let d = parse(Path::new("x"), "```tw-math v2\nx\n```\n");
-        assert!(d.blocks[0].is_code());
+        assert!(d.body()[0].is_code());
         assert_eq!(serialize(&d), "```tw-math v2\nx\n```\n");
     }
 
     #[test]
     fn a_paragraph_of_dashes_is_not_a_rule() {
         let d = parse(Path::new("x"), "\\---\n");
-        assert!(matches!(d.blocks[0], Block::Paragraph(_)));
+        assert!(matches!(d.body()[0], Block::Paragraph(_)));
         assert_eq!(text_of_block(&d, 0), "---");
         assert_eq!(serialize(&d), "\\---\n");
     }
@@ -955,12 +955,12 @@ mod tests {
         let np = |t: &str| para(vec![plain(t)]);
 
         // `#5` is a paragraph (no space after #).
-        assert_eq!(parse(Path::new("x"), "#5\n").blocks, vec![np("#5")]);
+        assert_eq!(parse(Path::new("x"), "#5\n").body(), vec![np("#5")]);
         // `#` alone is a paragraph (no content).
-        assert_eq!(parse(Path::new("x"), "#\n").blocks, vec![np("#")]);
+        assert_eq!(parse(Path::new("x"), "#\n").body(), vec![np("#")]);
         // `#### x` is a level-4 heading.
         assert_eq!(
-            parse(Path::new("x"), "#### x\n").blocks,
+            parse(Path::new("x"), "#### x\n").body(),
             vec![Block::Heading {
                 level: 4,
                 content: vec![plain("x")]
@@ -968,47 +968,47 @@ mod tests {
         );
         // `##### x` — too many hashes, a paragraph.
         assert_eq!(
-            parse(Path::new("x"), "##### x\n").blocks,
+            parse(Path::new("x"), "##### x\n").body(),
             vec![np("##### x")]
         );
         // No closer → literal.
         assert_eq!(
-            parse(Path::new("x"), "*no close\n").blocks,
+            parse(Path::new("x"), "*no close\n").body(),
             vec![np("*no close")]
         );
         assert_eq!(
-            parse(Path::new("x"), "**no close\n").blocks,
+            parse(Path::new("x"), "**no close\n").body(),
             vec![np("**no close")]
         );
         // Opening marker must be followed by non-space: `* space*` is plain
         // (a single literal `*`), and the trailing lone `*` is literal too.
         assert_eq!(
-            parse(Path::new("x"), "* space*\n").blocks,
+            parse(Path::new("x"), "* space*\n").body(),
             vec![np("* space*")]
         );
         // Escaped literal star.
         assert_eq!(
-            parse(Path::new("x"), "\\*literal\n").blocks,
+            parse(Path::new("x"), "\\*literal\n").body(),
             vec![np("*literal")]
         );
         // No nesting: bold run with literal inner markers.
         assert_eq!(
-            parse(Path::new("x"), "**a *b* c**\n").blocks,
+            parse(Path::new("x"), "**a *b* c**\n").body(),
             vec![para(vec![bold("a *b* c")])]
         );
         // CRLF tolerance.
         assert_eq!(
-            parse(Path::new("x"), "line one\r\nline two\r\n").blocks,
+            parse(Path::new("x"), "line one\r\nline two\r\n").body(),
             vec![np("line one line two")]
         );
         // Blank-line-only file → one empty paragraph.
         assert_eq!(
-            parse(Path::new("x"), "\n\n\n").blocks,
+            parse(Path::new("x"), "\n\n\n").body(),
             vec![empty_paragraph()]
         );
         // Multi-line paragraph joins to one line.
         assert_eq!(
-            parse(Path::new("x"), "a\nb\n\nc\n").blocks,
+            parse(Path::new("x"), "a\nb\n\nc\n").body(),
             vec![np("a b"), np("c")]
         );
     }
@@ -1021,10 +1021,10 @@ mod tests {
         let text = serialize(&d);
         assert_eq!(text, "A = 1 + R_2 / R_1\n");
         let back = parse(Path::new("x"), &text);
-        assert_eq!(back.blocks, d.blocks);
+        assert_eq!(back.body(), d.body());
         // Second round-trip stays stable too.
         let back2 = parse(Path::new("x"), &serialize(&back));
-        assert_eq!(back2.blocks, d.blocks);
+        assert_eq!(back2.body(), d.body());
     }
 
     #[test]
@@ -1034,8 +1034,8 @@ mod tests {
         let d = doc_with(vec![head(1, vec![plain("")])]);
         let text = serialize(&d);
         let back = parse(Path::new("x"), &text);
-        assert_eq!(back.blocks, d.blocks);
-        assert!(matches!(back.blocks[0], Block::Heading { level: 1, .. }));
+        assert_eq!(back.body(), d.body());
+        assert!(matches!(back.body()[0], Block::Heading { level: 1, .. }));
     }
 
     #[test]
@@ -1045,7 +1045,7 @@ mod tests {
         let d = doc_with(vec![head(2, vec![plain("")]), para(vec![plain("body")])]);
         let text = serialize(&d);
         let back = parse(Path::new("x"), &text);
-        assert_eq!(back.blocks, d.blocks);
+        assert_eq!(back.body(), d.body());
     }
 
     #[test]
@@ -1054,7 +1054,7 @@ mod tests {
         path.push(format!("typewritter_md_test_{}.md", std::process::id()));
 
         let mut d = Document::new(&path);
-        d.blocks = vec![
+        *d.body_mut() = vec![
             head(1, vec![plain("Title")]),
             para(vec![plain("Some "), bold("bold"), plain(" text")]),
         ];
@@ -1062,7 +1062,7 @@ mod tests {
         assert!(!d.is_dirty());
 
         let loaded = Document::load(&path).unwrap();
-        assert_eq!(loaded.blocks, d.blocks);
+        assert_eq!(loaded.body(), d.body());
 
         // NUL byte → refuse to load.
         std::fs::write(&path, b"a\x00b").unwrap();
@@ -1077,7 +1077,7 @@ mod tests {
     fn a_badge_is_a_verbatim_label_that_round_trips() {
         let text = "[[PS]] the same divider shows up next week\n";
         let d = parse(Path::new("n.md"), text);
-        let runs = d.blocks[0].inlines();
+        let runs = d.body()[0].inlines();
         assert!(runs[0].style().badge);
         assert_eq!(runs[0].text(), "PS");
         assert!(runs[1].style().is_plain());
@@ -1088,7 +1088,7 @@ mod tests {
     fn coloured_badges_round_trip_while_plain_markers_stay_orange() {
         let text = "[[TODO]] [[blue|INFO]] [[green|DONE]] [[purple|IDEA]]\n";
         let d = parse(Path::new("n.md"), text);
-        let colors: Vec<_> = d.blocks[0]
+        let colors: Vec<_> = d.body()[0]
             .inlines()
             .iter()
             .filter(|run| run.style().badge)
@@ -1111,14 +1111,14 @@ mod tests {
         for text in ["[[TODO but no closer\n", "[[]] empty\n", "a [ b [ c\n"] {
             let d = parse(Path::new("n.md"), text);
             assert!(
-                d.blocks[0].inlines().iter().all(|r| !r.style().badge),
+                d.body()[0].inlines().iter().all(|r| !r.style().badge),
                 "{text:?} should not have produced a badge"
             );
             // Serializing re-escapes the literal marker, so compare the
             // model rather than the bytes: `[[` on disk is `\[[` once it
             // has been through the editor, exactly as a literal `*` is.
             let out = serialize(&d);
-            assert_eq!(parse(Path::new("n.md"), &out).blocks, d.blocks);
+            assert_eq!(parse(Path::new("n.md"), &out).body(), d.body());
         }
     }
 
@@ -1126,7 +1126,7 @@ mod tests {
     fn a_highlight_nests_emphasis_rather_than_swallowing_it() {
         let text = "the ==**whole** story== here\n";
         let d = parse(Path::new("n.md"), text);
-        let runs = d.blocks[0].inlines();
+        let runs = d.body()[0].inlines();
         let marked: Vec<_> = runs.iter().filter(|r| r.style().highlight).collect();
         assert_eq!(marked.len(), 2, "`**whole**` and ` story` are both marked");
         assert!(marked[0].style().bold, "the emphasis survives the mark");
@@ -1139,7 +1139,7 @@ mod tests {
         // `is_boxed` styles draw their own box; a mark on top would fight
         // it, so the inner run keeps its own style and the mark is dropped.
         let d = parse(Path::new("n.md"), "==a `run` b==\n");
-        for inline in d.blocks[0].inlines() {
+        for inline in d.body()[0].inlines() {
             assert!(!(inline.style().highlight && inline.style().is_boxed()));
         }
     }
@@ -1151,7 +1151,7 @@ mod tests {
         let d = doc_with(vec![para(vec![plain("x [[y]] z == w [q] a = b")])]);
         let out = serialize(&d);
         assert_eq!(out, "x \\[[y]] z \\== w [q] a = b\n");
-        assert_eq!(parse(Path::new("n.md"), &out).blocks, d.blocks);
+        assert_eq!(parse(Path::new("n.md"), &out).body(), d.body());
     }
 
     // ---- inline code span tests -----------------------------------------
@@ -1161,10 +1161,10 @@ mod tests {
         let text = "the `foo()` call\n";
         let d = parse(Path::new("x"), text);
         assert_eq!(
-            d.blocks,
+            d.body(),
             vec![para(vec![plain("the "), code("foo()"), plain(" call")])]
         );
-        assert!(d.blocks[0].inlines()[1].style().code);
+        assert!(d.body()[0].inlines()[1].style().code);
         let back = serialize(&d);
         assert_eq!(back, "the `foo()` call\n");
     }
@@ -1174,10 +1174,10 @@ mod tests {
         // `*` inside a code span is literal, not emphasis.
         let text = "`a*b*c`\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 1);
-        assert_eq!(d.blocks[0].inlines().len(), 1);
-        assert!(d.blocks[0].inlines()[0].style().code);
-        assert_eq!(d.blocks[0].inlines()[0].text(), "a*b*c");
+        assert_eq!(d.body().len(), 1);
+        assert_eq!(d.body()[0].inlines().len(), 1);
+        assert!(d.body()[0].inlines()[0].style().code);
+        assert_eq!(d.body()[0].inlines()[0].text(), "a*b*c");
         // Round-trip.
         let back = serialize(&d);
         assert_eq!(back, "`a*b*c`\n");
@@ -1187,7 +1187,7 @@ mod tests {
     fn inline_code_span_no_closer_is_literal() {
         let text = "`no close\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks, vec![para(vec![plain("`no close")])]);
+        assert_eq!(d.body(), vec![para(vec![plain("`no close")])]);
     }
 
     #[test]
@@ -1196,9 +1196,9 @@ mod tests {
         let d = parse(Path::new("x"), text);
         // Two adjacent backticks: empty code span. Produces an empty
         // code-styled run, which survives as a valid (empty) run.
-        assert_eq!(d.blocks.len(), 1);
-        assert_eq!(d.blocks[0].inlines().len(), 1);
-        assert!(d.blocks[0].inlines()[0].style().code);
+        assert_eq!(d.body().len(), 1);
+        assert_eq!(d.body()[0].inlines().len(), 1);
+        assert!(d.body()[0].inlines()[0].style().code);
     }
 
     // ---- literal backtick in plain text --------------------------------
@@ -1211,7 +1211,7 @@ mod tests {
         // misread as a code-span opener on reload.
         assert_eq!(text, "use the \\` key\n");
         let back = parse(Path::new("x"), &text);
-        assert_eq!(back.blocks, d.blocks);
+        assert_eq!(back.body(), d.body());
     }
 
     // ---- fenced code block tests ---------------------------------------
@@ -1220,8 +1220,8 @@ mod tests {
     fn fenced_code_block_three_lines() {
         let text = "```\nline one\nline two\nline three\n```\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 3);
-        for (i, block) in d.blocks.iter().enumerate() {
+        assert_eq!(d.body().len(), 3);
+        for (i, block) in d.body().iter().enumerate() {
             assert!(block.is_code(), "block {i} should be CodeLine");
         }
         assert_eq!(text_of_block(&d, 0), "line one");
@@ -1233,14 +1233,14 @@ mod tests {
     }
 
     fn text_of_block(d: &Document, block: usize) -> String {
-        d.blocks[block].inlines().iter().map(Inline::text).collect()
+        d.body()[block].inlines().iter().map(Inline::text).collect()
     }
 
     #[test]
     fn fenced_code_contains_markdown_special_chars_verbatim() {
         let text = "```\n# not a heading\n**not bold**\n```\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 2);
+        assert_eq!(d.body().len(), 2);
         assert_eq!(text_of_block(&d, 0), "# not a heading");
         assert_eq!(text_of_block(&d, 1), "**not bold**");
         // Round-trip.
@@ -1252,10 +1252,10 @@ mod tests {
     fn fenced_code_empty_fence_round_trips() {
         let text = "```\n```\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 1);
-        assert!(d.blocks[0].is_code());
-        assert_eq!(d.blocks[0].inlines().len(), 1);
-        assert!(d.blocks[0].inlines()[0].text().is_empty());
+        assert_eq!(d.body().len(), 1);
+        assert!(d.body()[0].is_code());
+        assert_eq!(d.body()[0].inlines().len(), 1);
+        assert!(d.body()[0].inlines()[0].text().is_empty());
         // Round-trip: empty code line serializes as an empty line inside
         // the fence.
         let back = serialize(&d);
@@ -1266,14 +1266,14 @@ mod tests {
     fn fenced_code_paragraph_code_paragraph_round_trip() {
         let text = "intro\n\n```\ncode a\ncode b\n```\n\noutro\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 4);
-        assert!(!d.blocks[0].is_code());
+        assert_eq!(d.body().len(), 4);
+        assert!(!d.body()[0].is_code());
         assert_eq!(text_of_block(&d, 0), "intro");
-        assert!(d.blocks[1].is_code());
+        assert!(d.body()[1].is_code());
         assert_eq!(text_of_block(&d, 1), "code a");
-        assert!(d.blocks[2].is_code());
+        assert!(d.body()[2].is_code());
         assert_eq!(text_of_block(&d, 2), "code b");
-        assert!(!d.blocks[3].is_code());
+        assert!(!d.body()[3].is_code());
         assert_eq!(text_of_block(&d, 3), "outro");
         // Round-trip: exactly one newline sep before and after the group.
         let back = serialize(&d);
@@ -1284,10 +1284,10 @@ mod tests {
     fn fenced_code_unterminated_parses_without_panic() {
         let text = "before\n```\nline one\nline two\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 3);
-        assert!(!d.blocks[0].is_code());
-        assert!(d.blocks[1].is_code());
-        assert!(d.blocks[2].is_code());
+        assert_eq!(d.body().len(), 3);
+        assert!(!d.body()[0].is_code());
+        assert!(d.body()[1].is_code());
+        assert!(d.body()[2].is_code());
         assert_eq!(text_of_block(&d, 1), "line one");
         assert_eq!(text_of_block(&d, 2), "line two");
     }
@@ -1296,11 +1296,11 @@ mod tests {
     fn fenced_code_adjacent_fences_stay_separate() {
         let text = "```\na\n```\n\n```\nb\nc\n```\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 3);
-        assert!(d.blocks.iter().all(Block::is_code));
+        assert_eq!(d.body().len(), 3);
+        assert!(d.body().iter().all(Block::is_code));
         // First fence: one line, first block has first:true.
         assert!(matches!(
-            d.blocks[0],
+            d.body()[0],
             Block::CodeLine {
                 first: true,
                 lang: None,
@@ -1310,7 +1310,7 @@ mod tests {
         assert_eq!(text_of_block(&d, 0), "a");
         // Second fence: starts a new group, first block has first:true.
         assert!(matches!(
-            d.blocks[1],
+            d.body()[1],
             Block::CodeLine {
                 first: true,
                 lang: None,
@@ -1320,7 +1320,7 @@ mod tests {
         assert_eq!(text_of_block(&d, 1), "b");
         // Continuation of second fence: first:false.
         assert!(matches!(
-            d.blocks[2],
+            d.body()[2],
             Block::CodeLine {
                 first: false,
                 lang: None,
@@ -1337,13 +1337,13 @@ mod tests {
     fn fenced_code_blank_lines_inside_are_kept() {
         let text = "```\n\n\n\n```\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 3);
-        assert!(d.blocks[0].is_code());
-        assert!(d.blocks[0].inlines()[0].text().is_empty());
-        assert!(d.blocks[1].is_code());
-        assert!(d.blocks[1].inlines()[0].text().is_empty());
-        assert!(d.blocks[2].is_code());
-        assert!(d.blocks[2].inlines()[0].text().is_empty());
+        assert_eq!(d.body().len(), 3);
+        assert!(d.body()[0].is_code());
+        assert!(d.body()[0].inlines()[0].text().is_empty());
+        assert!(d.body()[1].is_code());
+        assert!(d.body()[1].inlines()[0].text().is_empty());
+        assert!(d.body()[2].is_code());
+        assert!(d.body()[2].inlines()[0].text().is_empty());
         let back = serialize(&d);
         assert_eq!(back, text);
     }
@@ -1352,12 +1352,12 @@ mod tests {
     fn fenced_code_tagged_opener() {
         let text = "prose before\n```lua\ncode line\n```\nprose after\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 3);
-        assert!(!d.blocks[0].is_code());
+        assert_eq!(d.body().len(), 3);
+        assert!(!d.body()[0].is_code());
         assert_eq!(text_of_block(&d, 0), "prose before");
-        assert!(d.blocks[1].is_code());
+        assert!(d.body()[1].is_code());
         assert_eq!(text_of_block(&d, 1), "code line");
-        assert!(!d.blocks[2].is_code());
+        assert!(!d.body()[2].is_code());
         assert_eq!(text_of_block(&d, 2), "prose after");
     }
 
@@ -1365,15 +1365,15 @@ mod tests {
     fn fenced_code_tagged_language_round_trips() {
         let text = "prose\n\n```lua\ncode\n```\n\nmore\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 3);
-        assert!(!d.blocks[0].is_code());
+        assert_eq!(d.body().len(), 3);
+        assert!(!d.body()[0].is_code());
         assert_eq!(text_of_block(&d, 0), "prose");
         assert!(matches!(
-            d.blocks[1],
+            d.body()[1],
             Block::CodeLine { first: true, lang: Some(ref l), .. } if l == "lua"
         ));
         assert_eq!(text_of_block(&d, 1), "code");
-        assert!(!d.blocks[2].is_code());
+        assert!(!d.body()[2].is_code());
         assert_eq!(text_of_block(&d, 2), "more");
         // Full round-trip: tag survives serialize.
         let back = serialize(&d);
@@ -1384,9 +1384,9 @@ mod tests {
     fn fenced_code_untagged_bare_fence_round_trips() {
         let text = "```\ncode\n```\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 1);
+        assert_eq!(d.body().len(), 1);
         assert!(matches!(
-            d.blocks[0],
+            d.body()[0],
             Block::CodeLine {
                 first: true,
                 lang: None,
@@ -1402,12 +1402,12 @@ mod tests {
     fn fenced_code_empty_tagged_fence_round_trips() {
         let text = "```lua\n```\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 1);
+        assert_eq!(d.body().len(), 1);
         assert!(matches!(
-            d.blocks[0],
+            d.body()[0],
             Block::CodeLine { first: true, lang: Some(ref l), .. } if l == "lua"
         ));
-        assert!(d.blocks[0].inlines()[0].text().is_empty());
+        assert!(d.body()[0].inlines()[0].text().is_empty());
         // Empty code line serializes as an empty line inside the fence.
         let back = serialize(&d);
         assert_eq!(back, "```lua\n\n```\n");
@@ -1417,14 +1417,14 @@ mod tests {
     fn fenced_code_two_tagged_fences_different_langs() {
         let text = "```lua\na\n```\n\n```rust\nb\n```\n";
         let d = parse(Path::new("x"), text);
-        assert_eq!(d.blocks.len(), 2);
+        assert_eq!(d.body().len(), 2);
         assert!(matches!(
-            d.blocks[0],
+            d.body()[0],
             Block::CodeLine { first: true, lang: Some(ref l), .. } if l == "lua"
         ));
         assert_eq!(text_of_block(&d, 0), "a");
         assert!(matches!(
-            d.blocks[1],
+            d.body()[1],
             Block::CodeLine { first: true, lang: Some(ref l), .. } if l == "rust"
         ));
         assert_eq!(text_of_block(&d, 1), "b");
@@ -1438,7 +1438,7 @@ mod tests {
     fn a_sidenote_round_trips_through_its_footnote_syntax() {
         let text = "The gain is stable[^1] across the band.\n\n[^1]: measured 10.94 at 1 kHz, bench rig B\n";
         let d = parse(Path::new("n.md"), text);
-        let runs = d.blocks[0].inlines();
+        let runs = d.body()[0].inlines();
         assert!(matches!(runs[1], Inline::Note(ref l) if l == "1"));
         assert_eq!(d.notes.len(), 1);
         assert_eq!(d.notes[0].label, "1");
@@ -1483,12 +1483,12 @@ mod tests {
     fn an_anchor_with_no_definition_survives_a_round_trip() {
         let text = "A note[^1] with no body\n";
         let d = parse(Path::new("n.md"), text);
-        assert!(matches!(d.blocks[0].inlines()[1], Inline::Note(ref l) if l == "1"));
+        assert!(matches!(d.body()[0].inlines()[1], Inline::Note(ref l) if l == "1"));
         assert!(d.notes.is_empty());
         let out = serialize(&d);
         assert_eq!(out, text);
         let back = parse(Path::new("n.md"), &out);
-        assert!(matches!(back.blocks[0].inlines()[1], Inline::Note(ref l) if l == "1"));
+        assert!(matches!(back.body()[0].inlines()[1], Inline::Note(ref l) if l == "1"));
     }
 
     #[test]
@@ -1527,15 +1527,15 @@ mod tests {
     fn a_bracket_that_is_not_a_footnote_is_ordinary_text() {
         // `[^` with no closing bracket is ordinary text.
         let d = parse(Path::new("n.md"), "see [^ the thing\n");
-        assert_eq!(d.blocks, vec![para(vec![plain("see [^ the thing")])]);
+        assert_eq!(d.body(), vec![para(vec![plain("see [^ the thing")])]);
         // A plain `[link]` is text, not a footnote.
         let d = parse(Path::new("n.md"), "a [link] here\n");
-        assert_eq!(d.blocks, vec![para(vec![plain("a [link] here")])]);
+        assert_eq!(d.body(), vec![para(vec![plain("a [link] here")])]);
         // A literal `[^1]` in prose is escaped on the way out so it re-reads
         // as text rather than as an anchor.
         let d = doc_with(vec![para(vec![plain("see [^1] done")])]);
         let out = serialize(&d);
         assert_eq!(out, "see \\[^1] done\n");
-        assert_eq!(parse(Path::new("n.md"), &out).blocks, d.blocks);
+        assert_eq!(parse(Path::new("n.md"), &out).body(), d.body());
     }
 }

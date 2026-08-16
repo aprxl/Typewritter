@@ -774,7 +774,7 @@ mod tests {
 
     fn range_doc(text: &str) -> Document {
         let mut doc = Document::new(Path::new("test.md"));
-        doc.blocks = vec![Block::Paragraph(vec![Inline::Text(Text {
+        *doc.body_mut() = vec![Block::Paragraph(vec![Inline::Text(Text {
             text: text.into(),
             style: Style::PLAIN,
         })])];
@@ -1007,10 +1007,12 @@ mod tests {
         );
 
         let mut lines = range_doc("first");
-        lines.blocks.push(Block::Paragraph(vec![Inline::Text(Text {
-            text: "second".into(),
-            style: Style::PLAIN,
-        })]));
+        lines
+            .body_mut()
+            .push(Block::Paragraph(vec![Inline::Text(Text {
+                text: "second".into(),
+                style: Style::PLAIN,
+            })]));
         assert_eq!(
             lines.range_text(Vim::operator_range(
                 &lines,
