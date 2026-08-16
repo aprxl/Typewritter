@@ -40,6 +40,12 @@ pub const GAP_HEADING: f32 = 26.0;
 pub const GAP_AFTER_HEADING: f32 = 8.0;
 /// Space below a rule — tighter than a paragraph's, for the same reason.
 pub const GAP_DIVIDER: f32 = 8.0;
+/// The size of an anchor's raised number. Matches the heading's auto-number:
+/// both are margin annotations, not part of the prose they annotate.
+pub const ANCHOR_SIZE: f32 = 11.0;
+/// How far an anchor's number sits above the line baseline — high enough to
+/// read as a footnote marker, low enough not to collide with the line above.
+pub const ANCHOR_RISE: f32 = 6.0;
 
 /// A run of a visual line that came from one source run, covering exactly
 /// `[start, start + len)` chars of it. Ranges on a line are contiguous and
@@ -72,6 +78,19 @@ pub struct BlockLayout {
     pub height: f32,
 }
 
+/// One sidenote anchor: where it is, and the number the reader sees.
+pub struct Anchor {
+    /// The block and inline run the anchor occupies.
+    pub block: usize,
+    pub inline: usize,
+    /// The author's label on disk — not shown, only used to find the note.
+    pub label: String,
+    /// The raised number shown, "1".."n" in document order.
+    pub number: String,
+    /// The y of the anchor's visual line, in document coordinates.
+    pub y: f32,
+}
+
 /// A whole document's layout.
 pub struct DocLayout {
     /// The visual blocks, one per source block.
@@ -81,6 +100,11 @@ pub struct DocLayout {
     /// A snapshot of the source blocks, so the editor can index a visual
     /// block back to its kind and runs without holding the live document.
     pub source: Vec<Block>,
+    /// Each sidenote anchor, in document order, with its derived number and
+    /// the y of the line it sits on. Nothing stores these — like the heading
+    /// outline, they are derived from position so a number can never
+    /// disagree with the anchor beside it.
+    pub anchors: Vec<Anchor>,
 }
 
 /// The smallest editable document node under a Normal-mode click.
@@ -142,6 +166,13 @@ pub fn text_style(kind: &Block, style: Style) -> TextStyle {
     base
 }
 
+/// The raised number an anchor draws with. The size matches the heading's
+/// auto-number and the colour is the accent, so an anchor reads as "this
+/// opens something" rather than as a word in the sentence.
+pub fn anchor_style() -> TextStyle {
+    TextStyle::serif(ANCHOR_SIZE, theme::ACCENT)
+}
+
 /// One word or whitespace stretch, with its source coordinates.
 struct Piece {
     text: String,
@@ -178,10 +209,15 @@ pub fn advance(
             math_layout::layout(list, 0, measure).width
         }
         Inline::Text(_) => measure(text, &text_style(block, style)),
-        // Real presentation lands in the next task; until then an anchor
-        // measures as a narrow fixed width so it stays one clickable
-        // position without claiming a glyph's width from the font.
-        Inline::Note(_) => 10.0,
+        // An anchor is measured from a fixed full-width digit, not from the
+        // author's label (which is not shown) and not from the derived
+        // number (which the caret path does not carry). The box is therefore
+        // always one digit wide and identical wherever it is asked for, so
+        // the caret and the drawing can never drift. A document with ten or
+        // more sidenotes draws a two-digit number slightly wider than this
+        // box; the anchor still occupies its one position and the gap is
+        // cosmetic.
+        Inline::Note(_) => measure("0", &anchor_style()),
     };
     let box_pad = if style.badge {
         theme::BADGE_PAD * 2.0
@@ -380,11 +416,41 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
         y += gap_after;
     }
 
+    let mut anchors = Vec::new();
+    let mut number = 0usize;
+    for (block, source) in doc.blocks.iter().enumerate() {
+        for (inline, run) in source.inlines().iter().enumerate() {
+            if let Inline::Note(label) = run {
+                number += 1;
+                anchors.push(Anchor {
+                    block,
+                    inline,
+                    label: label.clone(),
+                    number: number.to_string(),
+                    y: anchor_y(&blocks[block], inline),
+                });
+            }
+        }
+    }
+
     DocLayout {
         blocks,
         source: doc.blocks.clone(),
         height: y,
+        anchors,
     }
+}
+
+/// The y of the visual line the anchor `inline` sits on, in document
+/// coordinates — the same space the editor scrolls in. A note in the margin
+/// starts at this y, so it sits beside the sentence that anchored it.
+fn anchor_y(block: &BlockLayout, inline: usize) -> f32 {
+    for line in &block.lines {
+        if line.segments.iter().any(|segment| segment.inline == inline) {
+            return line.y;
+        }
+    }
+    block.y
 }
 
 fn run_text(run: &Inline) -> &str {
@@ -566,7 +632,7 @@ fn caret_for_click(
         if segment.style.badge {
             cum += theme::BADGE_PAD;
         }
-        if matches!(run, Inline::Math(_)) {
+        if matches!(run, Inline::Math(_) | Inline::Note(_)) {
             let w = advance(run, &text, block, segment.style, measure);
             if x <= cum + w / 2.0 {
                 pos = seg_flat;
@@ -617,6 +683,16 @@ fn flat_to_pos(block: &Block, flat: usize) -> (usize, usize) {
 }
 
 impl DocLayout {
+    /// Reports the label and y of each anchor in the document, in document
+    /// order, so the margin can put a note beside the sentence that made it.
+    /// The y is in document coordinates, the same space the editor scrolls in.
+    pub fn note_anchors(&self) -> Vec<(String, f32)> {
+        self.anchors
+            .iter()
+            .map(|anchor| (anchor.label.clone(), anchor.y))
+            .collect()
+    }
+
     /// (x, baseline-y, line-height) of a model caret, relative to content top.
     pub fn caret_pos(
         &self,
@@ -1627,6 +1703,73 @@ mod tests {
             )
             .expect("math immediately after a badge remains hittable");
         assert_eq!((hit.0, hit.1), (0, 1));
+    }
+
+    #[test]
+    fn note_anchors_are_reported_in_document_order() {
+        let d = doc_with(vec![
+            Block::Paragraph(vec![
+                Inline::Text(Text {
+                    text: "a".into(),
+                    style: Style::PLAIN,
+                }),
+                Inline::Note("second".into()),
+                Inline::Text(Text {
+                    text: " b".into(),
+                    style: Style::PLAIN,
+                }),
+            ]),
+            Block::Paragraph(vec![
+                Inline::Note("first".into()),
+                Inline::Text(Text {
+                    text: " text".into(),
+                    style: Style::PLAIN,
+                }),
+            ]),
+        ]);
+        let laid = layout(&d, 1000.0, &fake_measure);
+        // Labels follow document order, not the author's own label ordering —
+        // the anchor named "second" appears in the prose before "first".
+        assert_eq!(
+            laid.note_anchors(),
+            vec![
+                ("second".to_string(), laid.blocks[0].lines[0].y),
+                ("first".to_string(), laid.blocks[1].lines[0].y),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_anchor_advances_the_line_by_its_own_width() {
+        let block = Block::Paragraph(vec![
+            Inline::Note("a".into()),
+            Inline::Text(Text {
+                text: "word".into(),
+                style: Style::PLAIN,
+            }),
+        ]);
+        let d = doc_with(vec![block]);
+        let laid = layout(&d, 1000.0, &fake_measure);
+        let anchor_width = advance(
+            &d.blocks[0].inlines()[0],
+            "\u{FFFC}",
+            &d.blocks[0],
+            Style::PLAIN,
+            &fake_measure,
+        );
+        // The anchor measures as a raised digit, and the text after it starts
+        // at that width rather than on top of the number.
+        assert_eq!(anchor_width, fake_measure("0", &anchor_style()));
+        let (x, _, _) = laid.caret_pos(
+            Caret {
+                block: 0,
+                inline: 1,
+                offset: 0,
+                style: Style::PLAIN,
+            },
+            &fake_measure,
+        );
+        assert_eq!(x, anchor_width);
     }
 
     fn code_line_run(text: &str, first: bool) -> Block {

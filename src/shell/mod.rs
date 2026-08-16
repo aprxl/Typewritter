@@ -51,7 +51,6 @@ use crate::document::outline;
 use crate::frame::FrameScheduler;
 use crate::input::Input;
 use crate::layout::{Layout, NodeId, Rect, Size, Style};
-use crate::prose::Run;
 use crate::renderer::{Layer, LayerInvalidation, Renderer, ShaderEffect};
 use crate::tabs::Tabs;
 use crate::theme::{self, TextStyle};
@@ -211,6 +210,7 @@ pub struct Shell {
     breadcrumb_region: usize,
     topics_region: usize,
     text_region: usize,
+    sidenote_region: usize,
     status_region: usize,
     dialog_region: usize,
     palette_region: usize,
@@ -371,7 +371,7 @@ impl Shell {
             region(
                 renderer,
                 sidenotes,
-                Box::new(SidenoteMargin::new(mock_notes())),
+                Box::new(SidenoteMargin::new(Vec::new(), editor::TOP, 0.0)),
             ),
             region(renderer, topics, Box::new(Topics::new(Vec::new(), 0))),
             region(
@@ -399,6 +399,7 @@ impl Shell {
         let (tree_region, tab_region) = (idx(tree), idx(tabs));
         let (breadcrumb_region, topics_region, text_region) =
             (idx(breadcrumb), idx(topics), idx(text_column));
+        let sidenote_region = idx(sidenotes);
         let status_region = idx(status);
 
         // The overlays span the viewport by sitting on the root node, each
@@ -470,6 +471,7 @@ impl Shell {
             breadcrumb_region,
             topics_region,
             text_region,
+            sidenote_region,
             status_region,
             dialog_region,
             palette_region,
@@ -822,6 +824,7 @@ impl Shell {
                     blocks: Vec::new(),
                     height: 0.0,
                     source: Vec::new(),
+                    anchors: Vec::new(),
                 },
             }
         };
@@ -1019,6 +1022,57 @@ impl Shell {
             .unwrap_or_default()
     }
 
+    /// The margin's notes, stacked beside their anchors. Runs in
+    /// `rebuild_views`, so the resolution may lag the text a frame but never
+    /// animates (spec §12.2): a note jumps to its place rather than sliding.
+    fn sidenote_notes(&mut self) -> Vec<Note> {
+        let width = Editor::content_width(self.layout.rect(self.text_column));
+        let layout = self.current_layout(width);
+
+        // Resolve every borrow into a plain local first: a `Ref` from
+        // `docs.borrow()` held across the stacking below would still be
+        // alive there, and the `set_component` call this feeds would then
+        // find the `RefCell` already borrowed.
+        let anchored: Vec<(String, String, f32)> = layout
+            .anchors
+            .iter()
+            .map(|anchor| (anchor.label.clone(), anchor.number.clone(), anchor.y))
+            .collect();
+        let bodies: Vec<Vec<crate::document::Inline>> = {
+            let docs = self.docs.borrow();
+            match docs.active() {
+                Some(tab) => anchored
+                    .iter()
+                    .filter_map(|(label, _, _)| {
+                        tab.document
+                            .notes
+                            .iter()
+                            .find(|note| note.label == *label)
+                            .map(|note| note.body.clone())
+                    })
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+        let body_width = sidenotes::WIDTH - 46.0;
+        let mut wanted = Vec::with_capacity(anchored.len());
+        for (body, (_, _, y)) in bodies.iter().zip(&anchored) {
+            let runs = sidenotes::runs_of(body);
+            wanted.push((*y, sidenotes::body_height(&runs, body_width, &measure)));
+        }
+        let ys = sidenotes::stack(&wanted, sidenotes::GAP);
+
+        anchored
+            .iter()
+            .zip(&bodies)
+            .zip(&ys)
+            .map(|(((_, number, _), body), &y)| Note::new(number, sidenotes::runs_of(body), y))
+            .collect()
+    }
+
     /// Rebuilds the view regions (tab strip, breadcrumb, editor, status
     /// line) from a live snapshot. Called when [`Tabs::revision`] moves, and
     /// after the picker swaps the vault.
@@ -1168,6 +1222,14 @@ impl Shell {
         };
         self.regions[self.text_region].set_component(Box::new(editor.with_glow(self.glow.clone())));
         self.regions[self.status_region].set_component(Box::new(status));
+
+        let sidenote_notes = self.sidenote_notes();
+        let scroll = self.docs.borrow().editor_scroll;
+        self.regions[self.sidenote_region].set_component(Box::new(SidenoteMargin::new(
+            sidenote_notes,
+            editor::TOP,
+            scroll,
+        )));
     }
 }
 
@@ -1205,25 +1267,6 @@ fn dragged_width(rect: Rect, mouse_x: f32, from_right: bool) -> f32 {
     } else {
         mouse_x - rect.x
     }
-}
-
-/// Placeholder margin notes. Real ones need document anchors.
-fn mock_notes() -> Vec<Note> {
-    let body = TextStyle::serif(13.5, theme::DIM);
-    vec![
-        Note::new(
-            "1",
-            vec![
-                Run::text("ideal case —", body.clone()),
-                Run::text(" A → ∞", TextStyle::math(12.5, theme::DIM)),
-                Run::text(", input impedance taken as infinite", body.clone()),
-            ],
-        ),
-        Note::new(
-            "2",
-            vec![Run::text("measured 10.94 at 1 kHz, bench rig B", body)],
-        ),
-    ]
 }
 
 #[cfg(test)]

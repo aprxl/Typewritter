@@ -468,6 +468,14 @@ impl Tabs {
         self.edit(|doc| doc.insert_divider());
     }
 
+    /// Puts a sidenote anchor at the caret and opens an empty note for it.
+    /// A content change, so it goes through `edit` and promotes a preview.
+    pub fn insert_sidenote(&mut self) {
+        self.edit(|doc| {
+            doc.insert_sidenote();
+        });
+    }
+
     pub fn insert_inline_math(&mut self) {
         self.edit(Document::insert_inline_math);
     }

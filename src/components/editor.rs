@@ -2,6 +2,7 @@
 //! visible. The shell lays out the open document and hands it over as an
 //! [`Rc`]; this component only reads it.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::document::layout::{self, ContextHit, DocLayout, RangeKind};
@@ -262,6 +263,11 @@ pub struct Editor {
     /// blocks that are drawn, so a number can never disagree with the
     /// heading beside it.
     numbers: Vec<Option<String>>,
+    /// Each anchor's raised number, keyed by `(block, inline)`. Derived from
+    /// position in the same pass the heading numbers are, for the same
+    /// reason: a number that is stored is a number that can disagree with
+    /// what is beside it.
+    anchors: HashMap<(usize, usize), String>,
     selection: Option<FlatRange>,
     line_selection: bool,
     caret_on: bool,
@@ -292,6 +298,11 @@ impl Editor {
         for node in crate::document::outline::outline(&layout.source) {
             numbers[node.block] = Some(node.number);
         }
+        let anchors = layout
+            .anchors
+            .iter()
+            .map(|anchor| ((anchor.block, anchor.inline), anchor.number.clone()))
+            .collect();
         Self {
             layout,
             caret,
@@ -300,6 +311,7 @@ impl Editor {
             block_caret,
             caret_style,
             numbers,
+            anchors,
             selection: None,
             line_selection: false,
             math: None,
@@ -346,6 +358,7 @@ impl Editor {
                 blocks: Vec::new(),
                 height: 0.0,
                 source: Vec::new(),
+                anchors: Vec::new(),
             }),
             caret: Caret {
                 block: 0,
@@ -358,6 +371,7 @@ impl Editor {
             block_caret: false,
             caret_style: Style::PLAIN,
             numbers: Vec::new(),
+            anchors: HashMap::new(),
             selection: None,
             line_selection: false,
             math: None,
@@ -567,6 +581,7 @@ impl Component for Editor {
                 for segment in &line.segments {
                     let run = &kind.inlines()[segment.inline];
                     let is_math = matches!(run, Inline::Math(_));
+                    let is_note = matches!(run, Inline::Note(_));
                     let text: String = match run {
                         Inline::Text(t) => t
                             .text
@@ -575,13 +590,27 @@ impl Component for Editor {
                             .take(segment.len.min(VIEW_CAP))
                             .collect(),
                         Inline::Math(_) => ATOM.to_string(),
-                        // Real presentation lands in the next task; for now
-                        // an anchor is drawn as its own number.
-                        Inline::Note(label) => label.clone(),
+                        // An anchor draws its derived number, not the label
+                        // the author stored — see `Editor::anchors`.
+                        Inline::Note(_) => self
+                            .anchors
+                            .get(&(bi, segment.inline))
+                            .cloned()
+                            .unwrap_or_default(),
                     };
                     let width = layout::advance(run, &text, kind, segment.style, &|text, style| {
                         theme::width(layer, text, style)
                     });
+                    if is_note {
+                        let style = layout::anchor_style();
+                        theme::draw(
+                            layer,
+                            &text,
+                            (cursor, baseline - layout::ANCHOR_RISE),
+                            &style,
+                            theme::LEFT,
+                        );
+                    }
                     let label_x = cursor
                         + if segment.style.badge {
                             theme::BADGE_PAD
@@ -708,7 +737,10 @@ impl Component for Editor {
                     }
                 }
                 for ((text, style, at, _), segment) in pieces.iter().zip(&line.segments) {
-                    if matches!(kind.inlines()[segment.inline], Inline::Math(_)) {
+                    if matches!(
+                        kind.inlines()[segment.inline],
+                        Inline::Math(_) | Inline::Note(_)
+                    ) {
                         continue;
                     }
                     let style = layout::text_style(kind, *style);

@@ -327,6 +327,16 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.docs.borrow_mut().insert_divider(),
     },
     Command {
+        // Spec §5: a sidenote is a block like the rest, reachable from the
+        // same `/` menu. No chord: the obvious ones are taken, and the menu
+        // is enough on its own.
+        id: "format.sidenote",
+        title: "Sidenote",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().insert_sidenote(),
+    },
+    Command {
         // SPEC §6.1: <leader>m once a leader-binding mechanism exists.
         id: "format.math",
         title: "Math",
@@ -793,6 +803,17 @@ mod tests {
             editor
                 .iter()
                 .any(|command| command.id == "format.math_block")
+        );
+    }
+
+    #[test]
+    fn sidenote_appears_in_the_editors_slash_menu() {
+        // The `/` menu lists every Format-group command; a sidenote is one
+        // of them, so creating one is one keystroke away in Insert mode.
+        assert!(
+            editor_commands()
+                .iter()
+                .any(|command| command.id == "format.sidenote")
         );
     }
 
