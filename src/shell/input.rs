@@ -30,7 +30,7 @@ use crate::tabs::Tabs;
 use crate::theme::{self, TextStyle};
 use crate::vault::Vault;
 use crate::vim::{
-    Edit, ExtendedAction, Key, Mode, Motion, Operator, OperatorTarget, VimMode, VisualAction,
+    Edit, ExtendedAction, Key, Mode, Motion, Operator, OperatorTarget, Vim, VimMode, VisualAction,
     VisualMode, motion,
 };
 
@@ -586,11 +586,9 @@ impl Shell {
                 self.goal_x = None;
             }
             ExtendedAction::InsertAt(m) => {
-                self.docs.borrow_mut().begin_transaction();
-                self.docs.borrow_mut().touch(|doc| motion::apply(doc, m, 1));
-                self.vim.set_mode(Mode::Insert);
-                self.insert_repeat.clear();
                 self.insert_prefix = None;
+                self.start_insert();
+                self.docs.borrow_mut().touch(|doc| motion::apply(doc, m, 1));
                 self.goal_x = None;
             }
             ExtendedAction::Edit(edit, count) => {
@@ -606,7 +604,10 @@ impl Shell {
                 if self.search.is_some() {
                     self.finish_search();
                 }
-                self.vim.set_mode(mode);
+                match mode {
+                    Mode::Insert => self.start_insert(),
+                    Mode::Normal => self.vim.set_mode(Mode::Normal),
+                }
                 self.goal_x = None;
             }
             ExtendedAction::Leader => self.open_palette(),
@@ -738,7 +739,7 @@ impl Shell {
 
     fn start_insert(&mut self) {
         self.insert_repeat.clear();
-        self.vim.set_mode(Mode::Insert);
+        enter_insert(&mut self.docs.borrow_mut(), &mut self.vim);
     }
 
     fn apply_visual(&mut self, action: VisualAction) {
@@ -2287,6 +2288,17 @@ fn delete_chars(docs: &mut Tabs, count: usize) {
     });
 }
 
+/// Enter Insert mode, opening the undo transaction that groups the whole
+/// insert session into one step. This is the one place every path into
+/// Insert mode funnels through — `i`/`a`/`I`/`A`, the click that lands in a
+/// math atom, `o`/`O`, `s`, and the change operators — so they cannot drift
+/// apart on undo granularity again. `Tabs::begin_transaction` already guards
+/// against nesting, so a second entry while one is open is a no-op.
+fn enter_insert(docs: &mut Tabs, vim: &mut Vim) {
+    docs.begin_transaction();
+    vim.set_mode(Mode::Insert);
+}
+
 /// Edits `state` from one frame's input. Returns whether anything changed
 /// enough to need the palette region rebuilt. A free function rather than
 /// a method: it only ever needs the one field's worth of state, and taking
@@ -2529,14 +2541,15 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_brush_hits, brush_sweep_samples, delete_chars, delete_inside_math, math_menu_rows,
-        math_menu_variant_start, move_inside_math, moved_math_menu_selection,
+        add_brush_hits, brush_sweep_samples, delete_chars, delete_inside_math, enter_insert,
+        math_menu_rows, math_menu_variant_start, move_inside_math, moved_math_menu_selection,
         reset_brush_selection, symbol_base_glyph, symbol_context_ids,
     };
     use crate::document::layout::{ContextHit, RangeKind};
     use crate::document::math::MathNode;
     use crate::document::{Document, FlatPos, FlatRange, Inline, math_conversion, math_symbols};
     use crate::tabs::Tabs;
+    use crate::vim::{Mode, Vim};
 
     #[test]
     fn symbol_context_keeps_roles_first_and_offers_only_valid_variants() {
@@ -2725,6 +2738,55 @@ mod tests {
         tabs.open_full(&path);
         tabs.insert_inline_math();
         tabs
+    }
+
+    fn insert_tabs(tag: &str, content: &str) -> Tabs {
+        let path: PathBuf =
+            std::env::temp_dir().join(format!("tw-shell-insert-{tag}-{}.md", std::process::id()));
+        fs::write(&path, content).unwrap();
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        tabs
+    }
+
+    #[test]
+    fn every_way_into_insert_mode_opens_one_transaction() {
+        // The `i` path (`InsertAt`) and the click-into-math path
+        // (`Enter(Mode::Insert)`) both reach Insert mode through
+        // `start_insert`, whose transaction-open is `enter_insert`. Drive it
+        // directly here — `apply` itself needs a live Renderer — and check
+        // one entry groups the whole session while a repeated entry does not
+        // stack a second snapshot.
+        let mut tabs = insert_tabs("i", "abc");
+        let mut vim = Vim::new();
+        tabs.move_caret_to(0, 0, 3);
+        enter_insert(&mut tabs, &mut vim);
+        assert_eq!(vim.mode(), Mode::Insert);
+        tabs.type_text("d");
+        tabs.type_text("e");
+        tabs.end_transaction();
+        assert_eq!(tabs.active().unwrap().document.block_text(0), "abcde");
+        tabs.undo();
+        assert_eq!(tabs.active().unwrap().document.block_text(0), "abc");
+        tabs.undo();
+        assert_eq!(
+            tabs.active().unwrap().document.block_text(0),
+            "abc",
+            "the whole insert session undoes in one step"
+        );
+
+        // A second entry before Esc — the click handler firing Enter again
+        // while already in Insert — must not open a nested transaction.
+        let mut tabs = insert_tabs("click", "");
+        let mut vim = Vim::new();
+        enter_insert(&mut tabs, &mut vim);
+        enter_insert(&mut tabs, &mut vim);
+        tabs.type_text("x");
+        tabs.type_text("y");
+        tabs.end_transaction();
+        assert_eq!(tabs.active().unwrap().document.block_text(0), "xy");
+        tabs.undo();
+        assert_eq!(tabs.active().unwrap().document.block_text(0), "");
     }
 
     #[test]

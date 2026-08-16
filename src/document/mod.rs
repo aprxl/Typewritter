@@ -341,6 +341,74 @@ fn split_run(run: Inline, at: usize) -> (Inline, Inline) {
     }
 }
 
+/// Split inserted text into inline runs, reading `$…$` as a math expression
+/// exactly as `markdown::parse_inline` does, so pasting copied notation
+/// reconstructs the expression instead of leaving literal dollars. A `\`
+/// collapses onto the next character the way markdown reads it; everything
+/// else is one text run in `style`.
+fn inline_runs(text: &str, style: Style) -> Vec<Inline> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut runs: Vec<Inline> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                if i + 1 < chars.len() {
+                    buf.push(chars[i + 1]);
+                    i += 2;
+                } else {
+                    buf.push('\\');
+                    i += 1;
+                }
+            }
+            '$' => {
+                if let Some(close) = dollar_closer(&chars, i + 1) {
+                    push_text(&mut runs, &mut buf, style);
+                    let inner: String = chars[i + 1..close].iter().collect();
+                    runs.push(Inline::Math(math_notation::parse(&inner)));
+                    i = close + 1;
+                } else {
+                    buf.push('$');
+                    i += 1;
+                }
+            }
+            c => {
+                buf.push(c);
+                i += 1;
+            }
+        }
+    }
+    push_text(&mut runs, &mut buf, style);
+    runs
+}
+
+/// Char index of the next unescaped `$` at or after `start`, mirroring the
+/// closer scan `markdown` uses for inline math.
+fn dollar_closer(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += if i + 1 < chars.len() { 2 } else { 1 };
+        } else if chars[i] == '$' {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Append a pending text buffer as one text run, if it is non-empty.
+fn push_text(runs: &mut Vec<Inline>, buf: &mut String, style: Style) {
+    if !buf.is_empty() {
+        runs.push(Inline::Text(Text {
+            text: std::mem::take(buf),
+            style,
+        }));
+    }
+}
+
 impl Document {
     /// A fresh document with one empty paragraph; name from the path.
     pub fn new(path: &Path) -> Document {
@@ -409,7 +477,10 @@ impl Document {
     }
 
     /// Returns text in a range, inserting logical newlines between blocks.
-    /// A range containing math yields ATOM; yank serialization is future work.
+    /// A math atom is written as its `$…$` notation — the same bytes
+    /// `markdown::serialize` writes to disk — so copy, cut, and the yank
+    /// register all carry the expression rather than an object-replacement
+    /// character, and pasting back reads the expression again.
     pub fn range_text(&self, range: FlatRange) -> String {
         let range = range.normalized();
         let start = self.position(range.start.block, range.start.offset);
@@ -419,7 +490,6 @@ impl Document {
         }
         let mut text = String::new();
         for block in start.block..=end.block {
-            let block_text = self.block_text(block);
             let from = if block == start.block {
                 start.offset
             } else {
@@ -428,14 +498,46 @@ impl Document {
             let to = if block == end.block {
                 end.offset
             } else {
-                block_text.chars().count()
+                self.block_len(block)
             };
-            text.extend(block_text.chars().skip(from).take(to.saturating_sub(from)));
+            text.push_str(&self.block_range_text(block, from, to));
             if block != end.block {
                 text.push('\n');
             }
         }
         text
+    }
+
+    /// Flat-text form of `[from, to)` within one block. A math atom costs
+    /// exactly one flat position, so it is either wholly inside the range or
+    /// wholly outside it; the `$…$` form is emitted whole, never sliced, so
+    /// `from`/`to` stay aligned with every other flat offset.
+    fn block_range_text(&self, block: usize, from: usize, to: usize) -> String {
+        let mut out = String::new();
+        let mut cursor = 0;
+        for run in self.blocks[block].inlines() {
+            let run_start = cursor;
+            let run_end = cursor + run_len(run);
+            let slice_from = from.max(run_start);
+            let slice_to = to.min(run_end);
+            if slice_from < slice_to {
+                match run {
+                    Inline::Text(t) => out.extend(
+                        t.text
+                            .chars()
+                            .skip(slice_from - run_start)
+                            .take(slice_to - slice_from),
+                    ),
+                    Inline::Math(list) => {
+                        out.push('$');
+                        out.push_str(&math_notation::print(list));
+                        out.push('$');
+                    }
+                }
+            }
+            cursor = run_end;
+        }
+        out
     }
 
     /// Toggle style flags over selected text. Boxed styles replace all other
@@ -1161,13 +1263,35 @@ impl Document {
             return;
         }
         self.clamp_caret();
-        let len = text.chars().count();
         let s = self.caret.style;
         let b = self.caret.block;
         let i = self.caret.inline;
         let o = self.caret.offset;
         let flat = self.caret_flat(b);
 
+        // Pasting copied notation must reconstruct the expression, so `$…$`
+        // reads as math here exactly as `markdown` reads it on load. Plain
+        // text — the common case, and every single keystroke — never forms a
+        // `$…$` pair, so it keeps the style-merging path below unchanged.
+        if let Some(parsed) = text.contains('$').then(|| inline_runs(text, s))
+            && !matches!(parsed.as_slice(), [Inline::Text(_)])
+        {
+            let inserted: usize = parsed.iter().map(run_len).sum();
+            let (prefix, suffix) = split_run(self.blocks[b].inlines_mut().remove(i), o);
+            let mut runs = vec![prefix];
+            runs.extend(parsed);
+            runs.push(suffix);
+            self.blocks[b].inlines_mut().splice(i..i, runs);
+            let target = flat + inserted;
+            self.dirty = true;
+            self.enforce();
+            let (ni, no) = self.flat_to_pos(b, target.min(self.block_flat_len(b)));
+            self.caret.inline = ni;
+            self.caret.offset = no;
+            return;
+        }
+
+        let len = text.chars().count();
         let runs = self.blocks[b].inlines();
         let placeholder = runs.len() == 1 && runs[0].text().is_empty();
         let li = run_len(&runs[i]);
@@ -3632,5 +3756,65 @@ mod tests {
         d.toggle_style_range(first, badge);
         assert_eq!(runs(&d.blocks[0])[0].1, Style::PLAIN);
         assert_invariants(&d);
+    }
+
+    #[test]
+    fn copying_a_range_with_an_expression_yields_its_notation() {
+        let mut d = doc();
+        d.blocks = vec![Block::Paragraph(vec![
+            plain_run("The value is "),
+            Inline::Math(math_notation::parse("a/b")),
+            plain_run(" and here."),
+        ])];
+        let copied = d.range_text(d.line_range(0, 0));
+        assert!(copied.contains("$a/b$"), "copied: {copied:?}");
+        assert!(!copied.contains(ATOM), "no object-replacement character");
+        assert_eq!(copied, "The value is $a/b$ and here.");
+    }
+
+    #[test]
+    fn an_expression_survives_a_copy_and_a_paste() {
+        let original = math_notation::parse("a/b");
+        let mut source = doc();
+        source.blocks = vec![Block::Paragraph(vec![
+            plain_run("before "),
+            Inline::Math(original.clone()),
+            plain_run(" after"),
+        ])];
+        let copied = source.range_text(source.line_range(0, 0));
+        assert_eq!(copied, "before $a/b$ after");
+
+        // Paste back the way the app does: `insert_text` reads `$…$` as math
+        // again, so the copied notation comes back as an expression.
+        let mut target = doc();
+        target.insert_text(&copied);
+        assert_eq!(
+            target.blocks[0].inlines(),
+            &[
+                Inline::Text(Text {
+                    text: "before ".into(),
+                    style: Style::PLAIN,
+                }),
+                Inline::Math(original),
+                Inline::Text(Text {
+                    text: " after".into(),
+                    style: Style::PLAIN,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_selection_that_ends_before_an_expression_does_not_copy_it() {
+        let mut d = doc();
+        d.blocks = vec![Block::Paragraph(vec![
+            plain_run("abc"),
+            Inline::Math(math_notation::parse("a/b")),
+            plain_run("def"),
+        ])];
+        // "abc" occupies flat offsets 0..=2; the atom sits at offset 3, so a
+        // range ending at offset 3 must not pull it in.
+        let copied = d.range_text(FlatRange::new(d.position(0, 0), d.position(0, 3)));
+        assert_eq!(copied, "abc");
     }
 }
