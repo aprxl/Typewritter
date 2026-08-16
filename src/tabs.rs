@@ -119,6 +119,38 @@ impl Tabs {
         Ok(())
     }
 
+    /// Writes every tab that has unsaved changes and a path to write to.
+    /// Returns the paths that failed, so a caller can tell the reader which
+    /// notes did not make it rather than reporting a blanket success.
+    ///
+    /// A tab with no path on disk is skipped, not reported: it has never
+    /// been given a name, so there is nothing to write. One failing tab
+    /// does not stop the rest — that is why this returns a list of failures
+    /// instead of a `Result`.
+    pub fn save_all(&mut self) -> Vec<(PathBuf, std::io::Error)> {
+        let mut failed = Vec::new();
+        for tab in &mut self.tabs {
+            if !tab.document.is_dirty() {
+                continue;
+            }
+            if tab.document.path.as_os_str().is_empty() {
+                continue;
+            }
+            if let Err(error) = tab.document.save() {
+                failed.push((tab.document.path.clone(), error));
+            }
+        }
+        self.bump();
+        failed
+    }
+
+    /// Whether any open tab has unsaved changes. The autosave timer asks
+    /// this once the document has sat still; `save_all` is the only place
+    /// that needs to know *which* tabs are dirty.
+    pub fn any_dirty(&self) -> bool {
+        self.tabs.iter().any(|tab| tab.document.is_dirty())
+    }
+
     /// Single click: show `path` in a preview tab, replaced by the next
     /// preview open. A file already in a full tab just gets activated.
     /// Exactly one preview tab exists at any time.
@@ -921,6 +953,98 @@ mod tests {
         tabs.close_path(&a);
         assert!(tabs.tabs.is_empty());
         assert_eq!(tabs.tree_selected, None);
+    }
+
+    #[test]
+    fn save_all_writes_every_dirty_tab_and_skips_clean_ones() {
+        let a = temp_file("all-a", "a");
+        let b = temp_file("all-b", "b");
+        let c = temp_file("all-c", "c");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&a);
+        tabs.open_full(&b);
+        tabs.open_full(&c);
+
+        tabs.activate(0);
+        tabs.type_text(" edited");
+        tabs.activate(2);
+        tabs.type_text(" edited");
+
+        assert!(tabs.tabs[0].document.is_dirty());
+        assert!(!tabs.tabs[1].document.is_dirty());
+        assert!(tabs.tabs[2].document.is_dirty());
+
+        assert!(tabs.save_all().is_empty());
+
+        assert!(!tabs.tabs[0].document.is_dirty());
+        assert!(!tabs.tabs[2].document.is_dirty());
+        // The clean tab was never written: its file still holds the
+        // original contents.
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b");
+        // The edited tabs round-trip exactly to their in-memory contents.
+        assert_eq!(
+            Document::load(&a).unwrap().blocks,
+            tabs.tabs[0].document.blocks
+        );
+        assert_eq!(
+            Document::load(&c).unwrap().blocks,
+            tabs.tabs[2].document.blocks
+        );
+    }
+
+    #[test]
+    fn save_all_reports_a_failure_without_stopping() {
+        let good = temp_file("fail-good", "good");
+        // A file where a directory should be: writing anything beneath it
+        // fails with "not a directory".
+        let blocker = temp_file("fail-blocker", "blocker");
+        let bad = blocker.join("sub").join("note.md");
+
+        let mut tabs = Tabs::new();
+        tabs.open_full(&good);
+        tabs.tabs.push(Tab {
+            document: Document::new(&bad),
+            preview: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            yank: String::new(),
+        });
+        tabs.activate(0);
+        tabs.type_text(" edited");
+        tabs.activate(1);
+        tabs.type_text(" edited");
+
+        let failed = tabs.save_all();
+
+        // The good tab is written and clean.
+        assert!(!tabs.tabs[0].document.is_dirty());
+        assert_eq!(
+            Document::load(&good).unwrap().blocks,
+            tabs.tabs[0].document.blocks
+        );
+        // The bad tab comes back in the list, still dirty.
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, bad);
+        assert!(tabs.tabs[1].document.is_dirty());
+    }
+
+    #[test]
+    fn save_all_skips_a_tab_with_no_path() {
+        let mut tabs = Tabs::new();
+        tabs.tabs.push(Tab {
+            document: Document::new(Path::new("")),
+            preview: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            yank: String::new(),
+        });
+        tabs.active = Some(0);
+        tabs.type_text("untitled");
+        assert!(tabs.tabs[0].document.is_dirty());
+
+        // No path, no write: skipped, not reported as a failure.
+        assert!(tabs.save_all().is_empty());
+        assert!(tabs.tabs[0].document.is_dirty());
     }
 
     #[test]

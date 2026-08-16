@@ -145,6 +145,11 @@ enum InsertEvent {
 /// Half-width of the grab zone around a divider, in logical pixels.
 const GRAB: f32 = 3.0;
 
+/// How long the document must sit unchanged before it is written.
+/// Long enough not to fire between words, short enough that a crash
+/// costs a sentence rather than a lecture.
+const AUTOSAVE_IDLE: Duration = Duration::from_secs(2);
+
 /// Which panel a divider drag resizes. The two right-hand panels grow
 /// leftwards from their own right edge; the tree grows rightwards from
 /// its left edge.
@@ -223,6 +228,12 @@ pub struct Shell {
     /// middle of a step, so without this the loop would sleep past the
     /// blink — see [`stepped`].
     wake_at: Option<Instant>,
+    /// The wall clock of the last edit the autosave timer saw. Restarted
+    /// whenever [`Tabs::revision`] moves, so the save debounces from the
+    /// last edit rather than a fixed period.
+    autosave_last_edit: Instant,
+    /// The revision `autosave_last_edit` was captured at.
+    autosave_revision: u64,
     show_stats: bool,
     /// Draws each tree row's hit band (`d` toggles).
     debug_rows: bool,
@@ -469,6 +480,8 @@ impl Shell {
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
             pulse: Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16).ping_pong(),
             wake_at: None,
+            autosave_last_edit: Instant::now(),
+            autosave_revision: 0,
             show_stats: true,
             debug_rows: false,
             dragging: None,
@@ -518,6 +531,7 @@ impl Shell {
         renderer: &mut Renderer,
     ) -> bool {
         self.handle_input(input, viewport);
+        self.autosave();
         self.sync_math_menu();
         self.export_yank();
         self.sync_overlay_layers(renderer);
@@ -531,7 +545,14 @@ impl Shell {
         // cannot drive something that sleeps longer than the clamp.
         let mut animating = self.caret.advance();
         animating |= self.pulse.advance();
-        self.wake_at = Some(Instant::now() + self.caret.wake_in().min(self.pulse.wake_in()));
+        let animation_wake = Instant::now() + self.caret.wake_in().min(self.pulse.wake_in());
+        // A pending autosave is a deadline too: it must wake the loop from
+        // its sleep even though no animation is asking for a frame. Without
+        // this the save fires while typing and then never while idle.
+        self.wake_at = Some(
+            self.autosave_deadline()
+                .map_or(animation_wake, |at| at.min(animation_wake)),
+        );
         animating |= self.divider_hover.update(self.divider_hot, dt);
         animating |= self.divider_hover.is_animating();
         for panel in self.panels_mut() {
@@ -644,6 +665,44 @@ impl Shell {
     /// two frames a second, not for every frame between two blinks.
     pub fn wake_at(&self) -> Option<Instant> {
         self.wake_at
+    }
+
+    /// Runs the idle autosave: restart the clock whenever [`Tabs::revision`]
+    /// moves, and write every dirty tab once the document has sat still for
+    /// [`AUTOSAVE_IDLE`]. Failures are logged; a failing tab is retried on
+    /// the next idle window, not every frame.
+    fn autosave(&mut self) {
+        let revision = self.docs.borrow().revision();
+        if revision != self.autosave_revision {
+            self.autosave_revision = revision;
+            self.autosave_last_edit = Instant::now();
+            return;
+        }
+        let dirty = self.docs.borrow().any_dirty();
+        if autosave_due(self.autosave_last_edit, Instant::now(), dirty) {
+            let failed = self.docs.borrow_mut().save_all();
+            for (path, error) in failed {
+                eprintln!("autosave failed for {}: {error}", path.display());
+            }
+        }
+    }
+
+    /// The instant the idle autosave is next due, if a dirty tab is waiting.
+    /// `None` when nothing is dirty — there is no deadline to wake for.
+    fn autosave_deadline(&self) -> Option<Instant> {
+        if !self.docs.borrow().any_dirty() {
+            return None;
+        }
+        Some(self.autosave_last_edit + AUTOSAVE_IDLE)
+    }
+
+    /// Writes every dirty tab now, for the window-close path. Failures are
+    /// logged to stderr and swallowed — the window must always close, and
+    /// there is nothing left to retry once the loop has exited.
+    pub fn save_all(&mut self) {
+        for (path, error) in self.docs.borrow_mut().save_all() {
+            eprintln!("save failed for {}: {error}", path.display());
+        }
     }
 
     /// Attaches a layer to each overlay that is open and drops the layer of
@@ -1100,6 +1159,13 @@ impl Shell {
     }
 }
 
+/// Whether the idle autosave is due: a dirty document whose last edit was at
+/// least [`AUTOSAVE_IDLE`] ago. Kept as a pure function so the debounce is
+/// testable without running frames.
+fn autosave_due(last_edit: Instant, now: Instant, dirty: bool) -> bool {
+    dirty && now.saturating_duration_since(last_edit) >= AUTOSAVE_IDLE
+}
+
 /// The vault's display name, for the breadcrumb.
 fn vault_name(vault: &Option<Rc<RefCell<Vault>>>) -> Vec<String> {
     match vault {
@@ -1150,8 +1216,54 @@ fn mock_notes() -> Vec<Note> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dragged_width, grab_zone};
+    use super::{AUTOSAVE_IDLE, autosave_due, dragged_width, grab_zone};
     use crate::layout::Rect;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_edit_restarts_the_idle_clock() {
+        let first = Instant::now();
+        // A fresh edit is not yet due well inside the idle window.
+        assert!(!autosave_due(
+            first,
+            first + Duration::from_millis(500),
+            true
+        ));
+        // A second edit later restarts the clock: even though the first edit
+        // is now older than AUTOSAVE_IDLE, the document has only just
+        // changed again.
+        let second = first + Duration::from_millis(1500);
+        assert!(!autosave_due(
+            second,
+            second + Duration::from_millis(500),
+            true
+        ));
+        // Once that second edit sits still, it fires.
+        assert!(autosave_due(second, second + AUTOSAVE_IDLE, true));
+    }
+
+    #[test]
+    fn autosave_fires_once_the_document_sits_still() {
+        let edit = Instant::now();
+        assert!(!autosave_due(edit, edit, true));
+        assert!(!autosave_due(
+            edit,
+            edit + AUTOSAVE_IDLE - Duration::from_millis(1),
+            true
+        ));
+        assert!(autosave_due(edit, edit + AUTOSAVE_IDLE, true));
+        assert!(autosave_due(
+            edit,
+            edit + AUTOSAVE_IDLE + Duration::from_secs(1),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_clean_document_never_schedules_a_save() {
+        let edit = Instant::now();
+        assert!(!autosave_due(edit, edit + AUTOSAVE_IDLE * 10, false));
+    }
 
     #[test]
     fn a_right_hand_panel_grows_when_its_edge_is_dragged_left() {

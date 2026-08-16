@@ -111,7 +111,17 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Save every dirty tab before exiting — unconditionally, with
+                // no prompt and no "discard" path. The reader's notes are the
+                // reader's, this is a local vault with git sync planned, and a
+                // dialog between a student and their closing laptop is a way
+                // to lose work, not a way to protect it.
+                if let Some(shell) = &mut self.shell {
+                    shell.save_all();
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
                     // The one place physical pixels are correct.
