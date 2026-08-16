@@ -345,13 +345,23 @@ impl Shell {
                 }
             } else if let Some((block, inline, cursor)) = self.math_at(rect, mouse) {
                 self.goal_x = None;
+                set_body_coordinate_caret(
+                    &mut self.docs.borrow_mut(),
+                    BodyCoordinate::Caret(Caret {
+                        block,
+                        inline,
+                        offset: 0,
+                        style: Style::PLAIN,
+                    }),
+                );
                 self.docs.borrow_mut().enter_math_at(block, inline, cursor);
                 self.apply(ExtendedAction::Enter(Mode::Insert));
             } else if let Some(caret) = self.caret_at(rect, mouse) {
                 self.goal_x = None;
-                self.docs
-                    .borrow_mut()
-                    .move_caret_to(caret.block, caret.inline, caret.offset);
+                set_body_coordinate_caret(
+                    &mut self.docs.borrow_mut(),
+                    BodyCoordinate::Caret(caret),
+                );
             }
         }
 
@@ -838,9 +848,7 @@ impl Shell {
             None => (matches.len() - 1).wrapping_sub(count.max(1) - 1) % matches.len(),
         };
         let position = matches[index];
-        self.docs
-            .borrow_mut()
-            .touch(|doc| doc.set_flat_position(position));
+        set_body_coordinate_caret(&mut self.docs.borrow_mut(), BodyCoordinate::Flat(position));
     }
 
     fn start_insert(&mut self) {
@@ -2456,10 +2464,35 @@ fn enter_insert(docs: &mut Tabs, vim: &mut Vim) {
     vim.set_mode(Mode::Insert);
 }
 
+/// A coordinate resolved against the page's body layout. Both exact hit-test
+/// carets and flat search positions must reset focus before they touch the
+/// document, so a body coordinate can never be applied to a note by accident.
+#[derive(Clone, Copy)]
+enum BodyCoordinate {
+    Caret(Caret),
+    Flat(FlatPos),
+}
+
+/// Applies a body coordinate as one operation: focus body, then place caret.
+/// Keeping those writes together makes every page-derived caret move obey the
+/// same scope boundary.
+fn set_body_coordinate_caret(docs: &mut Tabs, coordinate: BodyCoordinate) {
+    docs.touch(|doc| {
+        doc.focus = Focus::Body;
+        match coordinate {
+            BodyCoordinate::Caret(caret) => doc.set_caret(caret.block, caret.inline, caret.offset),
+            BodyCoordinate::Flat(position) => doc.set_flat_position(position),
+        }
+    });
+}
+
 /// The note anchored at the caret — the anchor run the caret sits on, or the
 /// one immediately before it. A sidenote anchor occupies one flat position,
 /// so "on" and "immediately after" are the two flat offsets around it.
 fn note_at_caret(doc: &Document, caret: Caret) -> Option<usize> {
+    if doc.focus != Focus::Body {
+        return None;
+    }
     let label = anchor_label_at(doc.body(), caret)?;
     doc.notes.iter().position(|note| note.label == label)
 }
@@ -2802,19 +2835,20 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_brush_hits, brush_sweep_samples, delete_chars, delete_inside_math, enter_insert,
-        focus_note, focus_note_at, math_menu_rows, math_menu_variant_start, move_inside_math,
-        moved_math_menu_selection, note_at_caret, note_at_point, paste, reset_brush_selection,
-        return_to_anchor, symbol_base_glyph, symbol_context_ids,
+        BodyCoordinate, add_brush_hits, brush_sweep_samples, delete_chars, delete_inside_math,
+        enter_insert, focus_note, focus_note_at, math_menu_rows, math_menu_variant_start,
+        move_inside_math, moved_math_menu_selection, note_at_caret, note_at_point, paste,
+        reset_brush_selection, return_to_anchor, set_body_coordinate_caret, symbol_base_glyph,
+        symbol_context_ids,
     };
     use crate::document::layout::{ContextHit, RangeKind};
     use crate::document::math::MathNode;
     use crate::document::{
-        Block, Document, FlatPos, FlatRange, Focus, Inline, Style, Text, math_conversion,
+        Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, Style, Text, math_conversion,
         math_symbols,
     };
     use crate::tabs::Tabs;
-    use crate::vim::{Key, Mode, Vim};
+    use crate::vim::{Key, Mode, Motion, Vim, motion};
 
     #[test]
     fn symbol_context_keeps_roles_first_and_offers_only_valid_variants() {
@@ -2991,7 +3025,6 @@ mod tests {
             &mut point
         ));
     }
-    use crate::vim::Motion;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -3145,6 +3178,109 @@ mod tests {
         let doc = &tabs.active().unwrap().document;
         assert_eq!(doc.focus, Focus::Note(0));
         assert!(doc.caret.offset > 0);
+    }
+
+    #[test]
+    fn clicking_in_prose_while_a_note_is_focused_returns_focus_to_the_body_and_puts_the_caret_where_the_click_landed()
+     {
+        let mut tabs = note_tabs("click-prose");
+        focus_note(&mut tabs, 0);
+
+        set_body_coordinate_caret(
+            &mut tabs,
+            BodyCoordinate::Caret(Caret {
+                block: 0,
+                inline: 0,
+                offset: 2,
+                style: Style::PLAIN,
+            }),
+        );
+
+        let doc = &tabs.active().unwrap().document;
+        assert_eq!(doc.focus, Focus::Body);
+        assert_eq!(
+            (doc.caret.block, doc.caret.inline, doc.caret.offset),
+            (0, 0, 2)
+        );
+    }
+
+    #[test]
+    fn typing_after_that_click_lands_in_the_prose_not_in_the_note() {
+        let mut tabs = note_tabs("click-type");
+        focus_note(&mut tabs, 0);
+        set_body_coordinate_caret(
+            &mut tabs,
+            BodyCoordinate::Caret(Caret {
+                block: 0,
+                inline: 0,
+                offset: 2,
+                style: Style::PLAIN,
+            }),
+        );
+
+        tabs.type_text("X");
+
+        let doc = &tabs.active().unwrap().document;
+        assert_eq!(doc.focus, Focus::Body);
+        assert_eq!(doc.block_text(0), "boXdy\u{FFFC} tail");
+        assert_eq!(note_text(&tabs), "original");
+    }
+
+    #[test]
+    fn a_search_jump_while_a_note_is_focused_returns_focus_to_the_body_at_the_match() {
+        let mut tabs = note_tabs("search-note");
+        focus_note(&mut tabs, 0);
+        set_body_coordinate_caret(
+            &mut tabs,
+            BodyCoordinate::Flat(FlatPos {
+                block: 0,
+                offset: 5,
+            }),
+        );
+
+        let doc = &tabs.active().unwrap().document;
+        assert_eq!(doc.focus, Focus::Body);
+        assert_eq!(
+            doc.caret_position(),
+            FlatPos {
+                block: 0,
+                offset: 5
+            }
+        );
+    }
+
+    #[test]
+    fn a_motion_inside_a_note_stays_inside_the_notes_own_text() {
+        let mut tabs = note_tabs("motion-note");
+        focus_note(&mut tabs, 0);
+        tabs.touch(|doc| doc.set_caret(0, 0, 0));
+
+        motion::apply(
+            &mut tabs.active_mut().unwrap().document,
+            Motion::LastLine,
+            1,
+        );
+
+        let doc = &tabs.active().unwrap().document;
+        assert_eq!(doc.focus, Focus::Note(0));
+        assert_eq!(doc.caret.block, 0);
+        assert_eq!(doc.caret.offset, 0);
+    }
+
+    #[test]
+    fn note_edit_while_a_note_is_already_focused_does_nothing() {
+        let mut tabs = note_tabs("edit-note");
+        focus_note(&mut tabs, 0);
+        let before = tabs.active().unwrap().document.caret;
+
+        let index = {
+            let doc = &tabs.active().unwrap().document;
+            note_at_caret(doc, doc.caret)
+        };
+
+        assert_eq!(index, None);
+        assert_eq!(tabs.active().unwrap().document.focus, Focus::Note(0));
+        assert_eq!(tabs.active().unwrap().document.caret, before);
     }
 
     #[test]
