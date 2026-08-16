@@ -11,6 +11,8 @@
 //! prose collapses whitespace and carries no source offsets, both fatal to
 //! caret mapping.
 
+use std::collections::HashMap;
+
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::{Block, Caret, Document, FlatPos, FlatRange, Inline, Style, math_layout};
 use crate::theme::{self, TextStyle};
@@ -59,6 +61,10 @@ pub struct Segment {
     pub len: usize,
     /// The run's style — what to draw with.
     pub style: Style,
+    /// The raised number a sidenote anchor draws, and `None` for every other
+    /// run. Carried here so the caret, the hit tests, and the editor's
+    /// drawing all read the same number instead of deriving it each.
+    pub number: Option<String>,
 }
 
 /// One visual line: a contiguous slice of the source block's flat text.
@@ -181,6 +187,7 @@ struct Piece {
     start: usize,
     len: usize,
     space: bool,
+    number: Option<String>,
 }
 
 /// How far a run moves the cursor: its shaped width, plus the box
@@ -200,6 +207,7 @@ pub fn advance(
     text: &str,
     block: &Block,
     style: Style,
+    number: Option<&str>,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> f32 {
     let width = match run {
@@ -209,15 +217,13 @@ pub fn advance(
             math_layout::layout(list, 0, measure).width
         }
         Inline::Text(_) => measure(text, &text_style(block, style)),
-        // An anchor is measured from a fixed full-width digit, not from the
-        // author's label (which is not shown) and not from the derived
-        // number (which the caret path does not carry). The box is therefore
-        // always one digit wide and identical wherever it is asked for, so
-        // the caret and the drawing can never drift. A document with ten or
-        // more sidenotes draws a two-digit number slightly wider than this
-        // box; the anchor still occupies its one position and the gap is
-        // cosmetic.
-        Inline::Note(_) => measure("0", &anchor_style()),
+        // An anchor reserves the width of the number it actually draws, so
+        // the caret, the hit tests, and the editor's drawing — all of which
+        // ask `advance` — agree about where the character after the anchor
+        // begins. The number is derived from position once, in `layout`, and
+        // stamped onto the segment this run flows through; nothing measures
+        // it from a guess.
+        Inline::Note(_) => measure(number.unwrap_or("0"), &anchor_style()),
     };
     let box_pad = if style.badge {
         theme::BADGE_PAD * 2.0
@@ -233,6 +239,7 @@ fn piece_width(piece: &Piece, block: &Block, measure: &dyn Fn(&str, &TextStyle) 
         &piece.text,
         block,
         piece.style,
+        piece.number.as_deref(),
         measure,
     )
 }
@@ -283,10 +290,15 @@ fn wrap(
     lines
 }
 
-fn tokens(block: &Block) -> Vec<Piece> {
+fn tokens(
+    block: &Block,
+    block_index: usize,
+    numbers: &HashMap<(usize, usize), String>,
+) -> Vec<Piece> {
     let mut pieces = Vec::new();
     for (inline, run) in block.inlines().iter().enumerate() {
         let text = run.text();
+        let number = numbers.get(&(block_index, inline)).cloned();
         let chars: Vec<(usize, char)> = text.char_indices().collect();
         let mut k = 0;
         while k < chars.len() {
@@ -302,6 +314,7 @@ fn tokens(block: &Block) -> Vec<Piece> {
                 start: k,
                 len: j - k,
                 space,
+                number: number.clone(),
             });
             // Math text is one opaque ATOM character, so this already creates
             // one unsplittable non-space piece for the whole expression.
@@ -326,6 +339,7 @@ fn segments_for(pieces: &[Piece], line: &[usize]) -> Vec<Segment> {
                 start: p.start,
                 len: p.len,
                 style: p.style,
+                number: p.number.clone(),
             }),
         }
     }
@@ -334,6 +348,31 @@ fn segments_for(pieces: &[Piece], line: &[usize]) -> Vec<Segment> {
 
 /// One pass; `measure(text, style) -> width` is the only rendering input.
 pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) -> DocLayout {
+    // Number every anchor before measuring anything, so an anchor can reserve
+    // the width of the number it will actually draw. One counter, one source
+    // of truth: the ordinal lands on the `Anchor` and is stamped onto the
+    // pieces and segments the measuring and the drawing walks share, never
+    // recomputed in either.
+    let mut anchors = Vec::new();
+    let mut number_of = HashMap::new();
+    let mut number = 0usize;
+    for (block, source) in doc.blocks.iter().enumerate() {
+        for (inline, run) in source.inlines().iter().enumerate() {
+            if let Inline::Note(label) = run {
+                number += 1;
+                let ordinal = number.to_string();
+                number_of.insert((block, inline), ordinal.clone());
+                anchors.push(Anchor {
+                    block,
+                    inline,
+                    label: label.clone(),
+                    number: ordinal,
+                    y: 0.0,
+                });
+            }
+        }
+    }
+
     let mut blocks = Vec::with_capacity(doc.blocks.len());
     let mut y = 0.0f32;
     let mut first_block = true;
@@ -365,7 +404,7 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
             Block::Heading { .. } | Block::Paragraph(_) | Block::CodeLine { .. } => LINE_BODY,
         };
 
-        let pieces = tokens(block);
+        let pieces = tokens(block, source_index, &number_of);
         let grouped = wrap(&pieces, block, width, measure);
         let mut line_y = y;
         let lines = grouped
@@ -416,21 +455,10 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
         y += gap_after;
     }
 
-    let mut anchors = Vec::new();
-    let mut number = 0usize;
-    for (block, source) in doc.blocks.iter().enumerate() {
-        for (inline, run) in source.inlines().iter().enumerate() {
-            if let Inline::Note(label) = run {
-                number += 1;
-                anchors.push(Anchor {
-                    block,
-                    inline,
-                    label: label.clone(),
-                    number: number.to_string(),
-                    y: anchor_y(&blocks[block], inline),
-                });
-            }
-        }
+    // A note sits beside the line its anchor is on, and that line's y is only
+    // known after the block is laid out — fill it in now that the lines exist.
+    for anchor in &mut anchors {
+        anchor.y = anchor_y(&blocks[anchor.block], anchor.inline);
     }
 
     DocLayout {
@@ -540,7 +568,14 @@ fn x_of_flat(
         let text = segment_text(run, segment);
         let seg_len = segment.len;
         if flat >= seg_flat + seg_len {
-            x += advance(run, &text, block, segment.style, measure);
+            x += advance(
+                run,
+                &text,
+                block,
+                segment.style,
+                segment.number.as_deref(),
+                measure,
+            );
             seg_flat += seg_len;
         } else {
             // The caret is inside this segment: measure its prefix, past
@@ -633,7 +668,14 @@ fn caret_for_click(
             cum += theme::BADGE_PAD;
         }
         if matches!(run, Inline::Math(_) | Inline::Note(_)) {
-            let w = advance(run, &text, block, segment.style, measure);
+            let w = advance(
+                run,
+                &text,
+                block,
+                segment.style,
+                segment.number.as_deref(),
+                measure,
+            );
             if x <= cum + w / 2.0 {
                 pos = seg_flat;
                 break 'segments;
@@ -782,7 +824,14 @@ impl DocLayout {
                 .map(|run| run_text(run).chars().count())
                 .sum();
             let text = segment_text(run, segment);
-            let width = advance(run, &text, block, segment.style, measure);
+            let width = advance(
+                run,
+                &text,
+                block,
+                segment.style,
+                segment.number.as_deref(),
+                measure,
+            );
             if x >= advance_x && x <= advance_x + width {
                 let run_len = run_text(run).chars().count();
                 let whole_run = FlatRange::new(
@@ -903,7 +952,14 @@ impl DocLayout {
                 for segment in &line.segments {
                     let run = &block.inlines()[segment.inline];
                     let text = segment_text(run, segment);
-                    let width = advance(run, &text, block, segment.style, measure);
+                    let width = advance(
+                        run,
+                        &text,
+                        block,
+                        segment.style,
+                        segment.number.as_deref(),
+                        measure,
+                    );
                     let run_start: usize = block.inlines()[..segment.inline]
                         .iter()
                         .map(|run| run_text(run).chars().count())
@@ -1121,7 +1177,14 @@ impl DocLayout {
         for segment in &line.segments {
             let run = &block.inlines()[segment.inline];
             let text = segment_text(run, segment);
-            let width = advance(run, &text, block, segment.style, measure);
+            let width = advance(
+                run,
+                &text,
+                block,
+                segment.style,
+                segment.number.as_deref(),
+                measure,
+            );
             if let Inline::Math(list) = run {
                 let local = (x - advance_x, line.y + line.height / 2.0 - y);
                 let expression = math_layout::layout(list, 0, measure);
@@ -1189,7 +1252,14 @@ impl DocLayout {
         for segment in &line.segments {
             let run = &block.inlines()[segment.inline];
             let text = segment_text(run, segment);
-            let width = advance(run, &text, block, segment.style, measure);
+            let width = advance(
+                run,
+                &text,
+                block,
+                segment.style,
+                segment.number.as_deref(),
+                measure,
+            );
             if let Inline::Math(list) = run {
                 let local_x = x - advance_x;
                 // Math boxes use positive-up y; the line baseline is its centre.
@@ -1660,7 +1730,14 @@ mod tests {
         // The box counts: bare glyphs would put `x` under the chip.
         let bare = fake_measure("PS", &text_style(&block, badge));
         assert_eq!(
-            advance(&block.inlines()[0], "PS", &block, badge, &fake_measure),
+            advance(
+                &block.inlines()[0],
+                "PS",
+                &block,
+                badge,
+                None,
+                &fake_measure
+            ),
             bare + theme::BADGE_PAD * 2.0
         );
         assert_eq!(
@@ -1669,6 +1746,7 @@ mod tests {
                 "PS",
                 &block,
                 Style::PLAIN,
+                None,
                 &fake_measure,
             ),
             bare,
@@ -1750,16 +1828,18 @@ mod tests {
         ]);
         let d = doc_with(vec![block]);
         let laid = layout(&d, 1000.0, &fake_measure);
+        let number = laid.anchors[0].number.clone();
         let anchor_width = advance(
             &d.blocks[0].inlines()[0],
             "\u{FFFC}",
             &d.blocks[0],
             Style::PLAIN,
+            Some(&number),
             &fake_measure,
         );
-        // The anchor measures as a raised digit, and the text after it starts
-        // at that width rather than on top of the number.
-        assert_eq!(anchor_width, fake_measure("0", &anchor_style()));
+        // The anchor measures as its raised number, and the text after it
+        // starts at that width rather than on top of the number.
+        assert_eq!(anchor_width, fake_measure(&number, &anchor_style()));
         let (x, _, _) = laid.caret_pos(
             Caret {
                 block: 0,
@@ -1770,6 +1850,72 @@ mod tests {
             &fake_measure,
         );
         assert_eq!(x, anchor_width);
+    }
+
+    #[test]
+    fn an_anchor_reserves_the_width_of_its_own_number() {
+        // Eleven anchors: the eleventh draws "11", two digits wide, and must
+        // reserve both — never the one-digit box the first anchor got.
+        let d = doc_with(
+            (0..11)
+                .map(|i| Block::Paragraph(vec![Inline::Note(format!("note {i}"))]))
+                .collect(),
+        );
+        let laid = layout(&d, 1000.0, &fake_measure);
+        assert_eq!(laid.anchors.len(), 11);
+        for anchor in &laid.anchors {
+            let run = &d.blocks[anchor.block].inlines()[anchor.inline];
+            let width = advance(
+                run,
+                "\u{FFFC}",
+                &d.blocks[anchor.block],
+                Style::PLAIN,
+                Some(&anchor.number),
+                &fake_measure,
+            );
+            assert_eq!(
+                width,
+                fake_measure(&anchor.number, &anchor_style()),
+                "anchor {} reserves the width of the number it draws",
+                anchor.number
+            );
+        }
+        let first = advance(
+            &d.blocks[0].inlines()[0],
+            "\u{FFFC}",
+            &d.blocks[0],
+            Style::PLAIN,
+            Some(&laid.anchors[0].number),
+            &fake_measure,
+        );
+        let eleventh = advance(
+            &d.blocks[10].inlines()[0],
+            "\u{FFFC}",
+            &d.blocks[10],
+            Style::PLAIN,
+            Some(&laid.anchors[10].number),
+            &fake_measure,
+        );
+        assert!(eleventh > first);
+    }
+
+    #[test]
+    fn a_single_digit_anchor_is_not_padded_to_two() {
+        let d = doc_with(vec![Block::Paragraph(vec![Inline::Note("a".into())])]);
+        let laid = layout(&d, 1000.0, &fake_measure);
+        let number = laid.anchors[0].number.clone();
+        let width = advance(
+            &d.blocks[0].inlines()[0],
+            "\u{FFFC}",
+            &d.blocks[0],
+            Style::PLAIN,
+            Some(&number),
+            &fake_measure,
+        );
+        assert_eq!(number, "1");
+        // One digit wide — no reserve for a second digit that is not there.
+        assert_eq!(width, fake_measure("1", &anchor_style()));
+        assert_ne!(width, fake_measure("11", &anchor_style()));
     }
 
     fn code_line_run(text: &str, first: bool) -> Block {
@@ -1865,6 +2011,7 @@ mod tests {
             "\u{FFFC}",
             &d.blocks[0],
             Style::PLAIN,
+            None,
             &fake_measure,
         );
 
@@ -1898,6 +2045,7 @@ mod tests {
             "\u{FFFC}",
             &d.blocks[0],
             Style::PLAIN,
+            None,
             &fake_measure,
         );
         let line = &laid.blocks[0].lines[0];
@@ -2205,6 +2353,7 @@ mod tests {
             "\u{FFFC}",
             &d.blocks[0],
             Style::PLAIN,
+            None,
             &fake_measure,
         );
         let line = &laid.blocks[0].lines[0];

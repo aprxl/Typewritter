@@ -2,7 +2,6 @@
 //! visible. The shell lays out the open document and hands it over as an
 //! [`Rc`]; this component only reads it.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::document::layout::{self, ContextHit, DocLayout, RangeKind};
@@ -263,11 +262,6 @@ pub struct Editor {
     /// blocks that are drawn, so a number can never disagree with the
     /// heading beside it.
     numbers: Vec<Option<String>>,
-    /// Each anchor's raised number, keyed by `(block, inline)`. Derived from
-    /// position in the same pass the heading numbers are, for the same
-    /// reason: a number that is stored is a number that can disagree with
-    /// what is beside it.
-    anchors: HashMap<(usize, usize), String>,
     selection: Option<FlatRange>,
     line_selection: bool,
     caret_on: bool,
@@ -298,11 +292,6 @@ impl Editor {
         for node in crate::document::outline::outline(&layout.source) {
             numbers[node.block] = Some(node.number);
         }
-        let anchors = layout
-            .anchors
-            .iter()
-            .map(|anchor| ((anchor.block, anchor.inline), anchor.number.clone()))
-            .collect();
         Self {
             layout,
             caret,
@@ -311,7 +300,6 @@ impl Editor {
             block_caret,
             caret_style,
             numbers,
-            anchors,
             selection: None,
             line_selection: false,
             math: None,
@@ -371,7 +359,6 @@ impl Editor {
             block_caret: false,
             caret_style: Style::PLAIN,
             numbers: Vec::new(),
-            anchors: HashMap::new(),
             selection: None,
             line_selection: false,
             math: None,
@@ -591,16 +578,18 @@ impl Component for Editor {
                             .collect(),
                         Inline::Math(_) => ATOM.to_string(),
                         // An anchor draws its derived number, not the label
-                        // the author stored — see `Editor::anchors`.
-                        Inline::Note(_) => self
-                            .anchors
-                            .get(&(bi, segment.inline))
-                            .cloned()
-                            .unwrap_or_default(),
+                        // the author stored — carried on the segment, so the
+                        // drawing and `advance` read the same value.
+                        Inline::Note(_) => segment.number.clone().unwrap_or_default(),
                     };
-                    let width = layout::advance(run, &text, kind, segment.style, &|text, style| {
-                        theme::width(layer, text, style)
-                    });
+                    let width = layout::advance(
+                        run,
+                        &text,
+                        kind,
+                        segment.style,
+                        segment.number.as_deref(),
+                        &|text, style| theme::width(layer, text, style),
+                    );
                     if is_note {
                         let style = layout::anchor_style();
                         theme::draw(
@@ -928,9 +917,14 @@ impl Editor {
                 Inline::Note(_) => ATOM.to_string(),
             };
             if flat >= cursor + segment.len {
-                x += layout::advance(run, &text, block, segment.style, &|text, style| {
-                    theme::width(layer, text, style)
-                });
+                x += layout::advance(
+                    run,
+                    &text,
+                    block,
+                    segment.style,
+                    segment.number.as_deref(),
+                    &|text, style| theme::width(layer, text, style),
+                );
             } else {
                 let count = flat.saturating_sub(cursor);
                 if segment.style.badge {
@@ -1149,7 +1143,7 @@ mod tests {
         let atom = ATOM.to_string();
         let measure =
             |text: &str, style: &TextStyle| text.chars().count() as f32 * style.size * 0.5;
-        let width = layout::advance(&run, &atom, &block, Style::PLAIN, &measure);
+        let width = layout::advance(&run, &atom, &block, Style::PLAIN, None, &measure);
         let box_width = match &run {
             Inline::Math(list) => math_layout::layout(list, 0, &measure).width,
             Inline::Text(_) => unreachable!(),
