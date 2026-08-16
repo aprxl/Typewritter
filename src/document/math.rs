@@ -840,8 +840,8 @@ pub fn close_group(root: &mut MathList, cursor: &mut MathCursor, c: char) -> boo
     false
 }
 
-fn capture_operand(list: &mut MathList, index: usize) -> (usize, MathList) {
-    let start = if index > 0
+fn operand_start(list: &MathList, index: usize) -> usize {
+    if index > 0
         && (list[index - 1].is_structural() || matches!(list[index - 1], MathNode::Resolved { .. }))
     {
         index - 1
@@ -859,7 +859,11 @@ fn capture_operand(list: &mut MathList, index: usize) -> (usize, MathList) {
             start -= 1;
         }
         start
-    };
+    }
+}
+
+fn capture_operand(list: &mut MathList, index: usize) -> (usize, MathList) {
+    let start = operand_start(list, index);
     (start, list.drain(start..index).collect())
 }
 
@@ -897,7 +901,10 @@ pub fn insert_script(root: &mut MathList, cursor: &mut MathCursor, which: Slot) 
     // 1. Inside one script slot, fill the parent's other empty slot. A script
     // nested directly inside another script can no longer be typed in one
     // flow; grouping brackets from the next structure are required for that.
-    if let Some(step) = path.last()
+    let whole_slot_operand = list_at(root, &path)
+        .is_some_and(|list| index == list.len() && operand_start(list, index) == 0);
+    if whole_slot_operand
+        && let Some(step) = path.last()
         && matches!(step.slot, Slot::Sup | Slot::Sub)
         && step.slot != which
     {
@@ -1795,6 +1802,86 @@ mod tests {
 
         assert_eq!(root, vec![script(sym("x"), Some(sym("2")), Some(sym("i")))]);
         assert_eq!(cursor, at_path(&[(0, Slot::Sub)], 1));
+    }
+
+    #[test]
+    fn a_subscript_typed_after_a_multi_atom_superscript_attaches_to_the_last_operand_of_that_superscript_not_to_the_base()
+     {
+        let mut root = vec![script(sym("x"), Some(sym("a+b")), None)];
+        let mut cursor = at_path(&[(0, Slot::Sup)], 3);
+        insert_script(&mut root, &mut cursor, Slot::Sub);
+
+        assert_eq!(
+            root,
+            vec![script(
+                sym("x"),
+                Some(vec![
+                    MathNode::Sym('a'),
+                    MathNode::Sym('+'),
+                    script(sym("b"), None, Some(Vec::new())),
+                ]),
+                None,
+            )]
+        );
+        assert_eq!(cursor, at_path(&[(0, Slot::Sup), (2, Slot::Sub)], 0));
+    }
+
+    #[test]
+    fn a_subscript_typed_at_the_end_of_a_single_atom_superscript_still_fills_the_base_s_sibling_slot_the_x_2_3_flow()
+     {
+        let mut root = vec![script(sym("x"), Some(sym("2")), None)];
+        let mut cursor = at_path(&[(0, Slot::Sup)], 1);
+        insert_script(&mut root, &mut cursor, Slot::Sub);
+
+        assert_eq!(
+            root,
+            vec![script(sym("x"), Some(sym("2")), Some(Vec::new()))]
+        );
+        assert_eq!(cursor, at_path(&[(0, Slot::Sub)], 0));
+    }
+
+    #[test]
+    fn a_superscript_typed_after_a_multi_atom_subscript_attaches_to_the_last_operand_of_that_subscript()
+     {
+        let mut root = vec![script(sym("x"), None, Some(sym("a+b")))];
+        let mut cursor = at_path(&[(0, Slot::Sub)], 3);
+        insert_script(&mut root, &mut cursor, Slot::Sup);
+
+        assert_eq!(
+            root,
+            vec![script(
+                sym("x"),
+                None,
+                Some(vec![
+                    MathNode::Sym('a'),
+                    MathNode::Sym('+'),
+                    script(sym("b"), Some(Vec::new()), None),
+                ]),
+            )]
+        );
+        assert_eq!(cursor, at_path(&[(0, Slot::Sub), (2, Slot::Sup)], 0));
+    }
+
+    #[test]
+    fn a_subscript_typed_at_the_start_of_a_non_empty_superscript_does_not_silently_script_the_base()
+    {
+        let mut root = vec![script(sym("x"), Some(sym("ab")), None)];
+        let mut cursor = at_path(&[(0, Slot::Sup)], 0);
+        insert_script(&mut root, &mut cursor, Slot::Sub);
+
+        assert_eq!(
+            root,
+            vec![script(
+                sym("x"),
+                Some(vec![
+                    script(Vec::new(), None, Some(Vec::new())),
+                    MathNode::Sym('a'),
+                    MathNode::Sym('b')
+                ]),
+                None,
+            )]
+        );
+        assert_eq!(cursor, at_path(&[(0, Slot::Sup), (0, Slot::Base)], 0));
     }
 
     #[test]
