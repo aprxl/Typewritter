@@ -214,7 +214,7 @@ impl Shell {
             }
         }
 
-        toggle_brush_hits(
+        add_brush_hits(
             &mut self.brush_selected,
             &mut self.brush_inside,
             swept_hits,
@@ -2461,14 +2461,18 @@ fn moved_math_menu_selection(selected: usize, count: usize, delta: isize) -> usi
     ((selected as isize + delta).clamp(0, count as isize - 1)) as usize
 }
 
-fn toggle_brush_hits(
+/// Fold a stroke's swept hits into the selection. A hit already in `inside`
+/// is skipped, and one already in `selected` is not pushed again, so a stroke
+/// only ever grows the selection: re-entering a target never deselects it,
+/// and no target appears twice. `inside` is refreshed to the current circle.
+fn add_brush_hits(
     selected: &mut Vec<ContextHit>,
     inside: &mut Vec<ContextHit>,
     swept_hits: Vec<ContextHit>,
     current_hits: Vec<ContextHit>,
 ) {
     for hit in swept_hits.iter().filter(|hit| !inside.contains(hit)) {
-        if let None = selected.iter().position(|selected| selected == hit) {
+        if !selected.contains(hit) {
             selected.push(hit.clone());
         }
     }
@@ -2525,9 +2529,9 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        brush_sweep_samples, delete_chars, delete_inside_math, math_menu_rows,
+        add_brush_hits, brush_sweep_samples, delete_chars, delete_inside_math, math_menu_rows,
         math_menu_variant_start, move_inside_math, moved_math_menu_selection,
-        reset_brush_selection, symbol_base_glyph, symbol_context_ids, toggle_brush_hits,
+        reset_brush_selection, symbol_base_glyph, symbol_context_ids,
     };
     use crate::document::layout::{ContextHit, RangeKind};
     use crate::document::math::MathNode;
@@ -2556,7 +2560,7 @@ mod tests {
     }
 
     #[test]
-    fn brush_toggles_only_when_a_target_is_entered() {
+    fn brush_reentering_a_target_does_not_select_it_twice() {
         let target = ContextHit::Range {
             range: FlatRange::new(
                 FlatPos {
@@ -2573,14 +2577,14 @@ mod tests {
         let mut selected = Vec::new();
         let mut inside = Vec::new();
 
-        toggle_brush_hits(
+        add_brush_hits(
             &mut selected,
             &mut inside,
             vec![target.clone()],
             vec![target.clone()],
         );
         assert_eq!(selected, vec![target.clone()]);
-        toggle_brush_hits(
+        add_brush_hits(
             &mut selected,
             &mut inside,
             vec![target.clone()],
@@ -2588,14 +2592,14 @@ mod tests {
         );
         assert_eq!(selected, vec![target.clone()]);
 
-        toggle_brush_hits(&mut selected, &mut inside, Vec::new(), Vec::new());
-        toggle_brush_hits(
+        add_brush_hits(&mut selected, &mut inside, Vec::new(), Vec::new());
+        add_brush_hits(
             &mut selected,
             &mut inside,
             vec![target.clone()],
-            vec![target],
+            vec![target.clone()],
         );
-        assert!(selected.is_empty());
+        assert_eq!(selected, vec![target]);
     }
 
     #[test]
@@ -2614,16 +2618,21 @@ mod tests {
         let mut selected = vec![first.clone(), second.clone()];
         let mut inside = Vec::new();
 
-        toggle_brush_hits(
+        add_brush_hits(
             &mut selected,
             &mut inside,
             vec![third.clone()],
             vec![third.clone()],
         );
-        assert_eq!(selected, vec![first.clone(), second.clone(), third]);
-        toggle_brush_hits(&mut selected, &mut inside, Vec::new(), Vec::new());
-        toggle_brush_hits(&mut selected, &mut inside, vec![first.clone()], vec![first]);
-        assert_eq!(selected, vec![second, word(4)]);
+        assert_eq!(selected, vec![first.clone(), second.clone(), third.clone()]);
+        add_brush_hits(&mut selected, &mut inside, Vec::new(), Vec::new());
+        add_brush_hits(
+            &mut selected,
+            &mut inside,
+            vec![first.clone()],
+            vec![first.clone()],
+        );
+        assert_eq!(selected, vec![first, second, third]);
     }
 
     #[test]
@@ -2644,7 +2653,7 @@ mod tests {
     }
 
     #[test]
-    fn swept_hits_toggle_once_but_inside_tracks_only_the_current_circle() {
+    fn swept_hits_add_once_but_inside_tracks_only_the_current_circle() {
         let word = |offset| ContextHit::Range {
             range: FlatRange::new(
                 FlatPos { block: 0, offset },
@@ -2659,7 +2668,7 @@ mod tests {
         let mut selected = Vec::new();
         let mut inside = Vec::new();
 
-        toggle_brush_hits(
+        add_brush_hits(
             &mut selected,
             &mut inside,
             vec![crossed.clone(), current.clone()],
@@ -2669,13 +2678,13 @@ mod tests {
         assert_eq!(selected, vec![crossed.clone(), current.clone()]);
         assert_eq!(inside, vec![current]);
 
-        toggle_brush_hits(
+        add_brush_hits(
             &mut selected,
             &mut inside,
             vec![crossed.clone()],
             vec![crossed.clone()],
         );
-        assert_eq!(selected, vec![word(2)]);
+        assert_eq!(selected, vec![crossed.clone(), word(2)]);
         assert_eq!(inside, vec![crossed]);
     }
 

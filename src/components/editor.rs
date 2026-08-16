@@ -30,7 +30,6 @@ pub const MEASURE: f32 = 634.0;
 pub const RIGHT_MARGIN: f32 = 24.0;
 /// Radius of the Ctrl-drag selection brush in logical pixels.
 pub const BRUSH_RADIUS: f32 = 9.0;
-const BRUSH_RING: &str = "M 18 0 A 18 18 0 1 0 -18 0 A 18 18 0 1 0 18 0";
 /// Padding of the tint behind code: a fenced block gets the generous one,
 /// an inline span the tight one, so a `` `run` `` mid-sentence doesn't push
 /// the line apart.
@@ -1101,19 +1100,6 @@ mod tests {
 
         assert_eq!(editor.context_selections, vec![target]);
         assert_eq!(editor.brush_point, Some((42.0, 24.0)));
-    }
-
-    #[test]
-    fn brush_ring_is_valid_renderer_path_data() {
-        use lyon::path::Path;
-        use lyon_extra::parser::{ParserOptions, PathParser, Source};
-
-        let mut parser = PathParser::new();
-        let mut builder = Path::builder();
-        let mut source = Source::new(BRUSH_RING.chars());
-        parser
-            .parse(&ParserOptions::DEFAULT, &mut source, &mut builder)
-            .expect("brush ring path");
     }
 
     #[test]
