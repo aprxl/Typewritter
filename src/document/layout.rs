@@ -103,6 +103,11 @@ pub struct DocLayout {
     pub blocks: Vec<BlockLayout>,
     /// Total content height, for scroll bounds.
     pub height: f32,
+    /// How much smaller than the page this layout is set: every text size
+    /// and vertical measure is multiplied by it. The page is `1.0`; a margin
+    /// note is the page's own layout at a smaller scale, so its measuring and
+    /// its drawing read one number and can never disagree about a line break.
+    pub scale: f32,
     /// A snapshot of the source blocks, so the editor can index a visual
     /// block back to its kind and runs without holding the live document.
     pub source: Vec<Block>,
@@ -135,17 +140,22 @@ pub enum RangeKind {
 }
 
 /// The font a run renders with. Body is serif 17.5; headings are serif at
-/// 24/21/18.5 and always bold; a run's `bold`/`italic` stack on top.
-pub fn text_style(kind: &Block, style: Style) -> TextStyle {
+/// 24/21/18.5 and always bold; a run's `bold`/`italic` stack on top. `scale`
+/// multiplies every size, so a note laid out at the margin's scale reads from
+/// here rather than from a second copy of the size table.
+pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
     if style.code {
-        return TextStyle::mono(17.5, theme::INK);
+        return TextStyle::mono(17.5 * scale, theme::INK);
     }
     if style.badge {
         // A chip is set far smaller than the prose it sits in, tracked out
         // the way the design's labels are — it reads as machinery, not as
         // a word in the sentence.
-        return TextStyle::mono(theme::BADGE_SIZE, theme::badge_ink(style.badge_color))
-            .tracked(0.1);
+        return TextStyle::mono(
+            theme::BADGE_SIZE * scale,
+            theme::badge_ink(style.badge_color),
+        )
+        .tracked(0.1);
     }
     let mut base = match kind {
         Block::Heading { level, .. } => TextStyle::serif(
@@ -154,14 +164,14 @@ pub fn text_style(kind: &Block, style: Style) -> TextStyle {
                 2 => 21.0,
                 3 => 18.5,
                 _ => 17.5,
-            },
+            } * scale,
             theme::INK,
         )
         .bold(),
         Block::Paragraph(_) | Block::Divider(_) | Block::Math(_) => {
-            TextStyle::serif(17.5, theme::INK)
+            TextStyle::serif(17.5 * scale, theme::INK)
         }
-        Block::CodeLine { .. } => TextStyle::mono(17.5, theme::INK),
+        Block::CodeLine { .. } => TextStyle::mono(17.5 * scale, theme::INK),
     };
     if style.bold {
         base = base.bold();
@@ -208,6 +218,7 @@ pub fn advance(
     block: &Block,
     style: Style,
     number: Option<&str>,
+    scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> f32 {
     let width = match run {
@@ -216,7 +227,7 @@ pub fn advance(
             // fraction operands, not for making the atom itself larger.
             math_layout::layout(list, 0, measure).width
         }
-        Inline::Text(_) => measure(text, &text_style(block, style)),
+        Inline::Text(_) => measure(text, &text_style(block, style, scale)),
         // An anchor reserves the width of the number it actually draws, so
         // the caret, the hit tests, and the editor's drawing — all of which
         // ask `advance` — agree about where the character after the anchor
@@ -233,13 +244,19 @@ pub fn advance(
     width + box_pad
 }
 
-fn piece_width(piece: &Piece, block: &Block, measure: &dyn Fn(&str, &TextStyle) -> f32) -> f32 {
+fn piece_width(
+    piece: &Piece,
+    block: &Block,
+    scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> f32 {
     advance(
         &block.inlines()[piece.inline],
         &piece.text,
         block,
         piece.style,
         piece.number.as_deref(),
+        scale,
         measure,
     )
 }
@@ -254,6 +271,7 @@ fn wrap(
     pieces: &[Piece],
     block: &Block,
     width: f32,
+    scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> Vec<Vec<usize>> {
     let mut lines = Vec::new();
@@ -263,11 +281,11 @@ fn wrap(
 
     for (i, piece) in pieces.iter().enumerate() {
         if piece.space {
-            cursor += piece_width(piece, block, measure);
+            cursor += piece_width(piece, block, scale, measure);
             current.push(i);
             continue;
         }
-        let word_width = piece_width(piece, block, measure);
+        let word_width = piece_width(piece, block, scale, measure);
         if first {
             // First piece starts the line at the left, whatever it is.
         } else if cursor + word_width <= width {
@@ -346,8 +364,25 @@ fn segments_for(pieces: &[Piece], line: &[usize]) -> Vec<Segment> {
     segs
 }
 
-/// One pass; `measure(text, style) -> width` is the only rendering input.
+/// One pass over `doc`'s own blocks at full scale; `measure(text, style) ->
+/// width` is the only rendering input. The thin wrapper around
+/// [`layout_blocks`] — a whole document is just its body at scale `1.0`.
 pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) -> DocLayout {
+    layout_blocks(doc.body(), width, 1.0, measure)
+}
+
+/// Lays out a slice of blocks — a whole document's body, or one note's body —
+/// at `scale`, which multiplies every text size and vertical measure the
+/// layout produces. `measure(text, style) -> width` is the only rendering
+/// input. The scale is stored on the result so the measuring pass and the
+/// editor's drawing pass read one number and can never disagree about where a
+/// line breaks.
+pub fn layout_blocks(
+    blocks: &[Block],
+    width: f32,
+    scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> DocLayout {
     // Number every anchor before measuring anything, so an anchor can reserve
     // the width of the number it will actually draw. One counter, one source
     // of truth: the ordinal lands on the `Anchor` and is stamped onto the
@@ -356,7 +391,7 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
     let mut anchors = Vec::new();
     let mut number_of = HashMap::new();
     let mut number = 0usize;
-    for (block, source) in doc.body().iter().enumerate() {
+    for (block, source) in blocks.iter().enumerate() {
         for (inline, run) in source.inlines().iter().enumerate() {
             if let Inline::Note(label) = run {
                 number += 1;
@@ -373,15 +408,15 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
         }
     }
 
-    let mut blocks = Vec::with_capacity(doc.body().len());
+    let mut laid = Vec::with_capacity(blocks.len());
     let mut y = 0.0f32;
     let mut first_block = true;
 
-    for (source_index, block) in doc.body().iter().enumerate() {
+    for (source_index, block) in blocks.iter().enumerate() {
         let gap_above = if first_block {
             0.0
         } else if block.is_heading() {
-            GAP_HEADING
+            GAP_HEADING * scale
         } else {
             0.0
         };
@@ -389,23 +424,25 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
         first_block = false;
 
         let base_line_height = match block {
-            Block::Heading { level: 1, .. } => LINE_H1,
-            Block::Heading { level: 2, .. } => LINE_H2,
-            Block::Heading { level: 3, .. } => LINE_H3,
-            Block::Heading { level: 4, .. } => LINE_H4,
-            Block::Divider(_) => LINE_DIVIDER,
+            Block::Heading { level: 1, .. } => LINE_H1 * scale,
+            Block::Heading { level: 2, .. } => LINE_H2 * scale,
+            Block::Heading { level: 3, .. } => LINE_H3 * scale,
+            Block::Heading { level: 4, .. } => LINE_H4 * scale,
+            Block::Divider(_) => LINE_DIVIDER * scale,
             Block::Math(runs) => {
                 let Inline::Math(list) = &runs[0] else {
                     unreachable!("math block must contain one math atom")
                 };
                 let expression = math_layout::layout(list, 0, measure);
-                expression.ascent + expression.descent + MATH_PAD * 2.0
+                expression.ascent + expression.descent + MATH_PAD * 2.0 * scale
             }
-            Block::Heading { .. } | Block::Paragraph(_) | Block::CodeLine { .. } => LINE_BODY,
+            Block::Heading { .. } | Block::Paragraph(_) | Block::CodeLine { .. } => {
+                LINE_BODY * scale
+            }
         };
 
         let pieces = tokens(block, source_index, &number_of);
-        let grouped = wrap(&pieces, block, width, measure);
+        let grouped = wrap(&pieces, block, width, scale, measure);
         let mut line_y = y;
         let lines = grouped
             .iter()
@@ -416,7 +453,7 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
                         |&piece_index| match &block.inlines()[pieces[piece_index].inline] {
                             Inline::Math(list) => {
                                 let expression = math_layout::layout(list, 0, measure);
-                                Some(expression.ascent + expression.descent + MATH_LEADING)
+                                Some(expression.ascent + expression.descent + MATH_LEADING * scale)
                             }
                             Inline::Text(_) | Inline::Note(_) => None,
                         },
@@ -436,21 +473,21 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
         // VisLine heights are content-driven, so later lines start after the
         // actual height of every earlier line rather than a copied constant.
         let height = lines.iter().map(|line| line.height).sum();
-        blocks.push(BlockLayout { y, lines, height });
+        laid.push(BlockLayout { y, lines, height });
         y += height;
 
         let gap_after = if block.is_code()
             && matches!(
-                doc.body().get(source_index + 1),
+                blocks.get(source_index + 1),
                 Some(Block::CodeLine { first: false, .. })
             ) {
             0.0
         } else if block.is_heading() {
-            GAP_AFTER_HEADING
+            GAP_AFTER_HEADING * scale
         } else if block.is_divider() {
-            GAP_DIVIDER
+            GAP_DIVIDER * scale
         } else {
-            GAP_PARAGRAPH
+            GAP_PARAGRAPH * scale
         };
         y += gap_after;
     }
@@ -458,13 +495,14 @@ pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> 
     // A note sits beside the line its anchor is on, and that line's y is only
     // known after the block is laid out — fill it in now that the lines exist.
     for anchor in &mut anchors {
-        anchor.y = anchor_y(&blocks[anchor.block], anchor.inline);
+        anchor.y = anchor_y(&laid[anchor.block], anchor.inline);
     }
 
     DocLayout {
-        blocks,
-        source: doc.body().to_vec(),
+        blocks: laid,
+        source: blocks.to_vec(),
         height: y,
+        scale,
         anchors,
     }
 }
@@ -559,6 +597,7 @@ fn x_of_flat(
     line: &VisLine,
     line_start: usize,
     flat: usize,
+    scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> f32 {
     let mut x = 0.0;
@@ -574,6 +613,7 @@ fn x_of_flat(
                 block,
                 segment.style,
                 segment.number.as_deref(),
+                scale,
                 measure,
             );
             seg_flat += seg_len;
@@ -586,7 +626,7 @@ fn x_of_flat(
             if segment.style.badge {
                 x += theme::BADGE_PAD;
             }
-            x += measure(&prefix, &text_style(block, segment.style));
+            x += measure(&prefix, &text_style(block, segment.style, scale));
             break;
         }
     }
@@ -647,6 +687,7 @@ fn caret_for_click(
     block_idx: usize,
     line_idx: usize,
     x: f32,
+    scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> Caret {
     let block = &scan_source[block_idx];
@@ -674,6 +715,7 @@ fn caret_for_click(
                 block,
                 segment.style,
                 segment.number.as_deref(),
+                scale,
                 measure,
             );
             if x <= cum + w / 2.0 {
@@ -685,7 +727,7 @@ fn caret_for_click(
             continue;
         }
         for (ci, ch) in text.chars().enumerate() {
-            let w = measure(&ch.to_string(), &text_style(block, segment.style));
+            let w = measure(&ch.to_string(), &text_style(block, segment.style, scale));
             if x <= cum + w / 2.0 {
                 pos = seg_flat + ci;
                 break 'segments;
@@ -747,7 +789,7 @@ impl DocLayout {
         let line_idx = line_of_flat(layout_block, flat);
         let line = &layout_block.lines[line_idx];
         let line_start = line_flat_start(layout_block, line_idx);
-        let x = x_of_flat(block, line, line_start, flat, measure);
+        let x = x_of_flat(block, line, line_start, flat, self.scale, measure);
         (x, line.y + line.height / 2.0, line.height)
     }
 
@@ -757,7 +799,15 @@ impl DocLayout {
         let block_idx = block_of_y(self, y);
         let layout_block = &self.blocks[block_idx];
         let line_idx = line_of_y(layout_block, y);
-        caret_for_click(&self.source, layout_block, block_idx, line_idx, x, measure)
+        caret_for_click(
+            &self.source,
+            layout_block,
+            block_idx,
+            line_idx,
+            x,
+            self.scale,
+            measure,
+        )
     }
 
     /// The smallest contextual node under a Normal-mode click. Unlike
@@ -830,6 +880,7 @@ impl DocLayout {
                 block,
                 segment.style,
                 segment.number.as_deref(),
+                self.scale,
                 measure,
             );
             if x >= advance_x && x <= advance_x + width {
@@ -859,7 +910,10 @@ impl DocLayout {
 
                 let mut char_x = advance_x;
                 for (within_segment, ch) in text.chars().enumerate() {
-                    let char_width = measure(&ch.to_string(), &text_style(block, segment.style));
+                    let char_width = measure(
+                        &ch.to_string(),
+                        &text_style(block, segment.style, self.scale),
+                    );
                     if x < char_x + char_width || within_segment + 1 == segment.len {
                         if !ch.is_alphanumeric() && ch != '_' {
                             return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
@@ -958,6 +1012,7 @@ impl DocLayout {
                         block,
                         segment.style,
                         segment.number.as_deref(),
+                        self.scale,
                         measure,
                     );
                     let run_start: usize = block.inlines()[..segment.inline]
@@ -1050,8 +1105,10 @@ impl DocLayout {
                         } else {
                             let mut char_x = advance_x;
                             for (within_segment, ch) in text.chars().enumerate() {
-                                let char_width =
-                                    measure(&ch.to_string(), &text_style(block, segment.style));
+                                let char_width = measure(
+                                    &ch.to_string(),
+                                    &text_style(block, segment.style, self.scale),
+                                );
                                 if (ch.is_alphanumeric() || ch == '_')
                                     && circle_intersects_rect(
                                         point,
@@ -1183,6 +1240,7 @@ impl DocLayout {
                 block,
                 segment.style,
                 segment.number.as_deref(),
+                self.scale,
                 measure,
             );
             if let Inline::Math(list) = run {
@@ -1258,6 +1316,7 @@ impl DocLayout {
                 block,
                 segment.style,
                 segment.number.as_deref(),
+                self.scale,
                 measure,
             );
             if let Inline::Math(list) = run {
@@ -1302,6 +1361,7 @@ impl DocLayout {
                 block_idx,
                 line_idx - 1,
                 goal_x,
+                self.scale,
                 measure,
             ));
         }
@@ -1316,6 +1376,7 @@ impl DocLayout {
             prev,
             last_line,
             goal_x,
+            self.scale,
             measure,
         ))
     }
@@ -1339,6 +1400,7 @@ impl DocLayout {
                 block_idx,
                 line_idx + 1,
                 goal_x,
+                self.scale,
                 measure,
             ));
         }
@@ -1351,6 +1413,7 @@ impl DocLayout {
             block_idx + 1,
             0,
             goal_x,
+            self.scale,
             measure,
         ))
     }
@@ -1416,6 +1479,116 @@ mod tests {
         bold: true,
         ..Style::PLAIN
     };
+
+    #[test]
+    fn a_scaled_layout_is_narrower_and_shorter_and_scales_every_text_size() {
+        let blocks = vec![
+            para("word word word word word word"),
+            Block::Heading {
+                level: 1,
+                content: vec![Inline::Text(Text {
+                    text: "Title".into(),
+                    style: Style::PLAIN,
+                })],
+            },
+        ];
+        let full = layout_blocks(&blocks, 200.0, 1.0, &fake_measure);
+        let half = layout_blocks(&blocks, 200.0, 0.5, &fake_measure);
+
+        // Smaller text fits more words per line, so the same blocks come out
+        // shorter at half scale.
+        assert!(half.height < full.height);
+
+        // Every text size the layout produces is scaled by the same factor.
+        assert_eq!(
+            text_style(&blocks[0], Style::PLAIN, 0.5).size,
+            text_style(&blocks[0], Style::PLAIN, 1.0).size * 0.5
+        );
+        assert_eq!(
+            text_style(&blocks[1], Style::PLAIN, 0.5).size,
+            text_style(&blocks[1], Style::PLAIN, 1.0).size * 0.5
+        );
+
+        // A single word laid out at half scale measures half as wide — the
+        // "narrower" half of the claim, read off the caret's resting x.
+        let measure = |text: &str, style: &TextStyle| text.chars().count() as f32 * style.size;
+        let one = vec![para("word")];
+        let at_end = |layout: &DocLayout| {
+            layout
+                .caret_pos(
+                    Caret {
+                        block: 0,
+                        inline: 0,
+                        offset: 4,
+                        style: Style::PLAIN,
+                    },
+                    &measure,
+                )
+                .0
+        };
+        let full_x = at_end(&layout_blocks(&one, 1000.0, 1.0, &measure));
+        let half_x = at_end(&layout_blocks(&one, 1000.0, 0.5, &measure));
+        assert!(half_x < full_x);
+        assert!((half_x - full_x * 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn layout_blocks_at_scale_1_matches_layout_for_the_same_document() {
+        let d = doc_with(vec![
+            Block::Heading {
+                level: 1,
+                content: vec![Inline::Text(Text {
+                    text: "Title".into(),
+                    style: Style::PLAIN,
+                })],
+            },
+            Block::Paragraph(vec![
+                Inline::Text(Text {
+                    text: "body ".into(),
+                    style: Style::PLAIN,
+                }),
+                Inline::Note("1".into()),
+                Inline::Text(Text {
+                    text: " tail".into(),
+                    style: Style::PLAIN,
+                }),
+            ]),
+        ]);
+        let whole = layout(&d, 300.0, &fake_measure);
+        let by_blocks = layout_blocks(d.body(), 300.0, 1.0, &fake_measure);
+
+        assert_eq!(whole.height, by_blocks.height);
+        assert_eq!(whole.scale, by_blocks.scale);
+        assert_eq!(whole.source, by_blocks.source);
+
+        assert_eq!(whole.anchors.len(), by_blocks.anchors.len());
+        for (a, b) in whole.anchors.iter().zip(&by_blocks.anchors) {
+            assert_eq!(a.block, b.block);
+            assert_eq!(a.inline, b.inline);
+            assert_eq!(a.label, b.label);
+            assert_eq!(a.number, b.number);
+            assert_eq!(a.y, b.y);
+        }
+
+        assert_eq!(whole.blocks.len(), by_blocks.blocks.len());
+        for (a, b) in whole.blocks.iter().zip(&by_blocks.blocks) {
+            assert_eq!(a.y, b.y);
+            assert_eq!(a.height, b.height);
+            assert_eq!(a.lines.len(), b.lines.len());
+            for (al, bl) in a.lines.iter().zip(&b.lines) {
+                assert_eq!(al.y, bl.y);
+                assert_eq!(al.height, bl.height);
+                assert_eq!(al.segments.len(), bl.segments.len());
+                for (as_, bs) in al.segments.iter().zip(&bl.segments) {
+                    assert_eq!(as_.inline, bs.inline);
+                    assert_eq!(as_.start, bs.start);
+                    assert_eq!(as_.len, bs.len);
+                    assert_eq!(as_.style, bs.style);
+                    assert_eq!(as_.number, bs.number);
+                }
+            }
+        }
+    }
 
     #[test]
     fn layout_and_outline_are_unchanged_by_which_scope_is_focused() {
@@ -1705,7 +1878,7 @@ mod tests {
         layout(&d, 300.0, &check);
         assert_eq!(seen.get(), Some(24.0), "H1 text is measured at size 24");
         // The heading weight should be bold.
-        let h1_style = text_style(&d.body()[0], Style::PLAIN);
+        let h1_style = text_style(&d.body()[0], Style::PLAIN, 1.0);
         assert!(h1_style.weight > 0.0, "headings are always bold");
 
         // H4 matches body size (17.5) — bold is what distinguishes it.
@@ -1716,7 +1889,7 @@ mod tests {
                 style: Style::PLAIN,
             })],
         };
-        let h4_style = text_style(&h4, Style::PLAIN);
+        let h4_style = text_style(&h4, Style::PLAIN, 1.0);
         assert_eq!(
             h4_style.size, 17.5,
             "H4 is body-sized, distinguished by bold"
@@ -1743,8 +1916,8 @@ mod tests {
             first: true,
             lang: None,
         };
-        let ts_para = text_style(&para, code);
-        let ts_code = text_style(&code_block, code);
+        let ts_para = text_style(&para, code, 1.0);
+        let ts_code = text_style(&code_block, code, 1.0);
         assert_eq!(ts_para.font, theme::mono());
         assert_eq!(ts_code.font, theme::mono());
         assert_eq!(ts_para.size, 17.5);
@@ -1768,7 +1941,7 @@ mod tests {
             Inline::Math(vec![MathNode::Sym('x')]),
         ]);
         // The box counts: bare glyphs would put `x` under the chip.
-        let bare = fake_measure("PS", &text_style(&block, badge));
+        let bare = fake_measure("PS", &text_style(&block, badge, 1.0));
         assert_eq!(
             advance(
                 &block.inlines()[0],
@@ -1776,6 +1949,7 @@ mod tests {
                 &block,
                 badge,
                 None,
+                1.0,
                 &fake_measure
             ),
             bare + theme::BADGE_PAD * 2.0
@@ -1787,6 +1961,7 @@ mod tests {
                 &block,
                 Style::PLAIN,
                 None,
+                1.0,
                 &fake_measure,
             ),
             bare,
@@ -1875,6 +2050,7 @@ mod tests {
             &d.body()[0],
             Style::PLAIN,
             Some(&number),
+            1.0,
             &fake_measure,
         );
         // The anchor measures as its raised number, and the text after it
@@ -1911,6 +2087,7 @@ mod tests {
                 &d.body()[anchor.block],
                 Style::PLAIN,
                 Some(&anchor.number),
+                1.0,
                 &fake_measure,
             );
             assert_eq!(
@@ -1926,6 +2103,7 @@ mod tests {
             &d.body()[0],
             Style::PLAIN,
             Some(&laid.anchors[0].number),
+            1.0,
             &fake_measure,
         );
         let eleventh = advance(
@@ -1934,6 +2112,7 @@ mod tests {
             &d.body()[10],
             Style::PLAIN,
             Some(&laid.anchors[10].number),
+            1.0,
             &fake_measure,
         );
         assert!(eleventh > first);
@@ -1950,6 +2129,7 @@ mod tests {
             &d.body()[0],
             Style::PLAIN,
             Some(&number),
+            1.0,
             &fake_measure,
         );
         assert_eq!(number, "1");
@@ -2052,6 +2232,7 @@ mod tests {
             &d.body()[0],
             Style::PLAIN,
             None,
+            1.0,
             &fake_measure,
         );
 
@@ -2086,6 +2267,7 @@ mod tests {
             &d.body()[0],
             Style::PLAIN,
             None,
+            1.0,
             &fake_measure,
         );
         let line = &laid.blocks[0].lines[0];
@@ -2394,6 +2576,7 @@ mod tests {
             &d.body()[0],
             Style::PLAIN,
             None,
+            1.0,
             &fake_measure,
         );
         let line = &laid.blocks[0].lines[0];

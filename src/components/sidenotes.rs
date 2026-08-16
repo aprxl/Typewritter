@@ -1,14 +1,20 @@
 //! Inside the canvas, not a panel: the margin scrolls with the text column
 //! (spec §3.2), unlike the topics list further right. Each note sits beside
 //! the anchor it belongs to, resolved by [`stack`] off the typing path.
+//!
+//! A note's body is drawn by the same [`Editor`] the page uses, set smaller
+//! by one scale factor. The margin owns no text layout of its own, so a line
+//! can never break in two places because two wrappers disagreed.
 
-use crate::document::math_notation;
-use crate::document::{Inline, Style};
+use std::rc::Rc;
+
+use crate::components::editor::{Editor, Metrics};
+use crate::document::layout::DocLayout;
+use crate::document::{Caret, Style};
 use crate::layout::Rect;
-use crate::prose::Run;
 use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
-use crate::ui::Component;
+use crate::ui::{Component, Context, Dirty};
 
 pub const WIDTH: f32 = 215.0;
 
@@ -17,22 +23,60 @@ pub const WIDTH: f32 = 215.0;
 /// enough that a pushed note still sits near the sentence it belongs to.
 pub const GAP: f32 = 12.0;
 
-/// Notes are set tighter than the page's body text.
-const LINE_HEIGHT: f32 = 21.0;
+/// Notes are set smaller than the page's body text, by one scale factor so
+/// the note's layout and its drawing read one number and cannot disagree
+/// about where a line breaks.
+pub const SCALE: f32 = 13.5 / 17.5;
 
-/// One note: its marker (the raised number matching its anchor), its body,
-/// and the y it finally sits at after collision resolution.
+/// The note text column's inset within the margin, past the marker and rule.
+const NOTE_INSET: f32 = 30.0;
+/// Space kept at the note column's right edge.
+const NOTE_RIGHT_MARGIN: f32 = 16.0;
+
+/// The note text column's width — what each note's layout is laid out at.
+pub const NOTE_WIDTH: f32 = WIDTH - NOTE_INSET - NOTE_RIGHT_MARGIN;
+
+/// The editor metrics a note draws with: the margin's own insets and measure,
+/// no page furniture. An editor embedded in the margin fills no background
+/// and draws no current-line band or caret; its container already painted.
+const NOTE_METRICS: Metrics = Metrics {
+    inset: NOTE_INSET,
+    top: 0.0,
+    measure: NOTE_WIDTH,
+    right_margin: NOTE_RIGHT_MARGIN,
+    page: false,
+};
+
+/// One note: its marker (the raised number matching its anchor), the editor
+/// that draws its body, and the y it finally sits at after collision
+/// resolution.
 pub struct Note {
     marker: String,
-    body: Vec<Run>,
+    editor: Editor,
     y: f32,
 }
 
 impl Note {
-    pub fn new(marker: &str, body: Vec<Run>, y: f32) -> Self {
+    /// Builds a note over `layout`, already laid out at the margin's width
+    /// and scale. A note is read-only, so its caret is the default and it
+    /// never draws one.
+    pub fn new(marker: &str, layout: Rc<DocLayout>, y: f32) -> Self {
+        let editor = Editor::new(
+            layout,
+            Caret {
+                block: 0,
+                inline: 0,
+                offset: 0,
+                style: Style::PLAIN,
+            },
+            0.0,
+            false,
+            Style::PLAIN,
+            NOTE_METRICS,
+        );
         Self {
             marker: marker.into(),
-            body,
+            editor,
             y,
         }
     }
@@ -56,107 +100,6 @@ pub fn stack(anchors: &[(f32, f32)], gap: f32) -> Vec<f32> {
     out
 }
 
-/// The margin's own style for a note's body text: the document's `Style`
-/// flags mapped onto the smaller serif the margin uses, so emphasis and
-/// code survive the move into the margin.
-fn note_style(style: Style) -> TextStyle {
-    if style.code {
-        return TextStyle::mono(13.5, theme::DIM);
-    }
-    let mut text = TextStyle::serif(13.5, theme::DIM);
-    if style.bold {
-        text = text.bold();
-    }
-    if style.italic {
-        text = text.italic();
-    }
-    text
-}
-
-/// Converts a note's body runs to the margin's own run type. A math atom is
-/// shown as its linear notation — the margin is a caption, not an editor,
-/// and nothing here is meant to be edited in place.
-pub fn runs_of(body: &[Inline]) -> Vec<Run> {
-    body.iter()
-        .filter_map(|run| match run {
-            Inline::Text(text) => Some(Run::text(&text.text, note_style(text.style))),
-            Inline::Math(list) => Some(Run::text(
-                &math_notation::print(list),
-                TextStyle::math(12.5, theme::DIM),
-            )),
-            // An anchor inside a note's body is degenerate; drop it.
-            Inline::Note(_) => None,
-        })
-        .collect()
-}
-
-/// One placed word of a note body.
-struct Placed {
-    x: f32,
-    line: usize,
-    text: String,
-    style: TextStyle,
-}
-
-/// Greedy word wrap of a note body. Deliberately a body-only cousin of
-/// `prose::Paragraph`: the margin needs a height *before* it draws, so it
-/// can stack notes, and `Paragraph::draw` only reports the height after
-/// drawing. Both the measure and the draw below run through this one pass,
-/// so they can never disagree about where a line breaks.
-fn place(runs: &[Run], width: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) -> Vec<Placed> {
-    let mut out = Vec::new();
-    let (mut cursor, mut line, mut first) = (0.0f32, 0usize, true);
-    for run in runs {
-        let Run::Text(text, style) = run else {
-            continue;
-        };
-        let space = measure(" ", style);
-        for word in text.split_whitespace() {
-            let w = measure(word, style);
-            if !first && cursor + space + w > width {
-                line += 1;
-                cursor = 0.0;
-            } else if !first {
-                cursor += space;
-            }
-            out.push(Placed {
-                x: cursor,
-                line,
-                text: word.to_string(),
-                style: style.clone(),
-            });
-            cursor += w;
-            first = false;
-        }
-    }
-    out
-}
-
-/// The height `runs` occupy when wrapped to `width`. Exposed for the shell,
-/// which stacks notes in `rebuild_views` before they are drawn.
-pub fn body_height(runs: &[Run], width: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) -> f32 {
-    let lines = place(runs, width, measure).last().map_or(0, |p| p.line + 1);
-    lines as f32 * LINE_HEIGHT
-}
-
-/// Draws `runs` wrapped to `width`; returns the height used, so the caller
-/// can stack notes without guessing how many lines each took.
-fn draw_body(layer: &Layer, runs: &[Run], top_left: (f32, f32), width: f32) -> f32 {
-    let placed = place(runs, width, &|text, style| theme::width(layer, text, style));
-    for piece in &placed {
-        let baseline = top_left.1 + LINE_HEIGHT * (piece.line as f32 + 0.5);
-        theme::draw(
-            layer,
-            &piece.text,
-            (top_left.0 + piece.x, baseline),
-            &piece.style,
-            theme::LEFT,
-        );
-    }
-    let lines = placed.last().map_or(0, |p| p.line + 1);
-    lines as f32 * LINE_HEIGHT
-}
-
 pub struct SidenoteMargin {
     notes: Vec<Note>,
     /// The editor's content-top offset, so a note aligns with its anchor's
@@ -164,17 +107,42 @@ pub struct SidenoteMargin {
     top: f32,
     /// The editor's scroll, so the margin scrolls with the text (spec §3.2).
     scroll: f32,
+    dirty: Dirty,
 }
 
 impl SidenoteMargin {
     pub fn new(notes: Vec<Note>, top: f32, scroll: f32) -> Self {
-        Self { notes, top, scroll }
+        Self {
+            notes,
+            top,
+            scroll,
+            dirty: Dirty::new(),
+        }
     }
 }
 
 impl Component for SidenoteMargin {
     fn measure(&mut self, _: &Layer) -> (f32, f32) {
         (150.0, 120.0)
+    }
+
+    fn sync(&mut self, context: &Context) {
+        // The notes' editors are read-only today, but forwarding sync now is
+        // what lets a caret blink in one the day it is not.
+        for note in &mut self.notes {
+            note.editor.sync(context);
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.get() || self.notes.iter().any(|note| note.editor.is_dirty())
+    }
+
+    fn clear_dirty(&mut self) {
+        self.dirty.clear();
+        for note in &mut self.notes {
+            note.editor.clear_dirty();
+        }
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
@@ -189,7 +157,7 @@ impl Component for SidenoteMargin {
         // Document coordinates become screen coordinates the same way the
         // editor does: content top, minus the shared scroll.
         let top = rect.y + self.top - self.scroll;
-        for note in &self.notes {
+        for note in &mut self.notes {
             let y = top + note.y;
             theme::rule(layer, (rect.x, y + 8.0), 14.0, 1.0, theme::BORDER);
             theme::draw(
@@ -199,7 +167,15 @@ impl Component for SidenoteMargin {
                 &TextStyle::serif(10.0, theme::ACCENT),
                 theme::LEFT,
             );
-            draw_body(layer, &note.body, (rect.x + 30.0, y), rect.width - 46.0);
+            // The note editor draws into the note's own placed rectangle,
+            // which is exactly the note's laid-out height.
+            let note_rect = Rect {
+                x: rect.x,
+                y,
+                width: rect.width,
+                height: note.editor.content_height(),
+            };
+            note.editor.draw(layer, note_rect);
         }
     }
 }
@@ -207,6 +183,20 @@ impl Component for SidenoteMargin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::layout::layout_blocks;
+    use crate::document::{Block, Inline, Text};
+
+    fn para(text: &str) -> Block {
+        Block::Paragraph(vec![Inline::Text(Text {
+            text: text.into(),
+            style: Style::PLAIN,
+        })])
+    }
+
+    /// Every glyph 10 wide, so line breaks are countable by hand.
+    fn fake_measure(text: &str, _: &TextStyle) -> f32 {
+        text.chars().count() as f32 * 10.0
+    }
 
     #[test]
     fn a_note_sits_at_its_anchor() {
@@ -236,5 +226,31 @@ mod tests {
     #[test]
     fn stacking_is_stable_for_an_empty_column() {
         assert_eq!(stack(&[], GAP), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn a_notes_height_is_its_own_layouts_not_a_guess() {
+        // A note body that wraps is taller than one that does not, and the
+        // height used for stacking is the note's own layout height — a second
+        // note clears the first's real bottom, not a fixed line-count guess.
+        let tall = Rc::new(layout_blocks(
+            &[para("word word word word word")],
+            NOTE_WIDTH,
+            SCALE,
+            &fake_measure,
+        ));
+        let small = Rc::new(layout_blocks(
+            &[para("word")],
+            NOTE_WIDTH,
+            SCALE,
+            &fake_measure,
+        ));
+        assert!(tall.height > small.height);
+
+        let note = Note::new("1", tall.clone(), 0.0);
+        assert_eq!(note.editor.content_height(), tall.height);
+
+        let wanted = vec![(100.0, tall.height), (100.0, small.height)];
+        assert_eq!(stack(&wanted, GAP), vec![100.0, 100.0 + tall.height + GAP]);
     }
 }

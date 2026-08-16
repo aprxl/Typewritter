@@ -62,6 +62,43 @@ pub const VIEW_CAP: usize = 8000;
 /// should not mean writing on the bottom edge of the screen.
 pub const OVERSCROLL: f32 = 0.5;
 
+/// The numbers an editor draws with. The page has one value for each; a
+/// note embedded in the margin has its own. Both are named, so the two
+/// sites never drift into a shared "the" size that only one of them wants.
+pub struct Metrics {
+    /// Left padding of the content area.
+    pub inset: f32,
+    /// Top padding of the content area.
+    pub top: f32,
+    /// The content column is never wider than this.
+    pub measure: f32,
+    /// Space kept past the right edge before a line may wrap.
+    pub right_margin: f32,
+    /// Whether this editor is the page: it fills its rect with the page
+    /// background and draws the current-line band and the caret. An editor
+    /// embedded inside another component draws none of that — its container
+    /// already painted, and a band or caret spanning someone else's rect is
+    /// a second claim about what the rect is.
+    pub page: bool,
+}
+
+impl Metrics {
+    /// The text pane's metrics, unchanged from before these were instance
+    /// state: the page editor draws by exactly the values it always did.
+    pub const PAGE: Metrics = Metrics {
+        inset: INSET,
+        top: TOP,
+        measure: MEASURE,
+        right_margin: RIGHT_MARGIN,
+        page: true,
+    };
+
+    /// The content column's width in `rect`: the measure, or whatever fits.
+    pub fn content_width(&self, rect: Rect) -> f32 {
+        (rect.width - self.inset - self.right_margin).clamp(0.0, self.measure)
+    }
+}
+
 /// One measured piece of a visual line: `(text, style, x, width)`.
 type Painted = (String, Style, f32, f32);
 
@@ -245,6 +282,8 @@ fn badge_spans(pieces: &[Painted]) -> Vec<(f32, f32, BadgeColor)> {
 
 pub struct Editor {
     layout: Rc<DocLayout>,
+    /// Where this editor draws: the page's metrics or a note's.
+    metrics: Metrics,
     /// Model caret — its position is resolved against the layout at draw.
     caret: Caret,
     /// Content offset in logical pixels.
@@ -287,6 +326,7 @@ impl Editor {
         scroll: f32,
         block_caret: bool,
         caret_style: Style,
+        metrics: Metrics,
     ) -> Self {
         let mut numbers = vec![None; layout.source.len()];
         for node in crate::document::outline::outline(&layout.source) {
@@ -294,6 +334,7 @@ impl Editor {
         }
         Self {
             layout,
+            metrics,
             caret,
             scroll,
             has_file: true,
@@ -345,9 +386,11 @@ impl Editor {
             layout: Rc::new(DocLayout {
                 blocks: Vec::new(),
                 height: 0.0,
+                scale: 1.0,
                 source: Vec::new(),
                 anchors: Vec::new(),
             }),
+            metrics: Metrics::PAGE,
             caret: Caret {
                 block: 0,
                 inline: 0,
@@ -371,9 +414,16 @@ impl Editor {
         }
     }
 
-    /// The content column's width in `rect`: the measure, or whatever fits.
+    /// The content column's width in `rect` — the page's, since the shell's
+    /// own caret math is always about the text pane.
     pub fn content_width(rect: Rect) -> f32 {
-        (rect.width - INSET - RIGHT_MARGIN).clamp(0.0, MEASURE)
+        Metrics::PAGE.content_width(rect)
+    }
+
+    /// The laid-out content height: the page's scroll ceiling, and a note's
+    /// own height when this editor is the margin showing it.
+    pub fn content_height(&self) -> f32 {
+        self.layout.height
     }
 
     pub fn with_selection(mut self, selection: Option<FlatRange>, line: bool) -> Self {
@@ -390,9 +440,10 @@ impl Component for Editor {
     }
 
     fn sync(&mut self, context: &Context) {
-        // Only a document has a caret to blink; the placeholder must not
-        // redraw itself twice a second for a caret it never draws.
-        if self.has_file {
+        // Only the page's document has a caret to blink; the placeholder and
+        // a read-only margin note must not redraw twice a second for a caret
+        // neither draws.
+        if self.has_file && self.metrics.page {
             self.dirty.write(&mut self.caret_on, context.caret_on);
         }
     }
@@ -413,14 +464,18 @@ impl Component for Editor {
             glow.clear();
             glow.set_clip_rect(Some((rect.position(), rect.size())));
         }
-        layer.draw_rectangle(
-            rect.position(),
-            rect.size(),
-            theme::BACKGROUND,
-            Rounding::NONE,
-        );
+        // The page fills its whole rect; an editor embedded in a note does
+        // not, because its container already painted.
+        if self.metrics.page {
+            layer.draw_rectangle(
+                rect.position(),
+                rect.size(),
+                theme::BACKGROUND,
+                Rounding::NONE,
+            );
+        }
 
-        let x = rect.x + INSET;
+        let x = rect.x + self.metrics.inset;
         if !self.has_file {
             theme::draw(
                 layer,
@@ -445,7 +500,7 @@ impl Component for Editor {
             .layout
             .caret_pos(self.caret, &|text, style| theme::width(layer, text, style));
         let (band_top, band_bottom) = self.layout.caret_band(self.caret);
-        let content = rect.y + TOP;
+        let content = rect.y + self.metrics.top;
         let math_focus = if self.math.is_some()
             && self.caret.block < self.layout.source.len()
             && self.caret.inline < self.layout.source[self.caret.block].inlines().len()
@@ -459,13 +514,16 @@ impl Component for Editor {
         };
 
         // The current-line band does not blink — it identifies the line the
-        // caret is on, regardless of caret visibility.
-        layer.draw_rectangle(
-            (rect.x, content + band_top - self.scroll),
-            (rect.width, band_bottom - band_top),
-            theme::ALT,
-            Rounding::NONE,
-        );
+        // caret is on, regardless of caret visibility. Page furniture only:
+        // a note's editor has no caret, so no band to identify it with.
+        if self.metrics.page {
+            layer.draw_rectangle(
+                (rect.x, content + band_top - self.scroll),
+                (rect.width, band_bottom - band_top),
+                theme::ALT,
+                Rounding::NONE,
+            );
+        }
 
         // A fenced block is tinted as one slab, not line by line: its lines
         // sit flush against each other, so per-line boxes would notch the
@@ -482,7 +540,7 @@ impl Component for Editor {
                         layer.draw_rectangle(
                             (x - BLOCK_PAD.0, top - BLOCK_PAD.1),
                             (
-                                Self::content_width(rect) + BLOCK_PAD.0 * 2.0,
+                                self.metrics.content_width(rect) + BLOCK_PAD.0 * 2.0,
                                 bottom - top + BLOCK_PAD.1 * 2.0,
                             ),
                             theme::MATH,
@@ -513,7 +571,7 @@ impl Component for Editor {
                     layer.draw_rectangle(
                         (x - BLOCK_PAD.0, top - BLOCK_PAD.1),
                         (
-                            Self::content_width(rect) + BLOCK_PAD.0 * 2.0,
+                            self.metrics.content_width(rect) + BLOCK_PAD.0 * 2.0,
                             bottom - top + BLOCK_PAD.1 * 2.0,
                         ),
                         theme::CODE,
@@ -552,7 +610,13 @@ impl Component for Editor {
                     if top + line.height >= rect.y && top <= rect.bottom() {
                         // Whole pixel: a 1px rule on a fraction smears.
                         let y = (top + line.height * 0.5).round();
-                        theme::rule(layer, (x, y), Self::content_width(rect), 1.0, theme::BORDER);
+                        theme::rule(
+                            layer,
+                            (x, y),
+                            self.metrics.content_width(rect),
+                            1.0,
+                            theme::BORDER,
+                        );
                     }
                 }
                 continue;
@@ -588,6 +652,7 @@ impl Component for Editor {
                         kind,
                         segment.style,
                         segment.number.as_deref(),
+                        self.layout.scale,
                         &|text, style| theme::width(layer, text, style),
                     );
                     if is_note {
@@ -732,7 +797,7 @@ impl Component for Editor {
                     ) {
                         continue;
                     }
-                    let style = layout::text_style(kind, *style);
+                    let style = layout::text_style(kind, *style, self.layout.scale);
                     theme::draw(layer, text, (*at, baseline), &style, theme::LEFT);
                 }
                 // The auto-number, hung in the margin: virtual, so it is
@@ -772,6 +837,10 @@ impl Component for Editor {
         }
 
         if self.math.is_some() {
+            return;
+        }
+        // A note's editor is read-only: no caret of its own to draw.
+        if !self.metrics.page {
             return;
         }
         if self.block_caret {
@@ -877,10 +946,17 @@ impl Editor {
                                 line,
                                 line_start,
                                 start,
+                                self.layout.scale,
                                 layer,
                             );
-                            let right =
-                                Self::line_x(&self.layout.source[bi], line, line_start, end, layer);
+                            let right = Self::line_x(
+                                &self.layout.source[bi],
+                                line,
+                                line_start,
+                                end,
+                                self.layout.scale,
+                                layer,
+                            );
                             layer.draw_rectangle(
                                 (x + left, top),
                                 ((right - left).max(1.0), line.height),
@@ -900,6 +976,7 @@ impl Editor {
         line: &layout::VisLine,
         line_start: usize,
         flat: usize,
+        scale: f32,
         layer: &Layer,
     ) -> f32 {
         let mut x = 0.0;
@@ -923,6 +1000,7 @@ impl Editor {
                     block,
                     segment.style,
                     segment.number.as_deref(),
+                    scale,
                     &|text, style| theme::width(layer, text, style),
                 );
             } else {
@@ -931,7 +1009,11 @@ impl Editor {
                     x += theme::BADGE_PAD;
                 }
                 let prefix: String = text.chars().take(count).collect();
-                x += theme::width(layer, &prefix, &layout::text_style(block, segment.style));
+                x += theme::width(
+                    layer,
+                    &prefix,
+                    &layout::text_style(block, segment.style, scale),
+                );
                 break;
             }
             cursor += segment.len;
@@ -1095,6 +1177,7 @@ mod tests {
             0.0,
             false,
             Style::PLAIN,
+            Metrics::PAGE,
         );
 
         assert_eq!(
@@ -1126,8 +1209,15 @@ mod tests {
         let layout = layout::layout(&document, 1000.0, &|value, _| {
             value.chars().count() as f32 * 10.0
         });
-        let editor = Editor::new(Rc::new(layout), document.caret, 0.0, false, Style::PLAIN)
-            .with_context_selections(vec![target.clone()], Some((42.0, 24.0)));
+        let editor = Editor::new(
+            Rc::new(layout),
+            document.caret,
+            0.0,
+            false,
+            Style::PLAIN,
+            Metrics::PAGE,
+        )
+        .with_context_selections(vec![target.clone()], Some((42.0, 24.0)));
 
         assert_eq!(editor.context_selections, vec![target]);
         assert_eq!(editor.brush_point, Some((42.0, 24.0)));
@@ -1143,7 +1233,7 @@ mod tests {
         let atom = ATOM.to_string();
         let measure =
             |text: &str, style: &TextStyle| text.chars().count() as f32 * style.size * 0.5;
-        let width = layout::advance(&run, &atom, &block, Style::PLAIN, None, &measure);
+        let width = layout::advance(&run, &atom, &block, Style::PLAIN, None, 1.0, &measure);
         let box_width = match &run {
             Inline::Math(list) => math_layout::layout(list, 0, &measure).width,
             Inline::Text(_) => unreachable!(),

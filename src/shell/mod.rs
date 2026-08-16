@@ -44,7 +44,7 @@ use crate::components::{
 };
 use crate::config::Config;
 use crate::document::Caret;
-use crate::document::layout::{ContextHit, DocLayout, RangeKind};
+use crate::document::layout::{ContextHit, DocLayout, RangeKind, layout_blocks};
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_conversion;
 use crate::document::outline;
@@ -823,6 +823,7 @@ impl Shell {
                 None => DocLayout {
                     blocks: Vec::new(),
                     height: 0.0,
+                    scale: 1.0,
                     source: Vec::new(),
                     anchors: Vec::new(),
                 },
@@ -1055,23 +1056,29 @@ impl Shell {
             }
         };
 
+        // Each note is laid out at the margin's width and scale with the same
+        // measure the margin draws with, so a note's height is its own
+        // layout's, not a second wrapper's guess.
         let layer = self.regions[self.text_region].layer();
         let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
-        let body_width = sidenotes::WIDTH - 46.0;
-        let mut wanted = Vec::with_capacity(anchored.len());
+        let mut laid: Vec<(Rc<DocLayout>, f32)> = Vec::with_capacity(anchored.len());
         for (body, (_, _, y)) in bodies.iter().zip(&anchored) {
-            let runs = sidenotes::runs_of(body[0].inlines());
-            wanted.push((*y, sidenotes::body_height(&runs, body_width, &measure)));
+            let note_layout = Rc::new(layout_blocks(
+                body,
+                sidenotes::NOTE_WIDTH,
+                sidenotes::SCALE,
+                &measure,
+            ));
+            laid.push((note_layout, *y));
         }
+        let wanted: Vec<(f32, f32)> = laid.iter().map(|(layout, y)| (*y, layout.height)).collect();
         let ys = sidenotes::stack(&wanted, sidenotes::GAP);
 
         anchored
             .iter()
-            .zip(&bodies)
+            .zip(&laid)
             .zip(&ys)
-            .map(|(((_, number, _), body), &y)| {
-                Note::new(number, sidenotes::runs_of(body[0].inlines()), y)
-            })
+            .map(|(((_, number, _), (layout, _)), &y)| Note::new(number, layout.clone(), y))
             .collect()
     }
 
@@ -1187,11 +1194,18 @@ impl Shell {
                     };
                     let math = tab.document.math.clone();
                     (
-                        Editor::new(layout, caret, scroll, block_caret, caret.style)
-                            .with_math(math)
-                            .with_math_selection(math_selection)
-                            .with_context_selections(self.brush_selected.clone(), self.brush_point)
-                            .with_selection(selection, line_selection),
+                        Editor::new(
+                            layout,
+                            caret,
+                            scroll,
+                            block_caret,
+                            caret.style,
+                            editor::Metrics::PAGE,
+                        )
+                        .with_math(math)
+                        .with_math_selection(math_selection)
+                        .with_context_selections(self.brush_selected.clone(), self.brush_point)
+                        .with_selection(selection, line_selection),
                         StatusLine::new(
                             mode_label,
                             mode_color,
