@@ -228,11 +228,15 @@ pub struct Shell {
     /// middle of a step, so without this the loop would sleep past the
     /// blink — see [`stepped`].
     wake_at: Option<Instant>,
-    /// The wall clock of the last edit the autosave timer saw. Restarted
-    /// whenever [`Tabs::revision`] moves, so the save debounces from the
-    /// last edit rather than a fixed period.
-    autosave_last_edit: Instant,
-    /// The revision `autosave_last_edit` was captured at.
+    /// The wall clock of the last time the autosave timer restarted —
+    /// either an edit or a save attempt. Restarted whenever
+    /// [`Tabs::revision`] moves and whenever a save is attempted, so the
+    /// save debounces from the last activity rather than a fixed period.
+    /// Restarting on attempt is what keeps a tab that cannot be saved — a
+    /// failed write, or a dirty tab with no path — from retrying every
+    /// frame.
+    autosave_last_attempt: Instant,
+    /// The revision `autosave_last_attempt` was captured at.
     autosave_revision: u64,
     show_stats: bool,
     /// Draws each tree row's hit band (`d` toggles).
@@ -480,7 +484,7 @@ impl Shell {
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
             pulse: Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16).ping_pong(),
             wake_at: None,
-            autosave_last_edit: Instant::now(),
+            autosave_last_attempt: Instant::now(),
             autosave_revision: 0,
             show_stats: true,
             debug_rows: false,
@@ -668,22 +672,29 @@ impl Shell {
     }
 
     /// Runs the idle autosave: restart the clock whenever [`Tabs::revision`]
-    /// moves, and write every dirty tab once the document has sat still for
-    /// [`AUTOSAVE_IDLE`]. Failures are logged; a failing tab is retried on
-    /// the next idle window, not every frame.
+    /// moves or a save is attempted, and write every dirty tab once the
+    /// document has sat still for [`AUTOSAVE_IDLE`]. Failures are logged; a
+    /// failing tab is retried on the next idle window, not every frame.
+    ///
+    /// The clock is restarted on attempt, not only on edit, so that a tab
+    /// that stays dirty — a failed write, or a dirty tab with no path that
+    /// `save_all` skips without touching — retries once per
+    /// [`AUTOSAVE_IDLE`], never at frame rate.
     fn autosave(&mut self) {
         let revision = self.docs.borrow().revision();
         if revision != self.autosave_revision {
             self.autosave_revision = revision;
-            self.autosave_last_edit = Instant::now();
+            self.autosave_last_attempt = Instant::now();
             return;
         }
         let dirty = self.docs.borrow().any_dirty();
-        if autosave_due(self.autosave_last_edit, Instant::now(), dirty) {
+        let now = Instant::now();
+        if autosave_due(self.autosave_last_attempt, now, dirty) {
             let failed = self.docs.borrow_mut().save_all();
             for (path, error) in failed {
                 eprintln!("autosave failed for {}: {error}", path.display());
             }
+            self.autosave_last_attempt = now;
         }
     }
 
@@ -693,7 +704,7 @@ impl Shell {
         if !self.docs.borrow().any_dirty() {
             return None;
         }
-        Some(self.autosave_last_edit + AUTOSAVE_IDLE)
+        Some(self.autosave_last_attempt + AUTOSAVE_IDLE)
     }
 
     /// Writes every dirty tab now, for the window-close path. Failures are
@@ -1159,11 +1170,11 @@ impl Shell {
     }
 }
 
-/// Whether the idle autosave is due: a dirty document whose last edit was at
-/// least [`AUTOSAVE_IDLE`] ago. Kept as a pure function so the debounce is
-/// testable without running frames.
-fn autosave_due(last_edit: Instant, now: Instant, dirty: bool) -> bool {
-    dirty && now.saturating_duration_since(last_edit) >= AUTOSAVE_IDLE
+/// Whether the idle autosave is due: a dirty document whose last activity —
+/// an edit or a save attempt — was at least [`AUTOSAVE_IDLE`] ago. Kept as a
+/// pure function so the debounce is testable without running frames.
+fn autosave_due(last_attempt: Instant, now: Instant, dirty: bool) -> bool {
+    dirty && now.saturating_duration_since(last_attempt) >= AUTOSAVE_IDLE
 }
 
 /// The vault's display name, for the breadcrumb.
@@ -1263,6 +1274,39 @@ mod tests {
     fn a_clean_document_never_schedules_a_save() {
         let edit = Instant::now();
         assert!(!autosave_due(edit, edit + AUTOSAVE_IDLE * 10, false));
+    }
+
+    #[test]
+    fn a_failed_save_waits_a_full_idle_window_before_retrying() {
+        // A save attempt restarts the clock exactly like an edit does, so a
+        // tab that stays dirty after a failed write is not due again until a
+        // full idle window has passed — not the very next frame.
+        let attempt = Instant::now();
+        assert!(!autosave_due(
+            attempt,
+            attempt + AUTOSAVE_IDLE - Duration::from_millis(1),
+            true
+        ));
+        assert!(autosave_due(attempt, attempt + AUTOSAVE_IDLE, true));
+    }
+
+    #[test]
+    fn a_dirty_tab_with_no_path_does_not_retry_every_frame() {
+        // A pathless dirty tab is skipped and never written, so it stays
+        // dirty with nothing failed — but the attempt still restarts the
+        // clock, so it is not due again until a full idle window has passed.
+        let attempt = Instant::now();
+        assert!(!autosave_due(
+            attempt,
+            attempt + Duration::from_millis(1),
+            true
+        ));
+        assert!(!autosave_due(
+            attempt,
+            attempt + AUTOSAVE_IDLE - Duration::from_millis(1),
+            true
+        ));
+        assert!(autosave_due(attempt, attempt + AUTOSAVE_IDLE, true));
     }
 
     #[test]
