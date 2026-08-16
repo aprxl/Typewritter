@@ -1,13 +1,15 @@
 # Work log
 
 State at handoff: `cargo fmt --check` clean, `cargo clippy --all-targets -D
-warnings` clean, 483 tests passing, and the tree committed as `67b91e6`
-(`Reserve two digits for a two-digit sidenote anchor`).
+warnings` clean, 512 tests passing, and the tree committed as `fc46251`
+(`Scale math layout with document`).
 
 How the work is being done, since `AGENTS.md` is out of date on this: coding is
 delegated to the `opencode` CLI rather than to in-process subagents. The last
-session used `openrouter/deepseek/deepseek-v4-pro-0813 --variant high` for
-everything and it carried design-level work well. Each task spec names the
+last two sessions used `openrouter/deepseek/deepseek-v4-pro-0813 --variant
+high` and then `openrouter/openai/gpt-5.6-luna --variant high`; both carried
+design-level work well, and luna is cheaper. Luna needs `openai` allowed under
+OpenRouter's allowed-providers setting, or every run fails before it starts. Each task spec names the
 exact files that run owns, and no two runs in a wave own the same file; waves
 run one at a time, because parallel `cargo` builds contend. A spec must say *do
 the work yourself, do not delegate it further* — runs that delegate have
@@ -24,6 +26,69 @@ found: an autosave that retried every frame, a paste that mangled prices, and
 an anchor that reserved less width than it drew. Each was caught by reading the
 diff and fixed in a follow-up wave. A green `cargo test` says the tests agree
 with the code, not that the code is right.
+
+---
+
+## Session log — sidenote editing
+
+A note's text can now be edited with the same editor the page uses. Six waves.
+
+The shape of it: rather than build a second, smaller editor with its own state
+and its own key handling, the **editing scope became a property of the
+document**. The caret is either in the body or inside one note's body, and
+every primitive already written operates on whichever it is. `src/vim/` and
+`src/tabs.rs` never learned that notes exist — they call the same `Document`
+methods they always called. Undo needed nothing: a `Tab` snapshots the whole
+`Document`, and a note body is part of it.
+
+| Commit | Wave |
+|---|---|
+| `e26d8dc` | `Focus::Body`/`Focus::Note(i)`, note bodies become `Vec<Block>` |
+| `9ac62a9` | ↳ `scope()` vs `body()` — the repair, see below |
+| `cccff24` | `layout_blocks`, `Editor::Metrics`, margin draws real editors |
+| `44b362e` | `note.edit`, click an anchor, click a note, Escape back out |
+| `ab5fb94` | ↳ a body coordinate always returns focus to the body |
+| `fc46251` | ↳ math sized at the margin's scale |
+
+Three of the six waves needed a follow-up, all found by reading the diff:
+
+- **`e26d8dc` swept half the file.** `flat_to_pos` followed focus while
+  `position`, `set_flat_position`, `range_text`, `line_range`, `delete_range`,
+  `text_object_range` and `block_text` still indexed the body — and
+  `vim/motion.rs` read the public `doc.blocks` field directly in twenty-one
+  places. With the caret in a note, `x` and `dw` would have deleted prose. The
+  spec caused it by forbidding edits to `src/vim/`. `9ac62a9` made the field
+  private so the compiler forced a decision at all ~245 sites: `scope()` is the
+  blocks the caret is in, `body()` is the file's own.
+- **`44b362e` made Escape the only way out.** Clicking prose while a note was
+  focused hit the *page* layout and wrote the result through `move_caret_to`,
+  which resolves against the focused scope. `ab5fb94` routes every
+  body-derived coordinate through one helper that sets focus and places the
+  caret together. Motions stay scope-local: inside a note, `G` ends at the end
+  of the note.
+- **`cccff24` scaled every text size except math.** `math_layout` sizes off its
+  own `BASE_SIZE`, so an expression in a note rendered at full page size and
+  overflowed the column — in an app for math-heavy lecture notes. `fc46251`
+  threads the scale through, keeping it separate from the `level` that shrinks
+  a fraction's operands.
+
+That is the same pattern as the readiness pass: **a body coordinate handed to a
+scope-resolving function**, three times, each time passing every check first.
+
+Deliberate limits, both marked in the code: **one paragraph per note** (matches
+the one-line footnote definition written to disk; multi-paragraph footnotes are
+indented continuation lines, which is the upgrade path) and **no note inside a
+note**.
+
+Known and left: a Normal-mode click on prose opens the context menu without
+moving the caret, so focus stays in the note. The `*_at` edits it makes are
+explicitly body-addressed, so nothing lands in the wrong scope.
+
+**Not visually verified.** Every wave passed the 6-second smoke run with no
+panic and no wgpu error, but nothing here has been seen on screen: there is no
+headless X server on this machine, and the only display is the user's own
+session. The margin at its new scale, the caret blinking in a note, and the
+focused note's accent tick are all unwatched.
 
 ---
 
@@ -227,7 +292,7 @@ before firing the trigger — otherwise a fraction captures them as its numerato
 
 ## What is left
 
-In priority order, as of `67b91e6`. Everything above this line is done.
+In priority order, as of `fc46251`. Everything above this line is done.
 
 1. **Full-text search.** `file_finder.rs` is fuzzy *filename* matching only.
    SPEC §7.3 calls search the whole retrieval story and asks for three things,
@@ -243,9 +308,9 @@ In priority order, as of `67b91e6`. Everything above this line is done.
    many words: a folder of hand-named lecture notes sorts into nonsense.
    Default should be created-date descending with a toggle. Small, and stated.
 
-3. **Editing a sidenote in place.** The margin renders and `format.sidenote`
-   creates, but a note's text cannot be changed once written. Deliberately left
-   out of the wave that built the margin.
+3. **Seeing sidenote editing actually run.** The feature is built, tested and
+   committed, and no one has watched it work. Wants a real session: create a
+   note, type an expression into it, watch it wrap in the margin, Escape out.
 
 4. **External-change detection.** Nothing watches the vault. Edit a note on the
    other machine, save here, and the other version is overwritten silently.
