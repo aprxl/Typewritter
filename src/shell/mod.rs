@@ -44,6 +44,7 @@ use crate::components::{
 };
 use crate::config::Config;
 use crate::document::Caret;
+use crate::document::Focus;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind, layout_blocks};
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_conversion;
@@ -261,10 +262,12 @@ pub struct Shell {
         Option<crate::document::FlatRange>,
         bool,
     ),
-    /// Where the caret-follow last ran: `(active tab, caret)`. The
+    /// Where the caret-follow last ran: `(active tab, focus, caret)`. The
     /// editor only snaps to the caret when this changes, so a manual wheel
-    /// scroll can take the caret out of view freely.
-    followed: (usize, Caret),
+    /// scroll can take the caret out of view freely. Focus is part of the
+    /// key: moving focus into a note must follow the note, even when the
+    /// caret value happens not to move.
+    followed: (usize, Focus, Caret),
     /// The laid-out active document, keyed by `(revision, content width)`.
     /// Rebuilt in `rebuild_views`; the editor and the shell's own caret
     /// math (click, j/k) read the same `Rc`.
@@ -501,6 +504,7 @@ impl Shell {
             last_visual_state: (None, None, None, false),
             followed: (
                 usize::MAX,
+                Focus::Body,
                 Caret {
                     block: 0,
                     inline: 0,
@@ -847,34 +851,58 @@ impl Shell {
     /// Brings the caret's visual line into the editor's visible band, if
     /// scrolling is needed to do it. Only called when the caret actually
     /// moved — a wheel scroll must be able to take the caret out of view.
+    /// When focus is a note, the thing that must stay on screen is that note,
+    /// so its placed rectangle is fed in instead of the page caret; the
+    /// margin and the page share one scroll offset, so this is a change of
+    /// which band is followed, not a second scroll.
     fn ensure_caret_visible(&mut self) {
         let rect = self.layout.rect(self.text_column);
-        let (scroll, _max) = {
-            let scroll = self.docs.borrow().editor_scroll;
-            let max = self.editor_max_scroll();
-            let docs = self.docs.borrow();
-            let layout = self
-                .doc_layout
-                .as_ref()
-                .map(|(_, _, layout)| layout.clone());
-            if let (Some(layout), Some(tab)) = (layout, docs.active()) {
-                let (top, bottom) = layout.caret_band(tab.document.caret);
-                (
-                    editor::follow_scroll(
-                        scroll,
-                        top,
-                        bottom,
-                        rect.y + editor::TOP,
-                        rect.bottom(),
-                        max,
-                    ),
-                    max,
-                )
-            } else {
-                (scroll, max)
+        let band = match self.focused_note_band() {
+            Some(band) => band,
+            None => {
+                let docs = self.docs.borrow();
+                let Some(layout) = self
+                    .doc_layout
+                    .as_ref()
+                    .map(|(_, _, layout)| layout.clone())
+                else {
+                    return;
+                };
+                let Some(tab) = docs.active() else {
+                    return;
+                };
+                layout.caret_band(tab.document.caret)
             }
         };
+        let scroll = self.docs.borrow().editor_scroll;
+        let max = self.editor_max_scroll();
+        let scroll = editor::follow_scroll(
+            scroll,
+            band.0,
+            band.1,
+            rect.y + editor::TOP,
+            rect.bottom(),
+            max,
+        );
         self.docs.borrow_mut().set_editor_scroll(scroll);
+    }
+
+    /// The focused note's placed band in document coordinates — `(top,
+    /// bottom)` — or `None` when focus is the body. Runs the same stacking
+    /// pass the margin draws from, so the band is the note's real rectangle.
+    fn focused_note_band(&mut self) -> Option<(f32, f32)> {
+        let label = {
+            let docs = self.docs.borrow();
+            let tab = docs.active()?;
+            let Focus::Note(i) = tab.document.focus else {
+                return None;
+            };
+            tab.document.notes.get(i).map(|note| note.label.clone())?
+        };
+        self.stacked_notes()
+            .into_iter()
+            .find(|(note_label, _, _, _)| *note_label == label)
+            .map(|(_, _, y, layout)| (y, y + layout.height))
     }
 
     fn editor_point(&self, rect: Rect, mouse: (f32, f32)) -> Option<(f32, f32)> {
@@ -1023,10 +1051,13 @@ impl Shell {
             .unwrap_or_default()
     }
 
-    /// The margin's notes, stacked beside their anchors. Runs in
-    /// `rebuild_views`, so the resolution may lag the text a frame but never
-    /// animates (spec §12.2): a note jumps to its place rather than sliding.
-    fn sidenote_notes(&mut self) -> Vec<Note> {
+    /// The margin's notes stacked beside their anchors, as `(label, number,
+    /// placed y, layout)`. Runs in `rebuild_views`, so the resolution may lag
+    /// the text a frame but never animates (spec §12.2): a note jumps to its
+    /// place rather than sliding. Shared by `sidenote_notes` and the margin's
+    /// click handler, so a click can never land on a note the view drew at a
+    /// different y.
+    fn stacked_notes(&mut self) -> Vec<(String, String, f32, Rc<DocLayout>)> {
         let width = Editor::content_width(self.layout.rect(self.text_column));
         let layout = self.current_layout(width);
 
@@ -1075,10 +1106,43 @@ impl Shell {
         let ys = sidenotes::stack(&wanted, sidenotes::GAP);
 
         anchored
-            .iter()
-            .zip(&laid)
-            .zip(&ys)
-            .map(|(((_, number, _), (layout, _)), &y)| Note::new(number, layout.clone(), y))
+            .into_iter()
+            .zip(laid)
+            .zip(ys)
+            .map(|(((label, number, _), (layout, _)), y)| (label, number, y, layout))
+            .collect()
+    }
+
+    /// The margin's notes as components. The focused note — the one whose
+    /// label `Document::focus` names — is the only one handed a caret, so it
+    /// is the only one that draws one.
+    fn sidenote_notes(&mut self) -> Vec<Note> {
+        let (focused_label, note_caret, block_caret) = {
+            let docs = self.docs.borrow();
+            let block_caret =
+                !matches!(self.vim.current_mode(), VimMode::Insert | VimMode::Command);
+            match docs.active() {
+                Some(tab) => match tab.document.focus {
+                    Focus::Note(i) => (
+                        tab.document.notes.get(i).map(|note| note.label.clone()),
+                        Some(tab.document.caret),
+                        block_caret,
+                    ),
+                    Focus::Body => (None, None, block_caret),
+                },
+                None => (None, None, false),
+            }
+        };
+        self.stacked_notes()
+            .into_iter()
+            .map(|(label, number, y, layout)| {
+                let caret = if focused_label.as_deref() == Some(label.as_str()) {
+                    note_caret
+                } else {
+                    None
+                };
+                Note::new(&number, layout, y, caret, block_caret)
+            })
             .collect()
     }
 
@@ -1097,6 +1161,7 @@ impl Shell {
             let docs = self.docs.borrow();
             (
                 docs.active_index().unwrap_or(usize::MAX),
+                docs.active().map_or(Focus::Body, |tab| tab.document.focus),
                 docs.active().map_or(
                     Caret {
                         block: 0,
@@ -1185,6 +1250,13 @@ impl Shell {
             match docs.active_mut() {
                 Some(tab) => {
                     let caret = tab.document.caret;
+                    // The page draws the caret only while the body is focused;
+                    // when a note is focused the caret is note-relative and the
+                    // focused note's editor draws it instead.
+                    let page_caret = match tab.document.focus {
+                        Focus::Body => Some(caret),
+                        Focus::Note(_) => None,
+                    };
                     let math_path = if tab.document.math.is_some() {
                         let mut path = vec!["math"];
                         path.extend(tab.document.math_path_names());
@@ -1196,7 +1268,7 @@ impl Shell {
                     (
                         Editor::new(
                             layout,
-                            caret,
+                            page_caret,
                             scroll,
                             block_caret,
                             caret.style,

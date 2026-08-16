@@ -285,7 +285,10 @@ pub struct Editor {
     /// Where this editor draws: the page's metrics or a note's.
     metrics: Metrics,
     /// Model caret — its position is resolved against the layout at draw.
-    caret: Caret,
+    /// `None` when this editor has no caret: the page while focus lives in a
+    /// note, or an unfocused margin note. The value is the whole signal, so
+    /// there is no second flag duplicating [`crate::document::Focus`].
+    caret: Option<Caret>,
     /// Content offset in logical pixels.
     scroll: f32,
     /// False draws the "no file open" placeholder instead of a document.
@@ -322,7 +325,7 @@ pub struct Editor {
 impl Editor {
     pub fn new(
         layout: Rc<DocLayout>,
-        caret: Caret,
+        caret: Option<Caret>,
         scroll: f32,
         block_caret: bool,
         caret_style: Style,
@@ -391,12 +394,7 @@ impl Editor {
                 anchors: Vec::new(),
             }),
             metrics: Metrics::PAGE,
-            caret: Caret {
-                block: 0,
-                inline: 0,
-                offset: 0,
-                style: Style::PLAIN,
-            },
+            caret: None,
             scroll: 0.0,
             has_file: false,
             block_caret: false,
@@ -426,6 +424,13 @@ impl Editor {
         self.layout.height
     }
 
+    /// Whether this editor draws a caret — the page while the body is
+    /// focused, or the one focused note in the margin. The same signal the
+    /// margin uses to mark a note as focused.
+    pub fn has_caret(&self) -> bool {
+        self.caret.is_some()
+    }
+
     pub fn with_selection(mut self, selection: Option<FlatRange>, line: bool) -> Self {
         self.selection = selection;
         self.line_selection = line;
@@ -440,10 +445,10 @@ impl Component for Editor {
     }
 
     fn sync(&mut self, context: &Context) {
-        // Only the page's document has a caret to blink; the placeholder and
-        // a read-only margin note must not redraw twice a second for a caret
-        // neither draws.
-        if self.has_file && self.metrics.page {
+        // Only an editor with a caret blinks — the page while the body is
+        // focused, or the focused note. The placeholder and an unfocused
+        // note must not redraw twice a second for a caret neither draws.
+        if self.has_file && self.caret.is_some() {
             self.dirty.write(&mut self.caret_on, context.caret_on);
         }
     }
@@ -494,32 +499,51 @@ impl Component for Editor {
             return;
         }
 
-        // The current line's band and the caret: both are resolved against
-        // the same layout, so they cannot drift apart.
-        let (caret_x, caret_baseline, caret_height) = self
-            .layout
-            .caret_pos(self.caret, &|text, style| theme::width(layer, text, style));
-        let (band_top, band_bottom) = self.layout.caret_band(self.caret);
         let content = rect.y + self.metrics.top;
-        let math_focus = if self.math.is_some()
-            && self.caret.block < self.layout.source.len()
-            && self.caret.inline < self.layout.source[self.caret.block].inlines().len()
-            && matches!(
-                self.layout.source[self.caret.block].inlines()[self.caret.inline],
-                Inline::Math(_)
-            ) {
-            self.math.as_ref()
-        } else {
-            None
+
+        // The current line's band and the caret are resolved against the same
+        // layout, so they cannot drift apart. When there is no caret here —
+        // the page while focus lives in a note, or an unfocused margin note —
+        // the geometry is zero and neither is drawn.
+        let caret = self.caret;
+        let (caret_x, caret_baseline, caret_height, band_top, band_bottom) = match caret {
+            Some(caret) => {
+                let (cx, cb, ch) = self
+                    .layout
+                    .caret_pos(caret, &|text, style| theme::width(layer, text, style));
+                let (bt, bb) = self.layout.caret_band(caret);
+                (cx, cb, ch, bt, bb)
+            }
+            None => (0.0, 0.0, 0.0, 0.0, 0.0),
         };
+        let math_focus = caret.and_then(|caret| {
+            if self.math.is_some()
+                && caret.block < self.layout.source.len()
+                && caret.inline < self.layout.source[caret.block].inlines().len()
+                && matches!(
+                    self.layout.source[caret.block].inlines()[caret.inline],
+                    Inline::Math(_)
+                )
+            {
+                self.math.as_ref()
+            } else {
+                None
+            }
+        });
 
         // The current-line band does not blink — it identifies the line the
-        // caret is on, regardless of caret visibility. Page furniture only:
-        // a note's editor has no caret, so no band to identify it with.
-        if self.metrics.page {
+        // caret is on, regardless of caret visibility. The page's spans the
+        // whole column; a note's spans only its own content column, so the
+        // marker and rule beside it stay visible.
+        if caret.is_some() {
+            let (band_x, band_width) = if self.metrics.page {
+                (rect.x, rect.width)
+            } else {
+                (x, self.metrics.content_width(rect))
+            };
             layer.draw_rectangle(
-                (rect.x, content + band_top - self.scroll),
-                (rect.width, band_bottom - band_top),
+                (band_x, content + band_top - self.scroll),
+                (band_width, band_bottom - band_top),
                 theme::ALT,
                 Rounding::NONE,
             );
@@ -728,9 +752,9 @@ impl Component for Editor {
                             }
                         }
                         draw_math(layer, &box_, (cursor, baseline));
-                        if let Some(math_cursor) = math_focus
-                            && bi == self.caret.block
-                            && segment.inline == self.caret.inline
+                        if let (Some(math_cursor), Some(caret)) = (math_focus, caret)
+                            && bi == caret.block
+                            && segment.inline == caret.inline
                         {
                             let (cursor_x, cursor_y, cursor_height) =
                                 math_layout::cursor_pos(list, math_cursor, 0, &measure);
@@ -819,16 +843,17 @@ impl Component for Editor {
         }
 
         // The caret's glyph context, for Normal mode's block.
-        let caret_char = self
-            .layout
-            .source
-            .get(self.caret.block)
-            .and_then(|b| b.inlines().get(self.caret.inline))
-            .and_then(|run| match run {
-                Inline::Text(t) => t.text.chars().nth(self.caret.offset),
-                Inline::Math(_) => Some(ATOM),
-                Inline::Note(_) => Some(ATOM),
-            });
+        let caret_char = caret.and_then(|caret| {
+            self.layout
+                .source
+                .get(caret.block)
+                .and_then(|b| b.inlines().get(caret.inline))
+                .and_then(|run| match run {
+                    Inline::Text(t) => t.text.chars().nth(caret.offset),
+                    Inline::Math(_) => Some(ATOM),
+                    Inline::Note(_) => Some(ATOM),
+                })
+        });
         let screen_x = x + caret_x;
         let screen_y = content + caret_baseline - self.scroll;
 
@@ -839,8 +864,9 @@ impl Component for Editor {
         if self.math.is_some() {
             return;
         }
-        // A note's editor is read-only: no caret of its own to draw.
-        if !self.metrics.page {
+        // No caret here — the page while focus lives in a note, or an
+        // unfocused margin note. The text above already drew.
+        if caret.is_none() {
             return;
         }
         if self.block_caret {
@@ -1168,12 +1194,12 @@ mod tests {
         });
         let editor = Editor::new(
             Rc::new(layout),
-            Caret {
+            Some(Caret {
                 block: 0,
                 inline: 0,
                 offset: 0,
                 style: Style::PLAIN,
-            },
+            }),
             0.0,
             false,
             Style::PLAIN,
@@ -1211,7 +1237,7 @@ mod tests {
         });
         let editor = Editor::new(
             Rc::new(layout),
-            document.caret,
+            Some(document.caret),
             0.0,
             false,
             Style::PLAIN,

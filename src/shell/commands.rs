@@ -337,6 +337,13 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.docs.borrow_mut().insert_sidenote(),
     },
     Command {
+        id: "note.edit",
+        title: "Edit sidenote",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.edit_note_at_caret(),
+    },
+    Command {
         // SPEC §6.1: <leader>m once a leader-binding mechanism exists.
         id: "format.math",
         title: "Math",
@@ -814,6 +821,22 @@ mod tests {
             editor_commands()
                 .iter()
                 .any(|command| command.id == "format.sidenote")
+        );
+    }
+
+    #[test]
+    fn edit_sidenote_is_in_the_command_table_and_names_a_real_command() {
+        let command = COMMANDS.iter().find(|command| command.id == "note.edit");
+        assert!(command.is_some(), "note.edit must be in COMMANDS");
+        let command = command.unwrap();
+        assert_eq!(command.title, "Edit sidenote");
+        assert_eq!(command.group, "Format");
+        assert!(command.chord.is_none());
+        assert_eq!(menu(&["note.edit"]).len(), 1);
+        assert!(
+            editor_commands()
+                .iter()
+                .any(|entry| entry.id == "note.edit")
         );
     }
 

@@ -16,13 +16,14 @@ use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
     ContextMenu, Dialog, FileFinder, FileTree, MathMenu, Onboarding, Palette, SlashMenu,
-    context_menu, editor, file_finder, file_tree, math_menu, onboarding, title_bar,
+    context_menu, editor, file_finder, file_tree, math_menu, onboarding, sidenotes, title_bar,
 };
 use crate::config::Config;
-use crate::document::layout::{ContextHit, RangeKind};
+use crate::document::layout::{ContextHit, DocLayout, RangeKind};
 use crate::document::math::{self, AccentKind, BigOp, MathNode, NodeAddress, Slot, SymbolRole};
 use crate::document::{
-    BadgeColor, FlatPos, FlatRange, Inline, Style, math_conversion, math_layout,
+    BadgeColor, Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, Style, math_conversion,
+    math_layout,
 };
 use crate::input::Input;
 use crate::layout::Rect;
@@ -158,6 +159,86 @@ impl Shell {
         self.edit_frame(input);
     }
 
+    /// `note.edit`: focuses the note anchored at the caret, or does nothing
+    /// when the caret is not on an anchor. The command-table way into a note;
+    /// clicking the anchor and clicking the note are the other two.
+    pub(super) fn edit_note_at_caret(&mut self) {
+        let index = {
+            let docs = self.docs.borrow();
+            let Some(tab) = docs.active() else { return };
+            note_at_caret(&tab.document, tab.document.caret)
+        };
+        if let Some(index) = index {
+            focus_note(&mut self.docs.borrow_mut(), index);
+        }
+    }
+
+    /// A Normal-mode click on an anchor opens that note. Resolves the click
+    /// to its caret, then asks whether that caret sits on an anchor — the
+    /// same question `note.edit` asks, so the two ways in cannot disagree
+    /// about what counts as "on an anchor". Returns whether the click was
+    /// consumed.
+    fn click_anchor(&mut self, rect: Rect, mouse: (f32, f32)) -> bool {
+        let Some(caret) = self.caret_at(rect, mouse) else {
+            return false;
+        };
+        let index = {
+            let docs = self.docs.borrow();
+            let Some(tab) = docs.active() else {
+                return false;
+            };
+            note_at_caret(&tab.document, caret)
+        };
+        let Some(index) = index else { return false };
+        self.goal_x = None;
+        focus_note(&mut self.docs.borrow_mut(), index);
+        true
+    }
+
+    /// The note under `point` in the margin, as `(note index, caret)`, or
+    /// `None` when the point is not on a note. The caret is resolved against
+    /// the note's own layout — never handed to a `body()`-resolving function,
+    /// whose coordinates come from the page's layout and are wrong here.
+    fn margin_note_at(&mut self, point: (f32, f32)) -> Option<(usize, Caret)> {
+        let rect = self.layout.rect(self.sidenotes.node);
+        let (scroll, index_of) = {
+            let docs = self.docs.borrow();
+            let index_of: Vec<(String, usize)> = match docs.active() {
+                Some(tab) => tab
+                    .document
+                    .notes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, note)| (note.label.clone(), index))
+                    .collect(),
+                None => Vec::new(),
+            };
+            (docs.editor_scroll, index_of)
+        };
+        let content_top = rect.y + editor::TOP - scroll;
+        let notes: Vec<(String, f32, Rc<DocLayout>)> = self
+            .stacked_notes()
+            .into_iter()
+            .map(|(label, _, y, layout)| (label, y, layout))
+            .collect();
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+        let (label, caret) = note_at_point(
+            &notes,
+            point.0,
+            point.1,
+            rect.x,
+            content_top,
+            sidenotes::NOTE_INSET,
+            &measure,
+        )?;
+        let index = index_of
+            .iter()
+            .find(|(note_label, _)| *note_label == label)
+            .map(|(_, index)| *index)?;
+        Some((index, caret))
+    }
+
     fn handle_brush_input(&mut self, input: &Input) -> bool {
         if !(input.ctrl() && input.is_mouse_down(MouseButton::Left)) {
             if self.brush_point.take().is_some() || !self.brush_inside.is_empty() {
@@ -256,7 +337,9 @@ impl Shell {
 
         if has_tab && input.is_mouse_pressed(MouseButton::Left) && over_editor {
             if self.vim.current_mode() == VimMode::Normal {
-                if let Some(target) = self.context_at(rect, mouse) {
+                if self.click_anchor(rect, mouse) {
+                    // The click focused a note; nothing else to do with it.
+                } else if let Some(target) = self.context_at(rect, mouse) {
                     let ids = self.context_ids(&target);
                     self.open_context_target(&ids, mouse, Some(target));
                 }
@@ -269,6 +352,20 @@ impl Shell {
                 self.docs
                     .borrow_mut()
                     .move_caret_to(caret.block, caret.inline, caret.offset);
+            }
+        }
+
+        // A click on a note in the margin opens it at the clicked position.
+        // The margin shares the page's scroll, so the same rect math the
+        // editor uses places the note's text on screen.
+        if has_tab && input.is_mouse_pressed(MouseButton::Left) && input.is_cursor_in_window() {
+            let margin = self.layout.rect(self.sidenotes.node);
+            if self.sidenotes.open
+                && margin.contains(mouse)
+                && let Some((index, caret)) = self.margin_note_at(mouse)
+            {
+                self.goal_x = None;
+                focus_note_at(&mut self.docs.borrow_mut(), index, caret);
             }
         }
 
@@ -553,11 +650,20 @@ impl Shell {
             self.apply(action);
         }
         if input.is_key_pressed(KeyCode::Escape) {
+            // Escape pops one level in Normal mode too: leaving a focused
+            // note returns focus to the body. Esc while searching (or in any
+            // other state that already owns Escape) clears that first, so
+            // leaving the note is one more Escape away — the same shape as
+            // leaving Insert and then leaving anything else.
+            let normal = self.vim.current_mode() == VimMode::Normal;
             if self.vim.command_active() {
                 self.search = None;
             }
             let action = self.vim.key_extended(Key::Escape);
             self.apply(action);
+            if normal {
+                return_to_anchor(&mut self.docs.borrow_mut());
+            }
         }
     }
 
@@ -2350,6 +2456,110 @@ fn enter_insert(docs: &mut Tabs, vim: &mut Vim) {
     vim.set_mode(Mode::Insert);
 }
 
+/// The note anchored at the caret — the anchor run the caret sits on, or the
+/// one immediately before it. A sidenote anchor occupies one flat position,
+/// so "on" and "immediately after" are the two flat offsets around it.
+fn note_at_caret(doc: &Document, caret: Caret) -> Option<usize> {
+    let label = anchor_label_at(doc.body(), caret)?;
+    doc.notes.iter().position(|note| note.label == label)
+}
+
+/// The anchor run's label at `caret`, or `None` when the caret is neither on
+/// nor immediately after an anchor.
+fn anchor_label_at(blocks: &[Block], caret: Caret) -> Option<&str> {
+    let runs = blocks.get(caret.block)?.inlines();
+    match runs.get(caret.inline) {
+        Some(Inline::Note(label)) => Some(label.as_str()),
+        _ if caret.offset == 0 && caret.inline > 0 => match runs.get(caret.inline - 1) {
+            Some(Inline::Note(label)) => Some(label.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The anchor's position in the body — `(block, inline)` — for the note whose
+/// label is `label`.
+fn anchor_position(doc: &Document, label: &str) -> Option<(usize, usize)> {
+    doc.body()
+        .iter()
+        .enumerate()
+        .find_map(|(block, block_runs)| {
+            block_runs
+                .inlines()
+                .iter()
+                .position(|run| matches!(run, Inline::Note(l) if l == label))
+                .map(|inline| (block, inline))
+        })
+}
+
+/// Focuses `index`'s note and puts the caret at the end of its body. A note
+/// is a single paragraph, so "end of body" is the end of block 0. Caret-only,
+/// so it goes through `touch` and never promotes a preview tab.
+fn focus_note(docs: &mut Tabs, index: usize) {
+    docs.touch(|doc| {
+        doc.focus = Focus::Note(index);
+        doc.move_end();
+    });
+}
+
+/// Focuses `index`'s note with the caret at `caret` — a margin click's
+/// position, resolved against the note's own layout, never the body's.
+fn focus_note_at(docs: &mut Tabs, index: usize, caret: Caret) {
+    docs.touch(|doc| {
+        doc.focus = Focus::Note(index);
+        doc.set_caret(caret.block, caret.inline, caret.offset);
+    });
+}
+
+/// Leaves a focused note: focus returns to the body with the caret on the
+/// note's anchor. Called only from Normal mode's Escape — Insert mode's
+/// Escape still leaves Insert and stays in the note, so leaving a note while
+/// typing is two presses, the same shape as leaving Insert and then leaving
+/// anything else.
+fn return_to_anchor(docs: &mut Tabs) {
+    let anchor = {
+        let Some(tab) = docs.active() else { return };
+        let Focus::Note(i) = tab.document.focus else {
+            return;
+        };
+        let Some(label) = tab.document.notes.get(i).map(|note| note.label.clone()) else {
+            return;
+        };
+        anchor_position(&tab.document, &label)
+    };
+    if let Some((block, inline)) = anchor {
+        docs.touch(|doc| {
+            doc.focus = Focus::Body;
+            doc.set_caret(block, inline, 0);
+        });
+    }
+}
+
+/// The note whose placed y-band contains `y`, and the caret inside that note
+/// nearest `x` — resolved against the note's own layout, never the body's.
+/// `notes` is `(label, placed y, layout)`; `margin_x` and `inset` place the
+/// note's content column on screen, `content_top` the margin's content top.
+/// Pure, so the margin's click math is a test rather than a runtime surprise.
+fn note_at_point(
+    notes: &[(String, f32, Rc<DocLayout>)],
+    x: f32,
+    y: f32,
+    margin_x: f32,
+    content_top: f32,
+    inset: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> Option<(String, Caret)> {
+    for (label, note_y, layout) in notes {
+        let top = content_top + note_y;
+        if y >= top && y <= top + layout.height {
+            let caret = layout.hit(x - (margin_x + inset), y - top, measure);
+            return Some((label.clone(), caret));
+        }
+    }
+    None
+}
+
 /// Edits `state` from one frame's input. Returns whether anything changed
 /// enough to need the palette region rebuilt. A free function rather than
 /// a method: it only ever needs the one field's worth of state, and taking
@@ -2593,14 +2803,18 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
 mod tests {
     use super::{
         add_brush_hits, brush_sweep_samples, delete_chars, delete_inside_math, enter_insert,
-        math_menu_rows, math_menu_variant_start, move_inside_math, moved_math_menu_selection,
-        paste, reset_brush_selection, symbol_base_glyph, symbol_context_ids,
+        focus_note, focus_note_at, math_menu_rows, math_menu_variant_start, move_inside_math,
+        moved_math_menu_selection, note_at_caret, note_at_point, paste, reset_brush_selection,
+        return_to_anchor, symbol_base_glyph, symbol_context_ids,
     };
     use crate::document::layout::{ContextHit, RangeKind};
     use crate::document::math::MathNode;
-    use crate::document::{Document, FlatPos, FlatRange, Inline, math_conversion, math_symbols};
+    use crate::document::{
+        Block, Document, FlatPos, FlatRange, Focus, Inline, Style, Text, math_conversion,
+        math_symbols,
+    };
     use crate::tabs::Tabs;
-    use crate::vim::{Mode, Vim};
+    use crate::vim::{Key, Mode, Vim};
 
     #[test]
     fn symbol_context_keeps_roles_first_and_offers_only_valid_variants() {
@@ -2798,6 +3012,139 @@ mod tests {
         let mut tabs = Tabs::new();
         tabs.open_full(&path);
         tabs
+    }
+
+    fn note_tabs(tag: &str) -> Tabs {
+        insert_tabs(tag, "body[^1] tail\n\n[^1]: original\n")
+    }
+
+    fn note_text(tabs: &Tabs) -> String {
+        tabs.active().unwrap().document.notes[0].body[0]
+            .inlines()
+            .iter()
+            .map(|run| match run {
+                Inline::Text(text) => text.text.as_str(),
+                Inline::Math(_) | Inline::Note(_) => "\u{FFFC}",
+            })
+            .collect()
+    }
+
+    fn note_block(text: &str) -> Block {
+        Block::Paragraph(vec![Inline::Text(Text {
+            text: text.into(),
+            style: Style::PLAIN,
+        })])
+    }
+
+    fn fake_note_measure(text: &str, _: &crate::theme::TextStyle) -> f32 {
+        text.chars().count() as f32 * 10.0
+    }
+
+    #[test]
+    fn edit_sidenote_command_at_anchor_focuses_that_note() {
+        let mut tabs = note_tabs("edit-anchor");
+        tabs.move_caret_to(0, 1, 0);
+        let index = note_at_caret(
+            &tabs.active().unwrap().document,
+            tabs.active().unwrap().document.caret,
+        );
+        assert_eq!(index, Some(0));
+
+        focus_note(&mut tabs, index.unwrap());
+
+        let doc = &tabs.active().unwrap().document;
+        assert_eq!(doc.focus, Focus::Note(0));
+        assert_eq!(note_text(&tabs), "original");
+        assert_eq!(doc.caret.offset, "original".chars().count());
+    }
+
+    #[test]
+    fn edit_sidenote_command_in_ordinary_prose_does_nothing() {
+        let mut tabs = note_tabs("edit-prose");
+        tabs.move_caret_to(0, 0, 0);
+        let doc = &tabs.active().unwrap().document;
+
+        assert_eq!(note_at_caret(doc, doc.caret), None);
+        assert_eq!(doc.focus, Focus::Body);
+    }
+
+    #[test]
+    fn typing_after_focusing_a_note_lands_in_note_body_not_prose() {
+        let mut tabs = note_tabs("type-note");
+        tabs.move_caret_to(0, 1, 0);
+        focus_note(&mut tabs, 0);
+        let body_before = tabs.active().unwrap().document.body()[0].clone();
+
+        tabs.type_text(" edited");
+
+        let doc = &tabs.active().unwrap().document;
+        assert_eq!(doc.body()[0], body_before);
+        assert_eq!(note_text(&tabs), "original edited");
+        assert_eq!(doc.focus, Focus::Note(0));
+    }
+
+    #[test]
+    fn escape_in_normal_mode_inside_note_returns_focus_to_body_at_anchor() {
+        let mut tabs = note_tabs("escape-normal");
+        tabs.move_caret_to(0, 1, 0);
+        focus_note(&mut tabs, 0);
+        let mut vim = Vim::new();
+
+        let _ = vim.key_extended(Key::Escape);
+        return_to_anchor(&mut tabs);
+
+        let doc = &tabs.active().unwrap().document;
+        assert_eq!(vim.mode(), Mode::Normal);
+        assert_eq!(doc.focus, Focus::Body);
+        assert_eq!(doc.caret.block, 0);
+        assert_eq!(doc.caret.inline, 1);
+        assert_eq!(doc.caret.offset, 0);
+    }
+
+    #[test]
+    fn escape_in_insert_mode_inside_note_leaves_insert_mode_and_stays_in_note() {
+        let mut tabs = note_tabs("escape-insert");
+        tabs.move_caret_to(0, 1, 0);
+        focus_note(&mut tabs, 0);
+        let mut vim = Vim::new();
+        vim.set_mode(Mode::Insert);
+
+        let _ = vim.key_extended(Key::Escape);
+
+        assert_eq!(vim.mode(), Mode::Normal);
+        assert_eq!(tabs.active().unwrap().document.focus, Focus::Note(0));
+    }
+
+    #[test]
+    fn clicking_a_note_in_the_margin_focuses_it_at_the_clicked_caret() {
+        let layout = std::rc::Rc::new(crate::document::layout::layout_blocks(
+            &[note_block("one two")],
+            crate::components::sidenotes::NOTE_WIDTH,
+            crate::components::sidenotes::SCALE,
+            &fake_note_measure,
+        ));
+        let notes = vec![("1".into(), 40.0, layout.clone())];
+        let point = (
+            crate::components::sidenotes::NOTE_INSET + 45.0,
+            40.0 + layout.blocks[0].lines[0].y + layout.blocks[0].lines[0].height / 2.0,
+        );
+        let (label, caret) = note_at_point(
+            &notes,
+            point.0,
+            point.1,
+            0.0,
+            0.0,
+            crate::components::sidenotes::NOTE_INSET,
+            &fake_note_measure,
+        )
+        .unwrap();
+        assert_eq!(label, "1");
+
+        let mut tabs = note_tabs("click-note");
+        focus_note_at(&mut tabs, 0, caret);
+        let doc = &tabs.active().unwrap().document;
+        assert_eq!(doc.focus, Focus::Note(0));
+        assert!(doc.caret.offset > 0);
     }
 
     #[test]

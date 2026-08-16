@@ -29,7 +29,7 @@ pub const GAP: f32 = 12.0;
 pub const SCALE: f32 = 13.5 / 17.5;
 
 /// The note text column's inset within the margin, past the marker and rule.
-const NOTE_INSET: f32 = 30.0;
+pub const NOTE_INSET: f32 = 30.0;
 /// Space kept at the note column's right edge.
 const NOTE_RIGHT_MARGIN: f32 = 16.0;
 
@@ -37,8 +37,10 @@ const NOTE_RIGHT_MARGIN: f32 = 16.0;
 pub const NOTE_WIDTH: f32 = WIDTH - NOTE_INSET - NOTE_RIGHT_MARGIN;
 
 /// The editor metrics a note draws with: the margin's own insets and measure,
-/// no page furniture. An editor embedded in the margin fills no background
-/// and draws no current-line band or caret; its container already painted.
+/// no page furniture. An editor embedded in the margin fills no background;
+/// its container already painted. The focused note's editor still draws the
+/// caret and current-line band — the `caret` it is given is what enables that,
+/// not the page flag.
 const NOTE_METRICS: Metrics = Metrics {
     inset: NOTE_INSET,
     top: 0.0,
@@ -58,27 +60,33 @@ pub struct Note {
 
 impl Note {
     /// Builds a note over `layout`, already laid out at the margin's width
-    /// and scale. A note is read-only, so its caret is the default and it
-    /// never draws one.
-    pub fn new(marker: &str, layout: Rc<DocLayout>, y: f32) -> Self {
-        let editor = Editor::new(
-            layout,
-            Caret {
-                block: 0,
-                inline: 0,
-                offset: 0,
-                style: Style::PLAIN,
-            },
-            0.0,
-            false,
-            Style::PLAIN,
-            NOTE_METRICS,
-        );
+    /// and scale. `caret` is `Some` only for the focused note — its editor
+    /// then draws the caret and the current-line band, and blinks in step
+    /// with the page's, because it is the page's, just drawn here.
+    pub fn new(
+        marker: &str,
+        layout: Rc<DocLayout>,
+        y: f32,
+        caret: Option<Caret>,
+        block_caret: bool,
+    ) -> Self {
+        let caret_style = caret.map_or(Style::PLAIN, |caret| caret.style);
+        let editor = Editor::new(layout, caret, 0.0, block_caret, caret_style, NOTE_METRICS);
         Self {
             marker: marker.into(),
             editor,
             y,
         }
+    }
+
+    /// The note's laid-out height, in document coordinates.
+    pub fn height(&self) -> f32 {
+        self.editor.content_height()
+    }
+
+    /// Whether this is the focused note — its editor draws the caret.
+    pub fn is_focused(&self) -> bool {
+        self.editor.has_caret()
     }
 }
 
@@ -159,7 +167,15 @@ impl Component for SidenoteMargin {
         let top = rect.y + self.top - self.scroll;
         for note in &mut self.notes {
             let y = top + note.y;
-            theme::rule(layer, (rect.x, y + 8.0), 14.0, 1.0, theme::BORDER);
+            // The focused note's tick is accent, the others' is the quiet
+            // border — one small cue, on top of the caret that already blinks
+            // there, so the focused note reads at a glance.
+            let tick = if note.is_focused() {
+                theme::ACCENT
+            } else {
+                theme::BORDER
+            };
+            theme::rule(layer, (rect.x, y + 8.0), 14.0, 1.0, tick);
             theme::draw(
                 layer,
                 &note.marker,
@@ -247,7 +263,7 @@ mod tests {
         ));
         assert!(tall.height > small.height);
 
-        let note = Note::new("1", tall.clone(), 0.0);
+        let note = Note::new("1", tall.clone(), 0.0, None, false);
         assert_eq!(note.editor.content_height(), tall.height);
 
         let wanted = vec![(100.0, tall.height), (100.0, small.height)];
