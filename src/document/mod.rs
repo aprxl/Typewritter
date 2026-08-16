@@ -743,15 +743,12 @@ impl Document {
 
     /// Toggle style flags over selected text. Boxed styles replace all other
     /// styling in the range; non-boxed styles never layer onto boxed runs.
-    pub fn toggle_style_range(&mut self, range: FlatRange, mask: Style) {
-        self.clamp_caret();
-        let caret_block = self.caret.block;
-        let caret_flat = self.caret_flat(caret_block);
+    fn style_range_status(&self, range: FlatRange, mask: Style) -> Option<bool> {
         let range = range.normalized();
         let start = self.position(range.start.block, range.start.offset);
         let end = self.position(range.end.block, range.end.offset);
         if (start.block, start.offset) >= (end.block, end.offset) {
-            return;
+            return None;
         }
 
         if mask.code || mask.badge {
@@ -760,8 +757,8 @@ impl Document {
                 badge: !mask.code && mask.badge,
                 ..Style::PLAIN
             };
-            let mut has_selected = false;
-            let mut all_boxed = true;
+            let mut selected = false;
+            let mut active = true;
             for block in start.block..=end.block {
                 let from = if block == start.block {
                     start.offset
@@ -774,17 +771,96 @@ impl Document {
                     self.block_len(block)
                 };
                 for run in self.slice_runs(block, from, to) {
-                    has_selected = true;
-                    all_boxed &= if boxed.badge {
+                    selected = true;
+                    active &= if boxed.badge {
                         run.style().badge
                     } else {
                         run.style() == boxed
                     };
                 }
             }
-            if !has_selected {
-                return;
+            return selected.then_some(active);
+        }
+
+        let mut eligible = false;
+        let mut active = true;
+        for block in start.block..=end.block {
+            let from = if block == start.block {
+                start.offset
+            } else {
+                0
+            };
+            let to = if block == end.block {
+                end.offset
+            } else {
+                self.block_len(block)
+            };
+            for run in self.slice_runs(block, from, to) {
+                if !run.style().is_boxed() {
+                    eligible = true;
+                    active &= style_matches(run.style(), mask);
+                }
             }
+        }
+        eligible.then_some(active)
+    }
+
+    /// Whether every eligible run covered by `range` already has `mask`.
+    /// This shares the exact state calculation used by `toggle_style_range`.
+    pub fn style_range_is_active(&self, range: FlatRange, mask: Style) -> bool {
+        self.style_range_status(range, mask) == Some(true)
+    }
+
+    /// Whether every run covered by `range` is a badge of `color`.
+    pub fn badge_color_is_active(&self, range: FlatRange, color: BadgeColor) -> bool {
+        let range = range.normalized();
+        let start = self.position(range.start.block, range.start.offset);
+        let end = self.position(range.end.block, range.end.offset);
+        if (start.block, start.offset) >= (end.block, end.offset) {
+            return false;
+        }
+
+        let mut selected = false;
+        let mut active = true;
+        for block in start.block..=end.block {
+            let from = if block == start.block {
+                start.offset
+            } else {
+                0
+            };
+            let to = if block == end.block {
+                end.offset
+            } else {
+                self.block_len(block)
+            };
+            for run in self.slice_runs(block, from, to) {
+                selected = true;
+                active &= run.style().badge && run.style().badge_color == color;
+            }
+        }
+        selected && active
+    }
+
+    pub fn toggle_style_range(&mut self, range: FlatRange, mask: Style) {
+        self.clamp_caret();
+        let caret_block = self.caret.block;
+        let caret_flat = self.caret_flat(caret_block);
+        let range = range.normalized();
+        let start = self.position(range.start.block, range.start.offset);
+        let end = self.position(range.end.block, range.end.offset);
+        if (start.block, start.offset) >= (end.block, end.offset) {
+            return;
+        }
+
+        if mask.code || mask.badge {
+            let Some(all_boxed) = self.style_range_status(range, mask) else {
+                return;
+            };
+            let boxed = Style {
+                code: mask.code,
+                badge: !mask.code && mask.badge,
+                ..Style::PLAIN
+            };
             let target = if all_boxed { Style::PLAIN } else { boxed };
             for block in start.block..=end.block {
                 let from = if block == start.block {
@@ -817,29 +893,10 @@ impl Document {
             return;
         }
 
-        let mut eligible = false;
-        let mut enable = false;
-        for block in start.block..=end.block {
-            let from = if block == start.block {
-                start.offset
-            } else {
-                0
-            };
-            let to = if block == end.block {
-                end.offset
-            } else {
-                self.block_len(block)
-            };
-            for run in self.slice_runs(block, from, to) {
-                if !run.style().is_boxed() {
-                    eligible = true;
-                    enable |= !style_matches(run.style(), mask);
-                }
-            }
-        }
-        if !eligible {
+        let Some(active) = self.style_range_status(range, mask) else {
             return;
-        }
+        };
+        let enable = !active;
 
         for block in start.block..=end.block {
             let from = if block == start.block {
@@ -4035,6 +4092,101 @@ mod tests {
                 .all(|(_, style)| *style == Style::PLAIN)
         );
         assert_invariants(&d);
+    }
+
+    #[test]
+    fn a_word_that_is_already_italic_opens_a_menu_with_the_italic_row_checked() {
+        let italic = Style {
+            italic: true,
+            ..Style::PLAIN
+        };
+        let mut d = doc();
+        d.body_mut()[0] = Block::Paragraph(vec![Inline::Text(Text {
+            text: "hello".into(),
+            style: italic,
+        })]);
+        let range = FlatRange::new(
+            FlatPos {
+                block: 0,
+                offset: 0,
+            },
+            FlatPos {
+                block: 0,
+                offset: 5,
+            },
+        );
+
+        assert!(d.style_range_is_active(range, italic));
+    }
+
+    #[test]
+    fn a_word_that_is_only_partly_italic_opens_a_menu_with_the_italic_row_unchecked() {
+        let italic = Style {
+            italic: true,
+            ..Style::PLAIN
+        };
+        let mut d = doc();
+        d.body_mut()[0] = Block::Paragraph(vec![
+            Inline::Text(Text {
+                text: "hel".into(),
+                style: italic,
+            }),
+            plain_run("lo"),
+        ]);
+        let range = FlatRange::new(
+            FlatPos {
+                block: 0,
+                offset: 0,
+            },
+            FlatPos {
+                block: 0,
+                offset: 5,
+            },
+        );
+
+        assert!(!d.style_range_is_active(range, italic));
+        d.toggle_style_range(range, italic);
+        assert!(d.style_range_is_active(range, italic));
+    }
+
+    #[test]
+    fn a_plain_word_opens_a_menu_with_nothing_checked() {
+        let mut d = doc();
+        d.body_mut()[0] = Block::Paragraph(vec![plain_run("hello")]);
+        let range = FlatRange::new(
+            FlatPos {
+                block: 0,
+                offset: 0,
+            },
+            FlatPos {
+                block: 0,
+                offset: 5,
+            },
+        );
+        for mask in [
+            Style {
+                bold: true,
+                ..Style::PLAIN
+            },
+            Style {
+                italic: true,
+                ..Style::PLAIN
+            },
+            Style {
+                highlight: true,
+                ..Style::PLAIN
+            },
+            Style {
+                code: true,
+                ..Style::PLAIN
+            },
+            Style {
+                badge: true,
+                ..Style::PLAIN
+            },
+        ] {
+            assert!(!d.style_range_is_active(range, mask));
+        }
     }
 
     #[test]

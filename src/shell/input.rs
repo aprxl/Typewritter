@@ -1512,12 +1512,10 @@ impl Shell {
                         Inline::Note(_) => None,
                     });
                 match node {
-                    Some(MathNode::Sym(ch)) if ch.is_alphabetic() => {
-                        symbol_context_ids(*ch, "plain")
-                    }
+                    Some(MathNode::Sym(ch)) if ch.is_alphabetic() => symbol_context_ids(*ch),
                     Some(MathNode::Resolved { variant, body, .. }) => {
                         symbol_base_glyph(body, variant)
-                            .map(|glyph| symbol_context_ids(glyph, variant))
+                            .map(symbol_context_ids)
                             .unwrap_or_else(|| commands::SYMBOL_ROLE_MENU.to_vec())
                     }
                     Some(MathNode::Group { .. }) => commands::GROUP_MENU.to_vec(),
@@ -1545,6 +1543,150 @@ impl Shell {
                 node: Some(address),
             } => Some((*block, *inline, address.clone())),
             _ => None,
+        }
+    }
+
+    fn context_command_checked(&self, id: &str) -> bool {
+        let target = self
+            .context_menu
+            .as_ref()
+            .and_then(|state| state.target.clone());
+        let Some(target) = target else {
+            return false;
+        };
+        let docs = self.docs.borrow();
+        let Some(document) = docs.active().map(|tab| &tab.document) else {
+            return false;
+        };
+        Self::context_command_checked_for(document, target, id)
+    }
+
+    fn context_command_checked_for(document: &Document, target: ContextHit, id: &str) -> bool {
+        match target {
+            ContextHit::Range { range, .. } => {
+                let mask = match id {
+                    "context.bold" => Style {
+                        bold: true,
+                        ..Style::PLAIN
+                    },
+                    "context.italic" => Style {
+                        italic: true,
+                        ..Style::PLAIN
+                    },
+                    "context.highlight" => Style {
+                        highlight: true,
+                        ..Style::PLAIN
+                    },
+                    "context.inline_code" => Style {
+                        code: true,
+                        ..Style::PLAIN
+                    },
+                    "context.badge" => Style {
+                        badge: true,
+                        ..Style::PLAIN
+                    },
+                    _ => {
+                        return match id {
+                            "context.badge.orange" => {
+                                document.badge_color_is_active(range, BadgeColor::Orange)
+                            }
+                            "context.badge.blue" => {
+                                document.badge_color_is_active(range, BadgeColor::Blue)
+                            }
+                            "context.badge.green" => {
+                                document.badge_color_is_active(range, BadgeColor::Green)
+                            }
+                            "context.badge.purple" => {
+                                document.badge_color_is_active(range, BadgeColor::Purple)
+                            }
+                            _ => false,
+                        };
+                    }
+                };
+                document.style_range_is_active(range, mask)
+            }
+            ContextHit::Math {
+                block,
+                inline,
+                node: Some(address),
+            } => {
+                let node = document
+                    .body()
+                    .get(block)
+                    .and_then(|block| block.inlines().get(inline))
+                    .and_then(|run| match run {
+                        Inline::Math(list) => math::node_at(list, &address),
+                        Inline::Text(_) | Inline::Note(_) => None,
+                    });
+                match (id, node) {
+                    ("context.symbol.variable", Some(MathNode::Resolved { role, .. })) => {
+                        *role == SymbolRole::Variable
+                    }
+                    ("context.symbol.constant", Some(MathNode::Resolved { role, .. })) => {
+                        *role == SymbolRole::Constant
+                    }
+                    ("context.symbol.function", Some(MathNode::Resolved { role, .. })) => {
+                        *role == SymbolRole::Function
+                    }
+                    ("context.variant.plain", Some(MathNode::Sym(ch))) => ch.is_alphabetic(),
+                    ("context.variant.plain", Some(MathNode::Resolved { variant, .. })) => {
+                        variant == "plain"
+                    }
+                    ("context.variant.bold", Some(MathNode::Resolved { variant, .. })) => {
+                        variant == "bold"
+                    }
+                    ("context.variant.italic", Some(MathNode::Resolved { variant, .. })) => {
+                        variant == "italic"
+                    }
+                    ("context.variant.bold_italic", Some(MathNode::Resolved { variant, .. })) => {
+                        variant == "bold_italic"
+                    }
+                    ("context.variant.sans", Some(MathNode::Resolved { variant, .. })) => {
+                        variant == "sans"
+                    }
+                    ("context.variant.sans_bold", Some(MathNode::Resolved { variant, .. })) => {
+                        variant == "sans_bold"
+                    }
+                    ("context.variant.sans_italic", Some(MathNode::Resolved { variant, .. })) => {
+                        variant == "sans_italic"
+                    }
+                    (
+                        "context.variant.sans_bold_italic",
+                        Some(MathNode::Resolved { variant, .. }),
+                    ) => variant == "sans_bold_italic",
+                    ("context.variant.monospace", Some(MathNode::Resolved { variant, .. })) => {
+                        variant == "monospace"
+                    }
+                    ("context.group.parentheses", Some(MathNode::Group { open, .. })) => {
+                        *open == '('
+                    }
+                    ("context.group.brackets", Some(MathNode::Group { open, .. })) => *open == '[',
+                    ("context.accent.vector", Some(MathNode::Accent { kind, .. })) => {
+                        *kind == AccentKind::Vector
+                    }
+                    ("context.accent.dot", Some(MathNode::Accent { kind, .. })) => {
+                        *kind == AccentKind::Dot
+                    }
+                    ("context.accent.ddot", Some(MathNode::Accent { kind, .. })) => {
+                        *kind == AccentKind::DoubleDot
+                    }
+                    ("context.op.sum", Some(MathNode::BigOp { kind, .. })) => *kind == BigOp::Sum,
+                    ("context.op.product", Some(MathNode::BigOp { kind, .. })) => {
+                        *kind == BigOp::Prod
+                    }
+                    ("context.op.integral", Some(MathNode::BigOp { kind, .. })) => {
+                        *kind == BigOp::Integral
+                    }
+                    ("context.op.ring_integral", Some(MathNode::BigOp { kind, .. })) => {
+                        *kind == BigOp::ContourIntegral
+                    }
+                    ("context.op.limit", Some(MathNode::BigOp { kind, .. })) => {
+                        *kind == BigOp::Limit
+                    }
+                    _ => false,
+                }
+            }
+            ContextHit::Math { node: None, .. } => false,
         }
     }
 
@@ -1693,7 +1835,17 @@ impl Shell {
         let menu = match &self.context_menu {
             Some(state) => {
                 let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
-                ContextMenu::new(commands::menu_entries(&ids), state.selected, state.anchor)
+                let checked: Vec<bool> = state
+                    .items
+                    .iter()
+                    .map(|command| self.context_command_checked(command.id))
+                    .collect();
+                ContextMenu::new(
+                    commands::menu_entries(&ids),
+                    checked,
+                    state.selected,
+                    state.anchor,
+                )
             }
             None => ContextMenu::closed(),
         };
@@ -2703,15 +2855,12 @@ fn math_menu_variant_start(offers: &[math_conversion::Offer]) -> usize {
         .unwrap_or(offers.len())
 }
 
-fn symbol_context_ids(glyph: char, current_variant: &str) -> Vec<&'static str> {
+fn symbol_context_ids(glyph: char) -> Vec<&'static str> {
     let mut ids = commands::SYMBOL_ROLE_MENU.to_vec();
-    if current_variant != "plain" {
-        ids.push("context.variant.plain");
-    }
+    ids.push("context.variant.plain");
     ids.extend(
         crate::document::math_symbols::variants(glyph)
             .into_iter()
-            .filter(|variant| variant.key != current_variant)
             .filter_map(|variant| match variant.key {
                 "bold" => Some("context.variant.bold"),
                 "italic" => Some("context.variant.italic"),
@@ -2835,14 +2984,14 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BodyCoordinate, add_brush_hits, brush_sweep_samples, delete_chars, delete_inside_math,
-        enter_insert, focus_note, focus_note_at, math_menu_rows, math_menu_variant_start,
-        move_inside_math, moved_math_menu_selection, note_at_caret, note_at_point, paste,
-        reset_brush_selection, return_to_anchor, set_body_coordinate_caret, symbol_base_glyph,
-        symbol_context_ids,
+        BodyCoordinate, Shell, add_brush_hits, brush_sweep_samples, delete_chars,
+        delete_inside_math, enter_insert, focus_note, focus_note_at, math_menu_rows,
+        math_menu_variant_start, move_inside_math, moved_math_menu_selection, note_at_caret,
+        note_at_point, paste, reset_brush_selection, return_to_anchor, set_body_coordinate_caret,
+        symbol_base_glyph, symbol_context_ids,
     };
     use crate::document::layout::{ContextHit, RangeKind};
-    use crate::document::math::MathNode;
+    use crate::document::math::{MathNode, NodeAddress, SymbolRole};
     use crate::document::{
         Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, Style, Text, math_conversion,
         math_symbols,
@@ -2852,10 +3001,10 @@ mod tests {
 
     #[test]
     fn symbol_context_keeps_roles_first_and_offers_only_valid_variants() {
-        let latin = symbol_context_ids('x', "plain");
+        let latin = symbol_context_ids('x');
         assert_eq!(&latin[..3], super::commands::SYMBOL_ROLE_MENU);
+        assert!(latin.contains(&"context.variant.plain"));
         assert!(latin.contains(&"context.variant.bold"));
-        assert!(!latin.contains(&"context.variant.plain"));
 
         let italic_alpha = math_symbols::variants('α')
             .into_iter()
@@ -2866,9 +3015,37 @@ mod tests {
             symbol_base_glyph(&[MathNode::Sym(italic_alpha)], "italic"),
             Some('α')
         );
-        let greek = symbol_context_ids('α', "italic");
+        let greek = symbol_context_ids('α');
         assert!(greek.contains(&"context.variant.plain"));
+        assert!(greek.contains(&"context.variant.italic"));
         assert!(!greek.contains(&"context.variant.sans"));
+    }
+
+    #[test]
+    fn a_symbol_already_set_to_the_constant_role_opens_the_role_menu_with_that_row_checked() {
+        let mut document = Document::new(Path::new("test-context-role.md"));
+        document.body_mut()[0] = Block::Paragraph(vec![Inline::Math(vec![MathNode::Resolved {
+            id: "pi".into(),
+            role: SymbolRole::Constant,
+            variant: "plain".into(),
+            body: vec![MathNode::Sym('π')],
+        }])]);
+        let target = ContextHit::Math {
+            block: 0,
+            inline: 0,
+            node: Some(NodeAddress {
+                path: Vec::new(),
+                index: 0,
+            }),
+        };
+        let checked: Vec<bool> = super::commands::SYMBOL_ROLE_MENU
+            .iter()
+            .map(|id| Shell::context_command_checked_for(&document, target.clone(), id))
+            .collect();
+
+        for (index, id) in super::commands::SYMBOL_ROLE_MENU.iter().enumerate() {
+            assert_eq!(checked[index], *id == "context.symbol.constant");
+        }
     }
 
     #[test]

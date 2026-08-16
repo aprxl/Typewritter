@@ -13,10 +13,11 @@ use crate::ui::{Component, Context, Dirty};
 /// hint, which is exactly what an OS menu shows on the right of a row.
 pub use super::palette::Entry;
 
-const CARD_W: f32 = 210.0;
+const CARD_W: f32 = 224.0;
 const ROW_HEIGHT: f32 = 30.0;
 /// The card's own padding above the first row and below the last.
 const PAD_Y: f32 = 6.0;
+const TITLE_X: f32 = 34.0;
 
 /// The card for `rows` items, with its top-left corner at `anchor`. It
 /// flips up when it would overflow the viewport's bottom and shifts left
@@ -51,6 +52,7 @@ pub fn row_at(card: Rect, rows: usize, point: (f32, f32)) -> Option<usize> {
 
 pub struct ContextMenu {
     entries: Vec<Entry>,
+    checked: Vec<bool>,
     /// Indexes `entries`. Also what a hovered row sets, so keyboard and
     /// mouse drive one highlight rather than two.
     selected: usize,
@@ -60,10 +62,16 @@ pub struct ContextMenu {
 }
 
 impl ContextMenu {
-    pub fn new(entries: Vec<Entry>, selected: usize, anchor: (f32, f32)) -> Self {
+    pub fn new(
+        entries: Vec<Entry>,
+        checked: Vec<bool>,
+        selected: usize,
+        anchor: (f32, f32),
+    ) -> Self {
         let selected = selected.min(entries.len().saturating_sub(1));
         Self {
             entries,
+            checked,
             selected,
             anchor,
             open: true,
@@ -74,6 +82,7 @@ impl ContextMenu {
     pub fn closed() -> Self {
         Self {
             entries: Vec::new(),
+            checked: Vec::new(),
             selected: 0,
             anchor: (0.0, 0.0),
             open: false,
@@ -121,10 +130,20 @@ impl Component for ContextMenu {
                 layer.draw_rectangle(row.position(), row.size(), theme::SELECTION, Rounding::NONE);
             }
             let middle = row.y + row.height / 2.0;
+            if self.checked.get(index).copied().unwrap_or(false) {
+                theme::icon(
+                    layer,
+                    theme::icons::CHECK,
+                    (row.x + 10.0, middle - 7.0),
+                    14.0,
+                    theme::ACCENT,
+                    1.8,
+                );
+            }
             theme::draw(
                 layer,
                 &entry.title,
-                (row.x + 14.0, middle),
+                (row.x + TITLE_X, middle),
                 &title_style,
                 theme::LEFT,
             );
@@ -178,5 +197,24 @@ mod tests {
         );
         assert_eq!(row_at(card, 3, (card.x + 20.0, card.y + PAD_Y / 2.0)), None);
         assert_eq!(row_at(card, 3, (card.right() + 1.0, card.y + 15.0)), None);
+    }
+
+    #[test]
+    fn a_check_is_drawn_on_the_row_with_the_same_entry_index() {
+        let entries = vec![
+            Entry {
+                title: "First".into(),
+                group: "".into(),
+                hint: "".into(),
+            },
+            Entry {
+                title: "Second".into(),
+                group: "".into(),
+                hint: "".into(),
+            },
+        ];
+        let menu = ContextMenu::new(entries, vec![false, true], 0, (0.0, 0.0));
+        assert!(!menu.checked[0]);
+        assert!(menu.checked[1]);
     }
 }

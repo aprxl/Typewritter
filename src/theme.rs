@@ -321,6 +321,7 @@ pub fn icon(layer: &Layer, path: &str, at: (f32, f32), size: f32, color: Color, 
 /// Circles and rects from the source SVG are written out as arcs and
 /// closed subpaths: `draw_svg_icon` takes one path's `d`, not a document.
 pub mod icons {
+    pub const CHECK: &str = "M20 6L9 17l-5-5";
     pub const FILE: &str =
         "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z M14 2L14 8L20 8";
     pub const FILE_LINES: &str = "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z \
