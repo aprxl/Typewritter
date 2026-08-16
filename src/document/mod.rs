@@ -341,19 +341,16 @@ fn math_block() -> Block {
 /// into a placeholder of its own kind. Shared by the document's blocks and
 /// every note body, so invariants hold in every scope rather than only where
 /// the caret is.
-fn prune_block(block: &mut Block, preserve_boundary: Option<usize>) {
+fn prune_block(block: &mut Block) {
     let runs = std::mem::take(block.inlines_mut());
     let mut merged = Vec::with_capacity(runs.len());
-    let mut flat = 0;
     for run in runs {
         if run.text().is_empty() {
             continue;
         }
-        let run_start = flat;
-        flat += run_len(&run);
         match (merged.last_mut(), run) {
             (Some(Inline::Text(previous)), Inline::Text(current))
-                if previous.style == current.style && preserve_boundary != Some(run_start) =>
+                if previous.style == current.style =>
             {
                 previous.text.push_str(&current.text);
             }
@@ -747,6 +744,9 @@ impl Document {
     /// Toggle style flags over selected text. Boxed styles replace all other
     /// styling in the range; non-boxed styles never layer onto boxed runs.
     pub fn toggle_style_range(&mut self, range: FlatRange, mask: Style) {
+        self.clamp_caret();
+        let caret_block = self.caret.block;
+        let caret_flat = self.caret_flat(caret_block);
         let range = range.normalized();
         let start = self.position(range.start.block, range.start.offset);
         let end = self.position(range.end.block, range.end.offset);
@@ -812,6 +812,7 @@ impl Document {
             }
             self.dirty = true;
             self.enforce();
+            self.restore_caret_flat(caret_block, caret_flat);
             self.refresh_context();
             return;
         }
@@ -878,6 +879,7 @@ impl Document {
         }
         self.dirty = true;
         self.enforce();
+        self.restore_caret_flat(caret_block, caret_flat);
         self.refresh_context();
     }
 
@@ -1311,25 +1313,17 @@ impl Document {
     /// survives and can be typed into — the invariant that an empty document
     /// is one empty Paragraph is only about `Document::new`).
     fn prune_runs(&mut self) {
-        let focus = self.focus;
         let caret_block = self.caret.block.min(self.scope().len().saturating_sub(1));
         let caret_offset = self.caret_flat(caret_block);
         // The invariant holds in *every* scope, not just where the caret
         // happens to be: a note body left with an empty run would be an
         // invariant only until focus moved elsewhere.
-        for (index, block) in self.body.iter_mut().enumerate() {
-            prune_block(
-                block,
-                (focus == Focus::Body && caret_block == index).then_some(caret_offset),
-            );
+        for block in &mut self.body {
+            prune_block(block);
         }
-        for (note_index, note) in self.notes.iter_mut().enumerate() {
-            for (block_index, block) in note.body.iter_mut().enumerate() {
-                prune_block(
-                    block,
-                    (focus == Focus::Note(note_index) && caret_block == block_index)
-                        .then_some(caret_offset),
-                );
+        for note in &mut self.notes {
+            for block in &mut note.body {
+                prune_block(block);
             }
         }
 
@@ -1348,6 +1342,16 @@ impl Document {
             .collect();
         self.notes
             .retain(|note| !note.anchored || anchored.contains(&note.label.as_str()));
+
+        if match self.focus {
+            Focus::Body => true,
+            Focus::Note(index) => index < self.notes.len(),
+        } {
+            self.caret.block = caret_block;
+            let (inline, offset) = self.flat_to_pos(caret_block, caret_offset);
+            self.caret.inline = inline;
+            self.caret.offset = offset;
+        }
     }
 
     fn invariants_hold(&self) -> bool {
@@ -2554,6 +2558,17 @@ impl Document {
             .map_or_else(Vec::new, |(_, cursor)| math::path_names(cursor))
     }
 
+    /// Restore a caret from its block-flat position after run structure changes.
+    fn restore_caret_flat(&mut self, block: usize, flat: usize) {
+        if block >= self.scope().len() {
+            return;
+        }
+        self.caret.block = block;
+        let (inline, offset) = self.flat_to_pos(block, flat);
+        self.caret.inline = inline;
+        self.caret.offset = offset;
+    }
+
     /// After a deletion the context is the style of the char now before the
     /// caret (PLAIN at block start).
     fn refresh_context(&mut self) {
@@ -2871,7 +2886,33 @@ mod tests {
         d.set_caret(0, 1, 0);
         d.backspace();
         assert_eq!(text_of_block(&d, 0), "acd");
-        assert_eq!((d.caret.inline, d.caret.offset), (1, 0));
+        assert_eq!(
+            d.caret_position(),
+            FlatPos {
+                block: 0,
+                offset: 1
+            }
+        );
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn the_caret_keeps_its_position_in_the_text_when_pruning_merges_the_run_it_was_in() {
+        let mut d = doc();
+        d.body_mut()[0] = Block::Paragraph(vec![plain_run("ab"), plain_run("cd")]);
+        d.set_caret(0, 1, 1);
+
+        d.enforce();
+
+        assert_eq!(runs(&d.body()[0]), vec![("abcd".into(), Style::PLAIN)]);
+        assert_eq!(
+            d.caret_position(),
+            FlatPos {
+                block: 0,
+                offset: 3
+            }
+        );
+        assert_eq!((d.caret.inline, d.caret.offset), (0, 3));
         assert_invariants(&d);
     }
 
@@ -3997,32 +4038,35 @@ mod tests {
     }
 
     #[test]
-    fn toggling_italic_off_merges_adjacent_plain_runs_again() {
-        let mut d = doc();
-        d.body_mut()[0] = Block::Paragraph(vec![plain_run("hello world")]);
-        let range = FlatRange::new(
-            FlatPos {
-                block: 0,
-                offset: 0,
-            },
-            FlatPos {
-                block: 0,
-                offset: 5,
-            },
-        );
+    fn a_word_italicised_and_un_italicised_leaves_the_block_with_the_run_structure_it_started_with_whatever_block_the_caret_is_in_and_wherever_in_it_the_caret_sits()
+     {
         let italic = Style {
             italic: true,
             ..Style::PLAIN
         };
 
-        d.toggle_style_range(range, italic);
-        d.toggle_style_range(range, italic);
+        for block in 0..2 {
+            for offset in [0, 1, 5, 6, 11] {
+                let mut d = doc();
+                *d.body_mut() = vec![
+                    Block::Paragraph(vec![plain_run("hello world")]),
+                    Block::Paragraph(vec![plain_run("hello world")]),
+                ];
+                d.set_caret(block, 0, offset);
+                let range =
+                    FlatRange::new(FlatPos { block, offset: 0 }, FlatPos { block, offset: 5 });
 
-        assert_eq!(
-            runs(&d.body()[0]),
-            vec![("hello world".into(), Style::PLAIN)]
-        );
-        assert_invariants(&d);
+                d.toggle_style_range(range, italic);
+                d.toggle_style_range(range, italic);
+
+                assert_eq!(
+                    runs(&d.body()[block]),
+                    vec![("hello world".into(), Style::PLAIN)]
+                );
+                assert_eq!(d.caret_position(), FlatPos { block, offset });
+                assert_invariants(&d);
+            }
+        }
     }
 
     #[test]

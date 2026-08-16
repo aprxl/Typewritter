@@ -677,20 +677,90 @@ fn line_flat_start(layout_block: &BlockLayout, line_idx: usize) -> usize {
     flat
 }
 
-/// Shaped x-boundaries for each character in a text segment. Prefixes preserve
-/// kerning and tracking, while the final boundary is the same width drawing
-/// uses for the whole segment.
-fn char_boundaries(
+fn prefix_width(
     text: &str,
+    chars: usize,
     style: &TextStyle,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
-) -> Vec<f32> {
-    let mut boundaries = vec![0.0];
-    for (start, ch) in text.char_indices() {
-        let end = start + ch.len_utf8();
-        boundaries.push(measure(&text[..end], style));
+) -> f32 {
+    let end = text
+        .char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(start, _)| start);
+    measure(&text[..end], style)
+}
+
+/// First character whose right edge is strictly past x, or the segment length.
+fn first_char_past_x(
+    text: &str,
+    text_x: f32,
+    x: f32,
+    style: &TextStyle,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> (usize, Option<f32>) {
+    let len = text.chars().count();
+    let mut low = 0;
+    let mut high = len;
+    let mut right_width = None;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let width = prefix_width(text, mid + 1, style, measure);
+        if x < text_x + width {
+            high = mid;
+            right_width = Some(width);
+        } else {
+            low = mid + 1;
+        }
     }
-    boundaries
+    if low == len {
+        (len, None)
+    } else {
+        // Lower-bound search's final true probe is this character's right edge.
+        (
+            low,
+            right_width.or_else(|| Some(prefix_width(text, low + 1, style, measure))),
+        )
+    }
+}
+
+/// Character selected by caret placement: split at each character midpoint.
+fn caret_char_for_x(
+    text: &str,
+    text_x: f32,
+    x: f32,
+    style: &TextStyle,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> usize {
+    let len = text.chars().count();
+    let (right, right_width) = first_char_past_x(text, text_x, x, style, measure);
+    if right == len {
+        return len;
+    }
+    let left_width = if right == 0 {
+        0.0
+    } else {
+        prefix_width(text, right, style, measure)
+    };
+    let right_width = right_width.expect("right-edge search found a character");
+    if x <= text_x + left_width + (right_width - left_width) / 2.0 {
+        right
+    } else {
+        right + 1
+    }
+}
+
+/// Character selected by contextual hit testing: split at the right edge,
+/// with the last character owning x beyond the segment.
+fn context_char_for_x(
+    text: &str,
+    text_x: f32,
+    x: f32,
+    style: &TextStyle,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> usize {
+    first_char_past_x(text, text_x, x, style, measure)
+        .0
+        .min(text.chars().count() - 1)
 }
 
 /// A caret for a click at (x, y) on a specific visual line, per the
@@ -737,20 +807,16 @@ fn caret_for_click(
             }
         } else {
             let style = text_style(block, segment.style, scale);
-            let boundaries = char_boundaries(&text, &style, measure);
             let text_x = cum
                 + if segment.style.badge {
                     theme::BADGE_PAD * scale
                 } else {
                     0.0
                 };
-            for ci in 0..segment.len {
-                let start = text_x + boundaries[ci];
-                let end = text_x + boundaries[ci + 1];
-                if x <= start + (end - start) / 2.0 {
-                    pos = seg_flat + ci;
-                    break 'segments;
-                }
+            let ci = caret_char_for_x(&text, text_x, x, &style, measure);
+            if ci < segment.len {
+                pos = seg_flat + ci;
+                break 'segments;
             }
         }
         cum += width;
@@ -926,58 +992,47 @@ impl DocLayout {
                 }
 
                 let style = text_style(block, segment.style, self.scale);
-                let boundaries = char_boundaries(&text, &style, measure);
                 let text_x = advance_x
                     + if segment.style.badge {
                         theme::BADGE_PAD * self.scale
                     } else {
                         0.0
                     };
-                for within_segment in 0..segment.len {
-                    if x < text_x + boundaries[within_segment + 1]
-                        || within_segment + 1 == segment.len
-                    {
-                        let clicked = run_start + segment.start + within_segment;
-                        let ch = text
-                            .chars()
-                            .nth(within_segment)
-                            .expect("segment length matches segment text");
-                        if !ch.is_alphanumeric() && ch != '_' {
-                            return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
-                        }
-                        let chars: Vec<char> = block
-                            .inlines()
-                            .iter()
-                            .flat_map(|run| run_text(run).chars())
-                            .collect();
-                        let mut start = clicked;
-                        while start > 0
-                            && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_')
-                        {
-                            start -= 1;
-                        }
-                        let mut end = clicked + 1;
-                        while end < chars.len()
-                            && (chars[end].is_alphanumeric() || chars[end] == '_')
-                        {
-                            end += 1;
-                        }
-                        return Some(ContextHit::Range {
-                            range: FlatRange::new(
-                                FlatPos {
-                                    block: block_idx,
-                                    offset: start,
-                                },
-                                FlatPos {
-                                    block: block_idx,
-                                    offset: end,
-                                },
-                            ),
-                            kind: RangeKind::Word,
-                        });
-                    }
+                let within_segment = context_char_for_x(&text, text_x, x, &style, measure);
+                let clicked = run_start + segment.start + within_segment;
+                let ch = text
+                    .chars()
+                    .nth(within_segment)
+                    .expect("segment length matches segment text");
+                if !ch.is_alphanumeric() && ch != '_' {
+                    return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
                 }
-                return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
+                let chars: Vec<char> = block
+                    .inlines()
+                    .iter()
+                    .flat_map(|run| run_text(run).chars())
+                    .collect();
+                let mut start = clicked;
+                while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+                    start -= 1;
+                }
+                let mut end = clicked + 1;
+                while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                    end += 1;
+                }
+                return Some(ContextHit::Range {
+                    range: FlatRange::new(
+                        FlatPos {
+                            block: block_idx,
+                            offset: start,
+                        },
+                        FlatPos {
+                            block: block_idx,
+                            offset: end,
+                        },
+                    ),
+                    kind: RangeKind::Word,
+                });
             }
             advance_x += width;
         }
@@ -1480,6 +1535,7 @@ mod tests {
     use crate::document::math::{BigOp, MathNode, Slot, Step};
     use crate::document::math_layout::BoxKind;
     use crate::document::{Focus, Inline, Sidenote, Text};
+    use std::cell::Cell;
 
     /// Every glyph 10 wide, so line breaks are countable by hand.
     fn fake_measure(text: &str, style: &TextStyle) -> f32 {
@@ -1495,6 +1551,40 @@ mod tests {
         } else {
             chars * 10.0
         }
+    }
+
+    fn linear_caret_char(
+        text: &str,
+        x: f32,
+        style: &TextStyle,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> usize {
+        let mut left = 0.0;
+        for (index, _) in text.chars().enumerate() {
+            let prefix: String = text.chars().take(index + 1).collect();
+            let right = measure(&prefix, style);
+            if x <= left + (right - left) / 2.0 {
+                return index;
+            }
+            left = right;
+        }
+        text.chars().count()
+    }
+
+    fn linear_context_char(
+        text: &str,
+        x: f32,
+        style: &TextStyle,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> usize {
+        let len = text.chars().count();
+        for (index, _) in text.chars().enumerate() {
+            let prefix: String = text.chars().take(index + 1).collect();
+            if x < measure(&prefix, style) || index + 1 == len {
+                return index;
+            }
+        }
+        len - 1
     }
 
     fn doc_with(blocks: Vec<Block>) -> Document {
@@ -2394,6 +2484,40 @@ mod tests {
             })
         );
         assert_eq!(laid.hit_context(55.0, y, &fake_measure), None);
+    }
+
+    #[test]
+    fn binary_search_finds_the_same_character_as_a_linear_walk_over_shaped_text_at_every_x() {
+        let text = "a".repeat(80);
+        let style = text_style(&Block::Paragraph(vec![]), Style::PLAIN, 1.0);
+        let width = shaped_measure(&text, &style);
+
+        for x in 0..=width.ceil() as usize {
+            let x = x as f32;
+            assert_eq!(
+                caret_char_for_x(&text, 0.0, x, &style, &shaped_measure),
+                linear_caret_char(&text, x, &style, &shaped_measure),
+                "caret mismatch at x={x}"
+            );
+            assert_eq!(
+                context_char_for_x(&text, 0.0, x, &style, &shaped_measure),
+                linear_context_char(&text, x, &style, &shaped_measure),
+                "context mismatch at x={x}"
+            );
+        }
+
+        let measures = Cell::new(0);
+        let counting_measure = |text: &str, style: &TextStyle| {
+            measures.set(measures.get() + 1);
+            shaped_measure(text, style)
+        };
+        let mut maximum = 0;
+        for x in 0..=width.ceil() as usize {
+            measures.set(0);
+            let _ = caret_char_for_x(&text, 0.0, x as f32, &style, &counting_measure);
+            maximum = maximum.max(measures.get());
+        }
+        assert_eq!(maximum, 8);
     }
 
     #[test]
