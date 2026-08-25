@@ -73,8 +73,11 @@ pub const INTEGRAL_STROKE: f32 = 1.4;
 pub const INTEGRAL_WIDTH: f32 = 0.55;
 pub const INTEGRAL_HEIGHT: f32 = 1.55;
 /// Radius of the ring on a contour integral, as a fraction of the sign's
-/// height.
-pub const CONTOUR_RADIUS: f32 = 0.14;
+/// height. Sized so the ring is a little wider than the sign it crosses —
+/// below that it reads as a smudge on the spine rather than as a circle, and
+/// a `∮` that cannot be told from a `∫` at a glance is the whole failure.
+/// The sign's box widens to hold it.
+pub const CONTOUR_RADIUS: f32 = 0.19;
 
 // The renderer centers glyphs vertically, so glyph boxes are symmetric about
 // the anchor. Structural boxes use their near edge when clearance matters.
@@ -460,55 +463,194 @@ fn big_op(
     )
 }
 
-/// The integral sign, drawn rather than set. One cubic with point symmetry
-/// about the sign's centre — which is the symmetry the notation itself has —
-/// so the top terminal sits right of centre and bows further right, and the
-/// bottom mirrors it exactly. `ring` adds the contour integral's circle as a
-/// second subpath of the same stroke.
+/// The integral sign's shape, in a design space where x is a fraction of the
+/// sign's width and y a fraction of its height measured from the centre.
+///
+/// Three cubics, not one: a hook, a near-straight spine, and the hook again.
+/// One cubic can only bow — it cannot hold a straight middle and turn
+/// tightly at both ends, which is the whole silhouette of an integral.
+///
+/// The sign is point-symmetric about `(0.5, 0)`, so only the top half is
+/// written down here and [`integral_points`] mirrors it. Mirroring a point
+/// is `(1 - x, -y)`, and mirroring a *segment* also reverses its two
+/// controls, which is why the bottom hook reads backwards against the top.
+mod integral {
+    /// The hook's share of the height, measured from the very top.
+    pub const HOOK: f32 = 0.21;
+    /// Where the terminal sits across the width, and how far down inside the
+    /// hook it hangs as a share of [`HOOK`]. The tip points back down and
+    /// inwards, the way a pen leaves the stroke — it is the hang that tells
+    /// an integral from a plain swash, so it is most of the hook's depth.
+    pub const TIP_X: f32 = 0.34;
+    pub const TIP_DROP: f32 = 0.78;
+    /// How far sideways the hook throws its control. Past the edge on
+    /// purpose: a cubic's extreme lies well inside its controls, so this is
+    /// what gives the hook a real shoulder instead of a lazy curve.
+    pub const SWEEP: f32 = 1.30;
+    /// Where the spine leaves the hook, and its own control — close to
+    /// `SPINE_X` so the middle stays near-vertical rather than bulging.
+    pub const SPINE_X: f32 = 0.62;
+    pub const LEAN: f32 = 0.55;
+    /// How far along the spine its controls sit. A third keeps it straight.
+    pub const LEAN_ALONG: f32 = 0.34;
+}
+
+/// The ten points of the integral's three cubics, in design space:
+/// `[start, c1, c2, end, c1, c2, end, c1, c2, end]`.
+fn integral_points() -> [(f32, f32); 10] {
+    use integral::*;
+    // Only the top is written down; `mirror` supplies the rest.
+    let top = -0.5;
+    let mirror = |(x, y): (f32, f32)| (1.0 - x, -y);
+
+    let tip = (TIP_X, top + HOOK * TIP_DROP);
+    let hook_c1 = (TIP_X, top);
+    let hook_c2 = (SWEEP, top);
+    let spine_top = (SPINE_X, top + HOOK);
+    let spine_bottom = mirror(spine_top);
+    let along = (spine_bottom.1 - spine_top.1) * LEAN_ALONG;
+    let spine_c1 = (LEAN, spine_top.1 + along);
+
+    [
+        tip,
+        hook_c1,
+        hook_c2,
+        spine_top,
+        spine_c1,
+        mirror(spine_c1),
+        spine_bottom,
+        // The top hook mirrored *and* reversed: a segment's controls swap
+        // when the direction of travel does.
+        mirror(hook_c2),
+        mirror(hook_c1),
+        mirror(tip),
+    ]
+}
+
+/// The box the curve actually occupies, `(min_x, max_x, min_y, max_y)`, by
+/// sampling. A cubic stays strictly inside its control points, and the
+/// integral's hooks throw theirs well outside the shape on purpose, so the
+/// control points cannot stand in for the extent on either axis. The sign is
+/// then scaled to *this*, which is what makes [`INTEGRAL_WIDTH`] and
+/// [`INTEGRAL_HEIGHT`] describe the ink rather than a box with dead margin
+/// inside it — a sign floating in its own box would take the limits stacked
+/// above and below it out of alignment with the stroke they belong to.
+fn integral_extent(points: &[(f32, f32); 10]) -> (f32, f32, f32, f32) {
+    let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+    let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+    for segment in 0..3 {
+        let p = &points[segment * 3..segment * 3 + 4];
+        for step in 0..=64 {
+            let t = step as f32 / 64.0;
+            let u = 1.0 - t;
+            let at = |a: f32, b: f32, c: f32, d: f32| {
+                u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+            };
+            let x = at(p[0].0, p[1].0, p[2].0, p[3].0);
+            let y = at(p[0].1, p[1].1, p[2].1, p[3].1);
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+    }
+    (min_x, max_x, min_y, max_y)
+}
+
+/// The integral sign, drawn rather than set. `ring` adds the contour
+/// integral's circle, as four cubics on the same stroke — a circle is one
+/// shape every path renderer agrees on, where SVG's arc flags are one more
+/// thing to get wrong for no gain.
 fn integral_sign(ring: bool, level: usize, document_scale: f32) -> MathBox {
     let size = size(level, document_scale);
     let stroke = SHAPE_STROKE * INTEGRAL_STROKE * scale(level, document_scale);
-    let width = size * INTEGRAL_WIDTH;
+    let ink_width = size * INTEGRAL_WIDTH;
     let height = size * INTEGRAL_HEIGHT;
-    // Inset by half the stroke so the ink stays inside the box it reserves.
-    let inset = stroke * 0.5;
-    let top = -height * 0.5 + inset;
-    let bottom = height * 0.5 - inset;
-    let span = width - inset * 2.0;
-    let at = |fraction: f32| inset + span * fraction;
-    // Where the terminal sits and how far the hook swings past it, across the
-    // sign's width. The bottom half is these two mirrored, which is what
-    // makes the whole sign point-symmetric. They look like odd numbers
-    // because they are solved rather than picked: a cubic's extremes lie
-    // strictly inside its control points, so leaving the hook at the box edge
-    // would leave a quarter of the reserved width blank on each side. At
-    // these values the curve's own turning points land exactly on the edges,
-    // so the sign fills the width it takes up.
-    const TIP: f32 = 0.869;
-    const HOOK: f32 = 1.524;
-    // How far down the hook reaches before the spine straightens, as a share
-    // of the height. Small enough that the middle stays near-vertical.
-    let bow = height * 0.32;
-    let mut path = format!(
-        "M {} {top} C {} {}, {} {}, {} {bottom}",
-        at(TIP),
-        at(HOOK),
-        top + bow,
-        at(1.0 - HOOK),
-        bottom - bow,
-        at(1.0 - TIP),
-    );
-    if ring {
-        let radius = height * CONTOUR_RADIUS;
-        let center = width * 0.5;
+    let radius = height * CONTOUR_RADIUS;
+
+    // The ring is wider than the sign, so a contour integral reserves more
+    // room and the sign is centred in it. Both are centred on the same
+    // point, which the sign's own symmetry then keeps true.
+    let width = if ring {
+        ink_width.max(radius * 2.0 + stroke)
+    } else {
+        ink_width
+    };
+    let center = width * 0.5;
+
+    let points = integral_points();
+    let (min_x, max_x, min_y, max_y) = integral_extent(&points);
+    // Map the design space onto the ink on both axes, inset by half a stroke
+    // so the drawn edge lands on the box edge rather than half outside it.
+    let ink = (ink_width - stroke, height - stroke);
+    let x_scale = ink.0 / (max_x - min_x);
+    let y_scale = ink.1 / (max_y - min_y);
+    let at = |(x, y): (f32, f32)| {
+        (
+            center - ink.0 * 0.5 + (x - min_x) * x_scale,
+            -ink.1 * 0.5 + (y - min_y) * y_scale,
+        )
+    };
+
+    let point = |index: usize| {
+        let (x, y) = at(points[index]);
+        format!("{x} {y}")
+    };
+    let mut path = format!("M {}", point(0));
+    for segment in 0..3 {
+        let base = segment * 3;
         path.push_str(&format!(
-            " M {} 0 A {radius} {radius} 0 1 0 {} 0 A {radius} {radius} 0 1 0 {} 0",
-            center - radius,
-            center + radius,
-            center - radius,
+            " C {}, {}, {}",
+            point(base + 1),
+            point(base + 2),
+            point(base + 3)
         ));
     }
+    if ring {
+        path.push(' ');
+        path.push_str(&circle_path((center, 0.0), radius));
+    }
     stroked_box(width, height * 0.5, height * 0.5, path, stroke)
+}
+
+/// A closed circle as four cubics. `KAPPA` is the standard control-point
+/// distance that makes a cubic match a quarter arc to within a thousandth of
+/// the radius — the usual way vector formats draw circles, and it avoids
+/// depending on SVG arc flags.
+fn circle_path((cx, cy): (f32, f32), radius: f32) -> String {
+    const KAPPA: f32 = 0.5523;
+    let k = radius * KAPPA;
+    // Quarter turns clockwise from the left: left → top → right → bottom.
+    let quarters = [
+        (
+            (cx - radius, cy - k),
+            (cx - k, cy - radius),
+            (cx, cy - radius),
+        ),
+        (
+            (cx + k, cy - radius),
+            (cx + radius, cy - k),
+            (cx + radius, cy),
+        ),
+        (
+            (cx + radius, cy + k),
+            (cx + k, cy + radius),
+            (cx, cy + radius),
+        ),
+        (
+            (cx - k, cy + radius),
+            (cx - radius, cy + k),
+            (cx - radius, cy),
+        ),
+    ];
+    let mut path = format!("M {} {cy}", cx - radius);
+    for (c1, c2, end) in quarters {
+        path.push_str(&format!(
+            " C {} {}, {} {}, {} {}",
+            c1.0, c1.1, c2.0, c2.1, end.0, end.1
+        ));
+    }
+    path
 }
 
 fn stretchy_size(body: &MathBox, level: usize, document_scale: f32) -> f32 {
@@ -2337,6 +2479,187 @@ mod tests {
         );
     }
 
+    /// Every path this module emits goes to `Layer::draw_path`, which
+    /// `expect`s a successful parse — so a malformed one is a panic in the
+    /// running app, on the frame the reader first types that structure.
+    /// Parsed here through the very parser the renderer uses, so a path can
+    /// never reach the screen untested.
+    #[test]
+    fn every_generated_path_parses_as_svg() {
+        fn parses(d: &str) -> bool {
+            let mut parser = lyon_extra::parser::PathParser::new();
+            let mut builder = lyon::path::Path::builder();
+            let mut source = lyon_extra::parser::Source::new(d.chars());
+            parser
+                .parse(
+                    &lyon_extra::parser::ParserOptions::DEFAULT,
+                    &mut source,
+                    &mut builder,
+                )
+                .is_ok()
+        }
+
+        let mut checked = 0;
+        let mut check = |box_: &MathBox| {
+            fn walk(box_: &MathBox, out: &mut Vec<String>) {
+                match &box_.kind {
+                    BoxKind::Primitive(MathPrimitive::Stroke { path, .. }) => {
+                        out.push(path.clone())
+                    }
+                    BoxKind::Row { children } => {
+                        for (_, _, child) in children {
+                            walk(child, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut paths = Vec::new();
+            walk(box_, &mut paths);
+            assert!(!paths.is_empty(), "expected at least one stroked path");
+            for path in paths {
+                assert!(parses(&path), "lyon rejected: {path}");
+                checked += 1;
+            }
+        };
+
+        for ring in [false, true] {
+            check(&integral_sign(ring, 0, 1.0));
+        }
+        // Delimiters and the radical go through the same `draw_path`.
+        for (open, close) in [('(', ')'), ('[', ']'), ('|', '|'), ('⟨', '⟩')] {
+            let group = vec![MathNode::Group {
+                open,
+                close,
+                body: vec![MathNode::Sym('x')],
+            }];
+            check(&layout(&group, 0, &fake_measure));
+        }
+        check(&layout(
+            &vec![MathNode::Sqrt {
+                body: vec![MathNode::Sym('x')],
+            }],
+            0,
+            &fake_measure,
+        ));
+        assert!(checked >= 8, "only {checked} paths reached the parser");
+    }
+
+    /// Every point the pen actually visits in a `M`/`C` path, sampled. Not
+    /// the control points, which for the integral's hooks sit well outside
+    /// the shape on purpose.
+    fn stroke_samples(path: &str) -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        for subpath in path.split('M').skip(1) {
+            let mut segments = subpath.split('C');
+            let head: Vec<f32> = segments
+                .next()
+                .expect("a subpath opens with its move")
+                .split([' ', ','])
+                .filter_map(|t| t.parse().ok())
+                .collect();
+            let mut cursor = (head[0], head[1]);
+            out.push(cursor);
+            for segment in segments {
+                let n: Vec<f32> = segment
+                    .split([' ', ','])
+                    .filter_map(|t| t.parse().ok())
+                    .collect();
+                assert_eq!(n.len(), 6, "a cubic is three points: {segment}");
+                let (c1, c2, end) = ((n[0], n[1]), (n[2], n[3]), (n[4], n[5]));
+                for step in 1..=200 {
+                    let t = step as f32 / 200.0;
+                    let u = 1.0 - t;
+                    let at = |a: f32, b: f32, c: f32, d: f32| {
+                        u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+                    };
+                    out.push((
+                        at(cursor.0, c1.0, c2.0, end.0),
+                        at(cursor.1, c1.1, c2.1, end.1),
+                    ));
+                }
+                cursor = end;
+            }
+        }
+        out
+    }
+
+    /// `(min_x, max_x, min_y, max_y)` of the ink.
+    fn stroke_bounds(path: &str) -> (f32, f32, f32, f32) {
+        let samples = stroke_samples(path);
+        samples.iter().fold(
+            (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
+            |(lo_x, hi_x, lo_y, hi_y), &(x, y)| {
+                (lo_x.min(x), hi_x.max(x), lo_y.min(y), hi_y.max(y))
+            },
+        )
+    }
+
+    /// The silhouette that makes an integral an integral, and the reason it
+    /// is three cubics rather than one: a long near-straight spine through
+    /// the middle, and at each end a hook that reaches *wider* than the spine
+    /// ever does and then hangs back down past its own widest point. One
+    /// cubic can only bow, which reads as a parenthesis.
+    #[test]
+    fn the_integral_has_a_straight_spine_and_a_hooked_terminal() {
+        let sign = integral_sign(false, 0, 1.0);
+        let BoxKind::Primitive(MathPrimitive::Stroke { path, .. }) = &sign.kind else {
+            panic!("integral must be a stroked primitive");
+        };
+        let samples = stroke_samples(path);
+        let height = sign.ascent + sign.descent;
+
+        // The middle half of the sign, which is spine and nothing else.
+        let spine: Vec<(f32, f32)> = samples
+            .iter()
+            .copied()
+            .filter(|&(_, y)| y.abs() < height * 0.25)
+            .collect();
+        assert!(spine.len() > 50, "expected a sampled spine");
+        // Straight: every spine point sits close to the line through its
+        // ends. Measured across the width, so the bound is a share of it.
+        let (first, last) = (spine[0], spine[spine.len() - 1]);
+        let run = last.1 - first.1;
+        let drift = spine
+            .iter()
+            .map(|&(x, y)| {
+                let expected = first.0 + (last.0 - first.0) * ((y - first.1) / run);
+                (x - expected).abs()
+            })
+            .fold(0.0, f32::max);
+        assert!(
+            drift < sign.width * 0.06,
+            "spine bows {drift:.2}px, more than a straight stroke should"
+        );
+
+        // The hook reaches wider than the spine does, and its tip then hangs
+        // back *below* the point where it was widest — that hang is the
+        // terminal, and a plain bow has none.
+        let spine_max_x = spine.iter().fold(f32::MIN, |m, &(x, _)| m.max(x));
+        let (widest_x, widest_y) =
+            samples.iter().copied().fold(
+                (f32::MIN, 0.0),
+                |best, (x, y)| {
+                    if x > best.0 { (x, y) } else { best }
+                },
+            );
+        assert!(
+            widest_x > spine_max_x + sign.width * 0.15,
+            "the hook must reach past the spine: {widest_x:.2} vs {spine_max_x:.2}"
+        );
+        let tip = samples[0];
+        assert!(
+            tip.1 > widest_y,
+            "the top tip must hang below the hook's shoulder: {:.2} vs {:.2}",
+            tip.1,
+            widest_y
+        );
+        assert!(
+            tip.1 - (-sign.ascent) > height * 0.08,
+            "the hang is too shallow to read as a terminal"
+        );
+    }
+
     /// The sign must fill the box it reserves. A cubic's extremes lie inside
     /// its control points, so control points parked on the edges would leave
     /// the sign floating in dead space — and a big operator's limits are
@@ -2348,30 +2671,7 @@ mod tests {
         let BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }) = &sign.kind else {
             panic!("integral must be a stroked primitive");
         };
-        // "M x0 y0 C x1 y1, x2 y2, x3 y3" — the four points, in order.
-        let numbers: Vec<f32> = path
-            .split([' ', ','])
-            .filter_map(|token| token.parse().ok())
-            .collect();
-        assert_eq!(numbers.len(), 8, "one cubic, four points: {path}");
-        let point = |i: usize| (numbers[i * 2], numbers[i * 2 + 1]);
-        let (p0, c1, c2, p3) = (point(0), point(1), point(2), point(3));
-
-        let axis = |a: f32, b: f32, c: f32, d: f32, t: f32| {
-            let u = 1.0 - t;
-            u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
-        };
-        let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
-        let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
-        for step in 0..=2000 {
-            let t = step as f32 / 2000.0;
-            let x = axis(p0.0, c1.0, c2.0, p3.0, t);
-            let y = axis(p0.1, c1.1, c2.1, p3.1, t);
-            min_x = min_x.min(x);
-            max_x = max_x.max(x);
-            min_y = min_y.min(y);
-            max_y = max_y.max(y);
-        }
+        let (min_x, max_x, min_y, max_y) = stroke_bounds(path);
 
         // The ink is inset by half a stroke so the drawn edge lands on the
         // box edge rather than half outside it.
@@ -2404,9 +2704,34 @@ mod tests {
         };
         let plain = path_of(false);
         let contour = path_of(true);
-        assert!(!plain.contains('A'), "a plain integral has no arc: {plain}");
-        assert!(contour.starts_with(&plain), "the ring is appended to the S");
-        assert_eq!(contour.matches(" A ").count(), 2, "two half-arcs close it");
+        // Three cubics for the sign; the ring adds four more on a subpath of
+        // its own. Cubics, not SVG arcs — one shape every renderer agrees on.
+        assert_eq!(plain.matches(" C ").count(), 3, "sign is three cubics");
+        assert_eq!(plain.matches('M').count(), 1, "sign is one subpath");
+        assert_eq!(contour.matches(" C ").count(), 7, "sign plus a ring");
+        assert_eq!(contour.matches('M').count(), 2, "the ring is its own");
+
+        // The ring has to be big enough to read as a circle rather than a
+        // smudge on the spine: a `∮` indistinguishable from a `∫` is the
+        // whole failure. It is round, centred, and wider than the sign.
+        let ring = integral_sign(true, 0, 1.0);
+        // `split` eats the `M` it split on; the sampler needs it back.
+        let ring_path = format!("M{}", contour.split('M').nth(2).expect("ring subpath"));
+        let (min_x, max_x, min_y, max_y) = stroke_bounds(&ring_path);
+        let (across, down) = (max_x - min_x, max_y - min_y);
+        assert!((across - down).abs() < 0.05, "the ring is round");
+        assert!(
+            across > integral_sign(false, 0, 1.0).width * 0.9,
+            "the ring must be about as wide as the sign, was {across:.2}"
+        );
+        assert!(
+            (min_x + max_x - ring.width).abs() < 0.05 && (min_y + max_y).abs() < 0.05,
+            "the ring is centred on the sign"
+        );
+        assert!(
+            ring.width >= across,
+            "the box widens to hold a ring wider than the sign"
+        );
     }
 
     #[test]
