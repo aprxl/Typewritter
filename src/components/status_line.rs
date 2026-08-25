@@ -14,8 +14,8 @@ pub const HEIGHT: f32 = 38.0;
 /// instead, because it changes every frame.
 pub struct StatusLine {
     mode: String,
-    /// The badge's fill — `theme::COOL` in vim's Normal mode,
-    /// `theme::ACCENT` in Insert, chosen by the shell so this component
+    /// The badge's fill — `theme::cool()` in vim's Normal mode,
+    /// `theme::accent()` in Insert, chosen by the shell so this component
     /// doesn't need to know vim exists.
     mode_color: Color,
     note: String,
@@ -77,7 +77,7 @@ impl Component for StatusLine {
         // Measured against a fixed-width sample, not the live numbers: a
         // minimum that changed with every frametime digit would dirty the
         // layout on every frame, which is the opposite of the point.
-        let body = TextStyle::serif(13.5, theme::DIM);
+        let body = TextStyle::serif(13.5, theme::dim());
         let note = if self.command.is_empty() {
             &self.note
         } else {
@@ -88,7 +88,7 @@ impl Component for StatusLine {
         } else {
             theme::width(layer, &self.math_path, &body) + 32.0
         };
-        let left = theme::width(layer, &self.mode, &TextStyle::mono(10.0, theme::BACKGROUND))
+        let left = theme::width(layer, &self.mode, &TextStyle::mono(10.0, theme::background()))
             + theme::width(layer, note, &body)
             + math_width
             + 90.0;
@@ -97,7 +97,7 @@ impl Component for StatusLine {
             + theme::width(
                 layer,
                 "solves 000 · redrew 0/0 · 00.00ms",
-                &TextStyle::mono(11.0, theme::FAINT),
+                &TextStyle::mono(11.0, theme::faint()),
             )
             + 90.0;
         (left + right, HEIGHT)
@@ -119,11 +119,11 @@ impl Component for StatusLine {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(rect.position(), rect.size(), theme::PANEL, Rounding::NONE);
-        theme::rule(layer, (rect.x, rect.y), rect.width, 2.0, theme::BORDER);
+        layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
+        theme::rule(layer, (rect.x, rect.y), rect.width, 2.0, theme::border());
         let middle = rect.y + 2.0 + (rect.height - 2.0) / 2.0;
 
-        let mode_style = TextStyle::mono(10.0, theme::BACKGROUND).tracked(0.18);
+        let mode_style = TextStyle::mono(10.0, theme::background()).tracked(0.18);
         let mode_width = theme::width(layer, &self.mode, &mode_style) + 20.0;
         layer.draw_rectangle(
             (rect.x + 18.0, middle - 9.0),
@@ -139,7 +139,7 @@ impl Component for StatusLine {
             theme::LEFT,
         );
 
-        let body = TextStyle::serif(13.5, theme::DIM);
+        let body = TextStyle::serif(13.5, theme::dim());
         let x = rect.x + 18.0 + mode_width + 12.0;
 
         // The right cluster is laid out backwards from the right edge and
@@ -149,14 +149,14 @@ impl Component for StatusLine {
         let mut right = rect.right() - 18.0;
         if self.show_stats {
             let stats = self.stats();
-            let stats_style = TextStyle::mono(11.0, theme::FAINT);
+            let stats_style = TextStyle::mono(11.0, theme::faint());
             theme::draw(layer, &stats, (right, middle), &stats_style, theme::RIGHT);
             right -= theme::width(layer, &stats, &stats_style) + 12.0;
             theme::draw(
                 layer,
                 "·",
                 (right, middle),
-                &body.clone().color(theme::NON_TEXT),
+                &body.clone().color(theme::non_text()),
                 theme::RIGHT,
             );
             right -= 14.0;
@@ -168,7 +168,7 @@ impl Component for StatusLine {
                 layer,
                 "·",
                 (right, middle),
-                &body.clone().color(theme::NON_TEXT),
+                &body.clone().color(theme::non_text()),
                 theme::RIGHT,
             );
             right -= 14.0;
@@ -181,7 +181,7 @@ impl Component for StatusLine {
                 icons::BRANCH,
                 (right - 13.0, middle - 6.5),
                 13.0,
-                theme::LIVE,
+                theme::live(),
                 1.9,
             );
             right -= 26.0;
@@ -200,7 +200,7 @@ impl Component for StatusLine {
                 layer,
                 note,
                 (x, middle),
-                &body.clone().color(theme::INK),
+                &body.clone().color(theme::ink()),
                 theme::LEFT,
             );
             if !self.math_path.is_empty() {
@@ -212,7 +212,7 @@ impl Component for StatusLine {
                         icons::NEXT_SLOT,
                         (path_x, middle - 6.5),
                         13.0,
-                        theme::NON_TEXT,
+                        theme::non_text(),
                         1.9,
                     );
                     theme::draw(

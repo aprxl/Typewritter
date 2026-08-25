@@ -148,7 +148,7 @@ impl FileTree {
 
 impl Component for FileTree {
     fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        let style = TextStyle::serif(14.5, theme::INK);
+        let style = TextStyle::serif(14.5, theme::ink());
         let widest = self.vault.as_ref().map_or(0.0, |v| {
             v.borrow()
                 .visible()
@@ -228,13 +228,13 @@ impl Component for FileTree {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(rect.position(), rect.size(), theme::PANEL, Rounding::NONE);
+        layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
         theme::vertical_rule(
             layer,
             (rect.right() - 1.0, rect.y),
             rect.height,
             1.0,
-            theme::BORDER,
+            theme::border(),
         );
 
         let Some(vault_ref) = &self.vault else {
@@ -242,14 +242,14 @@ impl Component for FileTree {
                 layer,
                 "No vault loaded",
                 (rect.x + 18.0, rect.y + 48.0),
-                &TextStyle::serif(14.5, theme::INK),
+                &TextStyle::serif(14.5, theme::ink()),
                 theme::LEFT,
             );
             theme::draw(
                 layer,
                 "run with --onboard to choose one",
                 (rect.x + 18.0, rect.y + 78.0),
-                &TextStyle::mono(10.5, theme::COMMENT),
+                &TextStyle::mono(10.5, theme::comment()),
                 theme::LEFT,
             );
             return;
@@ -264,14 +264,14 @@ impl Component for FileTree {
                 icons::FOLDER,
                 (rect.x + 18.0, rect.y + HEADER_Y - 6.0),
                 12.0,
-                theme::COMMENT,
+                theme::comment(),
                 1.8,
             );
             theme::draw(
                 layer,
                 name,
                 (rect.x + 36.0, rect.y + HEADER_Y),
-                &TextStyle::mono(10.0, theme::COMMENT).tracked(0.18),
+                &TextStyle::mono(10.0, theme::comment()).tracked(0.18),
                 theme::LEFT,
             );
             theme::rule(
@@ -279,25 +279,25 @@ impl Component for FileTree {
                 (rect.x + 18.0, rect.y + HEADER_Y + 13.0),
                 (rect.width - 36.0).max(0.0),
                 1.0,
-                theme::BORDER,
+                theme::border(),
             );
         }
 
-        let name_style = TextStyle::serif(14.5, theme::DIM);
+        let name_style = TextStyle::serif(14.5, theme::dim());
         for (index, row) in vault.visible().iter().enumerate() {
             let y = rect.y + CONTENT_TOP - self.scroll + index as f32 * ROW_HEIGHT;
             let band = Rect::new(rect.x, y - ROW_HALF, rect.width - 1.0, ROW_HEIGHT);
             if self.debug_rows {
                 // The exact band `sync` hit-tests, so a misaligned hit is
                 // visible instead of mysterious.
-                theme::outline(layer, band, theme::WARNING);
+                theme::outline(layer, band, theme::warning());
             }
             let selected = selected.as_deref() == Some(row.path);
             if selected {
                 layer.draw_rectangle(
                     band.position(),
                     band.size(),
-                    theme::SELECTION,
+                    theme::selection(),
                     Rounding::NONE,
                 );
             }
@@ -317,14 +317,14 @@ impl Component for FileTree {
                     },
                     (chevron_x, y - 5.5),
                     11.0,
-                    theme::COMMENT,
+                    theme::comment(),
                     2.2,
                 );
             }
             let (name, icon_color) = if selected {
-                (name_style.clone().color(theme::INK), theme::ACCENT)
+                (name_style.clone().color(theme::ink()), theme::accent())
             } else {
-                (name_style.clone(), theme::NON_TEXT)
+                (name_style.clone(), theme::non_text())
             };
             theme::icon(
                 layer,
@@ -347,7 +347,7 @@ impl Component for FileTree {
                 (rect.right() - 1.0, rect.y),
                 rect.height,
                 1.0,
-                theme::fade(theme::ACCENT, self.divider_hover),
+                theme::fade(theme::accent(), self.divider_hover),
             );
         }
     }

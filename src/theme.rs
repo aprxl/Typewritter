@@ -1,8 +1,15 @@
-//! Guara (light) — colours, type, and icons.
+//! Colours, type, and icons.
 //!
-//! Palette is transcribed from `~/.dev/Guara/COLOR.md`; the role names are
+//! A [`Theme`] names every colour the application draws with, and
+//! [`ThemeServer`] owns the one that is current. Nothing outside this file
+//! names a colour or a font family, and nothing outside this file holds a
+//! colour past the frame it drew with it — [`set`] swaps the palette and
+//! every call site picks the new value up on its next read.
+//!
+//! Palettes are transcribed from `~/.dev/Guara/COLOR.md`; the role names are
 //! that document's, so a value here can be checked against it directly.
-//! Nothing else in the app names a colour or a font family.
+
+use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
 use crate::document::BadgeColor;
 use crate::layout::Rect;
@@ -11,46 +18,204 @@ use crate::renderer::{
     Rounding, Stroke, VerticalAlign,
 };
 
-// -- Surfaces --
-pub const BACKGROUND: Color = Color::rgb(0xF8, 0xED, 0xD0);
-/// Panels and chrome that sit behind the page (Guara's gutter).
-pub const PANEL: Color = Color::rgb(0xF0, 0xE3, 0xBE);
-/// Cursor line / alternate background — also the math slot fill.
-pub const ALT: Color = Color::rgb(0xEF, 0xE0, 0xA8);
-/// Chrome / statusline. Lighter than `PANEL`: the tab strip and breadcrumb.
-pub const CHROME: Color = Color::rgb(0xFA, 0xF1, 0xDB);
-pub const SELECTION: Color = Color::rgb(0xD2, 0xB2, 0x6E);
-/// Behind code, inline and fenced. A clear step down from `BACKGROUND` —
-/// the boundary of a code span has to read at a glance, since nothing else
-/// marks it.
-pub const CODE: Color = Color::rgb(0xD9, 0xC9, 0x9E);
-/// Behind a display math block. A sibling of `CODE` rather than the same
-/// tint: both are slabs of machinery on a page of prose, and telling one
-/// from the other at a glance is the whole point of tinting them at all.
-/// Cooler and greyer than code's warm tan, which is what separates them
-/// without introducing a colour the palette does not already live in.
-pub const MATH: Color = Color::rgb(0xD5, 0xCD, 0xB4);
-pub const BORDER: Color = Color::rgb(0xDD, 0xD0, 0xA0);
+/// Every colour the application draws with, one palette's worth. Sizes and
+/// spacings are *not* here: a badge is the same size in every theme, so
+/// swapping palettes can never move anything on the page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Theme {
+    // -- Surfaces --
+    /// The page itself.
+    pub background: Color,
+    /// Panels that sit behind the page (Guara's gutter): the tree, topics,
+    /// the title bar, the status line.
+    pub panel: Color,
+    /// A card floating *over* the page — the palette, the dialogs, the
+    /// menus. The same value as `panel` in Guara, a lighter one in Noir,
+    /// where a card that dropped to the gutter's value would sink into the
+    /// window instead of lifting off the page.
+    pub popup: Color,
+    /// Cursor line / alternate background — also the math slot fill.
+    pub alt: Color,
+    /// Chrome / statusline. Lighter than `panel`: the tab strip and
+    /// breadcrumb.
+    pub chrome: Color,
+    pub selection: Color,
+    /// Behind code, inline and fenced. A clear step down from `background` —
+    /// the boundary of a code span has to read at a glance, since nothing
+    /// else marks it.
+    pub code: Color,
+    /// Behind a display math block. A sibling of `code` rather than the same
+    /// tint: both are slabs of machinery on a page of prose, and telling one
+    /// from the other at a glance is the whole point of tinting them at all.
+    /// Cooler and greyer than code's warm tan, which is what separates them
+    /// without introducing a colour the palette does not already live in.
+    ///
+    /// Read it through [`math_surface`] — `math` alone is the notation font.
+    pub math: Color,
+    pub border: Color,
 
-// -- Badges and highlights --
-/// Type size of a badge's label. Small enough that the chip is shorter
-/// than the line it sits on, so it never opens the leading up.
-pub const BADGE_SIZE: f32 = 9.0;
-/// A badge's label and its outline share one colour, as in the design —
-/// the box is a hairline, not a filled tag.
-pub const BADGE_INK: Color = STRUCTURE;
-pub const BADGE_BLUE: Color = Color::rgb(0x1F, 0x70, 0xA0);
-pub const BADGE_GREEN: Color = Color::rgb(0x3E, 0x7D, 0x59);
-pub const BADGE_PURPLE: Color = Color::rgb(0x7B, 0x52, 0xA0);
+    // -- Badges and highlights --
+    /// A badge's label and its outline share one colour, as in the design —
+    /// the box is a hairline, not a filled tag.
+    pub badge_ink: Color,
+    pub badge_blue: Color,
+    pub badge_green: Color,
+    pub badge_purple: Color,
+    /// Underline highlight. Drawn as a bar *below* the text rather than a
+    /// wash behind it, so the glyphs keep the page's own contrast.
+    pub highlight: Color,
+    /// Saturated role colours behind resolved mathematical symbols. They sit
+    /// outside the page's warm surface palette so semantic tokens stand out.
+    pub variable: Color,
+    pub constant: Color,
+    pub function: Color,
+    /// Quietest ink that is still ink: dates, hints, disabled glyphs.
+    pub faint: Color,
+    /// Non-text: separators inside a line of type, empty-slot outlines.
+    pub non_text: Color,
 
-pub fn badge_ink(color: BadgeColor) -> Color {
-    match color {
-        BadgeColor::Orange => BADGE_INK,
-        BadgeColor::Blue => BADGE_BLUE,
-        BadgeColor::Green => BADGE_GREEN,
-        BadgeColor::Purple => BADGE_PURPLE,
+    // -- Foreground --
+    pub ink: Color,
+    pub dim: Color,
+    pub comment: Color,
+
+    // -- Semantic accents (Guara's syntax hues, reused as UI roles) --
+    /// Keyword orange: the one loud colour. Mode badge, active markers,
+    /// caret.
+    pub accent: Color,
+    /// Type orange, a shade deeper: structural annotations.
+    pub structure: Color,
+    /// Function green: things that are healthy or live.
+    pub live: Color,
+    /// Global teal — the deliberate cool outlier in a warm palette.
+    pub cool: Color,
+    pub warning: Color,
+}
+
+impl Theme {
+    /// Guara light. Kept whole and current, but nothing loads it yet — the
+    /// application starts on [`Theme::NOIR`], and choosing between them is
+    /// its own piece of work.
+    pub const LIGHT: Self = Self {
+        background: Color::rgb(0xF8, 0xED, 0xD0),
+        panel: Color::rgb(0xF0, 0xE3, 0xBE),
+        // Guara draws a float on the gutter's colour; only Noir splits them.
+        popup: Color::rgb(0xF0, 0xE3, 0xBE),
+        alt: Color::rgb(0xEF, 0xE0, 0xA8),
+        chrome: Color::rgb(0xFA, 0xF1, 0xDB),
+        selection: Color::rgb(0xD2, 0xB2, 0x6E),
+        code: Color::rgb(0xD9, 0xC9, 0x9E),
+        math: Color::rgb(0xD5, 0xCD, 0xB4),
+        border: Color::rgb(0xDD, 0xD0, 0xA0),
+        // The design gives a badge the structural orange rather than an ink
+        // of its own; the two entries carrying one value is that, written out.
+        badge_ink: Color::rgb(0xA8, 0x4C, 0x00),
+        badge_blue: Color::rgb(0x1F, 0x70, 0xA0),
+        badge_green: Color::rgb(0x3E, 0x7D, 0x59),
+        badge_purple: Color::rgb(0x7B, 0x52, 0xA0),
+        highlight: Color::rgb(0xE0, 0xA8, 0x2C),
+        variable: Color::rgb(0x6E, 0x9A, 0xF5),
+        constant: Color::rgb(0xEE, 0x91, 0x45),
+        function: Color::rgb(0x65, 0xB8, 0x78),
+        faint: Color::rgb(0xA0, 0x91, 0x83),
+        non_text: Color::rgb(0xC4, 0xB7, 0x9E),
+        ink: Color::rgb(0x3C, 0x38, 0x36),
+        dim: Color::rgb(0x7C, 0x6F, 0x64),
+        comment: Color::rgb(0x92, 0x83, 0x74),
+        accent: Color::rgb(0xC2, 0x4F, 0x1A),
+        structure: Color::rgb(0xA8, 0x4C, 0x00),
+        live: Color::rgb(0x3E, 0x7D, 0x59),
+        cool: Color::rgb(0x0D, 0x66, 0x78),
+        warning: Color::rgb(0xB0, 0x7B, 0x18),
+    };
+
+    /// Guara Noir, and what the application currently loads.
+    ///
+    /// Every entry the palette document names is transcribed from its NOIR
+    /// column. Five roles are the application's own — the code and math
+    /// slabs, the three math-symbol pills, the purple badge — and the
+    /// document's rule for those is stated at the top of it: *semantic hues
+    /// are constant across variants; only brightness and surface shift*.
+    /// Each is that, and nothing more inventive: the light entry's hue,
+    /// moved to the other side of the page. Each carries its working below.
+    pub const NOIR: Self = Self {
+        background: Color::rgb(0x1B, 0x17, 0x14),
+        panel: Color::rgb(0x14, 0x11, 0x10),
+        popup: Color::rgb(0x22, 0x1D, 0x18),
+        alt: Color::rgb(0x3C, 0x38, 0x36),
+        // Noir gives chrome the gutter's value, so the title bar, the tab
+        // strip, and the side panels are one dark surround and the page is
+        // the lighter thing inside it. `border` is what separates them, and
+        // in Noir it is darker than either.
+        chrome: Color::rgb(0x14, 0x11, 0x10),
+        // The one entry with an alpha: Noir selects by laying a warm veil
+        // over the line rather than replacing its background, so a
+        // selection over a highlight still shows the highlight. The hex is
+        // the document's `#B7B09884` — its prose says ~72% next to an alpha
+        // byte that reads 52%, and the byte is the part that was shipped.
+        selection: Color::rgba(0xB7, 0xB0, 0x98, 0x84),
+        // Light drops the code slab a clear step *below* the page; Noir
+        // lifts it the same step above, at the same warm hue and the lower
+        // saturation a dark surface needs to read as the same tint. Lands
+        // in the register Noir's own washes use (diff-change is `#2E2A1A`).
+        code: Color::rgb(0x33, 0x2C, 0x22),
+        // Code's hue, greyed — the same separation the two carry in light,
+        // where math is code's tint with the tan taken out of it.
+        math: Color::rgb(0x2F, 0x2E, 0x2B),
+        border: Color::rgb(0x0D, 0x0B, 0x09),
+        badge_ink: Color::rgb(0xFF, 0x97, 0x42),
+        badge_blue: Color::rgb(0x13, 0x94, 0xAF),
+        badge_green: Color::rgb(0x58, 0xAF, 0x7D),
+        // The one badge with no role in the document. Light's violet, lifted
+        // to the same contrast against the page that it has against Guara's
+        // (4.9:1) — the hue is untouched at 271°.
+        badge_purple: Color::rgb(0xA2, 0x78, 0xC9),
+        // Noir's search highlight is a background wash; this is a bar drawn
+        // under the text, with a glow over it, so a wash's value would leave
+        // both invisible. It takes the gold Noir does carry — annotation.
+        highlight: Color::rgb(0xC2, 0x87, 0x1A),
+        // The three pills sit *behind* math glyphs, which are drawn in
+        // `ink` — so on a dark page they darken rather than brighten, or the
+        // cream glyph on top stops reading. Each keeps its light hue
+        // (cornflower 223°, orange 26°, green 135°) at the contrast light
+        // holds against its own ink, ~5:1.
+        variable: Color::rgb(0x47, 0x60, 0x9F),
+        constant: Color::rgb(0x8F, 0x4E, 0x1D),
+        function: Color::rgb(0x2E, 0x6B, 0x3D),
+        faint: Color::rgb(0x92, 0x83, 0x74),
+        non_text: Color::rgb(0x36, 0x2C, 0x26),
+        ink: Color::rgb(0xF0, 0xE4, 0xC2),
+        dim: Color::rgb(0xCC, 0xBB, 0x9E),
+        comment: Color::rgb(0x92, 0x83, 0x74),
+        accent: Color::rgb(0xC0, 0x5B, 0x2D),
+        structure: Color::rgb(0xFF, 0x97, 0x42),
+        live: Color::rgb(0x58, 0xAF, 0x7D),
+        cool: Color::rgb(0x13, 0x94, 0xAF),
+        warning: Color::rgb(0xB5, 0x76, 0x14),
+    };
+
+    /// The ink a badge of `color` is drawn in — label and hairline box both.
+    pub fn badge(&self, color: BadgeColor) -> Color {
+        match color {
+            BadgeColor::Orange => self.badge_ink.clone(),
+            BadgeColor::Blue => self.badge_blue.clone(),
+            BadgeColor::Green => self.badge_green.clone(),
+            BadgeColor::Purple => self.badge_purple.clone(),
+        }
     }
 }
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::NOIR
+    }
+}
+
+/// Type size of a badge's label. Small enough that the chip is shorter
+/// than the line it sits on, so it never opens the leading up.
+///
+/// Sizes are constants, not theme entries: a palette may not move type.
+pub const BADGE_SIZE: f32 = 9.0;
 /// Space between a badge's label and its box, each side. Part of the run's
 /// advance (see `document::layout::advance`), not just of the drawing —
 /// a chip that flows as if it were only its label overlaps whatever comes
@@ -59,34 +224,175 @@ pub const BADGE_PAD: f32 = 4.0;
 /// Height of a badge's box. Fixed rather than derived from the line, so a
 /// chip in a heading is the same chip as one in a paragraph.
 pub const BADGE_HEIGHT: f32 = 16.0;
-/// Underline highlight. Drawn as a bar *below* the text rather than a
-/// wash behind it, so the glyphs keep the page's own contrast.
-pub const HIGHLIGHT: Color = Color::rgb(0xE0, 0xA8, 0x2C);
-/// Saturated role colors behind resolved mathematical symbols. They sit
-/// outside the page's warm surface palette so semantic tokens stand out.
-pub const VARIABLE: Color = Color::rgb(0x6E, 0x9A, 0xF5);
-pub const CONSTANT: Color = Color::rgb(0xEE, 0x91, 0x45);
-pub const FUNCTION: Color = Color::rgb(0x65, 0xB8, 0x78);
-/// Quietest ink that is still ink: dates, hints, disabled glyphs.
-pub const FAINT: Color = Color::rgb(0xA0, 0x91, 0x83);
-/// Non-text: separators inside a line of type, empty-slot outlines.
-pub const NON_TEXT: Color = Color::rgb(0xC4, 0xB7, 0x9E);
 
-// -- Foreground --
-pub const INK: Color = Color::rgb(0x3C, 0x38, 0x36);
-pub const DIM: Color = Color::rgb(0x7C, 0x6F, 0x64);
-pub const COMMENT: Color = Color::rgb(0x92, 0x83, 0x74);
+/// Holds the theme the application draws with, and answers for it.
+///
+/// Two things make it a server rather than a variable:
+///
+/// 1. **It is asked, never copied.** Drawing code reads its colour from here
+///    at the moment it draws, so a swap reaches the whole application at
+///    once and no widget can be left holding the old palette.
+/// 2. **It reports its own changes.** A swap bumps [`revision`] and arms a
+///    change flag; the shell takes that flag each frame and redraws every
+///    region — see [`take_change`]. A theme change is the one event that
+///    dirties everything at once, so nothing else has to notice it.
+///
+/// [`revision`]: ThemeServer::revision
+/// [`take_change`]: ThemeServer::take_change
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThemeServer {
+    theme: Theme,
+    revision: u64,
+    changed: bool,
+}
 
-// -- Semantic accents (Guara's syntax hues, reused as UI roles) --
-/// Keyword orange: the one loud colour. Mode badge, active markers, caret.
-pub const ACCENT: Color = Color::rgb(0xC2, 0x4F, 0x1A);
-/// Type orange, a shade deeper: structural annotations.
-pub const STRUCTURE: Color = Color::rgb(0xA8, 0x4C, 0x00);
-/// Function green: things that are healthy or live.
-pub const LIVE: Color = Color::rgb(0x3E, 0x7D, 0x59);
-/// Global teal — the deliberate cool outlier in a warm palette.
-pub const COOL: Color = Color::rgb(0x0D, 0x66, 0x78);
-pub const WARNING: Color = Color::rgb(0xB0, 0x7B, 0x18);
+impl ThemeServer {
+    pub const fn new(theme: Theme) -> Self {
+        Self {
+            theme,
+            revision: 0,
+            changed: false,
+        }
+    }
+
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// Bumped on every real change, so a holder of retained pixels can
+    /// compare it against the revision those pixels were drawn at.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Swaps the palette, and says whether that changed anything. Setting
+    /// the theme that is already current is not a change and must not cost
+    /// a frame — the same rule [`crate::ui::Dirty::write`] keeps.
+    pub fn set(&mut self, theme: Theme) -> bool {
+        if self.theme == theme {
+            return false;
+        }
+        self.theme = theme;
+        self.revision = self.revision.wrapping_add(1);
+        self.changed = true;
+        true
+    }
+
+    /// Takes the pending redraw request, if there is one. The shell calls
+    /// this once a frame; `true` means every region has to be redrawn,
+    /// because every one of them may be drawn in different colours now.
+    pub fn take_change(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
+    /// The ink a badge of `color` is drawn in.
+    pub fn badge(&self, color: BadgeColor) -> Color {
+        self.theme.badge(color)
+    }
+}
+
+impl Default for ThemeServer {
+    fn default() -> Self {
+        Self::new(Theme::NOIR)
+    }
+}
+
+/// The application's server.
+///
+/// A palette is read from nearly every draw call in the program; threading
+/// one down through the layout, the components, and the prose builders would
+/// put a `&Theme` in a few hundred signatures to say one thing that is true
+/// everywhere. It lives here instead, and is written only by [`set`].
+static SERVER: RwLock<ThemeServer> = RwLock::new(ThemeServer::new(Theme::NOIR));
+
+/// Reads the live server. A poisoned lock still holds a perfectly good
+/// palette, so it is taken rather than panicked on: a stale colour for one
+/// frame beats no window at all.
+pub fn server() -> RwLockReadGuard<'static, ThemeServer> {
+    SERVER.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A copy of the current palette, for a caller that wants to compare or
+/// derive one rather than read a single colour out of it.
+pub fn current() -> Theme {
+    server().theme().clone()
+}
+
+/// Switches the application to `theme`, arming a full redraw if that is a
+/// change. This is the only way the palette moves.
+pub fn set(theme: Theme) -> bool {
+    SERVER
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set(theme)
+}
+
+pub fn revision() -> u64 {
+    server().revision()
+}
+
+/// Takes the pending redraw request — see [`ThemeServer::take_change`].
+pub fn take_change() -> bool {
+    SERVER
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take_change()
+}
+
+/// Defines each colour twice: as a method on the server, and as a free
+/// function reading the application's server. The free functions are what
+/// drawing code calls (`theme::ink()`), so a call site names a role and
+/// nothing else — not a palette, not a theme, and never a hex value.
+macro_rules! palette {
+    ($($name:ident => $field:ident),* $(,)?) => {
+        impl ThemeServer {
+            $(
+                pub fn $name(&self) -> Color {
+                    self.theme.$field.clone()
+                }
+            )*
+        }
+
+        $(
+            pub fn $name() -> Color {
+                server().theme().$field.clone()
+            }
+        )*
+    };
+}
+
+palette! {
+    background => background,
+    panel => panel,
+    popup => popup,
+    alt => alt,
+    chrome => chrome,
+    selection => selection,
+    code => code,
+    // The surface behind display math needs a name of its own: `math` is
+    // already the notation font, three functions down.
+    math_surface => math,
+    border => border,
+    highlight => highlight,
+    variable => variable,
+    constant => constant,
+    function => function,
+    faint => faint,
+    non_text => non_text,
+    ink => ink,
+    dim => dim,
+    comment => comment,
+    accent => accent,
+    structure => structure,
+    live => live,
+    cool => cool,
+    warning => warning,
+}
+
+/// The ink a badge of `color` is drawn in — label and hairline box both.
+pub fn badge_ink(color: BadgeColor) -> Color {
+    server().badge(color)
+}
 
 /// Faux-bold outline expansion, as a fraction of font size.
 const FAUX_BOLD_WEIGHT_RATIO: f32 = 0.025;
@@ -120,6 +426,9 @@ pub struct TextStyle {
     pub color: Color,
     /// Faux-bold outline expansion, in logical pixels.
     pub weight: f32,
+    /// Faux condense/expand ratio: a horizontal scale applied to each
+    /// glyph's outline at rasterization. `< 1.0` condenses, `> 1.0` expands.
+    pub width: f32,
     /// Extra letter-spacing, in EM.
     pub tracking: f32,
     /// Faux-italic shear factor; `0.0` is upright.
@@ -133,6 +442,7 @@ impl TextStyle {
             size,
             color,
             weight: 0.0,
+            width: 1.0,
             tracking: 0.0,
             slant: 0.0,
         }
@@ -144,6 +454,7 @@ impl TextStyle {
             size,
             color,
             weight: 0.0,
+            width: 1.0,
             tracking: 0.0,
             slant: 0.0,
         }
@@ -155,6 +466,7 @@ impl TextStyle {
             size,
             color,
             weight: 0.0,
+            width: 1.0,
             tracking: 0.0,
             slant: 0.0,
         }
@@ -172,6 +484,12 @@ impl TextStyle {
     /// faux bold — the slant is synthesized by the renderer.
     pub fn italic(mut self) -> Self {
         self.slant = 0.21;
+        self
+    }
+
+    /// Faux condense/expand: a horizontal scale on each glyph's outline.
+    pub fn condensed(mut self, ratio: f32) -> Self {
+        self.width = ratio;
         self
     }
 
@@ -199,7 +517,7 @@ impl TextStyle {
         FontParameters {
             size: self.size,
             weight: self.weight,
-            width: 1.0,
+            width: self.width,
             tracking: self.tracking,
             slant: self.slant,
         }
@@ -287,7 +605,7 @@ pub fn hover_fill(layer: &Layer, rect: Rect, weight: f32) {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            fade(SELECTION, 0.32 * weight),
+            fade(selection(), 0.32 * weight),
             Rounding::NONE,
         );
     }
@@ -340,4 +658,48 @@ pub mod icons {
                               M3 18a3 3 0 1 0 6 0a3 3 0 1 0-6 0 M18 9a9 9 0 0 1-9 9";
     /// The "you are inside a structure" marker in the status line.
     pub const NEXT_SLOT: &str = "M18 7V4H6l6 8-6 8h12v-3";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The palette a widget reads has to be the one that was set, or a
+    /// theme switch is only half a switch.
+    #[test]
+    fn a_swap_reaches_the_free_functions() {
+        let mut server = ThemeServer::new(Theme::LIGHT);
+        assert_eq!(server.ink(), Theme::LIGHT.ink);
+
+        let mut other = Theme::LIGHT;
+        other.ink = Color::rgb(0x11, 0x22, 0x33);
+        assert!(server.set(other.clone()));
+        assert_eq!(server.ink(), other.ink);
+    }
+
+    #[test]
+    fn setting_the_current_theme_is_not_a_change() {
+        let mut server = ThemeServer::new(Theme::LIGHT);
+        assert!(!server.set(Theme::LIGHT), "same palette");
+        assert_eq!(server.revision(), 0);
+        assert!(!server.take_change(), "and so owes no redraw");
+
+        let mut other = Theme::LIGHT;
+        other.background = Color::rgb(0x00, 0x00, 0x00);
+        assert!(server.set(other));
+        assert_eq!(server.revision(), 1);
+    }
+
+    /// The redraw request is a one-shot: the shell takes it, redraws every
+    /// region once, and the next frame is idle again.
+    #[test]
+    fn a_change_is_taken_exactly_once() {
+        let mut server = ThemeServer::new(Theme::LIGHT);
+        let mut other = Theme::LIGHT;
+        other.panel = Color::rgb(0x0A, 0x0B, 0x0C);
+        server.set(other);
+
+        assert!(server.take_change(), "a swap owes a redraw");
+        assert!(!server.take_change(), "and only one");
+    }
 }

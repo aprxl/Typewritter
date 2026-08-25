@@ -166,12 +166,12 @@ impl Component for MathMenu {
         }
 
         let card = card_anchored(viewport, self.anchor, self.rows.len(), self.variant_start);
-        layer.draw_rectangle(card.position(), card.size(), theme::PANEL, Rounding::NONE);
-        theme::outline(layer, card, theme::BORDER);
+        layer.draw_rectangle(card.position(), card.size(), theme::popup(), Rounding::NONE);
+        theme::outline(layer, card, theme::border());
 
-        let name_style = TextStyle::serif(15.0, theme::INK);
-        let group_style = TextStyle::serif(11.5, theme::COMMENT);
-        let preview_style = TextStyle::math(17.0, theme::INK);
+        let name_style = TextStyle::serif(15.0, theme::ink());
+        let group_style = TextStyle::serif(11.5, theme::comment());
+        let preview_style = TextStyle::math(17.0, theme::ink());
         for (index, row) in self.rows[..self.variant_start].iter().enumerate() {
             let rect = item_rect(card, self.rows.len(), self.variant_start, index)
                 .expect("a menu row must have geometry");
@@ -179,7 +179,7 @@ impl Component for MathMenu {
                 layer.draw_rectangle(
                     rect.position(),
                     rect.size(),
-                    theme::SELECTION,
+                    theme::selection(),
                     Rounding::NONE,
                 );
             }
@@ -226,9 +226,9 @@ impl Component for MathMenu {
             let rect = item_rect(card, self.rows.len(), self.variant_start, flat_index)
                 .expect("a variant must have geometry");
             let color = if flat_index == self.selected {
-                theme::SELECTION
+                theme::selection()
             } else {
-                theme::ALT
+                theme::alt()
             };
             layer.draw_rectangle(rect.position(), rect.size(), color, Rounding::uniform(5.0));
             theme::draw(

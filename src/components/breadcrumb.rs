@@ -25,7 +25,7 @@ impl Breadcrumb {
     }
 
     fn style() -> TextStyle {
-        TextStyle::mono(11.5, theme::DIM)
+        TextStyle::mono(11.5, theme::dim())
     }
 }
 
@@ -65,14 +65,14 @@ impl Component for Breadcrumb {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(rect.position(), rect.size(), theme::CHROME, Rounding::NONE);
+        layer.draw_rectangle(rect.position(), rect.size(), theme::chrome(), Rounding::NONE);
         theme::hover_fill(layer, rect, self.hover.value());
         theme::rule(
             layer,
             (rect.x, rect.bottom() - 2.0),
             rect.width,
             2.0,
-            theme::BORDER,
+            theme::border(),
         );
         let middle = rect.y + (rect.height - 2.0) / 2.0;
 
@@ -81,16 +81,16 @@ impl Component for Breadcrumb {
             icons::FOLDER,
             (rect.x + 18.0, middle - 6.0),
             12.0,
-            theme::FAINT,
+            theme::faint(),
             1.8,
         );
         let crumb = Self::style();
-        let separator = TextStyle::mono(11.5, theme::NON_TEXT);
+        let separator = TextStyle::mono(11.5, theme::non_text());
         let mut x = rect.x + 37.0;
         for (index, name) in self.path.iter().enumerate() {
             let last = index + 1 == self.path.len();
             let style = if last {
-                crumb.clone().color(theme::INK)
+                crumb.clone().color(theme::ink())
             } else {
                 crumb.clone()
             };

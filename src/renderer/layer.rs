@@ -547,7 +547,16 @@ impl LayerPipelines {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    // A shape blends over what the layer already holds, the
+                    // same as text and images do. `REPLACE` here meant a
+                    // translucent fill *overwrote* the texel it landed on —
+                    // punching its own alpha into an opaque card instead of
+                    // tinting it, so at composite time whatever was under
+                    // the layer showed through the fill.
+                    //
+                    // Straight-alpha source in, premultiplied out (see
+                    // `build_composite_pipeline`).
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -795,10 +804,18 @@ impl LayerPipelines {
 }
 
 /// Build one of the two composite pipelines (plain and masked): a
-/// fullscreen `CompositeVertex` quad onto the swap-chain view with
-/// non-premultiplied alpha blending — a layer's texture is cleared to
-/// transparent, so untouched areas must let whatever composited before it
-/// show through.
+/// fullscreen `CompositeVertex` quad onto the swap-chain view. A layer's
+/// texture is cleared to transparent, so untouched areas must let whatever
+/// composited before it show through.
+///
+/// The blend is **premultiplied**, because a layer's texture already is.
+/// Everything that draws into one — shapes, text, images — blends with
+/// `ALPHA_BLENDING`, which takes a straight-alpha source and leaves a
+/// premultiplied result behind (`rgb * a`, `a`); so does the MSAA resolve,
+/// which averages covered samples against a transparent clear. Treating
+/// that as straight alpha here multiplied by alpha a second time, which
+/// darkened every translucent fill and every anti-aliased silhouette edge
+/// that sat over transparent layer.
 fn build_composite_pipeline(
     device: &wgpu::Device,
     surface_format: wgpu::TextureFormat,
@@ -829,7 +846,7 @@ fn build_composite_pipeline(
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),

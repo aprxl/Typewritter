@@ -157,10 +157,10 @@ impl Component for SidenoteMargin {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            theme::BACKGROUND,
+            theme::background(),
             Rounding::NONE,
         );
-        theme::vertical_rule(layer, (rect.x, rect.y), rect.height, 1.0, theme::SELECTION);
+        theme::vertical_rule(layer, (rect.x, rect.y), rect.height, 1.0, theme::selection());
 
         // Document coordinates become screen coordinates the same way the
         // editor does: content top, minus the shared scroll.
@@ -171,16 +171,16 @@ impl Component for SidenoteMargin {
             // border — one small cue, on top of the caret that already blinks
             // there, so the focused note reads at a glance.
             let tick = if note.is_focused() {
-                theme::ACCENT
+                theme::accent()
             } else {
-                theme::BORDER
+                theme::border()
             };
             theme::rule(layer, (rect.x, y + 8.0), 14.0, 1.0, tick);
             theme::draw(
                 layer,
                 &note.marker,
                 (rect.x + 20.0, y + 4.0),
-                &TextStyle::serif(10.0, theme::ACCENT),
+                &TextStyle::serif(10.0, theme::accent()),
                 theme::LEFT,
             );
             // The note editor draws into the note's own placed rectangle,

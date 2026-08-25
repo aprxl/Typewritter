@@ -152,7 +152,7 @@ pub enum RangeKind {
 /// here rather than from a second copy of the size table.
 pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
     if style.code {
-        return TextStyle::mono(17.5 * scale, theme::INK);
+        return TextStyle::mono(17.5 * scale, theme::ink());
     }
     if style.badge {
         // A chip is set far smaller than the prose it sits in, tracked out
@@ -172,13 +172,13 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
                 3 => 18.5,
                 _ => 17.5,
             } * scale,
-            theme::INK,
+            theme::ink(),
         )
         .bold(),
         Block::Paragraph(_) | Block::Divider(_) | Block::Math(_) => {
-            TextStyle::serif(17.5 * scale, theme::INK)
+            TextStyle::serif(17.5 * scale, theme::ink())
         }
-        Block::CodeLine { .. } => TextStyle::mono(17.5 * scale, theme::INK),
+        Block::CodeLine { .. } => TextStyle::mono(17.5 * scale, theme::ink()),
     };
     if style.bold {
         base = base.bold();
@@ -193,7 +193,7 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
 /// auto-number and the colour is the accent, so an anchor reads as "this
 /// opens something" rather than as a word in the sentence.
 pub fn anchor_style() -> TextStyle {
-    TextStyle::serif(ANCHOR_SIZE, theme::ACCENT)
+    TextStyle::serif(ANCHOR_SIZE, theme::accent())
 }
 
 /// One word or whitespace stretch, with its source coordinates.

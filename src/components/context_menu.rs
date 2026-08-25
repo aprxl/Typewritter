@@ -114,11 +114,11 @@ impl Component for ContextMenu {
         // Unlike the modal palette, a context menu is local to the pointer;
         // dimming the document behind it would make a small action menu noisy.
         let card = card_anchored(rect, self.anchor, self.entries.len());
-        layer.draw_rectangle(card.position(), card.size(), theme::PANEL, Rounding::NONE);
-        theme::outline(layer, card, theme::BORDER);
+        layer.draw_rectangle(card.position(), card.size(), theme::popup(), Rounding::NONE);
+        theme::outline(layer, card, theme::border());
 
-        let title_style = TextStyle::serif(14.5, theme::INK);
-        let hint_style = TextStyle::mono(10.0, theme::FAINT);
+        let title_style = TextStyle::serif(14.5, theme::ink());
+        let hint_style = TextStyle::mono(10.0, theme::faint());
         for (index, entry) in self.entries.iter().enumerate() {
             let row = Rect::new(
                 card.x,
@@ -127,7 +127,7 @@ impl Component for ContextMenu {
                 ROW_HEIGHT,
             );
             if index == self.selected {
-                layer.draw_rectangle(row.position(), row.size(), theme::SELECTION, Rounding::NONE);
+                layer.draw_rectangle(row.position(), row.size(), theme::selection(), Rounding::NONE);
             }
             let middle = row.y + row.height / 2.0;
             if self.checked.get(index).copied().unwrap_or(false) {
@@ -136,7 +136,7 @@ impl Component for ContextMenu {
                     theme::icons::CHECK,
                     (row.x + 10.0, middle - 7.0),
                     14.0,
-                    theme::ACCENT,
+                    theme::accent(),
                     1.8,
                 );
             }

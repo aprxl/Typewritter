@@ -54,7 +54,7 @@ impl Topics {
 
 impl Component for Topics {
     fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        let style = TextStyle::serif(14.5, theme::DIM);
+        let style = TextStyle::serif(14.5, theme::dim());
         let widest = self
             .entries
             .iter()
@@ -91,8 +91,8 @@ impl Component for Topics {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(rect.position(), rect.size(), theme::PANEL, Rounding::NONE);
-        theme::vertical_rule(layer, (rect.x, rect.y), rect.height, 1.0, theme::BORDER);
+        layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
+        theme::vertical_rule(layer, (rect.x, rect.y), rect.height, 1.0, theme::border());
 
         let mut y = rect.y + 24.0;
         theme::icon(
@@ -100,14 +100,14 @@ impl Component for Topics {
             icons::TOPICS,
             (rect.x + 18.0, y - 5.5),
             11.0,
-            theme::COMMENT,
+            theme::comment(),
             2.0,
         );
         theme::draw(
             layer,
             "TOPICS",
             (rect.x + 36.0, y),
-            &TextStyle::mono(10.0, theme::COMMENT).tracked(0.18),
+            &TextStyle::mono(10.0, theme::comment()).tracked(0.18),
             theme::LEFT,
         );
         y += 28.0;
@@ -118,7 +118,7 @@ impl Component for Topics {
             let row = Rect::new(rect.x + 1.0, y - 11.0, rect.width - 1.0, 22.0);
             self.entry_rects.push(row);
             if active {
-                layer.draw_rectangle(row.position(), row.size(), theme::SELECTION, Rounding::NONE);
+                layer.draw_rectangle(row.position(), row.size(), theme::selection(), Rounding::NONE);
             }
             // Same rule as the file tree: the active row's treatment wins
             // over the hover surface.
@@ -129,12 +129,12 @@ impl Component for Topics {
             let x = rect.x + 18.0 + depth as f32 * 13.0;
             let size = 14.5 - depth as f32 * 0.6;
             let color = if entry.depth == 0 {
-                theme::DIM
+                theme::dim()
             } else {
-                theme::COMMENT
+                theme::comment()
             };
             let number_style =
-                TextStyle::mono(size - 3.0, if active { theme::DIM } else { theme::FAINT });
+                TextStyle::mono(size - 3.0, if active { theme::dim() } else { theme::faint() });
             theme::draw(layer, &entry.number, (x, y), &number_style, theme::LEFT);
             // Measure number so long values do not collide with heading text.
             let name_x = x + theme::width(layer, &entry.number, &number_style) + 10.0;
@@ -142,7 +142,7 @@ impl Component for Topics {
                 layer,
                 &entry.name,
                 (name_x, y),
-                &TextStyle::serif(size, if active { theme::INK } else { color }),
+                &TextStyle::serif(size, if active { theme::ink() } else { color }),
                 theme::LEFT,
             );
             y += if entry.depth == 0 { 24.0 } else { 21.0 };
@@ -154,18 +154,18 @@ impl Component for Topics {
             (rect.x + 18.0, y),
             rect.width - 36.0,
             1.0,
-            theme::BORDER,
+            theme::border(),
         );
         y += 20.0;
         // The indicator fades rather than blinking: a hard on/off in the
         // corner of the eye reads as an error, a fade reads as a pulse.
-        let dot = theme::fade(theme::LIVE, 0.35 + 0.65 * self.pulse);
+        let dot = theme::fade(theme::live(), 0.35 + 0.65 * self.pulse);
         layer.draw_rectangle((rect.x + 18.0, y - 3.0), (6.0, 6.0), dot, Rounding::NONE);
         theme::draw(
             layer,
             "WRITING NOW",
             (rect.x + 32.0, y),
-            &TextStyle::mono(9.5, theme::FAINT).tracked(0.16),
+            &TextStyle::mono(9.5, theme::faint()).tracked(0.16),
             theme::LEFT,
         );
     }

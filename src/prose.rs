@@ -263,7 +263,7 @@ mod tests {
     fn plain(text: &str) -> Paragraph {
         Paragraph::new(
             30.0,
-            vec![Run::text(text, TextStyle::serif(17.5, theme::INK))],
+            vec![Run::text(text, TextStyle::serif(17.5, theme::ink()))],
         )
     }
 
@@ -287,7 +287,7 @@ mod tests {
     fn a_run_boundary_mid_sentence_keeps_its_space() {
         // How the design's bold terms are written: "…into the", "bold",
         // " terminal". Without the leading space the words would collide.
-        let style = TextStyle::serif(17.5, theme::INK);
+        let style = TextStyle::serif(17.5, theme::ink());
         let paragraph = Paragraph::new(
             30.0,
             vec![

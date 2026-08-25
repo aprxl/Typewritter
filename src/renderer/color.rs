@@ -55,6 +55,34 @@ pub enum Color {
     PerVertex([Rgba; 4]),
 }
 
+/// One sRGB colour channel, `0..=255`, as the linear-light value the GPU
+/// works in.
+///
+/// The surface is `Rgba8UnormSrgb` (see `Renderer::new`), which encodes
+/// linear→sRGB on write. So a channel handed to the vertex buffer is read
+/// as *linear*, and a colour authored the way every colour is authored —
+/// an sRGB hex out of a design document — has to be decoded first or it
+/// leaves the shader too light by exactly the sRGB curve.
+///
+/// The error is small at the top of the range (`0xF8` lands on `0xFC`) and
+/// enormous at the bottom (`0x1B` lands on `0x5B`, near-black to mid-grey),
+/// which is why it stayed invisible until a dark palette was drawn with it.
+///
+/// This is the exact piecewise sRGB transfer function, not a 2.2 power
+/// approximation, so it inverts what the hardware encoder does rather than
+/// merely coming close to it.
+///
+/// Alpha is *not* passed through here: it is a coverage fraction, not a
+/// colour, and sRGB formats leave the alpha channel linear.
+pub fn to_linear(channel: u8) -> f32 {
+    let c = channel as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 impl Color {
     /// Shorthand for [`Color::Solid`] from separate `r, g, b, a` channels.
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
@@ -79,12 +107,16 @@ impl Color {
     /// `[min, max]` (points from a shape's own tessellation always do) but
     /// is clamped defensively so a slightly-out-of-range point (tessellator
     /// rounding) can't produce a wildly wrong color.
+    ///
+    /// The result is linear-light — see [`to_linear`]. Every shape's vertex
+    /// colors pass through here, so this is the one place the conversion
+    /// has to happen, and the one place it can be got wrong.
     pub fn resolve(&self, pos: [f32; 2], min: [f32; 2], max: [f32; 2]) -> [f32; 4] {
         let unit = |c: Rgba| {
             [
-                c[0] as f32 / 255.0,
-                c[1] as f32 / 255.0,
-                c[2] as f32 / 255.0,
+                to_linear(c[0]),
+                to_linear(c[1]),
+                to_linear(c[2]),
                 c[3] as f32 / 255.0,
             ]
         };
@@ -148,5 +180,57 @@ impl Color {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The GPU's own sRGB encoder, as the spec writes it. `to_linear` has
+    /// to be its exact inverse or every colour the app draws lands on a
+    /// different byte than the one it asked for.
+    fn to_srgb(linear: f32) -> f32 {
+        if linear <= 0.003_130_8 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    #[test]
+    fn every_channel_survives_the_round_trip_to_the_surface() {
+        for channel in 0..=255u8 {
+            let back = (to_srgb(to_linear(channel)) * 255.0).round() as u8;
+            assert_eq!(back, channel, "channel {channel} came back as {back}");
+        }
+    }
+
+    #[test]
+    fn the_endpoints_are_exact() {
+        assert_eq!(to_linear(0), 0.0);
+        assert_eq!(to_linear(255), 1.0);
+    }
+
+    /// The bug this pins: passing an sRGB byte through as if it were
+    /// linear. It is a rounding error at the top of the range and a
+    /// near-black-to-mid-grey error at the bottom, which is how it hid in
+    /// a light palette for so long.
+    #[test]
+    fn a_dark_channel_is_nothing_like_its_raw_fraction() {
+        let raw = 0x1B as f32 / 255.0;
+        assert!(
+            to_linear(0x1B) < raw * 0.35,
+            "sRGB 0x1B is {} linear, not {raw}",
+            to_linear(0x1B)
+        );
+    }
+
+    #[test]
+    fn alpha_is_left_alone_by_resolve() {
+        let color = Color::rgba(0x1B, 0x17, 0x14, 0x84);
+        let resolved = color.resolve([0.0, 0.0], [0.0, 0.0], [1.0, 1.0]);
+        assert_eq!(resolved[3], 0x84 as f32 / 255.0);
+        assert_eq!(resolved[0], to_linear(0x1B));
     }
 }

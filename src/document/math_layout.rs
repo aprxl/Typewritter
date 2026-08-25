@@ -54,30 +54,32 @@ pub const ACCENT_GAP: f32 = 0.10;
 pub const VARIABLE_PAD_X: f32 = 3.0;
 pub const VARIABLE_PAD_Y: f32 = 2.0;
 /// Optical overlap between adjacent integral-family signs at level zero, so
-/// `∫∫` nests the way a double integral is set. About a sixth of
-/// [`INTEGRAL_WIDTH`] — it was that share of the font glyph this replaced,
-/// and the drawn sign is the narrower of the two, so the pixel count came
-/// down with it rather than doubling the nesting.
+/// `∫∫` nests the way a double integral is set. About a sixth of the sign's
+/// width — the condensed glyph is narrower than a normal operator, so the
+/// pixel count came down with it rather than doubling the nesting.
 pub const INTEGRAL_OVERLAP: f32 = 1.5;
-/// The integral sign's stroke, as a multiple of [`SHAPE_STROKE`]. It is
-/// drawn rather than set from the font for the reason `SHAPE_STROKE` exists:
-/// a glyph's stroke scales with its size, so JuliaMono's `∫` at
-/// [`BIGOP_SCALE`] comes out far heavier than the notation around it. Drawn,
-/// the weight is a decision instead of a side effect — kept a little above a
-/// delimiter's, because a large operator does carry more of the expression.
-pub const INTEGRAL_STROKE: f32 = 1.4;
-/// The integral sign's width and height, as multiples of the current text
-/// size. Tall and narrow, which is the shape the notation actually has. The
-/// sign is drawn to fill both exactly, so these are its ink, not a box with
-/// margin inside it.
-pub const INTEGRAL_WIDTH: f32 = 0.55;
-pub const INTEGRAL_HEIGHT: f32 = 1.55;
-/// Radius of the ring on a contour integral, as a fraction of the sign's
-/// height. Sized so the ring is a little wider than the sign it crosses —
-/// below that it reads as a smudge on the spine rather than as a circle, and
-/// a `∮` that cannot be told from a `∫` at a glance is the whole failure.
-/// The sign's box widens to hold it.
-pub const CONTOUR_RADIUS: f32 = 0.19;
+/// How far the integral sign's glyph is condensed horizontally, as a faux
+/// width ratio handed to [`TextStyle::condensed`]. JuliaMono's `∫` and `∮`
+/// are full-width monospace cells, so at [`BIGOP_SCALE`] they read as a
+/// wide, heavy swash rather than the tall narrow sign the notation has.
+/// Condensing the outline re-narrows the ink and thins the spine while
+/// keeping the font's own curve — so its edges stay exactly as smooth as
+/// every glyph around it. This is the one constant worth tuning by eye.
+pub const INTEGRAL_CONDENSE: f32 = 0.6;
+/// How far the integral sign's glyph is lifted above the anchor line, as a
+/// fraction of the operator's size. JuliaMono's `∫` is a text glyph whose
+/// ink leans below the em box's centre (its bottom hook hangs like a
+/// descender), so centring the box leaves the sign riding low and clipping
+/// the lower limit. Lifting it re-centres the ink on the math axis. Tune by
+/// eye, alongside [`INTEGRAL_CONDENSE`].
+pub const INTEGRAL_RISE: f32 = 0.15;
+/// TeX's automatic inter-atom spacing, as fractions of the current math size
+/// (an em, where `1mu = 1/18 em`). Thin sits after punctuation, medium braces
+/// a binary operator, thick braces a relation. [`layout_inner`] reads them
+/// from the classes of adjacent atoms.
+pub const THIN_SPACE: f32 = 3.0 / 18.0;
+pub const MED_SPACE: f32 = 4.0 / 18.0;
+pub const THICK_SPACE: f32 = 5.0 / 18.0;
 
 // The renderer centers glyphs vertically, so glyph boxes are symmetric about
 // the anchor. Structural boxes use their near edge when clearance matters.
@@ -137,6 +139,12 @@ pub enum BoxKind {
         size: f32,
         /// Horizontal offset from the box edge to the glyph itself.
         offset_x: f32,
+        /// Vertical offset of the glyph's centre from the box's anchor line,
+        /// positive upward. The integral rides above the anchor because its
+        /// ink is bottom-biased in JuliaMono's em box.
+        offset_y: f32,
+        /// Faux condense ratio (`< 1.0` narrower), handed to the renderer.
+        condense: f32,
     },
     Bar {
         thickness: f32,
@@ -176,11 +184,19 @@ fn layout_inner(
         return slot_box(level, document_scale);
     }
 
+    // TeX spacing: a binary operator on the edge of the list (a unary sign)
+    // is demoted to ordinary, then each adjacent pair gets its classed gap.
+    let classes: Vec<AtomClass> = list.iter().map(atom_class).collect();
+    let spaced: Vec<AtomClass> = (0..list.len()).map(|i| demote(&classes, i)).collect();
+
     let mut children = Vec::with_capacity(list.len());
     let mut x = 0.0;
     for (index, node) in list.iter().enumerate() {
         if index > 0 && integral_family(&list[index - 1]) && integral_family(node) {
             x -= INTEGRAL_OVERLAP * scale(level, document_scale);
+        }
+        if index > 0 {
+            x += space_between(spaced[index - 1], spaced[index]) * size(level, document_scale);
         }
         let child = layout_node(node, level, document_scale, measure, semantic_highlights);
         children.push((x, 0.0, child));
@@ -211,6 +227,88 @@ fn integral_family(node: &MathNode) -> bool {
             ..
         }
     )
+}
+
+/// The TeX atom class of a node, which decides the space around it. Only the
+/// classes that carry spacing are distinguished; every composite node — a
+/// fraction, group, script, accent, or big operator — is an ordinary atom.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AtomClass {
+    /// A variable, number, or composite. No space around it.
+    Ord,
+    /// A binary operator (`+`, `−`, `·`, `∪`…): medium space on both sides
+    /// when it sits between operands.
+    Bin,
+    /// A relation (`=`, `≤`, `∈`, `⊂`…): thick space on both sides.
+    Rel,
+    /// Punctuation (`,` `;`): thin space after it, none before.
+    Punct,
+    /// A standalone opening/closing delimiter. These normally live inside a
+    /// [`MathNode::Group`] and rarely appear as bare atoms.
+    Open,
+    Close,
+}
+
+fn atom_class(node: &MathNode) -> AtomClass {
+    match node {
+        MathNode::Sym(ch) => char_class(*ch),
+        _ => AtomClass::Ord,
+    }
+}
+
+fn char_class(ch: char) -> AtomClass {
+    match ch {
+        '+' | '-' | '−' | '±' | '∓' | '×' | '÷' | '·' | '∗' | '⋆' | '∘' | '⊕' | '⊗' | '⊖' | '⊙'
+        | '⊎' | '⊔' | '∖' | '∪' | '∩' | '∧' | '∨' => AtomClass::Bin,
+        '=' | '<' | '>' | '≤' | '≥' | '≠' | '≈' | '≡' | '∼' | '≃' | '≅' | '⊂' | '⊃' | '⊆' | '⊇'
+        | '∈' | '∉' | '∝' | '≪' | '≫' | '→' | '←' | '↔' | '⇒' | '⇐' | '⇔' | '↦' | '∥' | '⊥'
+        | '≺' | '≻' => AtomClass::Rel,
+        ',' | ';' => AtomClass::Punct,
+        '(' | '[' | '{' | '⟨' | '⌈' | '⌊' => AtomClass::Open,
+        ')' | ']' | '}' | '⟩' | '⌉' | '⌋' => AtomClass::Close,
+        _ => AtomClass::Ord,
+    }
+}
+
+/// A binary operator that is not strictly between operands — it starts or
+/// ends the list, or touches an operator, relation, or punctuation — reads as
+/// a unary sign and is demoted to an ordinary atom so it gets no space. This
+/// is TeX's rule that tells `x − y` (spaced) from `−x` (not).
+fn demote(classes: &[AtomClass], index: usize) -> AtomClass {
+    if classes[index] != AtomClass::Bin {
+        return classes[index];
+    }
+    let left_demotes = match index.checked_sub(1).map(|i| classes[i]) {
+        Some(c) => matches!(
+            c,
+            AtomClass::Bin | AtomClass::Rel | AtomClass::Open | AtomClass::Punct
+        ),
+        None => true,
+    };
+    let right_demotes = match classes.get(index + 1).copied() {
+        Some(c) => matches!(c, AtomClass::Rel | AtomClass::Close | AtomClass::Punct),
+        None => true,
+    };
+    if left_demotes || right_demotes {
+        AtomClass::Ord
+    } else {
+        AtomClass::Bin
+    }
+}
+
+/// The space between two adjacent atoms, as a fraction of the current math
+/// size. Nothing sits before punctuation; a binary operator is braced with a
+/// medium space; a relation with a thick space.
+fn space_between(prev: AtomClass, next: AtomClass) -> f32 {
+    use AtomClass::*;
+    match (prev, next) {
+        (_, Punct) => 0.0,
+        (Bin, _) | (_, Bin) => MED_SPACE,
+        (Rel, Rel) => 0.0,
+        (Rel, _) | (_, Rel) => THICK_SPACE,
+        (Punct, _) => THIN_SPACE,
+        _ => 0.0,
+    }
 }
 
 fn glyph(
@@ -250,7 +348,7 @@ fn glyph_with_highlight(
         0.0
     };
     MathBox {
-        width: measure(&text, &TextStyle::math(size, theme::INK)) + pad_x * 2.0,
+        width: measure(&text, &TextStyle::math(size, theme::ink())) + pad_x * 2.0,
         ascent: half + pad_y,
         descent: half + pad_y,
         highlight,
@@ -258,6 +356,8 @@ fn glyph_with_highlight(
             text,
             size,
             offset_x: pad_x,
+            offset_y: 0.0,
+            condense: 1.0,
         },
     }
 }
@@ -372,10 +472,24 @@ fn layout_node(
     }
 }
 
-fn text_glyph(text: &str, size: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) -> MathBox {
+/// A large operator set from the font rather than drawn. `condense` is the
+/// faux width ratio (`1.0` = natural) applied to the glyph's outline when it
+/// is rasterized — [`TextStyle::condensed`]'s theme-side knob; measurement
+/// applies the same ratio, so rendered and reserved widths stay in step.
+/// `rise` lifts the glyph's centre above the anchor as a fraction of `size`,
+/// which the integral needs because its ink is bottom-biased in JuliaMono's
+/// em box.
+fn text_glyph(
+    text: &str,
+    size: f32,
+    condense: f32,
+    rise: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> MathBox {
     let half = size * 0.5;
+    let style = TextStyle::math(size, theme::ink()).condensed(condense);
     MathBox {
-        width: measure(text, &TextStyle::math(size, theme::INK)),
+        width: measure(text, &style),
         ascent: half,
         descent: half,
         highlight: None,
@@ -383,6 +497,8 @@ fn text_glyph(text: &str, size: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) 
             text: text.to_owned(),
             size,
             offset_x: 0.0,
+            offset_y: size * rise,
+            condense,
         },
     }
 }
@@ -398,14 +514,38 @@ fn big_op(
 ) -> MathBox {
     let document_scale = options.document_scale;
     let semantic_highlights = options.semantic_highlights;
-    // The integral family is drawn; everything else is set from the font.
-    // See `INTEGRAL_STROKE` for why those two are the exception.
+    // Every operator is set from the font; the integral family is condensed
+    // to the sign's tall, narrow shape. See `INTEGRAL_CONDENSE`.
     let operator = match kind {
-        BigOp::Integral => integral_sign(false, level, document_scale),
-        BigOp::ContourIntegral => integral_sign(true, level, document_scale),
-        BigOp::Sum => text_glyph("∑", size(level, document_scale) * BIGOP_SCALE, measure),
-        BigOp::Prod => text_glyph("∏", size(level, document_scale) * BIGOP_SCALE, measure),
-        BigOp::Limit => text_glyph("lim", size(level, document_scale), measure),
+        BigOp::Integral => text_glyph(
+            "∫",
+            size(level, document_scale) * BIGOP_SCALE,
+            INTEGRAL_CONDENSE,
+            INTEGRAL_RISE,
+            measure,
+        ),
+        BigOp::ContourIntegral => text_glyph(
+            "∮",
+            size(level, document_scale) * BIGOP_SCALE,
+            INTEGRAL_CONDENSE,
+            INTEGRAL_RISE,
+            measure,
+        ),
+        BigOp::Sum => text_glyph(
+            "∑",
+            size(level, document_scale) * BIGOP_SCALE,
+            1.0,
+            0.0,
+            measure,
+        ),
+        BigOp::Prod => text_glyph(
+            "∏",
+            size(level, document_scale) * BIGOP_SCALE,
+            1.0,
+            0.0,
+            measure,
+        ),
+        BigOp::Limit => text_glyph("lim", size(level, document_scale), 1.0, 0.0, measure),
     };
     let operand_level = (level + 1).min(2);
     let hide_empty_limits = matches!(kind, BigOp::Integral | BigOp::ContourIntegral);
@@ -461,211 +601,6 @@ fn big_op(
             .map(|child| child.expect("every big operator child must be laid out"))
             .collect(),
     )
-}
-
-/// The integral sign's shape, in a design space where x is a fraction of the
-/// sign's width and y a fraction of its height measured from the centre.
-///
-/// Three cubics: a hook, a straight spine, and the hook again. One cubic can
-/// only bow — it cannot hold a straight middle and turn at both ends, which
-/// is the whole silhouette of an integral.
-///
-/// Two things make it read as one continuous stroke rather than three
-/// pieces. The spine is exactly straight, so the eye follows it. And each
-/// hook leaves the join along the spine's own direction, so the tangent is
-/// continuous and there is no corner where they meet — that join is where a
-/// hand-built integral looks broken, and it is enforced here by construction
-/// rather than by choosing control points that happen to line up.
-///
-/// The hooks turn *outward* — right at the top, left at the bottom — the way
-/// the notation does. Arcing back over the spine instead gives a flat shelf
-/// and puts the terminal on the wrong side.
-///
-/// The sign is point-symmetric about `(0.5, 0)`, so only the top half is
-/// written down here and [`integral_points`] mirrors it. Mirroring a point
-/// is `(1 - x, -y)`.
-mod integral {
-    /// The hook's share of the height, measured from the very top. The rest
-    /// is spine.
-    pub const HOOK: f32 = 0.22;
-    /// How far the spine's top end sits right of centre. Deliberately small:
-    /// the sign should read as a barely-slanted vertical with something
-    /// hanging off each end, not as a diagonal.
-    pub const LEAN: f32 = 0.10;
-    /// How far the hook's first control runs back up the spine's own line,
-    /// as a share of the spine's length. This is the whole reason the stroke
-    /// reads as continuous: the hook leaves the join along exactly the
-    /// direction the spine arrives on, so there is no corner to see. Any
-    /// positive value is smooth; the size decides how tight the curl is.
-    pub const CONTINUE: f32 = 0.34;
-    /// The terminal, and the control that carries the stroke up over the
-    /// apex and back down into it. The tip sits outboard of the spine and
-    /// *below* the apex — that overhang is the hang, and it is what tells an
-    /// integral from a long s.
-    pub const TIP: (f32, f32) = (0.99, -0.38);
-    pub const CURL: (f32, f32) = (0.92, -0.58);
-}
-
-/// The ten points of the integral's three cubics, in design space:
-/// `[start, c1, c2, end, c1, c2, end, c1, c2, end]`.
-///
-/// Travel runs top tip → spine → bottom tip, so the top hook is written
-/// backwards against the direction it was designed in (out from the spine),
-/// which is why its two controls appear swapped.
-fn integral_points() -> [(f32, f32); 10] {
-    use integral::*;
-    let mirror = |(x, y): (f32, f32)| (1.0 - x, -y);
-
-    let spine_top = (0.5 + LEAN, -0.5 + HOOK);
-    let spine_bottom = mirror(spine_top);
-    let down = (spine_bottom.0 - spine_top.0, spine_bottom.1 - spine_top.1);
-    let along = |from: (f32, f32), share: f32| (from.0 + down.0 * share, from.1 + down.1 * share);
-
-    // Controls a third and two thirds down make the spine exactly straight:
-    // four collinear, evenly spaced points are a line, not a curve.
-    let spine_c1 = along(spine_top, 1.0 / 3.0);
-    // Backwards along the same line, so the hook and the spine share a
-    // tangent at the join.
-    let hook_c1 = along(spine_top, -CONTINUE);
-
-    [
-        TIP,
-        CURL,
-        hook_c1,
-        spine_top,
-        spine_c1,
-        mirror(spine_c1),
-        spine_bottom,
-        mirror(hook_c1),
-        mirror(CURL),
-        mirror(TIP),
-    ]
-}
-
-/// The box the curve actually occupies, `(min_x, max_x, min_y, max_y)`, by
-/// sampling. A cubic stays strictly inside its control points, and the
-/// integral's hooks throw theirs well outside the shape on purpose, so the
-/// control points cannot stand in for the extent on either axis. The sign is
-/// then scaled to *this*, which is what makes [`INTEGRAL_WIDTH`] and
-/// [`INTEGRAL_HEIGHT`] describe the ink rather than a box with dead margin
-/// inside it — a sign floating in its own box would take the limits stacked
-/// above and below it out of alignment with the stroke they belong to.
-fn integral_extent(points: &[(f32, f32); 10]) -> (f32, f32, f32, f32) {
-    let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
-    let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
-    for segment in 0..3 {
-        let p = &points[segment * 3..segment * 3 + 4];
-        for step in 0..=64 {
-            let t = step as f32 / 64.0;
-            let u = 1.0 - t;
-            let at = |a: f32, b: f32, c: f32, d: f32| {
-                u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
-            };
-            let x = at(p[0].0, p[1].0, p[2].0, p[3].0);
-            let y = at(p[0].1, p[1].1, p[2].1, p[3].1);
-            min_x = min_x.min(x);
-            max_x = max_x.max(x);
-            min_y = min_y.min(y);
-            max_y = max_y.max(y);
-        }
-    }
-    (min_x, max_x, min_y, max_y)
-}
-
-/// The integral sign, drawn rather than set. `ring` adds the contour
-/// integral's circle, as four cubics on the same stroke — a circle is one
-/// shape every path renderer agrees on, where SVG's arc flags are one more
-/// thing to get wrong for no gain.
-fn integral_sign(ring: bool, level: usize, document_scale: f32) -> MathBox {
-    let size = size(level, document_scale);
-    let stroke = SHAPE_STROKE * INTEGRAL_STROKE * scale(level, document_scale);
-    let ink_width = size * INTEGRAL_WIDTH;
-    let height = size * INTEGRAL_HEIGHT;
-    let radius = height * CONTOUR_RADIUS;
-
-    // The ring is wider than the sign, so a contour integral reserves more
-    // room and the sign is centred in it. Both are centred on the same
-    // point, which the sign's own symmetry then keeps true.
-    let width = if ring {
-        ink_width.max(radius * 2.0 + stroke)
-    } else {
-        ink_width
-    };
-    let center = width * 0.5;
-
-    let points = integral_points();
-    let (min_x, max_x, min_y, max_y) = integral_extent(&points);
-    // Map the design space onto the ink on both axes, inset by half a stroke
-    // so the drawn edge lands on the box edge rather than half outside it.
-    let ink = (ink_width - stroke, height - stroke);
-    let x_scale = ink.0 / (max_x - min_x);
-    let y_scale = ink.1 / (max_y - min_y);
-    let at = |(x, y): (f32, f32)| {
-        (
-            center - ink.0 * 0.5 + (x - min_x) * x_scale,
-            -ink.1 * 0.5 + (y - min_y) * y_scale,
-        )
-    };
-
-    let point = |index: usize| {
-        let (x, y) = at(points[index]);
-        format!("{x} {y}")
-    };
-    let mut path = format!("M {}", point(0));
-    for segment in 0..3 {
-        let base = segment * 3;
-        path.push_str(&format!(
-            " C {}, {}, {}",
-            point(base + 1),
-            point(base + 2),
-            point(base + 3)
-        ));
-    }
-    if ring {
-        path.push(' ');
-        path.push_str(&circle_path((center, 0.0), radius));
-    }
-    stroked_box(width, height * 0.5, height * 0.5, path, stroke)
-}
-
-/// A closed circle as four cubics. `KAPPA` is the standard control-point
-/// distance that makes a cubic match a quarter arc to within a thousandth of
-/// the radius — the usual way vector formats draw circles, and it avoids
-/// depending on SVG arc flags.
-fn circle_path((cx, cy): (f32, f32), radius: f32) -> String {
-    const KAPPA: f32 = 0.5523;
-    let k = radius * KAPPA;
-    // Quarter turns clockwise from the left: left → top → right → bottom.
-    let quarters = [
-        (
-            (cx - radius, cy - k),
-            (cx - k, cy - radius),
-            (cx, cy - radius),
-        ),
-        (
-            (cx + k, cy - radius),
-            (cx + radius, cy - k),
-            (cx + radius, cy),
-        ),
-        (
-            (cx + radius, cy + k),
-            (cx + k, cy + radius),
-            (cx, cy + radius),
-        ),
-        (
-            (cx - k, cy + radius),
-            (cx - radius, cy + k),
-            (cx - radius, cy),
-        ),
-    ];
-    let mut path = format!("M {} {cy}", cx - radius);
-    for (c1, c2, end) in quarters {
-        path.push_str(&format!(
-            " C {} {}, {} {}, {} {}",
-            c1.0, c1.1, c2.0, c2.1, end.0, end.1
-        ));
-    }
-    path
 }
 
 fn stretchy_size(body: &MathBox, level: usize, document_scale: f32) -> f32 {
@@ -2326,7 +2261,7 @@ mod tests {
         assert_eq!(children[0].2.width, BASE_SIZE * 0.5 + VARIABLE_PAD_X * 2.0);
         assert_eq!(children[0].2.ascent, BASE_SIZE * 0.5 + VARIABLE_PAD_Y);
         assert_eq!(children[1].0, children[0].2.width);
-        assert_ne!(theme::VARIABLE, theme::ALT);
+        assert_ne!(theme::variable(), theme::alt());
     }
 
     #[test]
@@ -2416,6 +2351,138 @@ mod tests {
         ));
     }
 
+    /// The integral family is set from the font — like ∑, ∏ and lim —, and
+    /// condensed, because JuliaMono's `∫`/`∮` are full-width monospace cells
+    /// that read as a wide swash at [`BIGOP_SCALE`]. Rendering through the
+    /// text pipeline is what keeps its edges as smooth as the glyphs around
+    /// it; condensing is what keeps it tall and narrow, and rising clears its
+    /// lower limit.
+    #[test]
+    fn the_integral_is_a_raised_condensed_glyph_not_a_drawn_path() {
+        for (kind, text) in [(BigOp::Integral, "∫"), (BigOp::ContourIntegral, "∮")] {
+            let list = layout(
+                &vec![big_op(kind, Vec::new(), Vec::new())],
+                0,
+                &fake_measure,
+            );
+            let BoxKind::Row { children } = &list.kind else {
+                panic!("list must produce row");
+            };
+            let BoxKind::Row { children: operator } = &children[0].2.kind else {
+                panic!("operator must produce row");
+            };
+            let BoxKind::Glyph {
+                text: glyph,
+                size,
+                condense,
+                offset_y,
+                ..
+            } = &operator[0].2.kind
+            else {
+                panic!("the integral must be a glyph, not a drawn path");
+            };
+            assert_eq!(glyph.as_str(), text);
+            assert!((*size - BASE_SIZE * BIGOP_SCALE).abs() < 0.0001);
+            assert!((*condense - INTEGRAL_CONDENSE).abs() < 0.0001);
+            assert!(*condense < 1.0, "the integral glyph must be condensed");
+            assert!(
+                (*offset_y - *size * INTEGRAL_RISE).abs() < 0.0001,
+                "the integral glyph must ride above the anchor"
+            );
+        }
+
+        // ∑/∏/lim stay on the anchor; only the integral family is raised.
+        let sum = layout(
+            &vec![big_op(BigOp::Sum, Vec::new(), Vec::new())],
+            0,
+            &fake_measure,
+        );
+        let BoxKind::Row { children } = &sum.kind else {
+            panic!("list must produce row");
+        };
+        let BoxKind::Row { children: operator } = &children[0].2.kind else {
+            panic!("operator must produce row");
+        };
+        let BoxKind::Glyph { offset_y, .. } = &operator[0].2.kind else {
+            panic!("the sum must be a glyph");
+        };
+        assert!((offset_y - 0.0).abs() < 0.0001, "∑ must sit on the anchor");
+    }
+
+    #[test]
+    fn operators_and_relations_are_classified_apart_from_ordinary_atoms() {
+        use AtomClass::*;
+        for ch in ['+', '-', '·', '×', '∪', '∩', '∧'] {
+            assert_eq!(char_class(ch), Bin, "{ch} should be a binary operator");
+        }
+        for ch in ['=', '<', '>', '≤', '∈', '⊂', '→'] {
+            assert_eq!(char_class(ch), Rel, "{ch} should be a relation");
+        }
+        for ch in ['x', 'X', '1', 'α', '∞', '∫', '∑'] {
+            assert_eq!(char_class(ch), Ord, "{ch} should be ordinary");
+        }
+        assert_eq!(char_class(','), Punct);
+        assert_eq!(char_class('('), Open);
+        assert_eq!(char_class(')'), Close);
+    }
+
+    /// The space around operators follows TeX's atom classes: medium around a
+    /// binary operator, thick around a relation, thin after punctuation, and
+    /// none around ordinary atoms — with a leading/trailing binary operator
+    /// (a unary sign) demoted so it gets no space.
+    #[test]
+    fn operators_are_spaced_from_operands_but_unary_signs_are_not() {
+        let w = |s: &str| layout(&symbols(s), 0, &fake_measure).width;
+        let xw = w("x");
+        let pw = w("+");
+        let ew = w("=");
+        let mw = w("-");
+        let cw = w(",");
+        let med = MED_SPACE * BASE_SIZE;
+        let thick = THICK_SPACE * BASE_SIZE;
+        let thin = THIN_SPACE * BASE_SIZE;
+        let eps = 0.0001;
+
+        // x + y — medium space on both sides of the plus.
+        let BoxKind::Row { children } = layout(&symbols("x+y"), 0, &fake_measure).kind else {
+            panic!("expected row");
+        };
+        assert!((children[1].0 - (xw + med)).abs() < eps);
+        assert!((children[2].0 - (children[1].0 + pw + med)).abs() < eps);
+
+        // x = y — thick space on both sides of the relation.
+        let BoxKind::Row { children } = layout(&symbols("x=y"), 0, &fake_measure).kind else {
+            panic!("expected row");
+        };
+        assert!((children[1].0 - (xw + thick)).abs() < eps);
+        assert!((children[2].0 - (children[1].0 + ew + thick)).abs() < eps);
+
+        // xy — adjacent ordinary atoms stay flush.
+        let BoxKind::Row { children } = layout(&symbols("xy"), 0, &fake_measure).kind else {
+            panic!("expected row");
+        };
+        assert!((children[1].0 - xw).abs() < eps);
+
+        // -x — a leading minus is a unary sign: no space before x.
+        let BoxKind::Row { children } = layout(&symbols("-x"), 0, &fake_measure).kind else {
+            panic!("expected row");
+        };
+        assert!((children[1].0 - mw).abs() < eps);
+
+        // x- — a trailing minus is a unary sign too: no space after x.
+        let BoxKind::Row { children } = layout(&symbols("x-"), 0, &fake_measure).kind else {
+            panic!("expected row");
+        };
+        assert!((children[1].0 - xw).abs() < eps);
+
+        // x, y — thin space after the comma, none before it.
+        let BoxKind::Row { children } = layout(&symbols("x,y"), 0, &fake_measure).kind else {
+            panic!("expected row");
+        };
+        assert!((children[1].0 - xw).abs() < eps);
+        assert!((children[2].0 - (children[1].0 + cw + thin)).abs() < eps);
+    }
+
     #[test]
     fn empty_integral_limits_are_invisible_without_changing_the_operator_box() {
         for kind in [BigOp::Integral, BigOp::ContourIntegral] {
@@ -2431,11 +2498,10 @@ mod tests {
             let BoxKind::Row { children: operator } = &operator_box.kind else {
                 panic!("operator must produce row");
             };
-            // Drawn, not set from the font — see `INTEGRAL_STROKE`.
+            // Set from the font, condensed to the integral's narrow shape.
             assert!(matches!(
-                operator[0].2.kind,
-                BoxKind::Primitive(MathPrimitive::Stroke { thickness, .. })
-                    if (thickness - SHAPE_STROKE * INTEGRAL_STROKE).abs() < 0.0001
+                &operator[0].2.kind,
+                BoxKind::Glyph { condense, .. } if (*condense - INTEGRAL_CONDENSE).abs() < 0.0001
             ));
             assert_eq!(operator_box.width, operator[0].2.width);
             assert_eq!(operator_box.ascent, operator[0].2.ascent);
@@ -2470,28 +2536,6 @@ mod tests {
                 assert_eq!(hit_cursor.index, 0);
             }
         }
-    }
-
-    /// The whole point of drawing the integral instead of setting it: a
-    /// glyph's stroke scales with its size, a drawn one does not. The sign
-    /// gets bigger at a deeper level only in the sense that everything does —
-    /// its weight tracks the level scale, never `BIGOP_SCALE`.
-    #[test]
-    fn the_integral_is_drawn_at_a_weight_that_does_not_follow_its_size() {
-        let stroke_of = |box_: &MathBox| match &box_.kind {
-            BoxKind::Primitive(MathPrimitive::Stroke { thickness, .. }) => *thickness,
-            other => panic!("integral must be a stroked primitive, got {other:?}"),
-        };
-        let sign = integral_sign(false, 0, 1.0);
-        assert!((stroke_of(&sign) - SHAPE_STROKE * INTEGRAL_STROKE).abs() < 0.0001);
-        // Far lighter than the glyph it replaces would be: JuliaMono's own
-        // stroke at `BASE_SIZE * BIGOP_SCALE` is a large multiple of this.
-        assert!(stroke_of(&sign) < BASE_SIZE * BIGOP_SCALE * 0.1);
-        assert!(sign.ascent > 0.0 && (sign.ascent - sign.descent).abs() < 0.0001);
-        assert!(
-            sign.width < sign.ascent + sign.descent,
-            "integrals are tall"
-        );
     }
 
     /// Every path this module emits goes to `Layer::draw_path`, which
@@ -2538,9 +2582,6 @@ mod tests {
             }
         };
 
-        for ring in [false, true] {
-            check(&integral_sign(ring, 0, 1.0));
-        }
         // Delimiters and the radical go through the same `draw_path`.
         for (open, close) in [('(', ')'), ('[', ']'), ('|', '|'), ('⟨', '⟩')] {
             let group = vec![MathNode::Group {
@@ -2558,223 +2599,6 @@ mod tests {
             &fake_measure,
         ));
         assert!(checked >= 8, "only {checked} paths reached the parser");
-    }
-
-    /// Every point the pen actually visits in a `M`/`C` path, sampled. Not
-    /// the control points, which for the integral's hooks sit well outside
-    /// the shape on purpose.
-    fn stroke_samples(path: &str) -> Vec<(f32, f32)> {
-        let mut out = Vec::new();
-        for subpath in path.split('M').skip(1) {
-            let mut segments = subpath.split('C');
-            let head: Vec<f32> = segments
-                .next()
-                .expect("a subpath opens with its move")
-                .split([' ', ','])
-                .filter_map(|t| t.parse().ok())
-                .collect();
-            let mut cursor = (head[0], head[1]);
-            out.push(cursor);
-            for segment in segments {
-                let n: Vec<f32> = segment
-                    .split([' ', ','])
-                    .filter_map(|t| t.parse().ok())
-                    .collect();
-                assert_eq!(n.len(), 6, "a cubic is three points: {segment}");
-                let (c1, c2, end) = ((n[0], n[1]), (n[2], n[3]), (n[4], n[5]));
-                for step in 1..=200 {
-                    let t = step as f32 / 200.0;
-                    let u = 1.0 - t;
-                    let at = |a: f32, b: f32, c: f32, d: f32| {
-                        u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
-                    };
-                    out.push((
-                        at(cursor.0, c1.0, c2.0, end.0),
-                        at(cursor.1, c1.1, c2.1, end.1),
-                    ));
-                }
-                cursor = end;
-            }
-        }
-        out
-    }
-
-    /// `(min_x, max_x, min_y, max_y)` of the ink.
-    fn stroke_bounds(path: &str) -> (f32, f32, f32, f32) {
-        let samples = stroke_samples(path);
-        samples.iter().fold(
-            (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
-            |(lo_x, hi_x, lo_y, hi_y), &(x, y)| {
-                (lo_x.min(x), hi_x.max(x), lo_y.min(y), hi_y.max(y))
-            },
-        )
-    }
-
-    /// "One continuous thing" is a measurable property: the direction the
-    /// stroke travels must never jump. Three cubics joined carelessly corner
-    /// where they meet, and that corner is exactly what reads as the spine
-    /// stopping and a hook starting. Walks the sampled curve and bounds the
-    /// turn between consecutive steps.
-    #[test]
-    fn the_integral_never_corners() {
-        let sign = integral_sign(false, 0, 1.0);
-        let BoxKind::Primitive(MathPrimitive::Stroke { path, .. }) = &sign.kind else {
-            panic!("integral must be a stroked primitive");
-        };
-        let samples = stroke_samples(path);
-        let mut sharpest: f32 = 0.0;
-        for window in samples.windows(3) {
-            let (a, b, c) = (window[0], window[1], window[2]);
-            let (u, v) = ((b.0 - a.0, b.1 - a.1), (c.0 - b.0, c.1 - b.1));
-            let (mu, mv) = (u.0.hypot(u.1), v.0.hypot(v.1));
-            if mu < 1e-6 || mv < 1e-6 {
-                continue;
-            }
-            let cos = ((u.0 * v.0 + u.1 * v.1) / (mu * mv)).clamp(-1.0, 1.0);
-            sharpest = sharpest.max(cos.acos().to_degrees());
-        }
-        // Each step is a two-hundredth of a segment, so a smooth curve turns
-        // a fraction of a degree per step. A tangent break at a join shows up
-        // here as several degrees at once.
-        assert!(
-            sharpest < 3.0,
-            "the stroke corners by {sharpest:.1}° somewhere; it must flow"
-        );
-    }
-
-    /// The silhouette that makes an integral an integral, and the reason it
-    /// is three cubics rather than one: a straight spine through the middle,
-    /// and at each end a hook turning outward past the spine and hanging back
-    /// below its own apex. One cubic can only bow, which reads as a
-    /// parenthesis.
-    #[test]
-    fn the_integral_has_a_straight_spine_and_a_hooked_terminal() {
-        let sign = integral_sign(false, 0, 1.0);
-        let BoxKind::Primitive(MathPrimitive::Stroke { path, .. }) = &sign.kind else {
-            panic!("integral must be a stroked primitive");
-        };
-        let samples = stroke_samples(path);
-        let height = sign.ascent + sign.descent;
-
-        // The middle half of the sign, which is spine and nothing else.
-        let spine: Vec<(f32, f32)> = samples
-            .iter()
-            .copied()
-            .filter(|&(_, y)| y.abs() < height * 0.25)
-            .collect();
-        assert!(spine.len() > 50, "expected a sampled spine");
-        // Straight: every spine point sits close to the line through its
-        // ends. Measured across the width, so the bound is a share of it.
-        let (first, last) = (spine[0], spine[spine.len() - 1]);
-        let run = last.1 - first.1;
-        let drift = spine
-            .iter()
-            .map(|&(x, y)| {
-                let expected = first.0 + (last.0 - first.0) * ((y - first.1) / run);
-                (x - expected).abs()
-            })
-            .fold(0.0, f32::max);
-        assert!(
-            drift < sign.width * 0.02,
-            "spine bows {drift:.2}px; it is meant to be straight"
-        );
-        // Barely slanted, not diagonal.
-        assert!(
-            (last.0 - first.0).abs() < sign.width * 0.35,
-            "the spine leans {:.2}px across the sign; it should read vertical",
-            (last.0 - first.0).abs()
-        );
-
-        // The hook turns outward past the spine, and its tip hangs back
-        // below the apex it just came over. That overhang is the hang, and a
-        // plain bow has none.
-        let spine_max_x = spine.iter().fold(f32::MIN, |m, &(x, _)| m.max(x));
-        let tip = samples[0];
-        assert!(
-            tip.0 > spine_max_x + sign.width * 0.2,
-            "the hook must turn outward past the spine: {:.2} vs {spine_max_x:.2}",
-            tip.0
-        );
-        let apex = samples.iter().fold(f32::MAX, |m, &(_, y)| m.min(y));
-        assert!(
-            tip.1 - apex > height * 0.06,
-            "the tip must hang below the apex; hang was {:.2}px",
-            tip.1 - apex
-        );
-    }
-
-    /// The sign must fill the box it reserves. A cubic's extremes lie inside
-    /// its control points, so control points parked on the edges would leave
-    /// the sign floating in dead space — and a big operator's limits are
-    /// centred on that width, so the blank would push them off the ink.
-    /// Samples the real curve rather than trusting the constants.
-    #[test]
-    fn the_integral_fills_the_width_and_height_it_reserves() {
-        let sign = integral_sign(false, 0, 1.0);
-        let BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }) = &sign.kind else {
-            panic!("integral must be a stroked primitive");
-        };
-        let (min_x, max_x, min_y, max_y) = stroke_bounds(path);
-
-        // The ink is inset by half a stroke so the drawn edge lands on the
-        // box edge rather than half outside it.
-        let inset = thickness * 0.5;
-        let tolerance = 0.05;
-        assert!(
-            (min_x - inset).abs() < tolerance && (max_x - (sign.width - inset)).abs() < tolerance,
-            "x spans {min_x}..{max_x}, want {inset}..{}",
-            sign.width - inset
-        );
-        assert!(
-            (min_y - (-sign.ascent + inset)).abs() < tolerance
-                && (max_y - (sign.descent - inset)).abs() < tolerance,
-            "y spans {min_y}..{max_y}, want {}..{}",
-            -sign.ascent + inset,
-            sign.descent - inset
-        );
-        // Point symmetry about the centre — the bottom is the top mirrored.
-        assert!((min_x + max_x - sign.width).abs() < tolerance);
-        assert!((min_y + max_y).abs() < tolerance);
-    }
-
-    /// The ring is the only difference between the two, and it rides on the
-    /// same stroke rather than being a second primitive to keep in step.
-    #[test]
-    fn only_the_contour_integral_carries_a_ring() {
-        let path_of = |ring: bool| match integral_sign(ring, 0, 1.0).kind {
-            BoxKind::Primitive(MathPrimitive::Stroke { path, .. }) => path,
-            other => panic!("integral must be a stroked primitive, got {other:?}"),
-        };
-        let plain = path_of(false);
-        let contour = path_of(true);
-        // Three cubics for the sign; the ring adds four more on a subpath of
-        // its own. Cubics, not SVG arcs — one shape every renderer agrees on.
-        assert_eq!(plain.matches(" C ").count(), 3, "sign is three cubics");
-        assert_eq!(plain.matches('M').count(), 1, "sign is one subpath");
-        assert_eq!(contour.matches(" C ").count(), 7, "sign plus a ring");
-        assert_eq!(contour.matches('M').count(), 2, "the ring is its own");
-
-        // The ring has to be big enough to read as a circle rather than a
-        // smudge on the spine: a `∮` indistinguishable from a `∫` is the
-        // whole failure. It is round, centred, and wider than the sign.
-        let ring = integral_sign(true, 0, 1.0);
-        // `split` eats the `M` it split on; the sampler needs it back.
-        let ring_path = format!("M{}", contour.split('M').nth(2).expect("ring subpath"));
-        let (min_x, max_x, min_y, max_y) = stroke_bounds(&ring_path);
-        let (across, down) = (max_x - min_x, max_y - min_y);
-        assert!((across - down).abs() < 0.05, "the ring is round");
-        assert!(
-            across > integral_sign(false, 0, 1.0).width * 0.9,
-            "the ring must be about as wide as the sign, was {across:.2}"
-        );
-        assert!(
-            (min_x + max_x - ring.width).abs() < 0.05 && (min_y + max_y).abs() < 0.05,
-            "the ring is centred on the sign"
-        );
-        assert!(
-            ring.width >= across,
-            "the box widens to hold a ring wider than the sign"
-        );
     }
 
     #[test]

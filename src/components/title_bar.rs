@@ -73,8 +73,8 @@ where
 
 /// Search-box geometry shared by drawing and shell-level click handling.
 pub fn search_box_rect(layer: &Layer, rect: Rect) -> Rect {
-    let search_style = TextStyle::serif(12.5, theme::COMMENT);
-    let shortcut_style = TextStyle::mono(10.0, theme::FAINT).tracked(0.1);
+    let search_style = TextStyle::serif(12.5, theme::comment());
+    let shortcut_style = TextStyle::mono(10.0, theme::faint()).tracked(0.1);
     let box_width = theme::width(layer, "search the vault", &search_style)
         + theme::width(layer, "⌘ /", &shortcut_style)
         + 55.0;
@@ -88,11 +88,11 @@ pub fn search_box_rect(layer: &Layer, rect: Rect) -> Rect {
 
 impl Component for TitleBar {
     fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        let title = theme::width(layer, &self.title, &TextStyle::serif(17.0, theme::INK));
+        let title = theme::width(layer, &self.title, &TextStyle::serif(17.0, theme::ink()));
         let search = theme::width(
             layer,
             "search the vault",
-            &TextStyle::serif(12.5, theme::COMMENT),
+            &TextStyle::serif(12.5, theme::comment()),
         );
         (title + search + 190.0, HEIGHT)
     }
@@ -123,13 +123,13 @@ impl Component for TitleBar {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(rect.position(), rect.size(), theme::PANEL, Rounding::NONE);
+        layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
         theme::rule(
             layer,
             (rect.x, rect.bottom() - 2.0),
             rect.width,
             2.0,
-            theme::BORDER,
+            theme::border(),
         );
         let middle = rect.y + (rect.height - 2.0) / 2.0;
 
@@ -137,18 +137,18 @@ impl Component for TitleBar {
         layer.draw_rectangle(
             (rect.x + 18.0, middle - 12.0),
             (24.0, 24.0),
-            theme::ACCENT,
+            theme::accent(),
             Rounding::NONE,
         );
         theme::draw(
             layer,
             "T",
             (rect.x + 30.0, middle),
-            &TextStyle::mono(14.0, theme::BACKGROUND).bold(),
+            &TextStyle::mono(14.0, theme::background()).bold(),
             theme::CENTER,
         );
 
-        let title_style = TextStyle::serif(17.0, theme::INK);
+        let title_style = TextStyle::serif(17.0, theme::ink());
         theme::draw(
             layer,
             &self.title,
@@ -157,25 +157,25 @@ impl Component for TitleBar {
             theme::LEFT,
         );
         let mut x = rect.x + 54.0 + theme::width(layer, &self.title, &title_style) + 9.0;
-        theme::vertical_rule(layer, (x, middle - 6.0), 12.0, 1.0, theme::BORDER);
+        theme::vertical_rule(layer, (x, middle - 6.0), 12.0, 1.0, theme::border());
         x += 10.0;
         theme::draw(
             layer,
             &self.kind,
             (x, middle),
-            &TextStyle::mono(9.5, theme::COMMENT).tracked(0.2),
+            &TextStyle::mono(9.5, theme::comment()).tracked(0.2),
             theme::LEFT,
         );
 
         // Search sits against the right edge, so it is laid out backwards
         // from there and simply runs off if the window is too narrow.
-        let shortcut_style = TextStyle::mono(10.0, theme::FAINT).tracked(0.1);
+        let shortcut_style = TextStyle::mono(10.0, theme::faint()).tracked(0.1);
         let search_style = TextStyle::serif(
             12.5,
             if self.finder_open {
-                theme::INK
+                theme::ink()
             } else {
-                theme::COMMENT
+                theme::comment()
             },
         );
         self.search_rect = search_box_rect(layer, rect);
@@ -186,11 +186,11 @@ impl Component for TitleBar {
             layer,
             self.search_rect,
             if self.finder_open {
-                theme::ACCENT
+                theme::accent()
             } else if self.hover.value() > 0.0 {
-                theme::fade(theme::ACCENT, 0.25 + self.hover.value() * 0.75)
+                theme::fade(theme::accent(), 0.25 + self.hover.value() * 0.75)
             } else {
-                theme::BORDER
+                theme::border()
             },
         );
         theme::icon(
@@ -198,7 +198,7 @@ impl Component for TitleBar {
             icons::SEARCH,
             (box_left + 9.0, middle - 6.5),
             13.0,
-            theme::COMMENT,
+            theme::comment(),
             1.8,
         );
         let input_right = box_right - 9.0;
@@ -223,7 +223,7 @@ impl Component for TitleBar {
                 layer.draw_rectangle(
                     (x, middle - 8.0),
                     (2.0, 16.0),
-                    theme::ACCENT,
+                    theme::accent(),
                     Rounding::NONE,
                 );
             }

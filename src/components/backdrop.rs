@@ -13,7 +13,7 @@ impl Component for Backdrop {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            theme::BACKGROUND,
+            theme::background(),
             Rounding::NONE,
         );
     }

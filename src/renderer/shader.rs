@@ -15,7 +15,7 @@
 //! scope, so a bad shader logs and leaves the layer unaffected rather than
 //! panicking the whole renderer.
 
-use super::Color;
+use super::{Color, to_linear};
 
 /// A post-process effect a [`super::Layer`] can have applied to its whole
 /// composited output.
@@ -183,10 +183,12 @@ impl ColorMatrix {
             return Self::IDENTITY;
         };
         let keep = 1.0 - amount;
+        // Linear-light, like every other colour that reaches a shader —
+        // this one blends against pixels that are already in that space.
         let target = [
-            rgba[0] as f32 / 255.0,
-            rgba[1] as f32 / 255.0,
-            rgba[2] as f32 / 255.0,
+            to_linear(rgba[0]),
+            to_linear(rgba[1]),
+            to_linear(rgba[2]),
         ];
         Self([
             keep,

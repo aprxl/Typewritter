@@ -98,10 +98,10 @@ impl Dialog {
     /// caret at its character offset.
     fn draw_field(&self, layer: &Layer, card: Rect, input: &[char], caret: usize) {
         let field = field(card);
-        layer.draw_rectangle(field.position(), field.size(), theme::ALT, Rounding::NONE);
-        theme::outline(layer, field, theme::BORDER);
+        layer.draw_rectangle(field.position(), field.size(), theme::alt(), Rounding::NONE);
+        theme::outline(layer, field, theme::border());
 
-        let style = TextStyle::serif(16.0, theme::INK);
+        let style = TextStyle::serif(16.0, theme::ink());
         let middle = field.y + field.height / 2.0;
         let mut shown = String::new();
         let mut shown_width = 0.0;
@@ -118,7 +118,7 @@ impl Dialog {
                 layer,
                 "note-name",
                 (field.x + 12.0, middle),
-                &style.clone().color(theme::FAINT),
+                &style.clone().color(theme::faint()),
                 theme::LEFT,
             );
         } else {
@@ -132,7 +132,7 @@ impl Dialog {
             layer.draw_rectangle(
                 (x, middle - 10.0),
                 (2.0, 20.0),
-                theme::ACCENT,
+                theme::accent(),
                 Rounding::NONE,
             );
         }
@@ -168,19 +168,19 @@ impl Component for Dialog {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            theme::fade(theme::BACKGROUND, 0.72),
+            theme::fade(theme::background(), 0.72),
             Rounding::NONE,
         );
 
         let card = card(rect);
-        layer.draw_rectangle(card.position(), card.size(), theme::PANEL, Rounding::NONE);
-        theme::outline(layer, card, theme::BORDER);
+        layer.draw_rectangle(card.position(), card.size(), theme::popup(), Rounding::NONE);
+        theme::outline(layer, card, theme::border());
 
         theme::draw(
             layer,
             prompt.title(),
             (card.x + card.width / 2.0, card.y + 34.0),
-            &TextStyle::serif(19.0, theme::INK).bold(),
+            &TextStyle::serif(19.0, theme::ink()).bold(),
             theme::CENTER,
         );
 
@@ -193,14 +193,14 @@ impl Component for Dialog {
                     layer,
                     name,
                     (card.x + card.width / 2.0, card.y + 82.0),
-                    &TextStyle::serif(16.0, theme::INK),
+                    &TextStyle::serif(16.0, theme::ink()),
                     theme::CENTER,
                 );
                 theme::draw(
                     layer,
                     "is deleted from disk. This cannot be undone.",
                     (card.x + card.width / 2.0, card.y + 108.0),
-                    &TextStyle::serif(13.5, theme::DIM),
+                    &TextStyle::serif(13.5, theme::dim()),
                     theme::CENTER,
                 );
             }
@@ -210,16 +210,16 @@ impl Component for Dialog {
             layer,
             prompt.hint(),
             (card.x + 18.0, card.bottom() - 26.0),
-            &TextStyle::mono(10.0, theme::FAINT),
+            &TextStyle::mono(10.0, theme::faint()),
             theme::LEFT,
         );
 
         let (confirm, cancel) = buttons(rect);
         let accent = match prompt {
-            Prompt::NewNote { .. } | Prompt::NewFolder { .. } => theme::ACCENT,
+            Prompt::NewNote { .. } | Prompt::NewFolder { .. } => theme::accent(),
             // A destructive default deserves a different colour from the
             // one the whole interface uses for "this is where you are".
-            Prompt::DeleteNote { .. } => theme::STRUCTURE,
+            Prompt::DeleteNote { .. } => theme::structure(),
         };
         layer.draw_rectangle(confirm.position(), confirm.size(), accent, Rounding::NONE);
         theme::draw(
@@ -229,17 +229,17 @@ impl Component for Dialog {
                 confirm.x + confirm.width / 2.0,
                 confirm.y + confirm.height / 2.0,
             ),
-            &TextStyle::serif(13.0, theme::BACKGROUND),
+            &TextStyle::serif(13.0, theme::background()),
             theme::CENTER,
         );
 
         layer.draw_rectangle(
             cancel.position(),
             cancel.size(),
-            theme::PANEL,
+            theme::popup(),
             Rounding::NONE,
         );
-        theme::outline(layer, cancel, theme::BORDER);
+        theme::outline(layer, cancel, theme::border());
         theme::draw(
             layer,
             "Cancel",
@@ -247,7 +247,7 @@ impl Component for Dialog {
                 cancel.x + cancel.width / 2.0,
                 cancel.y + cancel.height / 2.0,
             ),
-            &TextStyle::serif(13.0, theme::DIM),
+            &TextStyle::serif(13.0, theme::dim()),
             theme::CENTER,
         );
     }

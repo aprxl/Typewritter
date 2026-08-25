@@ -382,7 +382,7 @@ impl Shell {
                 status,
                 Box::new(StatusLine::new(
                     "NORMAL",
-                    theme::COOL,
+                    theme::cool(),
                     "no file open".into(),
                     String::new(),
                     String::new(),
@@ -545,6 +545,7 @@ impl Shell {
         self.sync_math_menu();
         self.export_yank();
         self.sync_overlay_layers(renderer);
+        self.sync_theme();
 
         // Every animation, every frame, accumulated with `|=` — `||` would
         // short-circuit and stop advancing the rest.
@@ -753,6 +754,37 @@ impl Shell {
                 (false, true) => self.regions[index].detach(),
                 _ => {}
             }
+        }
+    }
+
+    /// Answers a palette swap, if one is pending.
+    ///
+    /// A theme change is the one event that invalidates the whole window at
+    /// once, and it invalidates it in three places:
+    ///
+    /// 1. the cached document layout, which carries a colour in every
+    ///    [`TextStyle`] it holds;
+    /// 2. the view components, which are built from that layout and from
+    ///    colours of their own (the mode badge's fill, for one);
+    /// 3. every region's retained layer, which holds pixels painted in the
+    ///    palette that just went away.
+    ///
+    /// None of the three can notice on its own — a swap moves no revision, no
+    /// rect, and no component's state — so the flag from
+    /// [`ThemeServer::take_change`] is what stands in for all of them. Taking
+    /// it here, before the frame's sync and draw passes, means the new
+    /// palette lands on the same frame the swap was asked for.
+    ///
+    /// [`TextStyle`]: crate::theme::TextStyle
+    /// [`ThemeServer::take_change`]: crate::theme::ThemeServer::take_change
+    fn sync_theme(&mut self) {
+        if !theme::take_change() {
+            return;
+        }
+        self.doc_layout = None;
+        self.rebuild_views();
+        for region in &mut self.regions {
+            region.poke();
         }
     }
 
@@ -1221,11 +1253,11 @@ impl Shell {
         // The badge and the caret shape both read peripherally, so both get
         // a colour/shape pair rather than just a label.
         let (mode_label, mode_color) = match self.vim.current_mode() {
-            VimMode::Normal => ("NORMAL", theme::COOL),
-            VimMode::Insert => ("INSERT", theme::ACCENT),
-            VimMode::VisualChar => ("VISUAL", theme::ACCENT),
-            VimMode::VisualLine => ("V-LINE", theme::ACCENT),
-            VimMode::Command => ("COMMAND", theme::ACCENT),
+            VimMode::Normal => ("NORMAL", theme::cool()),
+            VimMode::Insert => ("INSERT", theme::accent()),
+            VimMode::VisualChar => ("VISUAL", theme::accent()),
+            VimMode::VisualLine => ("V-LINE", theme::accent()),
+            VimMode::Command => ("COMMAND", theme::accent()),
         };
         let block_caret = !matches!(self.vim.current_mode(), VimMode::Insert | VimMode::Command);
         let command = self.search.as_ref().map_or_else(String::new, |search| {

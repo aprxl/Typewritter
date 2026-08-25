@@ -76,9 +76,9 @@ impl Component for FileFinder {
         );
 
         layer.set_clip_rect(Some((panel.position(), panel.size())));
-        layer.draw_rectangle(panel.position(), panel.size(), theme::PANEL, Rounding::NONE);
-        theme::outline(layer, panel, theme::BORDER);
-        let row_style = TextStyle::serif(13.0, theme::INK);
+        layer.draw_rectangle(panel.position(), panel.size(), theme::popup(), Rounding::NONE);
+        theme::outline(layer, panel, theme::border());
+        let row_style = TextStyle::serif(13.0, theme::ink());
         let row_content_width = (panel.width - 24.0).max(0.0);
         for (offset, &index) in self.visible[self.first_visible..]
             .iter()
@@ -92,7 +92,7 @@ impl Component for FileFinder {
                 ROW_HEIGHT,
             );
             if self.first_visible + offset == self.selected {
-                layer.draw_rectangle(row.position(), row.size(), theme::SELECTION, Rounding::NONE);
+                layer.draw_rectangle(row.position(), row.size(), theme::selection(), Rounding::NONE);
             }
             let file = &self.files[index];
             let middle = row.y + row.height / 2.0;
@@ -110,7 +110,7 @@ impl Component for FileFinder {
                 layer,
                 "No matching file",
                 (panel.x + 12.0, panel.y + 20.0),
-                &TextStyle::serif(13.0, theme::FAINT),
+                &TextStyle::serif(13.0, theme::faint()),
                 theme::LEFT,
             );
         }

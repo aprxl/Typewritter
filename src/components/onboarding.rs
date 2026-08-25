@@ -90,23 +90,23 @@ impl Component for Onboarding {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            theme::BACKGROUND,
+            theme::background(),
             Rounding::NONE,
         );
 
         let card = card(rect);
-        layer.draw_rectangle(card.position(), card.size(), theme::PANEL, Rounding::NONE);
-        theme::outline(layer, card, theme::BORDER);
+        layer.draw_rectangle(card.position(), card.size(), theme::popup(), Rounding::NONE);
+        theme::outline(layer, card, theme::border());
 
         // The mark, echoing the title bar's.
         let center_x = card.x + card.width / 2.0;
         let mark = Rect::new(center_x - 12.0, card.y + 32.0, 24.0, 24.0);
-        layer.draw_rectangle(mark.position(), mark.size(), theme::ACCENT, Rounding::NONE);
+        layer.draw_rectangle(mark.position(), mark.size(), theme::accent(), Rounding::NONE);
         theme::draw(
             layer,
             "T",
             (mark.x + 12.0, mark.y + 12.0),
-            &TextStyle::mono(14.0, theme::BACKGROUND).bold(),
+            &TextStyle::mono(14.0, theme::background()).bold(),
             theme::CENTER,
         );
 
@@ -114,21 +114,21 @@ impl Component for Onboarding {
             layer,
             "Welcome to Typewritter",
             (center_x, card.y + 92.0),
-            &TextStyle::serif(24.0, theme::INK).bold(),
+            &TextStyle::serif(24.0, theme::ink()).bold(),
             theme::CENTER,
         );
         theme::draw(
             layer,
             "Pick a folder to keep your notes in.",
             (center_x, card.y + 126.0),
-            &TextStyle::serif(13.5, theme::DIM),
+            &TextStyle::serif(13.5, theme::dim()),
             theme::CENTER,
         );
         theme::draw(
             layer,
             "It becomes your vault.",
             (center_x, card.y + 150.0),
-            &TextStyle::serif(13.5, theme::DIM),
+            &TextStyle::serif(13.5, theme::dim()),
             theme::CENTER,
         );
 
@@ -140,13 +140,13 @@ impl Component for Onboarding {
         layer.draw_rectangle(
             button.position(),
             button.size(),
-            theme::mix(theme::PANEL, theme::ACCENT, weight),
+            theme::mix(theme::popup(), theme::accent(), weight),
             Rounding::NONE,
         );
         theme::outline(
             layer,
             button,
-            theme::mix(theme::ACCENT, theme::BACKGROUND, weight),
+            theme::mix(theme::accent(), theme::background(), weight),
         );
         theme::draw(
             layer,
@@ -155,14 +155,14 @@ impl Component for Onboarding {
                 button.x + button.width / 2.0,
                 button.y + button.height / 2.0,
             ),
-            &TextStyle::serif(14.0, theme::mix(theme::ACCENT, theme::BACKGROUND, weight)),
+            &TextStyle::serif(14.0, theme::mix(theme::accent(), theme::background(), weight)),
             theme::CENTER,
         );
         theme::draw(
             layer,
             "or press Enter / Ctrl+O",
             (center_x, button.bottom() + 10.0),
-            &TextStyle::mono(10.0, theme::FAINT),
+            &TextStyle::mono(10.0, theme::faint()),
             theme::CENTER,
         );
     }

@@ -45,7 +45,7 @@ mod text_stack;
 pub use alignment::{Alignment, HorizontalAlign, VerticalAlign};
 #[allow(unused_imports)]
 pub use color::Rgba;
-pub use color::{Color, GradientDirection};
+pub use color::{Color, GradientDirection, to_linear};
 pub use font::Font;
 pub use font_parameters::FontParameters;
 pub use layer::{Layer, LayerInvalidation};

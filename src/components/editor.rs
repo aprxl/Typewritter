@@ -156,22 +156,22 @@ fn draw_math_selection(
     layer.draw_rectangle(
         rect.position(),
         rect.size(),
-        theme::SELECTION,
+        theme::selection(),
         MATH_SELECTION_ROUNDING,
     );
 }
 
 fn draw_brush(layer: &Layer, center: (f32, f32)) {
-    layer.draw_circle(center, BRUSH_RADIUS, theme::fade(theme::ACCENT, 0.14));
+    layer.draw_circle(center, BRUSH_RADIUS, theme::fade(theme::accent(), 0.14));
 }
 
 fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: bool, slots: bool) {
     if let Some(role) = box_.highlight.filter(|_| !covered) {
         let height = box_.ascent + box_.descent;
         let color = match role {
-            SymbolRole::Variable => theme::VARIABLE,
-            SymbolRole::Constant => theme::CONSTANT,
-            SymbolRole::Function => theme::FUNCTION,
+            SymbolRole::Variable => theme::variable(),
+            SymbolRole::Constant => theme::constant(),
+            SymbolRole::Function => theme::function(),
         };
         layer.draw_rectangle(
             (origin.0, origin.1 - box_.ascent),
@@ -186,14 +186,16 @@ fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: b
             text,
             size,
             offset_x,
+            offset_y,
+            condense,
         } => {
             // Math boxes use glyph centers as their baseline for now; LEFT's
             // vertical centering therefore matches the prose baseline draw.
             theme::draw(
                 layer,
                 text,
-                (origin.0 + offset_x, origin.1),
-                &TextStyle::math(*size, theme::INK),
+                (origin.0 + offset_x, origin.1 - offset_y),
+                &TextStyle::math(*size, theme::ink()).condensed(*condense),
                 theme::LEFT,
             );
         }
@@ -204,7 +206,7 @@ fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: b
                 (origin.0, (origin.1 - thickness * 0.5).round()),
                 box_.width,
                 *thickness,
-                theme::INK,
+                theme::ink(),
             );
         }
         BoxKind::Slot { visible, .. } => {
@@ -219,12 +221,12 @@ fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: b
                 width: box_.width,
                 height: box_.ascent + box_.descent,
             };
-            layer.draw_rectangle(rect.position(), rect.size(), theme::ALT, Rounding::NONE);
-            theme::outline(layer, rect, theme::NON_TEXT);
+            layer.draw_rectangle(rect.position(), rect.size(), theme::alt(), Rounding::NONE);
+            theme::outline(layer, rect, theme::non_text());
         }
         BoxKind::Primitive(primitive) => match primitive {
             MathPrimitive::Stroke { path, thickness } => {
-                let mut stroke = Stroke::new(theme::INK, *thickness);
+                let mut stroke = Stroke::new(theme::ink(), *thickness);
                 stroke.cap = LineCap::Round;
                 stroke.join = LineJoin::Round;
                 layer
@@ -233,7 +235,7 @@ fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: b
             }
             MathPrimitive::Dots { centers, radius } => {
                 for &(x, y) in centers {
-                    layer.draw_circle((origin.0 + x, origin.1 + y), *radius, theme::INK);
+                    layer.draw_circle((origin.0 + x, origin.1 + y), *radius, theme::ink());
                 }
             }
         },
@@ -484,7 +486,7 @@ impl Component for Editor {
             layer.draw_rectangle(
                 rect.position(),
                 rect.size(),
-                theme::BACKGROUND,
+                theme::background(),
                 Rounding::NONE,
             );
         }
@@ -495,14 +497,14 @@ impl Component for Editor {
                 layer,
                 "No file open",
                 (x, rect.y + 56.0),
-                &TextStyle::serif(17.5, theme::DIM),
+                &TextStyle::serif(17.5, theme::dim()),
                 theme::LEFT,
             );
             theme::draw(
                 layer,
                 "click a note in the tree — one click previews, two pins it",
                 (x, rect.y + 84.0),
-                &TextStyle::mono(10.5, theme::COMMENT),
+                &TextStyle::mono(10.5, theme::comment()),
                 theme::LEFT,
             );
             return;
@@ -553,7 +555,7 @@ impl Component for Editor {
             layer.draw_rectangle(
                 (band_x, content + band_top - self.scroll),
                 (band_width, band_bottom - band_top),
-                theme::ALT,
+                theme::alt(),
                 Rounding::NONE,
             );
         }
@@ -576,7 +578,7 @@ impl Component for Editor {
                                 self.metrics.content_width(rect) + BLOCK_PAD.0 * 2.0,
                                 bottom - top + BLOCK_PAD.1 * 2.0,
                             ),
-                            theme::MATH,
+                            theme::math_surface(),
                             CODE_ROUNDING,
                         );
                     }
@@ -607,7 +609,7 @@ impl Component for Editor {
                             self.metrics.content_width(rect) + BLOCK_PAD.0 * 2.0,
                             bottom - top + BLOCK_PAD.1 * 2.0,
                         ),
-                        theme::CODE,
+                        theme::code(),
                         CODE_ROUNDING,
                     );
                 }
@@ -648,7 +650,7 @@ impl Component for Editor {
                             (x, y),
                             self.metrics.content_width(rect),
                             1.0,
-                            theme::BORDER,
+                            theme::border(),
                         );
                     }
                 }
@@ -789,7 +791,7 @@ impl Component for Editor {
                                     baseline - cursor_y - cursor_height * 0.5 + 2.0,
                                 ),
                                 (2.0, cursor_height - 4.0),
-                                theme::ACCENT,
+                                theme::accent(),
                                 Rounding::NONE,
                             );
                         }
@@ -805,7 +807,7 @@ impl Component for Editor {
                             end - start + INLINE_PAD.0 * 2.0,
                             line.height - INLINE_PAD.1 * 2.0,
                         ),
-                        theme::CODE,
+                        theme::code(),
                         CODE_ROUNDING,
                     );
                 }
@@ -829,12 +831,12 @@ impl Component for Editor {
                 for (start, end) in spans(&pieces, |p| p.1.highlight) {
                     let at = (start - HIGHLIGHT_PAD, baseline + HIGHLIGHT_DROP);
                     let size = (end - start + HIGHLIGHT_PAD * 2.0, HIGHLIGHT_THICKNESS);
-                    layer.draw_rectangle(at, size, theme::HIGHLIGHT, HIGHLIGHT_ROUNDING);
+                    layer.draw_rectangle(at, size, theme::highlight(), HIGHLIGHT_ROUNDING);
                     if let Some(glow) = &self.glow {
                         glow.draw_rectangle(
                             (at.0 - GLOW_SPREAD, at.1 - GLOW_SPREAD),
                             (size.0 + GLOW_SPREAD * 2.0, size.1 + GLOW_SPREAD * 2.0),
-                            theme::fade(theme::HIGHLIGHT, GLOW_ALPHA),
+                            theme::fade(theme::highlight(), GLOW_ALPHA),
                             HIGHLIGHT_ROUNDING,
                         );
                     }
@@ -860,7 +862,7 @@ impl Component for Editor {
                         layer,
                         number,
                         (x - NUMBER_GUTTER, baseline),
-                        &TextStyle::mono(NUMBER_SIZE, theme::NON_TEXT),
+                        &TextStyle::mono(NUMBER_SIZE, theme::non_text()),
                         theme::RIGHT,
                     );
                 }
@@ -899,18 +901,18 @@ impl Component for Editor {
             // legible. Falls back to a space's advance past the end of the
             // line, like the old line editor did.
             let sample = caret_char.map(String::from).unwrap_or_else(|| " ".into());
-            let width = theme::width(layer, &sample, &TextStyle::serif(17.5, theme::INK)).max(1.0);
+            let width = theme::width(layer, &sample, &TextStyle::serif(17.5, theme::ink())).max(1.0);
             layer.draw_rectangle(
                 (screen_x, screen_y - caret_height * 0.5 + 2.0),
                 (width, caret_height - 4.0),
-                theme::fade(theme::ACCENT, 0.35),
+                theme::fade(theme::accent(), 0.35),
                 Rounding::NONE,
             );
         } else if self.caret_on {
             layer.draw_rectangle(
                 (screen_x, screen_y - caret_height * 0.5 + 2.0),
                 (2.0, caret_height - 4.0),
-                theme::ACCENT,
+                theme::accent(),
                 Rounding::NONE,
             );
             // The style context: a tiny mono marker on the bar's top-right,
@@ -933,7 +935,7 @@ impl Component for Editor {
                     layer,
                     &marker,
                     (screen_x + 3.0, screen_y - caret_height * 0.5),
-                    &TextStyle::mono(9.0, theme::ACCENT),
+                    &TextStyle::mono(9.0, theme::accent()),
                     theme::TOP_LEFT,
                 );
             }
@@ -970,7 +972,7 @@ impl Editor {
                             layer.draw_rectangle(
                                 (rect.x, top),
                                 (rect.width, line.height),
-                                theme::SELECTION,
+                                theme::selection(),
                                 Rounding::NONE,
                             );
                         }
@@ -1011,7 +1013,7 @@ impl Editor {
                             layer.draw_rectangle(
                                 (x + left, top),
                                 ((right - left).max(1.0), line.height),
-                                theme::SELECTION,
+                                theme::selection(),
                                 Rounding::NONE,
                             );
                         }
@@ -1291,7 +1293,7 @@ mod tests {
             Inline::Note(_) => unreachable!(),
         };
         assert_eq!(width, box_width);
-        assert!(width > measure(&atom, &TextStyle::serif(17.5, theme::INK)));
+        assert!(width > measure(&atom, &TextStyle::serif(17.5, theme::ink())));
     }
 
     /// `math_rect` is what a whole-expression selection is drawn to now that

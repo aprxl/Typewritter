@@ -111,8 +111,8 @@ impl Component for SlashMenu {
         }
 
         let card = card_anchored(rect, self.anchor);
-        layer.draw_rectangle(card.position(), card.size(), theme::PANEL, Rounding::NONE);
-        theme::outline(layer, card, theme::BORDER);
+        layer.draw_rectangle(card.position(), card.size(), theme::popup(), Rounding::NONE);
+        theme::outline(layer, card, theme::border());
 
         self.draw_query(layer, card);
         theme::rule(
@@ -120,7 +120,7 @@ impl Component for SlashMenu {
             (card.x + 20.0, card.y + QUERY_H),
             card.width - 40.0,
             1.0,
-            theme::BORDER,
+            theme::border(),
         );
 
         if self.visible.is_empty() {
@@ -128,7 +128,7 @@ impl Component for SlashMenu {
                 layer,
                 "No matching command",
                 (card.x + card.width / 2.0, card.y + QUERY_H + 32.0),
-                &TextStyle::serif(13.5, theme::FAINT),
+                &TextStyle::serif(13.5, theme::faint()),
                 theme::CENTER,
             );
         } else {
@@ -139,14 +139,14 @@ impl Component for SlashMenu {
 
 impl SlashMenu {
     fn draw_query(&self, layer: &Layer, card: Rect) {
-        let style = TextStyle::serif(16.0, theme::INK);
+        let style = TextStyle::serif(16.0, theme::ink());
         let middle = card.y + QUERY_H / 2.0;
         if self.query.is_empty() {
             theme::draw(
                 layer,
                 "Type a command",
                 (card.x + 20.0, middle),
-                &style.clone().color(theme::FAINT),
+                &style.clone().color(theme::faint()),
                 theme::LEFT,
             );
         } else {
@@ -164,16 +164,16 @@ impl SlashMenu {
             layer.draw_rectangle(
                 (x, middle - 10.0),
                 (2.0, 20.0),
-                theme::ACCENT,
+                theme::accent(),
                 Rounding::NONE,
             );
         }
     }
 
     fn draw_rows(&self, layer: &Layer, card: Rect) {
-        let title_style = TextStyle::serif(15.0, theme::INK);
-        let group_style = TextStyle::serif(11.5, theme::COMMENT);
-        let hint_style = TextStyle::mono(10.5, theme::FAINT);
+        let title_style = TextStyle::serif(15.0, theme::ink());
+        let group_style = TextStyle::serif(11.5, theme::comment());
+        let hint_style = TextStyle::mono(10.5, theme::faint());
 
         let window = self.visible[self.first_visible..]
             .iter()
@@ -190,7 +190,7 @@ impl SlashMenu {
             let middle = row.y + row.height / 2.0;
 
             if self.first_visible + offset == self.selected {
-                layer.draw_rectangle(row.position(), row.size(), theme::SELECTION, Rounding::NONE);
+                layer.draw_rectangle(row.position(), row.size(), theme::selection(), Rounding::NONE);
             }
 
             theme::draw(

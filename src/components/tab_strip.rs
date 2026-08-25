@@ -64,9 +64,9 @@ impl TabStrip {
         TextStyle::serif(
             14.0,
             if tab.preview {
-                theme::COMMENT
+                theme::comment()
             } else {
-                theme::INK
+                theme::ink()
             },
         )
     }
@@ -124,13 +124,13 @@ impl Component for TabStrip {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(rect.position(), rect.size(), theme::CHROME, Rounding::NONE);
+        layer.draw_rectangle(rect.position(), rect.size(), theme::chrome(), Rounding::NONE);
         theme::rule(
             layer,
             (rect.x, rect.bottom() - 1.0),
             rect.width,
             1.0,
-            theme::BORDER,
+            theme::border(),
         );
         let middle = rect.y + (rect.height - 1.0) / 2.0;
 
@@ -147,10 +147,10 @@ impl Component for TabStrip {
                 layer.draw_rectangle(
                     tab_rect.position(),
                     tab_rect.size(),
-                    theme::BACKGROUND,
+                    theme::background(),
                     Rounding::NONE,
                 );
-                theme::rule(layer, (x, rect.bottom() - 2.0), width, 2.0, theme::ACCENT);
+                theme::rule(layer, (x, rect.bottom() - 2.0), width, 2.0, theme::accent());
             }
             if self.hovered == Some(index) {
                 theme::hover_fill(layer, tab_rect, self.hover.value());
@@ -161,9 +161,9 @@ impl Component for TabStrip {
                 (x + 18.0, middle - 6.5),
                 13.0,
                 if active {
-                    theme::ACCENT
+                    theme::accent()
                 } else {
-                    theme::COMMENT
+                    theme::comment()
                 },
                 1.7,
             );
@@ -174,7 +174,7 @@ impl Component for TabStrip {
                 layer.draw_rectangle(
                     (x + width - 30.0, middle - 2.0),
                     (4.0, 4.0),
-                    theme::WARNING,
+                    theme::warning(),
                     Rounding::NONE,
                 );
             }
@@ -184,9 +184,9 @@ impl Component for TabStrip {
                 (close_rect(tab_rect).x + 4.0, middle - 6.5),
                 13.0,
                 if self.hovered == Some(index) {
-                    theme::NON_TEXT
+                    theme::non_text()
                 } else {
-                    theme::FAINT
+                    theme::faint()
                 },
                 1.8,
             );
@@ -200,7 +200,7 @@ impl Component for TabStrip {
             icons::PLUS,
             (x + 14.0, middle - 7.0),
             14.0,
-            theme::FAINT,
+            theme::faint(),
             1.7,
         );
     }
