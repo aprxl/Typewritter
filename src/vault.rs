@@ -194,8 +194,19 @@ fn collect_files(root: &Path, dir: &Path, files: &mut Vec<VaultFile>) {
         if node.is_dir {
             collect_files(root, &node.path, files);
         } else if let Ok(relative) = node.path.strip_prefix(root) {
+            // Always `/`, never the platform separator. This name is what the
+            // finder shows and fuzzy-matches against, and `/` is already the
+            // app's own path vocabulary — a new note is named `math/lecture 3`
+            // on every platform (`resolve_new_path`). Letting Windows show
+            // `math\lecture 3` here would mean the reader has to type a
+            // different separator than the one they create notes with.
+            let name = relative
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             files.push(VaultFile {
-                name: relative.to_string_lossy().into_owned(),
+                name,
                 path: node.path,
             });
         }

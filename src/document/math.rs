@@ -1353,7 +1353,7 @@ fn move_to_slot(root: &MathList, cursor: &mut MathCursor, next: bool) -> bool {
         candidates
             .iter()
             .rposition(|p| position_less(&p.path, p.index, &path, index))
-            .map_or(candidates.len() - 1, |index| index)
+            .unwrap_or(candidates.len() - 1)
     };
     cursor.path = candidates[target].path.clone();
     cursor.index = candidates[target].index;
