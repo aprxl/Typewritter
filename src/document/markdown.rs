@@ -794,6 +794,23 @@ mod tests {
         run(t, Style::PLAIN)
     }
 
+    /// `$` opens an expression in the editor, so `$$` is the escape hatch
+    /// that types a literal one. That literal has to survive the file: it is
+    /// written escaped, and must come back as text rather than reopening as
+    /// math on the next load.
+    #[test]
+    fn a_literal_dollar_round_trips_as_text() {
+        let doc = doc_with(vec![Block::Paragraph(vec![plain("costs $40 and $12")])]);
+        let text = serialize(&doc);
+        assert!(text.contains("\\$40"), "written escaped: {text}");
+        let back = parse(Path::new("notes/test.md"), &text);
+        assert_eq!(
+            back.body(),
+            doc.body(),
+            "a literal dollar must not reopen as math"
+        );
+    }
+
     fn bold(t: &str) -> Inline {
         run(
             t,

@@ -2203,6 +2203,44 @@ impl Document {
         self.math = Some(math::MathCursor::default());
     }
 
+    /// Drops the focused inline expression if nothing has been typed into it
+    /// yet, leaving the caret exactly where the atom was. Returns whether it
+    /// went.
+    ///
+    /// This is what makes `$` its own escape hatch: `$` opens an expression,
+    /// and a second `$` before typing anything takes it back, so the shell
+    /// can put a literal dollar in its place. The same shape as `//` for the
+    /// slash menu.
+    ///
+    /// A display block is never discarded. `Block::Math` *is* its atom —
+    /// `prune_block` rebuilds one the moment it is missing — so removing it
+    /// here would be undone before anyone saw it.
+    pub fn math_discard_if_empty(&mut self) -> bool {
+        if self.math.is_none() {
+            return false;
+        }
+        self.clamp_caret();
+        let b = self.caret.block;
+        let i = self.caret.inline;
+        if self.scope()[b].is_math() {
+            return false;
+        }
+        match self.scope()[b].inlines().get(i) {
+            Some(Inline::Math(list)) if list.is_empty() => {}
+            _ => return false,
+        }
+        // The atom occupies exactly one flat position, and the caret sits at
+        // its start; that position is where the text after it now begins.
+        let flat = self.caret_flat(b);
+        self.scope_mut()[b].inlines_mut().remove(i);
+        self.math = None;
+        self.dirty = true;
+        self.enforce();
+        let (inline, offset) = self.flat_to_pos(b, flat);
+        self.set_caret(b, inline, offset);
+        true
+    }
+
     /// Puts an anchor at the caret and opens an empty note for it, choosing
     /// the lowest label not already in use. Returns the new note's label, or
     /// `None` when no anchor was placed.
@@ -3288,6 +3326,51 @@ mod tests {
         ));
         assert_eq!((d.caret.inline, d.caret.offset), (1, 0));
         assert!(d.math.is_some());
+    }
+
+    /// `$` opens an expression and a second `$` takes it back, so a literal
+    /// dollar is still typeable. The atom must leave no trace: the run it
+    /// split rejoins, and the caret lands where the dollar goes.
+    #[test]
+    fn an_untouched_inline_expression_is_discarded_whole() {
+        let mut d = doc();
+        d.insert_text("abcd");
+        d.set_caret(0, 0, 2);
+        d.insert_inline_math();
+        assert!(d.math.is_some());
+
+        assert!(d.math_discard_if_empty());
+        assert!(d.math.is_none());
+        assert!(
+            matches!(d.body()[0].inlines(), [Inline::Text(Text { text, .. })] if text == "abcd"),
+            "the split run rejoins: {:?}",
+            d.body()[0].inlines()
+        );
+        d.insert_text("$");
+        assert!(
+            matches!(d.body()[0].inlines(), [Inline::Text(Text { text, .. })] if text == "ab$cd")
+        );
+    }
+
+    #[test]
+    fn an_expression_with_anything_in_it_is_never_discarded() {
+        let mut d = doc();
+        d.insert_inline_math();
+        d.math_insert_char('x');
+        assert!(!d.math_discard_if_empty());
+        assert!(d.math.is_some(), "focus stays put when nothing was removed");
+        assert!(matches!(d.body()[0].inlines(), [Inline::Math(list)] if list.len() == 1));
+    }
+
+    /// A display block *is* its atom — `prune_block` rebuilds one the moment
+    /// it is missing — so discarding it would be undone before it was seen.
+    #[test]
+    fn an_empty_display_block_is_not_discarded() {
+        let mut d = doc();
+        d.insert_math_block();
+        assert!(d.math.is_some());
+        assert!(!d.math_discard_if_empty());
+        assert!(d.body().iter().any(Block::is_math));
     }
 
     #[test]

@@ -19,15 +19,14 @@
 
 ## Who writes the code
 
-Opus reasons and designs; it does not implement. Every coding task is
-delegated to a subagent — **prefer Sonnet, fall back to Haiku only for
-mechanical work**. Opus may edit directly only for changes small and
-obvious enough to need no real work: a doc tweak, a renamed symbol, a
-one-line fix.
+Do the work yourself, inline. No subagents, no delegation, no farming a
+task out to another CLI — design it and then write it in this session.
 
-A delegated task is given the design, the exact files it owns, and the
-verification it must pass (`cargo fmt`, `cargo clippy --all-targets` clean,
-`cargo test`). Two agents never own the same file in the same wave.
+Every change ends the same way, and the report is never the evidence:
+`cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test`
+all clean, then **read the diff**. A green suite says the tests agree with
+the code, not that the code is right; several changes here have passed
+every check and still shipped a defect that only reading the code found.
 
 Commit after every change. Small commits make history easy to follow and
 easy to bisect later.
@@ -95,12 +94,23 @@ API references (read before writing code against them):
 ## Verification
 
 `cargo check` passing does not mean the renderer works — wgpu validation and
-WGSL errors only surface at runtime. After any renderer change, smoke test:
+WGSL errors only surface at runtime. After any renderer change, smoke test
+by launching the app, giving it a few seconds, and killing it: still running
+means it ran clean. Then check the log for `panic` / `wgpu error`.
 
-```bash
-timeout 6 cargo run > /tmp/typewritter_run.log 2>&1
+On Windows (the current machine), PowerShell:
+
+```powershell
+$p = Start-Process cargo -ArgumentList run -NoNewWindow -PassThru -RedirectStandardError "$env:TEMP\tw.log"; if ($p.WaitForExit(90000)) { "exited early: $($p.ExitCode)" } else { Stop-Process -Id $p.Id -Force; "ran clean" }; Get-Content "$env:TEMP\tw.log" -Tail 40
 ```
 
-Exit 124/143 means it ran clean; then grep the log for `panic|wgpu error`.
+On Linux/macOS, `timeout 6 cargo run > /tmp/typewritter_run.log 2>&1`;
+exit 124/143 means it ran clean.
+
+The code is cross-platform and the suite is expected to pass on all three.
+Path handling is the recurring trap: prefer `std::env::home_dir` and
+`Path`/`PathBuf` joins over `$HOME` and hardcoded separators, and remember
+that `/` is the app's own path vocabulary in anything the reader types or
+reads (`resolve_new_path`, the file finder's labels).
 
 Keep the code warning-free.

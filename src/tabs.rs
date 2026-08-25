@@ -491,6 +491,12 @@ impl Tabs {
         self.edit(|doc| doc.math_insert_char(c));
     }
 
+    pub fn math_discard_if_empty(&mut self) -> bool {
+        let mut discarded = false;
+        self.edit(|doc| discarded = doc.math_discard_if_empty());
+        discarded
+    }
+
     pub fn math_fraction(&mut self) {
         self.edit(Document::math_insert_fraction);
     }

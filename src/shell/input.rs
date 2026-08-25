@@ -503,6 +503,24 @@ impl Shell {
         }
         {
             for c in input.text().chars() {
+                // `$` is math entry (SPEC §12.1: the one-key alias for the
+                // highest-frequency gesture in the app). A second `$` before
+                // anything is typed takes it back and leaves a literal
+                // dollar, so the character is still reachable — the same
+                // escape hatch `//` gives the slash menu.
+                //
+                // Once open, the rest of this frame's text belongs to the
+                // expression: at speed, two characters land in one frame, and
+                // the `in_math` read at the top of this function is already
+                // stale by then.
+                if self.docs.borrow().in_math() {
+                    self.math_type_char(c);
+                    continue;
+                }
+                if c == '$' {
+                    self.docs.borrow_mut().insert_inline_math();
+                    continue;
+                }
                 if matches!(
                     self.vim.key_extended(Key::Char(c)),
                     ExtendedAction::Passthrough
@@ -510,6 +528,15 @@ impl Shell {
                     self.docs.borrow_mut().type_text(&c.to_string());
                     self.insert_repeat.push(super::InsertEvent::Text(c));
                 }
+            }
+            // A `$` in this frame moved the caret into an expression, and
+            // everything below here is prose-addressed: a prose backspace
+            // with the caret on an atom eats the character *before* it. The
+            // rest of the frame belongs to math, which picks it up next
+            // frame; dropping one key beats editing the wrong scope.
+            if self.docs.borrow().in_math() {
+                self.goal_x = None;
+                return;
             }
             if input.is_key_typed(KeyCode::Backspace) {
                 let _ = self.vim.key_extended(Key::Backspace);
@@ -556,38 +583,57 @@ impl Shell {
         }
     }
 
-    fn edit_frame_math(&mut self, input: &Input) {
-        for c in input.text().chars() {
-            match c {
-                c if math::PAIRS
-                    .iter()
-                    .any(|&(open, close)| open == c || close == c) =>
-                {
-                    let closed = {
-                        let mut docs = self.docs.borrow_mut();
-                        docs.math_close_group(c)
-                    };
-                    if !closed {
-                        let opened = {
-                            let mut docs = self.docs.borrow_mut();
-                            docs.math_open_group(c)
-                        };
-                        if !opened {
-                            self.docs.borrow_mut().math_type(c);
-                        }
-                    }
+    /// One typed character while the caret is inside an expression. Split out
+    /// of [`Shell::edit_frame_math`] because Insert mode reaches it too: a `$`
+    /// opens math mid-frame, and everything typed after it in that same frame
+    /// belongs to the expression, not to the prose.
+    fn math_type_char(&mut self, c: char) {
+        match c {
+            // `$` closes an expression the way it opened one. On an
+            // expression still empty it is taken back entirely and a literal
+            // dollar is typed instead — the escape hatch, mirroring `//`.
+            '$' => {
+                let discarded = self.docs.borrow_mut().math_discard_if_empty();
+                if discarded {
+                    self.docs.borrow_mut().type_text("$");
+                } else {
+                    self.docs.borrow_mut().math_exit_after();
                 }
-                ' ' => {
-                    let inserted = self.docs.borrow_mut().math_insert_word();
-                    if !inserted {
+            }
+            c if math::PAIRS
+                .iter()
+                .any(|&(open, close)| open == c || close == c) =>
+            {
+                let closed = {
+                    let mut docs = self.docs.borrow_mut();
+                    docs.math_close_group(c)
+                };
+                if !closed {
+                    let opened = {
+                        let mut docs = self.docs.borrow_mut();
+                        docs.math_open_group(c)
+                    };
+                    if !opened {
                         self.docs.borrow_mut().math_type(c);
                     }
                 }
-                '/' => self.docs.borrow_mut().math_fraction(),
-                '^' => self.docs.borrow_mut().math_script(Slot::Sup),
-                '_' => self.docs.borrow_mut().math_script(Slot::Sub),
-                _ => self.docs.borrow_mut().math_type(c),
             }
+            ' ' => {
+                let inserted = self.docs.borrow_mut().math_insert_word();
+                if !inserted {
+                    self.docs.borrow_mut().math_type(c);
+                }
+            }
+            '/' => self.docs.borrow_mut().math_fraction(),
+            '^' => self.docs.borrow_mut().math_script(Slot::Sup),
+            '_' => self.docs.borrow_mut().math_script(Slot::Sub),
+            _ => self.docs.borrow_mut().math_type(c),
+        }
+    }
+
+    fn edit_frame_math(&mut self, input: &Input) {
+        for c in input.text().chars() {
+            self.math_type_char(c);
         }
         if input.is_key_typed(KeyCode::Backspace) {
             let _ = delete_inside_math(&mut self.docs.borrow_mut(), false);

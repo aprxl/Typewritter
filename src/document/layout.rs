@@ -36,6 +36,13 @@ pub const MATH_PAD: f32 = 10.0;
 pub const MATH_LEADING: f32 = 4.0;
 /// Space below a paragraph.
 pub const GAP_PARAGRAPH: f32 = 14.0;
+/// Clear space above *and* below a display expression — the **total**, not
+/// an addition to whatever the neighbouring block already contributes, so an
+/// equation is inset by the same amount top and bottom whatever it sits
+/// between. Wider than a paragraph's gap because a displayed equation is set
+/// apart from the prose around it rather than wrapped into it. This is on
+/// top of [`MATH_PAD`], which is the breathing room *inside* the block.
+pub const GAP_MATH: f32 = 24.0;
 /// Space *above* a heading (the first block gets none).
 pub const GAP_HEADING: f32 = 26.0;
 /// Space below a heading.
@@ -411,10 +418,16 @@ pub fn layout_blocks(
     let mut laid = Vec::with_capacity(blocks.len());
     let mut y = 0.0f32;
     let mut first_block = true;
+    // The gap the previous block already contributed below itself. A display
+    // expression tops this up to `GAP_MATH` rather than adding to it, which
+    // is what keeps its space above equal to its space below.
+    let mut gap_below_previous = 0.0f32;
 
     for (source_index, block) in blocks.iter().enumerate() {
         let gap_above = if first_block {
             0.0
+        } else if block.is_math() {
+            (GAP_MATH * scale - gap_below_previous).max(0.0)
         } else if block.is_heading() {
             GAP_HEADING * scale
         } else {
@@ -482,6 +495,8 @@ pub fn layout_blocks(
                 Some(Block::CodeLine { first: false, .. })
             ) {
             0.0
+        } else if block.is_math() {
+            GAP_MATH * scale
         } else if block.is_heading() {
             GAP_AFTER_HEADING * scale
         } else if block.is_divider() {
@@ -490,6 +505,7 @@ pub fn layout_blocks(
             GAP_PARAGRAPH * scale
         };
         y += gap_after;
+        gap_below_previous = gap_after;
     }
 
     // A note sits beside the line its anchor is on, and that line's y is only
@@ -1541,6 +1557,59 @@ mod tests {
     fn fake_measure(text: &str, style: &TextStyle) -> f32 {
         let _ = style;
         text.chars().count() as f32 * 10.0
+    }
+
+    /// A display expression is inset by `GAP_MATH` above *and* below, whoever
+    /// its neighbours are — the gap tops the previous block's own up rather
+    /// than stacking on it, so the equation is not pushed off-centre by the
+    /// paragraph that happens to precede it.
+    #[test]
+    fn a_display_expression_is_inset_equally_above_and_below() {
+        let math = Block::Math(vec![Inline::Math(vec![MathNode::Sym('x')])]);
+        let text = || {
+            Block::Paragraph(vec![Inline::Text(Text {
+                text: "a".into(),
+                style: Style::PLAIN,
+            })])
+        };
+        let blocks = vec![text(), math, text()];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+
+        let above = laid.blocks[1].y - (laid.blocks[0].y + laid.blocks[0].height);
+        let below = laid.blocks[2].y - (laid.blocks[1].y + laid.blocks[1].height);
+        assert!(
+            (above - GAP_MATH).abs() < 0.0001,
+            "space above was {above}, want {GAP_MATH}"
+        );
+        assert!(
+            (below - GAP_MATH).abs() < 0.0001,
+            "space below was {below}, want {GAP_MATH}"
+        );
+        const {
+            assert!(
+                GAP_MATH > GAP_PARAGRAPH,
+                "a display expression breathes more than a paragraph"
+            )
+        };
+    }
+
+    /// A heading's `gap_after` is tighter than a paragraph's, so the top-up
+    /// has to be larger there. The result is the same either way.
+    #[test]
+    fn a_display_expression_after_a_heading_keeps_the_same_inset() {
+        let blocks = vec![
+            Block::Heading {
+                level: 1,
+                content: vec![Inline::Text(Text {
+                    text: "h".into(),
+                    style: Style::PLAIN,
+                })],
+            },
+            Block::Math(vec![Inline::Math(vec![MathNode::Sym('x')])]),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        let above = laid.blocks[1].y - (laid.blocks[0].y + laid.blocks[0].height);
+        assert!((above - GAP_MATH).abs() < 0.0001, "space above was {above}");
     }
 
     fn shaped_measure(text: &str, style: &TextStyle) -> f32 {

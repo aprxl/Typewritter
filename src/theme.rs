@@ -30,9 +30,6 @@ pub const CODE: Color = Color::rgb(0xD9, 0xC9, 0x9E);
 /// Cooler and greyer than code's warm tan, which is what separates them
 /// without introducing a colour the palette does not already live in.
 pub const MATH: Color = Color::rgb(0xD5, 0xCD, 0xB4);
-/// Subtle expression-level tint for math embedded in prose. Kept translucent
-/// so the current-line and selection bands remain legible underneath it.
-pub const INLINE_MATH: Color = Color::rgba(0xDD, 0xD4, 0xBA, 0x88);
 pub const BORDER: Color = Color::rgb(0xDD, 0xD0, 0xA0);
 
 // -- Badges and highlights --

@@ -53,8 +53,28 @@ pub const ACCENT_GAP: f32 = 0.10;
 /// Space inside the rounded background of a variable at level zero.
 pub const VARIABLE_PAD_X: f32 = 3.0;
 pub const VARIABLE_PAD_Y: f32 = 2.0;
-/// Optical overlap between adjacent integral-family glyphs at level zero.
-pub const INTEGRAL_OVERLAP: f32 = 2.5;
+/// Optical overlap between adjacent integral-family signs at level zero, so
+/// `∫∫` nests the way a double integral is set. About a sixth of
+/// [`INTEGRAL_WIDTH`] — it was that share of the font glyph this replaced,
+/// and the drawn sign is the narrower of the two, so the pixel count came
+/// down with it rather than doubling the nesting.
+pub const INTEGRAL_OVERLAP: f32 = 1.5;
+/// The integral sign's stroke, as a multiple of [`SHAPE_STROKE`]. It is
+/// drawn rather than set from the font for the reason `SHAPE_STROKE` exists:
+/// a glyph's stroke scales with its size, so JuliaMono's `∫` at
+/// [`BIGOP_SCALE`] comes out far heavier than the notation around it. Drawn,
+/// the weight is a decision instead of a side effect — kept a little above a
+/// delimiter's, because a large operator does carry more of the expression.
+pub const INTEGRAL_STROKE: f32 = 1.4;
+/// The integral sign's width and height, as multiples of the current text
+/// size. Tall and narrow, which is the shape the notation actually has. The
+/// sign is drawn to fill both exactly, so these are its ink, not a box with
+/// margin inside it.
+pub const INTEGRAL_WIDTH: f32 = 0.55;
+pub const INTEGRAL_HEIGHT: f32 = 1.55;
+/// Radius of the ring on a contour integral, as a fraction of the sign's
+/// height.
+pub const CONTOUR_RADIUS: f32 = 0.14;
 
 // The renderer centers glyphs vertically, so glyph boxes are symmetric about
 // the anchor. Structural boxes use their near edge when clearance matters.
@@ -375,14 +395,15 @@ fn big_op(
 ) -> MathBox {
     let document_scale = options.document_scale;
     let semantic_highlights = options.semantic_highlights;
-    let (operator_text, operator_size) = match kind {
-        BigOp::Sum => ("∑", size(level, document_scale) * BIGOP_SCALE),
-        BigOp::Prod => ("∏", size(level, document_scale) * BIGOP_SCALE),
-        BigOp::Integral => ("∫", size(level, document_scale) * BIGOP_SCALE),
-        BigOp::ContourIntegral => ("∮", size(level, document_scale) * BIGOP_SCALE),
-        BigOp::Limit => ("lim", size(level, document_scale)),
+    // The integral family is drawn; everything else is set from the font.
+    // See `INTEGRAL_STROKE` for why those two are the exception.
+    let operator = match kind {
+        BigOp::Integral => integral_sign(false, level, document_scale),
+        BigOp::ContourIntegral => integral_sign(true, level, document_scale),
+        BigOp::Sum => text_glyph("∑", size(level, document_scale) * BIGOP_SCALE, measure),
+        BigOp::Prod => text_glyph("∏", size(level, document_scale) * BIGOP_SCALE, measure),
+        BigOp::Limit => text_glyph("lim", size(level, document_scale), measure),
     };
-    let operator = text_glyph(operator_text, operator_size, measure);
     let operand_level = (level + 1).min(2);
     let hide_empty_limits = matches!(kind, BigOp::Integral | BigOp::ContourIntegral);
     let lower_visible = !lower.is_empty() || !hide_empty_limits;
@@ -439,27 +460,72 @@ fn big_op(
     )
 }
 
+/// The integral sign, drawn rather than set. One cubic with point symmetry
+/// about the sign's centre — which is the symmetry the notation itself has —
+/// so the top terminal sits right of centre and bows further right, and the
+/// bottom mirrors it exactly. `ring` adds the contour integral's circle as a
+/// second subpath of the same stroke.
+fn integral_sign(ring: bool, level: usize, document_scale: f32) -> MathBox {
+    let size = size(level, document_scale);
+    let stroke = SHAPE_STROKE * INTEGRAL_STROKE * scale(level, document_scale);
+    let width = size * INTEGRAL_WIDTH;
+    let height = size * INTEGRAL_HEIGHT;
+    // Inset by half the stroke so the ink stays inside the box it reserves.
+    let inset = stroke * 0.5;
+    let top = -height * 0.5 + inset;
+    let bottom = height * 0.5 - inset;
+    let span = width - inset * 2.0;
+    let at = |fraction: f32| inset + span * fraction;
+    // Where the terminal sits and how far the hook swings past it, across the
+    // sign's width. The bottom half is these two mirrored, which is what
+    // makes the whole sign point-symmetric. They look like odd numbers
+    // because they are solved rather than picked: a cubic's extremes lie
+    // strictly inside its control points, so leaving the hook at the box edge
+    // would leave a quarter of the reserved width blank on each side. At
+    // these values the curve's own turning points land exactly on the edges,
+    // so the sign fills the width it takes up.
+    const TIP: f32 = 0.869;
+    const HOOK: f32 = 1.524;
+    // How far down the hook reaches before the spine straightens, as a share
+    // of the height. Small enough that the middle stays near-vertical.
+    let bow = height * 0.32;
+    let mut path = format!(
+        "M {} {top} C {} {}, {} {}, {} {bottom}",
+        at(TIP),
+        at(HOOK),
+        top + bow,
+        at(1.0 - HOOK),
+        bottom - bow,
+        at(1.0 - TIP),
+    );
+    if ring {
+        let radius = height * CONTOUR_RADIUS;
+        let center = width * 0.5;
+        path.push_str(&format!(
+            " M {} 0 A {radius} {radius} 0 1 0 {} 0 A {radius} {radius} 0 1 0 {} 0",
+            center - radius,
+            center + radius,
+            center - radius,
+        ));
+    }
+    stroked_box(width, height * 0.5, height * 0.5, path, stroke)
+}
+
 fn stretchy_size(body: &MathBox, level: usize, document_scale: f32) -> f32 {
     size(level, document_scale).max((body.ascent + body.descent) * DELIM_FILL)
 }
 
-fn stroked_box(
-    width: f32,
-    ascent: f32,
-    descent: f32,
-    path: String,
-    level: usize,
-    document_scale: f32,
-) -> MathBox {
+/// `thickness` is passed rather than derived, because a delimiter and a big
+/// operator are drawn at the same height but not at the same weight. Every
+/// caller already has the scaled stroke it drew the path with, so taking it
+/// here also stops the two from being computed twice and drifting.
+fn stroked_box(width: f32, ascent: f32, descent: f32, path: String, thickness: f32) -> MathBox {
     MathBox {
         width,
         ascent,
         descent,
         highlight: None,
-        kind: BoxKind::Primitive(MathPrimitive::Stroke {
-            path,
-            thickness: SHAPE_STROKE * scale(level, document_scale),
-        }),
+        kind: BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }),
     }
 }
 
@@ -496,14 +562,7 @@ fn delimiter(ch: char, height: f32, level: usize, document_scale: f32) -> MathBo
         '⟩' => format!("M 0 {top} L {} 0 L 0 {bottom}", width - stroke * 0.5,),
         _ => format!("M {} {top} V {bottom}", width * 0.5),
     };
-    stroked_box(
-        width,
-        height * 0.5,
-        height * 0.5,
-        path,
-        level,
-        document_scale,
-    )
+    stroked_box(width, height * 0.5, height * 0.5, path, stroke)
 }
 
 fn group(
@@ -566,8 +625,7 @@ fn radical(
         -top + stroke * 0.5,
         valley + stroke * 0.5,
         path,
-        level,
-        document_scale,
+        stroke,
     );
     let mut children = (0..2).map(|_| None).collect::<Vec<_>>();
     children[0] = Some((0.0, 0.0, sign));
@@ -2203,7 +2261,7 @@ mod tests {
 
     #[test]
     fn empty_integral_limits_are_invisible_without_changing_the_operator_box() {
-        for (kind, glyph) in [(BigOp::Integral, "∫"), (BigOp::ContourIntegral, "∮")] {
+        for kind in [BigOp::Integral, BigOp::ContourIntegral] {
             let source = vec![big_op(kind, Vec::new(), Vec::new())];
             let list = layout(&source, 0, &fake_measure);
             let bounds = interaction_bounds(&list);
@@ -2216,9 +2274,11 @@ mod tests {
             let BoxKind::Row { children: operator } = &operator_box.kind else {
                 panic!("operator must produce row");
             };
+            // Drawn, not set from the font — see `INTEGRAL_STROKE`.
             assert!(matches!(
                 operator[0].2.kind,
-                BoxKind::Glyph { ref text, .. } if text == glyph
+                BoxKind::Primitive(MathPrimitive::Stroke { thickness, .. })
+                    if (thickness - SHAPE_STROKE * INTEGRAL_STROKE).abs() < 0.0001
             ));
             assert_eq!(operator_box.width, operator[0].2.width);
             assert_eq!(operator_box.ascent, operator[0].2.ascent);
@@ -2253,6 +2313,100 @@ mod tests {
                 assert_eq!(hit_cursor.index, 0);
             }
         }
+    }
+
+    /// The whole point of drawing the integral instead of setting it: a
+    /// glyph's stroke scales with its size, a drawn one does not. The sign
+    /// gets bigger at a deeper level only in the sense that everything does —
+    /// its weight tracks the level scale, never `BIGOP_SCALE`.
+    #[test]
+    fn the_integral_is_drawn_at_a_weight_that_does_not_follow_its_size() {
+        let stroke_of = |box_: &MathBox| match &box_.kind {
+            BoxKind::Primitive(MathPrimitive::Stroke { thickness, .. }) => *thickness,
+            other => panic!("integral must be a stroked primitive, got {other:?}"),
+        };
+        let sign = integral_sign(false, 0, 1.0);
+        assert!((stroke_of(&sign) - SHAPE_STROKE * INTEGRAL_STROKE).abs() < 0.0001);
+        // Far lighter than the glyph it replaces would be: JuliaMono's own
+        // stroke at `BASE_SIZE * BIGOP_SCALE` is a large multiple of this.
+        assert!(stroke_of(&sign) < BASE_SIZE * BIGOP_SCALE * 0.1);
+        assert!(sign.ascent > 0.0 && (sign.ascent - sign.descent).abs() < 0.0001);
+        assert!(
+            sign.width < sign.ascent + sign.descent,
+            "integrals are tall"
+        );
+    }
+
+    /// The sign must fill the box it reserves. A cubic's extremes lie inside
+    /// its control points, so control points parked on the edges would leave
+    /// the sign floating in dead space — and a big operator's limits are
+    /// centred on that width, so the blank would push them off the ink.
+    /// Samples the real curve rather than trusting the constants.
+    #[test]
+    fn the_integral_fills_the_width_and_height_it_reserves() {
+        let sign = integral_sign(false, 0, 1.0);
+        let BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }) = &sign.kind else {
+            panic!("integral must be a stroked primitive");
+        };
+        // "M x0 y0 C x1 y1, x2 y2, x3 y3" — the four points, in order.
+        let numbers: Vec<f32> = path
+            .split([' ', ','])
+            .filter_map(|token| token.parse().ok())
+            .collect();
+        assert_eq!(numbers.len(), 8, "one cubic, four points: {path}");
+        let point = |i: usize| (numbers[i * 2], numbers[i * 2 + 1]);
+        let (p0, c1, c2, p3) = (point(0), point(1), point(2), point(3));
+
+        let axis = |a: f32, b: f32, c: f32, d: f32, t: f32| {
+            let u = 1.0 - t;
+            u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+        };
+        let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+        let (mut min_y, mut max_y) = (f32::MAX, f32::MIN);
+        for step in 0..=2000 {
+            let t = step as f32 / 2000.0;
+            let x = axis(p0.0, c1.0, c2.0, p3.0, t);
+            let y = axis(p0.1, c1.1, c2.1, p3.1, t);
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+
+        // The ink is inset by half a stroke so the drawn edge lands on the
+        // box edge rather than half outside it.
+        let inset = thickness * 0.5;
+        let tolerance = 0.05;
+        assert!(
+            (min_x - inset).abs() < tolerance && (max_x - (sign.width - inset)).abs() < tolerance,
+            "x spans {min_x}..{max_x}, want {inset}..{}",
+            sign.width - inset
+        );
+        assert!(
+            (min_y - (-sign.ascent + inset)).abs() < tolerance
+                && (max_y - (sign.descent - inset)).abs() < tolerance,
+            "y spans {min_y}..{max_y}, want {}..{}",
+            -sign.ascent + inset,
+            sign.descent - inset
+        );
+        // Point symmetry about the centre — the bottom is the top mirrored.
+        assert!((min_x + max_x - sign.width).abs() < tolerance);
+        assert!((min_y + max_y).abs() < tolerance);
+    }
+
+    /// The ring is the only difference between the two, and it rides on the
+    /// same stroke rather than being a second primitive to keep in step.
+    #[test]
+    fn only_the_contour_integral_carries_a_ring() {
+        let path_of = |ring: bool| match integral_sign(ring, 0, 1.0).kind {
+            BoxKind::Primitive(MathPrimitive::Stroke { path, .. }) => path,
+            other => panic!("integral must be a stroked primitive, got {other:?}"),
+        };
+        let plain = path_of(false);
+        let contour = path_of(true);
+        assert!(!plain.contains('A'), "a plain integral has no arc: {plain}");
+        assert!(contour.starts_with(&plain), "the ring is appended to the S");
+        assert_eq!(contour.matches(" A ").count(), 2, "two half-arcs close it");
     }
 
     #[test]

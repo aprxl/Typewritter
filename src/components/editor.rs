@@ -36,7 +36,6 @@ pub const BRUSH_RADIUS: f32 = 9.0;
 const BLOCK_PAD: (f32, f32) = (10.0, 6.0);
 const INLINE_PAD: (f32, f32) = (8.0, 4.0);
 const CODE_ROUNDING: Rounding = Rounding::uniform(6.0);
-const INLINE_MATH_ROUNDING: Rounding = Rounding::uniform(5.0);
 const MATH_SELECTION_ROUNDING: Rounding = Rounding::uniform(4.0);
 /// The highlight bar: an underline, not a wash, so the glyphs keep the
 /// page's own contrast. `DROP` is measured down from the line's centre.
@@ -105,8 +104,15 @@ type Painted = (String, Style, f32, f32);
 /// Draws a laid-out expression. `origin` is the box's baseline-left point
 /// on screen; child offsets are baseline-relative with y positive upward,
 /// so descending into a child subtracts its y.
-fn draw_math(layer: &Layer, box_: &MathBox, origin: (f32, f32)) {
-    draw_math_inner(layer, box_, origin, false);
+///
+/// `slots` draws the empty-slot placeholders. They are typing affordances —
+/// they say where the next character lands — so they appear only while the
+/// caret is actually inside this expression in Insert mode; read back later,
+/// an expression shows its notation and nothing else. Their geometry is
+/// reserved either way, so an expression never resizes as the caret enters
+/// or leaves it.
+fn draw_math(layer: &Layer, box_: &MathBox, origin: (f32, f32), slots: bool) {
+    draw_math_inner(layer, box_, origin, false, slots);
 }
 
 fn math_rect(box_: &MathBox, origin: (f32, f32)) -> Rect {
@@ -159,7 +165,7 @@ fn draw_brush(layer: &Layer, center: (f32, f32)) {
     layer.draw_circle(center, BRUSH_RADIUS, theme::fade(theme::ACCENT, 0.14));
 }
 
-fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: bool) {
+fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: bool, slots: bool) {
     if let Some(role) = box_.highlight.filter(|_| !covered) {
         let height = box_.ascent + box_.descent;
         let color = match role {
@@ -202,7 +208,9 @@ fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: b
             );
         }
         BoxKind::Slot { visible, .. } => {
-            if !visible {
+            // `visible` is structural — an integral's unasked-for limits are
+            // never drawn. `slots` is the mode gate on top of it.
+            if !visible || !slots {
                 return;
             }
             let rect = Rect {
@@ -231,7 +239,7 @@ fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: b
         },
         BoxKind::Row { children } => {
             for (x, y, child) in children {
-                draw_math_inner(layer, child, (origin.0 + x, origin.1 - y), covered);
+                draw_math_inner(layer, child, (origin.0 + x, origin.1 - y), covered, slots);
             }
         }
     }
@@ -710,15 +718,11 @@ impl Component for Editor {
                         let measure =
                             |text: &str, style: &TextStyle| theme::width(layer, text, style);
                         let box_ = math_layout::layout(list, 0, self.layout.scale, &measure);
-                        if !kind.is_math() {
-                            let rect = math_rect(&box_, (cursor, baseline));
-                            layer.draw_rectangle(
-                                rect.position(),
-                                rect.size(),
-                                theme::INLINE_MATH,
-                                INLINE_MATH_ROUNDING,
-                            );
-                        }
+                        // An expression in prose gets no tint of its own: the
+                        // notation is already distinct from the words around
+                        // it, and a box behind every inline `$x$` reads as
+                        // clutter down a page of them. A display block keeps
+                        // its slab — that one is a block, not a phrase.
                         if let Some((selected_block, selected_inline, address)) =
                             &self.math_selection
                             && *selected_block == bi
@@ -754,7 +758,20 @@ impl Component for Editor {
                                 );
                             }
                         }
-                        draw_math(layer, &box_, (cursor, baseline));
+                        // Typing into *this* expression, right now: the same
+                        // condition the math cursor below is drawn on, minus
+                        // Normal mode, where the slots have nothing to say.
+                        let typing_here = matches!(
+                            (math_focus, caret),
+                            (Some(_), Some(caret))
+                                if bi == caret.block && segment.inline == caret.inline
+                        );
+                        draw_math(
+                            layer,
+                            &box_,
+                            (cursor, baseline),
+                            typing_here && !self.block_caret,
+                        );
                         if let (Some(math_cursor), Some(caret)) = (math_focus, caret)
                             && bi == caret.block
                             && segment.inline == caret.inline
@@ -1277,8 +1294,11 @@ mod tests {
         assert!(width > measure(&atom, &TextStyle::serif(17.5, theme::INK)));
     }
 
+    /// `math_rect` is what a whole-expression selection is drawn to now that
+    /// inline math has no background of its own — it must still cover the
+    /// box exactly, ascent above the baseline and descent below.
     #[test]
-    fn inline_math_background_matches_the_complete_box() {
+    fn a_math_rect_covers_the_whole_box_around_its_baseline() {
         let box_ = MathBox {
             width: 42.0,
             ascent: 19.0,
@@ -1295,7 +1315,5 @@ mod tests {
                 height: 30.0,
             }
         );
-        assert_ne!(theme::INLINE_MATH, theme::MATH);
-        assert_ne!(theme::INLINE_MATH, theme::VARIABLE);
     }
 }
