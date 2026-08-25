@@ -16,7 +16,8 @@ use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
     ContextMenu, Dialog, FileFinder, FileTree, MathMenu, Onboarding, Palette, SlashMenu,
-    context_menu, editor, file_finder, file_tree, math_menu, onboarding, sidenotes, title_bar,
+    context_menu, editor, file_finder, file_tree, math_menu, onboarding, sidenotes, theme_switch,
+    title_bar,
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind};
@@ -100,6 +101,23 @@ impl Shell {
                 self.open_picker();
             }
             return;
+        }
+
+        // The palette switch. Its rect comes from the title bar's node
+        // rather than from anything the component recorded while drawing,
+        // so a click on the first frame lands as well as one on the
+        // thousandth. A swap already running swallows the click — see
+        // `ThemeSwap`.
+        if input.is_mouse_pressed(MouseButton::Left) && input.is_cursor_in_window() {
+            let switch =
+                theme_switch::switch_rect(self.layout.rect(self.regions[self.title_region].node()));
+            if switch.contains(input.mouse_position()) {
+                self.request_theme_swap((
+                    switch.x + switch.width / 2.0,
+                    switch.y + switch.height / 2.0,
+                ));
+                return;
+            }
         }
 
         if input.is_mouse_pressed(MouseButton::Left)

@@ -195,6 +195,14 @@ pub struct Renderer {
     // render) while callers never have to think about DPI themselves — the
     // same contract CSS px/SwiftUI points/Android dp give their callers.
     scale_factor: f64,
+    // Whether the surface was configured with `COPY_SRC` — see
+    // `Renderer::supports_capture`.
+    capture_supported: bool,
+    // The layer a `Renderer::capture_into` call is waiting to blit the next
+    // presented frame into. `Weak` for the same reason `layers` is: the
+    // caller may drop the layer between arming the capture and the frame
+    // that would serve it.
+    pending_capture: Option<std::rc::Weak<RefCell<layer::LayerInner>>>,
 }
 
 /// How many timestamp readback buffers are kept in flight. Each is tiny
@@ -465,8 +473,19 @@ impl Renderer {
             .copied()
             .unwrap_or(caps.formats[0]);
 
+        // `COPY_SRC` is what `Renderer::capture_into` reads the presented
+        // frame out of. Every desktop backend this app ships on offers it,
+        // but it is a surface capability rather than a guarantee, so it is
+        // asked for only when it is there and `capture_supported` tells the
+        // caller which world it is in — see `Renderer::supports_capture`.
+        let capture_supported = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        let mut surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if capture_supported {
+            surface_usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: surface_usage,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -535,7 +554,43 @@ impl Renderer {
             frame_delta: Duration::ZERO,
             start_time: Instant::now(),
             scale_factor,
+            capture_supported,
+            pending_capture: None,
         }
+    }
+
+    /// Whether [`Renderer::capture_into`] can do anything on this surface.
+    /// `false` means a caller that wanted to freeze a frame has to do
+    /// without one — swap instantly instead of animating, rather than
+    /// showing an empty layer.
+    pub fn supports_capture(&self) -> bool {
+        self.capture_supported
+    }
+
+    /// Copy the frame this renderer is about to present into `layer`, and
+    /// leave the layer holding it: from the next frame on it composites
+    /// that image instead of rendering its own content, until it is
+    /// [`Layer::thaw`]ed or dropped.
+    ///
+    /// This is the "snapshot view" every compositor grows eventually: a
+    /// picture of the interface as it stands, cheap to keep on screen while
+    /// the real interface changes underneath it. A theme swap is the case
+    /// it was built for — the old palette stays on top as a still image and
+    /// is wiped away (see [`ShaderEffect::RadialWipe`]) while the live
+    /// window redraws itself in the new one below, so the two never have to
+    /// exist as two live interfaces at once.
+    ///
+    /// The copy is recorded at the *end* of the next [`Renderer::render`],
+    /// after every layer has composited, so what lands in `layer` is the
+    /// finished frame — including `layer`'s own contribution to it, which
+    /// for the intended use is nothing at all (it is created empty for
+    /// this). One capture can be pending at a time; asking again replaces
+    /// it. A no-op when [`Renderer::supports_capture`] is `false`.
+    pub fn capture_into(&mut self, layer: &Layer) {
+        if !self.capture_supported {
+            return;
+        }
+        self.pending_capture = Some(Rc::downgrade(&layer.0));
     }
 
     /// Update the window scale factor — call this from
@@ -716,6 +771,10 @@ impl Renderer {
             self.scale_factor as f32,
         );
 
+        // After every layer has composited, so a capture is of the finished
+        // frame rather than of some prefix of it — see `capture_into`.
+        self.record_pending_capture(&mut encoder, &frame.texture, surface_size);
+
         let map_slot = self
             .timestamps
             .as_mut()
@@ -742,6 +801,36 @@ impl Renderer {
         self.previous_frame_at = Some(now);
 
         Ok(())
+    }
+
+    /// Record the pending [`Renderer::capture_into`] blit, if the layer it
+    /// named is still alive and still the size of the surface, and hand the
+    /// layer its frozen state. A layer that was dropped or resized out from
+    /// under the request simply doesn't get one — the capture is a visual
+    /// nicety, and there is nothing to recover.
+    fn record_pending_capture(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &wgpu::Texture,
+        surface_size: (u32, u32),
+    ) {
+        let Some(target) = self.pending_capture.take().and_then(|weak| weak.upgrade()) else {
+            return;
+        };
+        let mut target = target.borrow_mut();
+        if target.texture_size() != surface_size {
+            return;
+        }
+        encoder.copy_texture_to_texture(
+            frame.as_image_copy(),
+            target.texture().as_image_copy(),
+            wgpu::Extent3d {
+                width: surface_size.0,
+                height: surface_size.1,
+                depth_or_array_layers: 1,
+            },
+        );
+        target.freeze();
     }
 
     /// Wall-clock time between the two most recent frames — the value to

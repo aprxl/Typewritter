@@ -1,5 +1,6 @@
 //! App identity and the vault search affordance.
 
+use super::theme_switch;
 use crate::layout::Rect;
 use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle, icons};
@@ -17,6 +18,11 @@ pub struct TitleBar {
     /// Filled in by `draw`, hit-tested by `sync` on the next frame.
     search_rect: Rect,
     hover: Hover,
+    /// The palette switch's own hover, and whether a swap is still running.
+    /// The switch has no state beyond these two — everything else it draws
+    /// it reads straight off the theme server.
+    switch_hover: Hover,
+    theme_locked: bool,
     dirty: Dirty,
 }
 
@@ -31,6 +37,8 @@ impl TitleBar {
             shortcut: "⌘ /".into(),
             search_rect: Rect::default(),
             hover: Hover::new(),
+            switch_hover: Hover::new(),
+            theme_locked: false,
             dirty: Dirty::new(),
         }
     }
@@ -78,8 +86,10 @@ pub fn search_box_rect(layer: &Layer, rect: Rect) -> Rect {
     let box_width = theme::width(layer, "search the vault", &search_style)
         + theme::width(layer, "⌘ /", &shortcut_style)
         + 55.0;
+    // The palette switch owns the right edge; search is laid out backwards
+    // from its left side rather than from the bar's.
     Rect::new(
-        rect.right() - 18.0 - box_width,
+        theme_switch::switch_rect(rect).x - theme_switch::GAP - box_width,
         rect.y + (rect.height - 2.0) / 2.0 - 13.0,
         box_width,
         26.0,
@@ -100,6 +110,14 @@ impl Component for TitleBar {
     fn sync(&mut self, context: &Context) {
         let over = context.hovering(self.search_rect);
         let mut dirty = self.hover.update(over, context.animation_dt);
+        // The switch's rect is derived from the region's own rect, not
+        // measured during a draw, so it is right on the first frame — and a
+        // locked switch reads as un-hovered however the pointer moves.
+        let switch = theme_switch::switch_rect(context.self_rect);
+        let over_switch = !context.theme_locked && context.hovering(switch);
+        dirty |= self.switch_hover.update(over_switch, context.animation_dt);
+        dirty |= self.theme_locked != context.theme_locked;
+        self.theme_locked = context.theme_locked;
         if self.finder_open {
             let before = self.caret_on;
             self.caret_on = context.caret_on;
@@ -119,7 +137,7 @@ impl Component for TitleBar {
     }
 
     fn is_animating(&self) -> bool {
-        self.hover.is_animating()
+        self.hover.is_animating() || self.switch_hover.is_animating()
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
@@ -236,5 +254,12 @@ impl Component for TitleBar {
                 theme::RIGHT,
             );
         }
+
+        theme_switch::draw(
+            layer,
+            theme_switch::switch_rect(rect),
+            self.switch_hover.value(),
+            self.theme_locked,
+        );
     }
 }

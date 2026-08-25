@@ -18,11 +18,35 @@ use crate::renderer::{
     Rounding, Stroke, VerticalAlign,
 };
 
+/// Whether a palette is a light one or a dark one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Light,
+    Dark,
+}
+
+impl Mode {
+    /// The other one.
+    pub fn flipped(self) -> Self {
+        match self {
+            Mode::Light => Mode::Dark,
+            Mode::Dark => Mode::Light,
+        }
+    }
+}
+
 /// Every colour the application draws with, one palette's worth. Sizes and
 /// spacings are *not* here: a badge is the same size in every theme, so
 /// swapping palettes can never move anything on the page.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
+    /// Whether this palette reads as a light or a dark one. Not a colour
+    /// and not derived from one: it is the theme's own claim about itself,
+    /// so the one affordance that has to know — the switch, which draws a
+    /// sun or a moon and picks a counterpart to swap to — asks instead of
+    /// guessing from a luminance threshold.
+    pub mode: Mode,
+
     // -- Surfaces --
     /// The page itself.
     pub background: Color,
@@ -97,6 +121,7 @@ impl Theme {
     /// application starts on [`Theme::NOIR`], and choosing between them is
     /// its own piece of work.
     pub const LIGHT: Self = Self {
+        mode: Mode::Light,
         background: Color::rgb(0xF8, 0xED, 0xD0),
         panel: Color::rgb(0xF0, 0xE3, 0xBE),
         // Guara draws a float on the gutter's colour; only Noir splits them.
@@ -139,6 +164,7 @@ impl Theme {
     /// Each is that, and nothing more inventive: the light entry's hue,
     /// moved to the other side of the page. Each carries its working below.
     pub const NOIR: Self = Self {
+        mode: Mode::Dark,
         background: Color::rgb(0x1B, 0x17, 0x14),
         panel: Color::rgb(0x14, 0x11, 0x10),
         popup: Color::rgb(0x22, 0x1D, 0x18),
@@ -193,6 +219,15 @@ impl Theme {
         cool: Color::rgb(0x13, 0x94, 0xAF),
         warning: Color::rgb(0xB5, 0x76, 0x14),
     };
+
+    /// The built-in palette for `mode`. The pair the switch flips between,
+    /// and the one place that mapping is written down.
+    pub const fn of(mode: Mode) -> Self {
+        match mode {
+            Mode::Light => Self::LIGHT,
+            Mode::Dark => Self::NOIR,
+        }
+    }
 
     /// The ink a badge of `color` is drawn in — label and hairline box both.
     pub fn badge(&self, color: BadgeColor) -> Color {
@@ -329,6 +364,16 @@ pub fn set(theme: Theme) -> bool {
 
 pub fn revision() -> u64 {
     server().revision()
+}
+
+/// Whether the application is currently on a light or a dark palette.
+pub fn mode() -> Mode {
+    server().theme().mode
+}
+
+/// The palette the switch would move to from here.
+pub fn counterpart() -> Theme {
+    Theme::of(mode().flipped())
 }
 
 /// Takes the pending redraw request — see [`ThemeServer::take_change`].
@@ -617,18 +662,56 @@ pub fn hover_fill(layer: &Layer, rect: Rect, weight: f32) {
 /// source SVG means it, so the design's `stroke-width="1.8"` is `1.8` here
 /// regardless of the size the icon is drawn at.
 pub fn icon(layer: &Layer, path: &str, at: (f32, f32), size: f32, color: Color, stroke: f32) {
+    icon_turned(layer, path, at, size, 0.0, color, stroke);
+}
+
+/// [`icon`], tilted by `rotation` radians clockwise about the icon's own
+/// centre. `at` still names the upright icon's top-left corner, so a
+/// caller can place the icon once and animate the tilt without also having
+/// to re-derive where it sits.
+// Seven params; the alternative is a struct for one call site — the same
+// call `Layer::draw_svg_icon_rotated` already made.
+#[allow(clippy::too_many_arguments)]
+pub fn icon_turned(
+    layer: &Layer,
+    path: &str,
+    at: (f32, f32),
+    size: f32,
+    rotation: f32,
+    color: Color,
+    stroke: f32,
+) {
     let mut pen = Stroke::new(color, stroke);
     pen.cap = LineCap::Round;
     pen.join = LineJoin::Round;
     layer
-        .draw_svg_icon(
+        .draw_svg_icon_rotated(
             path,
             (0.0, 0.0, 24.0, 24.0),
             (size, size),
             at,
+            rotation,
             PathPaint::Stroke(pen),
         )
         .expect("icon paths are constants — a parse failure is a typo, not input");
+}
+
+/// Stroke an open polyline in logical pixels — the arcs and seam the theme
+/// switch draws, which are not any of the closed shapes `draw_*` names.
+pub fn polyline(layer: &Layer, points: &[(f32, f32)], color: Color, thickness: f32) {
+    let Some(((first_x, first_y), rest)) = points.split_first() else {
+        return;
+    };
+    let mut d = format!("M{first_x} {first_y}");
+    for (x, y) in rest {
+        d.push_str(&format!("L{x} {y}"));
+    }
+    let mut pen = Stroke::new(color, thickness);
+    pen.cap = LineCap::Round;
+    pen.join = LineJoin::Round;
+    layer
+        .draw_path(&d, (0.0, 0.0), PathPaint::Stroke(pen))
+        .expect("a polyline's own path data is generated here, not parsed from input");
 }
 
 /// Feather-style 24×24 stroked icons, taken from the design.
@@ -658,6 +741,16 @@ pub mod icons {
                               M3 18a3 3 0 1 0 6 0a3 3 0 1 0-6 0 M18 9a9 9 0 0 1-9 9";
     /// The "you are inside a structure" marker in the status line.
     pub const NEXT_SLOT: &str = "M18 7V4H6l6 8-6 8h12v-3";
+    /// The light palette, on the theme switch. Not the usual sun: at the
+    /// switch's size a stock icon's two-unit rays land under a pixel and
+    /// read as dust around a disc. The disc here is smaller and the rays
+    /// are more than twice as long, which is what keeps them rays.
+    pub const SUN: &str = "M12 8.4a3.6 3.6 0 1 0 0 7.2a3.6 3.6 0 1 0 0-7.2 \
+                           M12 1L12 5.4 M12 18.6L12 23 M1 12L5.4 12 M18.6 12L23 12 \
+                           M4.22 4.22L7.33 7.33 M16.67 16.67L19.78 19.78 \
+                           M19.78 4.22L16.67 7.33 M4.22 19.78L7.33 16.67";
+    /// The dark palette, on the theme switch.
+    pub const MOON: &str = "M12 3a6 6 0 0 0 9 9a9 9 0 1 1-9-9z";
 }
 
 #[cfg(test)]
@@ -688,6 +781,24 @@ mod tests {
         other.background = Color::rgb(0x00, 0x00, 0x00);
         assert!(server.set(other));
         assert_eq!(server.revision(), 1);
+    }
+
+    /// The switch flips between exactly two palettes and reads which one it
+    /// is on off the palette itself, so the pair has to close: each mode's
+    /// theme must claim that mode, and flipping twice must come home.
+    #[test]
+    fn the_two_built_in_palettes_are_each_others_counterpart() {
+        for mode in [Mode::Light, Mode::Dark] {
+            assert_eq!(Theme::of(mode).mode, mode);
+            assert_eq!(mode.flipped().flipped(), mode);
+            assert_eq!(
+                Theme::of(mode.flipped()),
+                Theme::of(Theme::of(mode).mode.flipped())
+            );
+        }
+        assert_ne!(Theme::LIGHT, Theme::NOIR);
+        assert_eq!(Theme::of(Mode::Light), Theme::LIGHT);
+        assert_eq!(Theme::of(Mode::Dark), Theme::NOIR);
     }
 
     /// The redraw request is a one-shot: the shell takes it, redraws every

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use winit::event::MouseButton;
 
-use crate::animation::Easing;
+use crate::animation::{Animation, Easing};
 use crate::components::dialog::Prompt;
 use crate::components::sidenotes::Note;
 use crate::components::tab_strip::TabView;
@@ -114,6 +114,43 @@ struct MathMenuState {
 struct SearchState {
     query: String,
     forward: bool,
+}
+
+/// How long a palette swap takes, from the click to the last frame of the
+/// wipe. Short enough to stay out of the way, long enough to read as a
+/// transition rather than a flicker.
+const SWAP_DURATION: Duration = Duration::from_millis(240);
+/// Width of the wipe's soft edge, logical pixels. A hard circle sweeping
+/// across a page of text shows every stair-step in its own boundary; this
+/// is wide enough to hide them and narrow enough to still read as an edge.
+const SWAP_FEATHER: f32 = 48.0;
+
+/// A palette swap in flight — the state the switch is locked by.
+///
+/// The whole point of the sequence is that the two palettes never exist as
+/// two live interfaces at once. The frame that was on screen when the
+/// switch was clicked is copied into a layer of its own and held there as a
+/// still image (see [`Renderer::capture_into`]); the palette then moves,
+/// and the entire window redraws itself underneath that image while the
+/// image is wiped away from the switch outward. One live interface, one
+/// picture, and the picture costs a texture for a quarter of a second.
+enum ThemeSwap {
+    /// Asked for, and waiting for a frame. The capture can only be armed
+    /// from inside [`Shell::update`], which is where the renderer is, so a
+    /// click leaves the request here for the same frame's sync to pick up.
+    Requested { origin: (f32, f32) },
+    /// Armed. The frame being drawn right now — still in the old palette,
+    /// because nothing has moved yet — is the one that will be held.
+    Capturing { origin: (f32, f32), layer: Layer },
+    /// `layer` holds that frame; the new palette is live underneath it and
+    /// the wipe is eating it from `origin` outward. Dropping the layer at
+    /// the end frees the captured frame and the wipe's own output texture
+    /// together.
+    Wiping {
+        origin: (f32, f32),
+        layer: Layer,
+        animation: Animation,
+    },
 }
 
 #[derive(Clone)]
@@ -292,6 +329,11 @@ pub struct Shell {
     /// here because `rebuild_views` swaps the editor component out and the
     /// layer has to outlive that.
     glow: Layer,
+    /// The palette swap in flight, if there is one — see [`ThemeSwap`].
+    /// `Some` is also what locks the switch: a swap cannot be spammed,
+    /// because a second one would capture a frame mid-wipe and hold *that*
+    /// as its still image.
+    theme_swap: Option<ThemeSwap>,
 }
 
 impl Shell {
@@ -525,6 +567,7 @@ impl Shell {
             insert_prefix: None,
             last_width: 0.0,
             glow,
+            theme_swap: None,
         }
     }
 
@@ -532,7 +575,8 @@ impl Shell {
     /// frames *now*; see [`Shell::wake_at`] for the ones that want one later.
     ///
     /// `renderer` is here for the overlay layers, which are attached on open
-    /// and dropped on close rather than held for the session.
+    /// and dropped on close rather than held for the session, and for the
+    /// palette swap, which captures a frame into a layer of its own.
     pub fn update(
         &mut self,
         input: &Input,
@@ -540,21 +584,27 @@ impl Shell {
         frametime: Duration,
         renderer: &mut Renderer,
     ) -> bool {
+        // Every animation, every frame, accumulated with `|=` — `||` would
+        // short-circuit and stop advancing the rest.
+        let dt = FrameScheduler::animation_delta(frametime);
+
         self.handle_input(input, viewport);
         self.autosave();
         self.sync_math_menu();
         self.export_yank();
         self.sync_overlay_layers(renderer);
+        // Before `sync_theme`, and on purpose: the step that swaps the
+        // palette is in here, and the redraw it arms has to be taken in the
+        // same frame or the window would spend one frame in the old colours
+        // underneath a still image of the old colours.
+        let mut animating = self.sync_theme_swap(renderer, viewport, dt);
         self.sync_theme();
 
-        // Every animation, every frame, accumulated with `|=` — `||` would
-        // short-circuit and stop advancing the rest.
-        let dt = FrameScheduler::animation_delta(frametime);
         // The two stepped ones report a *step change*, not "still running",
         // so they fall silent between steps and the loop can sleep. They
         // keep their own wall clock; `dt` is clamped, and clamped time
         // cannot drive something that sleeps longer than the clamp.
-        let mut animating = self.caret.advance();
+        animating |= self.caret.advance();
         animating |= self.pulse.advance();
         let animation_wake = Instant::now() + self.caret.wake_in().min(self.pulse.wake_in());
         // A pending autosave is a deadline too: it must wake the loop from
@@ -608,6 +658,7 @@ impl Shell {
                 || self.context_menu.is_some()
                 || self.math_menu.is_some()
                 || self.finder.is_some(),
+            theme_locked: self.theme_swap.is_some(),
         };
         for region in &mut self.regions {
             let mut context = context;
@@ -753,6 +804,81 @@ impl Shell {
                 }
                 (false, true) => self.regions[index].detach(),
                 _ => {}
+            }
+        }
+    }
+
+    /// Asks for a palette swap, expanding from `origin`. Ignored while one
+    /// is already running — see [`ThemeSwap`] for why that lock exists.
+    pub(super) fn request_theme_swap(&mut self, origin: (f32, f32)) {
+        if self.theme_swap.is_none() {
+            self.theme_swap = Some(ThemeSwap::Requested { origin });
+        }
+    }
+
+    /// Drives the palette swap one frame, and reports whether it wants
+    /// another. Each arm is one step of the sequence [`ThemeSwap`]
+    /// describes; the state is taken rather than borrowed so every arm can
+    /// end the swap simply by not putting one back.
+    fn sync_theme_swap(&mut self, renderer: &mut Renderer, viewport: Rect, dt: Duration) -> bool {
+        let Some(swap) = self.theme_swap.take() else {
+            return false;
+        };
+        match swap {
+            ThemeSwap::Requested { origin } => {
+                // No capture, no still image to wipe, and a wipe over a
+                // window already in the new palette would be a grey circle
+                // sweeping over nothing. Swap outright instead.
+                if !renderer.supports_capture() {
+                    theme::set(theme::counterpart());
+                    return false;
+                }
+                // Empty, and stays empty: the layer exists to be blitted
+                // into, and its own render pass is skipped from the moment
+                // the capture lands.
+                let layer = renderer.new_layer_top(LayerInvalidation::Manual);
+                renderer.capture_into(&layer);
+                self.theme_swap = Some(ThemeSwap::Capturing { origin, layer });
+                true
+            }
+            ThemeSwap::Capturing { origin, layer } => {
+                theme::set(theme::counterpart());
+                // The capture can be refused — a resize between the request
+                // and the frame that served it leaves the layer the wrong
+                // size. The palette still moves; it just moves at once.
+                if !layer.is_frozen() {
+                    return false;
+                }
+                // Radius zero on the first frame: the still image covers the
+                // window exactly, which is what makes the swap underneath it
+                // invisible.
+                wipe(&layer, origin, viewport, 0.0);
+                self.theme_swap = Some(ThemeSwap::Wiping {
+                    origin,
+                    layer,
+                    animation: Animation::new(SWAP_DURATION, Easing::EaseOut),
+                });
+                true
+            }
+            ThemeSwap::Wiping {
+                origin,
+                layer,
+                mut animation,
+            } => {
+                let running = animation.advance(dt);
+                wipe(&layer, origin, viewport, animation.weight());
+                if running {
+                    self.theme_swap = Some(ThemeSwap::Wiping {
+                        origin,
+                        layer,
+                        animation,
+                    });
+                }
+                // Not putting the swap back drops the layer, and with it the
+                // captured frame, the wipe's output texture, and its place
+                // in the composite. Nothing is left allocated for a
+                // transition that has finished.
+                running
             }
         }
     }
@@ -1356,6 +1482,38 @@ impl Shell {
 /// Whether the idle autosave is due: a dirty document whose last activity —
 /// an edit or a save attempt — was at least [`AUTOSAVE_IDLE`] ago. Kept as a
 /// pure function so the debounce is testable without running frames.
+/// Set the wipe on the layer holding the captured frame: a hole centred on
+/// `origin` that has eaten none of it at weight 0 and all of it at weight 1.
+///
+/// The radius runs from just under zero to past the furthest corner, both
+/// by half the feather, so the soft edge is fully outside the window at
+/// each end — otherwise weight 0 would show a faint disc at the switch
+/// before the wipe had started, and weight 1 would leave a smudge in the
+/// far corner after it had finished.
+///
+/// Re-setting the same effect with a new radius patches a uniform rather
+/// than rebuilding the layer's effect, so this costs a buffer write per
+/// frame — see `Layer::set_effect`.
+fn wipe(layer: &Layer, origin: (f32, f32), viewport: Rect, weight: f32) {
+    let corners = [
+        (viewport.x, viewport.y),
+        (viewport.right(), viewport.y),
+        (viewport.right(), viewport.bottom()),
+        (viewport.x, viewport.bottom()),
+    ];
+    let reach = corners
+        .iter()
+        .map(|(x, y)| (x - origin.0).hypot(y - origin.1))
+        .fold(0.0f32, f32::max);
+    let span = reach + SWAP_FEATHER;
+    layer.set_effect(Some(ShaderEffect::RadialWipe {
+        center: origin,
+        radius: weight * span - SWAP_FEATHER / 2.0,
+        feather: SWAP_FEATHER,
+        keep_inside: false,
+    }));
+}
+
 fn autosave_due(last_attempt: Instant, now: Instant, dirty: bool) -> bool {
     dirty && now.saturating_duration_since(last_attempt) >= AUTOSAVE_IDLE
 }

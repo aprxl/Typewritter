@@ -464,6 +464,77 @@ struct ColorMatrixUniform {
     cols: [[f32; 4]; 5],
 }
 
+/// A soft-edged circular wipe — see [`ShaderEffect::RadialWipe`].
+///
+/// The distance test runs against `@builtin(position)`, which is the
+/// fragment's own framebuffer coordinate in physical pixels, so `center`
+/// and `radius` arrive here already scaled and the shader needs no
+/// resolution uniform of its own.
+///
+/// Everything the layer holds is premultiplied by the time it reaches an
+/// effect pass (see `build_composite_pipeline`), so scaling the whole
+/// `vec4` by one coverage factor is the correct fade: colour and alpha
+/// stay in step, and the composite blends the result without a halo.
+const RADIAL_WIPE_SHADER_SRC: &str = r#"
+struct WipeParams {
+    center: vec2<f32>,
+    radius: f32,
+    feather: f32,
+    keep_inside: f32,
+    _pad: f32,
+};
+@group(0) @binding(0) var<uniform> params: WipeParams;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(
+    @location(0) in_pos: vec2<f32>,
+    @location(1) in_uv: vec2<f32>,
+) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = vec4<f32>(in_pos, 0.0, 1.0);
+    out.uv = in_uv;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let c = textureSampleLevel(tex, samp, in.uv, 0.0);
+    let half_band = max(params.feather, 0.0001) * 0.5;
+    let distance_from_centre = distance(in.clip_pos.xy, params.center);
+    let outside = smoothstep(
+        params.radius - half_band,
+        params.radius + half_band,
+        distance_from_centre
+    );
+    let keep = mix(outside, 1.0 - outside, params.keep_inside);
+    return c * keep;
+}
+"#;
+
+/// Uniform buffer layout for [`RADIAL_WIPE_SHADER_SRC`]'s `WipeParams`.
+/// Same padding rule as [`BlurParamsUniform`]: a `vec2<f32>` member gives
+/// the struct 8-byte alignment, so 20 bytes rounds up to 24 and `_pad`
+/// writes that out rather than leaving it implicit.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct RadialWipeUniform {
+    center: [f32; 2],
+    radius: f32,
+    feather: f32,
+    /// `1.0` keeps the disc and erases around it, `0.0` the other way
+    /// round. A float rather than a bool because WGSL uniforms have no
+    /// bool, and `mix` wants it as a weight anyway.
+    keep_inside: f32,
+    _pad: f32,
+}
+
 /// Every GPU resource shared by all layers: the two pipelines and their
 /// bind group layouts, plus the one composite quad every layer's composite
 /// draw reuses. Built once in [`super::Renderer::new`], cloned (cheaply —
@@ -497,6 +568,8 @@ pub(super) struct LayerPipelines {
     blur_bind_group_layout: wgpu::BindGroupLayout,
     colormatrix_pipeline: wgpu::RenderPipeline,
     colormatrix_bind_group_layout: wgpu::BindGroupLayout,
+    radial_wipe_pipeline: wgpu::RenderPipeline,
+    radial_wipe_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl LayerPipelines {
@@ -785,6 +858,19 @@ impl LayerPipelines {
             &colormatrix_bind_group_layout,
         );
 
+        let radial_wipe_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("atomos-layer-radial-wipe-bgl"),
+                entries: &effect_bind_group_layout_entries,
+            });
+        let radial_wipe_pipeline = build_fullscreen_pipeline(
+            device,
+            surface_format,
+            "atomos-layer-radial-wipe",
+            RADIAL_WIPE_SHADER_SRC,
+            &radial_wipe_bind_group_layout,
+        );
+
         Self {
             solid_pipeline,
             screen_size_bind_group_layout,
@@ -799,6 +885,8 @@ impl LayerPipelines {
             blur_bind_group_layout,
             colormatrix_pipeline,
             colormatrix_bind_group_layout,
+            radial_wipe_pipeline,
+            radial_wipe_bind_group_layout,
         }
     }
 }
@@ -953,8 +1041,12 @@ enum EffectGpuKind {
     Blur(Box<BlurEffectGpu>),
     /// One pass: `texture_view` -> `EffectGpu::output_view`.
     ColorMatrix {
-        #[allow(dead_code)]
         matrix_buffer: wgpu::Buffer,
+        bind_group: wgpu::BindGroup,
+    },
+    /// One pass: `texture_view` -> `EffectGpu::output_view`.
+    RadialWipe {
+        params_buffer: wgpu::Buffer,
         bind_group: wgpu::BindGroup,
     },
     /// One pass, caller-supplied pipeline: `texture_view` ->
@@ -974,9 +1066,7 @@ struct BlurEffectGpu {
     #[allow(dead_code)]
     ping_texture: wgpu::Texture,
     ping_view: wgpu::TextureView,
-    #[allow(dead_code)]
     params_buffer_h: wgpu::Buffer,
-    #[allow(dead_code)]
     params_buffer_v: wgpu::Buffer,
     bind_group_h: wgpu::BindGroup,
     bind_group_v: wgpu::BindGroup,
@@ -1147,6 +1237,8 @@ pub(super) struct LayerInner {
     blur_bind_group_layout: wgpu::BindGroupLayout,
     colormatrix_pipeline: wgpu::RenderPipeline,
     colormatrix_bind_group_layout: wgpu::BindGroupLayout,
+    radial_wipe_pipeline: wgpu::RenderPipeline,
+    radial_wipe_bind_group_layout: wgpu::BindGroupLayout,
     // The caller's last `set_effect` request, in *logical* pixels (mirrors
     // every `draw_*` command's own convention) — `rebuild_effect_gpu`
     // scales `ShaderEffect::Blur`'s radius by the layer's *current*
@@ -1190,6 +1282,16 @@ pub(super) struct LayerInner {
 
     pending: Vec<DrawCommand>,
     invalidation: InvalidationState,
+
+    // Set by `Renderer::capture_into`: this layer's texture holds a copy of
+    // a presented frame rather than anything it drew, so its own render
+    // pass is skipped entirely — that pass begins by clearing the texture,
+    // which would wipe the capture on the very next frame.
+    //
+    // Cleared by `resize_if_needed`, because a resize replaces the texture
+    // with a fresh, never-rendered one: staying frozen would composite
+    // whatever the driver left in it.
+    frozen: bool,
 }
 
 /// GPU state for one `DrawCommand::Image`, rebuilt whenever the layer
@@ -1305,6 +1407,8 @@ impl LayerInner {
             blur_bind_group_layout: pipelines.blur_bind_group_layout.clone(),
             colormatrix_pipeline: pipelines.colormatrix_pipeline.clone(),
             colormatrix_bind_group_layout: pipelines.colormatrix_bind_group_layout.clone(),
+            radial_wipe_pipeline: pipelines.radial_wipe_pipeline.clone(),
+            radial_wipe_bind_group_layout: pipelines.radial_wipe_bind_group_layout.clone(),
             effect: None,
             effect_gpu: None,
             clip_rect: None,
@@ -1313,6 +1417,7 @@ impl LayerInner {
             scale_factor,
             pending: Vec::new(),
             invalidation: invalidation_state,
+            frozen: false,
         }
     }
 
@@ -1346,6 +1451,9 @@ impl LayerInner {
             return;
         }
         self.size = size;
+        // The capture this layer was holding was the size of the old
+        // surface and is gone with the old texture — see `frozen`.
+        self.frozen = false;
         let (texture, texture_view) = create_layer_texture(&self.device, self.format, size);
         self.queue.write_buffer(
             &self.screen_size_buffer,
@@ -1414,6 +1522,96 @@ impl LayerInner {
     /// human-timescale resize rates. Split "rebuild textures/bind-groups"
     /// from "rebuild pipeline" if profiling ever shows resize hitching
     /// with a `Custom` effect active.
+    /// The two [`BlurParamsUniform`]s (horizontal pass, then vertical) for
+    /// a blur of `radius` *logical* pixels at this layer's current size and
+    /// DPI — see the `effect` field's doc for why the radius is stored in
+    /// logical units and re-derived here rather than baked in once.
+    fn blur_uniforms(&self, radius: f32) -> [BlurParamsUniform; 2] {
+        let texel_size = [
+            1.0 / self.size.0.max(1) as f32,
+            1.0 / self.size.1.max(1) as f32,
+        ];
+        let radius = radius * self.scale_factor;
+        [[1.0, 0.0], [0.0, 1.0]].map(|direction| BlurParamsUniform {
+            direction,
+            texel_size,
+            radius,
+            _pad: 0.0,
+        })
+    }
+
+    /// The [`RadialWipeUniform`] for `effect` at this layer's current DPI.
+    /// Panics on any other variant — only [`LayerInner::rebuild_effect_gpu`]
+    /// and [`LayerInner::update_effect_uniforms`] call it, both having
+    /// matched the variant already.
+    fn radial_wipe_uniform(&self, effect: &ShaderEffect) -> RadialWipeUniform {
+        let ShaderEffect::RadialWipe {
+            center,
+            radius,
+            feather,
+            keep_inside,
+        } = effect
+        else {
+            unreachable!("radial_wipe_uniform is only reached with a RadialWipe effect");
+        };
+        let s = self.scale_factor;
+        RadialWipeUniform {
+            center: [center.0 * s, center.1 * s],
+            radius: radius * s,
+            feather: feather * s,
+            keep_inside: if *keep_inside { 1.0 } else { 0.0 },
+            _pad: 0.0,
+        }
+    }
+
+    /// Try to answer a `set_effect` call by rewriting the uniform buffer
+    /// the active effect already owns, instead of rebuilding it.
+    ///
+    /// Every built-in effect's *shape* — which passes run, how big their
+    /// scratch textures are, what samples what — depends only on the
+    /// variant and the layer's size, never on the numbers inside it. So a
+    /// caller animating a parameter (a wipe's radius growing frame by
+    /// frame, a colour matrix easing in) is asking for a buffer write, and
+    /// rebuilding would hand it a fresh surface-sized output texture on
+    /// every frame of the animation instead.
+    ///
+    /// Returns `false` when the request is a genuine change of effect — a
+    /// different variant, or none at all — which is
+    /// [`LayerInner::rebuild_effect_gpu`]'s job.
+    fn update_effect_uniforms(&self, effect: &ShaderEffect) -> bool {
+        let Some(gpu) = &self.effect_gpu else {
+            return false;
+        };
+        match (&gpu.kind, effect) {
+            (EffectGpuKind::Blur(blur), ShaderEffect::Blur { radius }) => {
+                let [horizontal, vertical] = self.blur_uniforms(*radius);
+                self.queue
+                    .write_buffer(&blur.params_buffer_h, 0, bytemuck::bytes_of(&horizontal));
+                self.queue
+                    .write_buffer(&blur.params_buffer_v, 0, bytemuck::bytes_of(&vertical));
+                true
+            }
+            (
+                EffectGpuKind::ColorMatrix { matrix_buffer, .. },
+                ShaderEffect::ColorMatrix(matrix),
+            ) => {
+                let uniform = ColorMatrixUniform {
+                    cols: matrix.to_columns(),
+                };
+                self.queue
+                    .write_buffer(matrix_buffer, 0, bytemuck::bytes_of(&uniform));
+                true
+            }
+            (EffectGpuKind::RadialWipe { params_buffer, .. }, ShaderEffect::RadialWipe { .. }) => {
+                let uniform = self.radial_wipe_uniform(effect);
+                self.queue
+                    .write_buffer(params_buffer, 0, bytemuck::bytes_of(&uniform));
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn rebuild_effect_gpu(&mut self) {
         let Some(effect) = self.effect.clone() else {
             self.effect_gpu = None;
@@ -1426,36 +1624,22 @@ impl LayerInner {
 
         let kind = match &effect {
             ShaderEffect::Blur { radius } => {
-                let physical_radius = radius * self.scale_factor;
                 let (ping_texture, ping_view) =
                     create_layer_texture(&self.device, self.format, self.size);
-                let texel_size = [
-                    1.0 / self.size.0.max(1) as f32,
-                    1.0 / self.size.1.max(1) as f32,
-                ];
+                let [horizontal, vertical] = self.blur_uniforms(*radius);
                 let params_buffer_h =
                     self.device
                         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("atomos-layer-blur-params-h"),
-                            contents: bytemuck::bytes_of(&BlurParamsUniform {
-                                direction: [1.0, 0.0],
-                                texel_size,
-                                radius: physical_radius,
-                                _pad: 0.0,
-                            }),
-                            usage: wgpu::BufferUsages::UNIFORM,
+                            contents: bytemuck::bytes_of(&horizontal),
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         });
                 let params_buffer_v =
                     self.device
                         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("atomos-layer-blur-params-v"),
-                            contents: bytemuck::bytes_of(&BlurParamsUniform {
-                                direction: [0.0, 1.0],
-                                texel_size,
-                                radius: physical_radius,
-                                _pad: 0.0,
-                            }),
-                            usage: wgpu::BufferUsages::UNIFORM,
+                            contents: bytemuck::bytes_of(&vertical),
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         });
                 let bind_group_h = create_effect_bind_group(
                     &self.device,
@@ -1488,7 +1672,7 @@ impl LayerInner {
                             contents: bytemuck::bytes_of(&ColorMatrixUniform {
                                 cols: matrix.to_columns(),
                             }),
-                            usage: wgpu::BufferUsages::UNIFORM,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         });
                 let bind_group = create_effect_bind_group(
                     &self.device,
@@ -1499,6 +1683,26 @@ impl LayerInner {
                 );
                 EffectGpuKind::ColorMatrix {
                     matrix_buffer,
+                    bind_group,
+                }
+            }
+            ShaderEffect::RadialWipe { .. } => {
+                let params_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("atomos-layer-radial-wipe-params"),
+                            contents: bytemuck::bytes_of(&self.radial_wipe_uniform(&effect)),
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        });
+                let bind_group = create_effect_bind_group(
+                    &self.device,
+                    &self.radial_wipe_bind_group_layout,
+                    &params_buffer,
+                    &self.texture_view,
+                    &self.composite_sampler,
+                );
+                EffectGpuKind::RadialWipe {
+                    params_buffer,
                     bind_group,
                 }
             }
@@ -1568,6 +1772,15 @@ impl LayerInner {
                 run_fullscreen_pass(
                     encoder,
                     &self.colormatrix_pipeline,
+                    bind_group,
+                    &effect_gpu.output_view,
+                    &self.composite_quad_vbuf,
+                );
+            }
+            EffectGpuKind::RadialWipe { bind_group, .. } => {
+                run_fullscreen_pass(
+                    encoder,
+                    &self.radial_wipe_pipeline,
                     bind_group,
                     &effect_gpu.output_view,
                     &self.composite_quad_vbuf,
@@ -1878,6 +2091,11 @@ impl LayerInner {
     /// geometry (an empty `pending` still needs its texture cleared to
     /// transparent so it doesn't keep showing stale content).
     fn render_to_texture(&self, encoder: &mut wgpu::CommandEncoder, msaa_view: &wgpu::TextureView) {
+        // A frozen layer's texture is a captured frame, not something it
+        // drew; the pass below would clear it before drawing nothing.
+        if self.frozen {
+            return;
+        }
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("atomos-layer-pass"),
             // Render into the renderer's shared multisampled scratch
@@ -1953,6 +2171,24 @@ impl LayerInner {
         }
     }
 
+    /// This layer's own texture — the copy destination for
+    /// [`super::Renderer::capture_into`].
+    pub(super) fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    /// Physical size of that texture, for the caller to check a capture
+    /// against before recording a copy.
+    pub(super) fn texture_size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// Hold whatever is in the texture now instead of drawing over it —
+    /// see the `frozen` field.
+    pub(super) fn freeze(&mut self) {
+        self.frozen = true;
+    }
+
     /// Composite this layer's already-rendered texture onto `view`
     /// (expected to already contain everything drawn below it — the caller
     /// is responsible for `LoadOp::Load` and drawing layers in
@@ -1988,7 +2224,13 @@ fn create_layer_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        // `COPY_DST` is for `Renderer::capture_into`, which blits the
+        // presented frame straight into a layer's texture. It costs
+        // nothing to allow — a usage flag is a promise about what the
+        // texture may be asked to do, not an allocation.
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -2183,6 +2425,7 @@ fn clip_shape_to_command(shape: &ClipShape, s: f32) -> DrawCommand {
             d: d.clone(),
             position: [position.0 * s, position.1 * s],
             scale: s,
+            rotation: 0.0,
             paint: PathPaint::fill(WHITE),
         },
     }
@@ -2245,8 +2488,17 @@ fn tessellate_command(
             d,
             position,
             scale,
+            rotation,
             paint,
-        } => tessellate_svg_path(d, *position, *scale, paint, tessellator, stroke_tessellator),
+        } => tessellate_svg_path(
+            d,
+            *position,
+            *scale,
+            *rotation,
+            paint,
+            tessellator,
+            stroke_tessellator,
+        ),
         // Handled directly in `LayerInner::build_buffers`, which needs its
         // own texture per image rather than a shared vertex/index buffer
         // — filtered out before ever reaching here.
@@ -2430,13 +2682,22 @@ fn tessellate_stroked(
 /// Tessellate an SVG `d` string, re-parsed here (see [`DrawCommand::Path`]
 /// for why): the parsed path is scaled to physical pixels first (see
 /// [`scale_path`]), then filled and/or stroked per `paint` — each resolving
-/// color against the path's own (scaled) local bounding box — and finally
-/// translated by `position` (already physical-pixel scaled by the caller,
-/// same as every other `draw_*` method — see `Layer::draw_path`).
+/// color against the path's own (scaled) local bounding box — then turned
+/// by `rotation` about that box's centre, and finally translated by
+/// `position` (already physical-pixel scaled by the caller, same as every
+/// other `draw_*` method — see `Layer::draw_path`).
+///
+/// Rotating the tessellated vertices rather than the parsed path means the
+/// curve flattening tolerance is applied in the shape's own upright frame,
+/// which is the frame the tolerance was chosen for; it also leaves colour
+/// resolution reading the same upright bounding box, so a gradient turns
+/// with the shape instead of staying pinned to the screen axes.
+#[allow(clippy::too_many_arguments)]
 fn tessellate_svg_path(
     d: &str,
     position: [f32; 2],
     scale: f32,
+    rotation: f32,
     paint: &PathPaint,
     tessellator: &mut FillTessellator,
     stroke_tessellator: &mut StrokeTessellator,
@@ -2480,6 +2741,18 @@ fn tessellate_svg_path(
             append_geometry(&mut vertices, &mut indices, v, i);
             let (v, i) = tessellate_stroked(&path, stroke, scale, min, max, stroke_tessellator);
             append_geometry(&mut vertices, &mut indices, v, i);
+        }
+    }
+
+    if rotation != 0.0 {
+        let (sin, cos) = rotation.sin_cos();
+        let pivot = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5];
+        for vertex in &mut vertices {
+            let x = vertex.position[0] - pivot[0];
+            let y = vertex.position[1] - pivot[1];
+            // Screen y grows downward, so this is a clockwise turn.
+            vertex.position[0] = pivot[0] + x * cos - y * sin;
+            vertex.position[1] = pivot[1] + x * sin + y * cos;
         }
     }
 
@@ -2769,8 +3042,27 @@ impl Layer {
         position: (f32, f32),
         paint: PathPaint,
     ) -> Result<(), lyon_extra::parser::ParseError> {
+        self.draw_path_rotated(d, position, 0.0, paint)
+    }
+
+    /// [`Layer::draw_path`], turned by `rotation` radians clockwise about
+    /// the path's own bounding-box centre.
+    ///
+    /// The pivot is the shape's centre rather than `position` because that
+    /// is what "turn this thing" means for every caller that has one: an
+    /// icon tilting on hover, a chevron swinging open, a spinner. Rotating
+    /// about the origin instead would send the shape off across the
+    /// window, and every caller would have to undo that with a translate
+    /// of its own.
+    pub fn draw_path_rotated(
+        &self,
+        d: &str,
+        position: (f32, f32),
+        rotation: f32,
+        paint: PathPaint,
+    ) -> Result<(), lyon_extra::parser::ParseError> {
         let s = self.scale_factor();
-        self.push_path_command(d, [position.0 * s, position.1 * s], s, paint)
+        self.push_path_command(d, [position.0 * s, position.1 * s], s, rotation, paint)
     }
 
     /// Draw an SVG icon whose `d` was authored against `viewbox` (the
@@ -2796,6 +3088,24 @@ impl Layer {
         position: (f32, f32),
         paint: PathPaint,
     ) -> Result<(), lyon_extra::parser::ParseError> {
+        self.draw_svg_icon_rotated(d, viewbox, size, position, 0.0, paint)
+    }
+
+    /// [`Layer::draw_svg_icon`], turned by `rotation` radians clockwise
+    /// about the icon's own centre — see [`Layer::draw_path_rotated`] for
+    /// why the centre is the pivot.
+    // Six params, five distinct types, and the alternative is a params
+    // struct for one method — the same call `LayerInner::new` already made.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_svg_icon_rotated(
+        &self,
+        d: &str,
+        viewbox: (f32, f32, f32, f32),
+        size: (f32, f32),
+        position: (f32, f32),
+        rotation: f32,
+        paint: PathPaint,
+    ) -> Result<(), lyon_extra::parser::ParseError> {
         let (min_x, min_y, vb_width, _vb_height) = viewbox;
         let dpi_s = self.scale_factor();
         let icon_scale = size.0 / vb_width;
@@ -2804,7 +3114,7 @@ impl Layer {
             dpi_s * (position.0 - min_x * icon_scale),
             dpi_s * (position.1 - min_y * icon_scale),
         ];
-        self.push_path_command(d, position_physical, scale, paint)
+        self.push_path_command(d, position_physical, scale, rotation, paint)
     }
 
     /// Shared by [`Layer::draw_path`]/[`Layer::draw_svg_icon`] — both just
@@ -2816,6 +3126,7 @@ impl Layer {
         d: &str,
         position: [f32; 2],
         scale: f32,
+        rotation: f32,
         paint: PathPaint,
     ) -> Result<(), lyon_extra::parser::ParseError> {
         debug_assert!(
@@ -2827,6 +3138,7 @@ impl Layer {
             d: d.to_string(),
             position,
             scale,
+            rotation,
             paint,
         });
         Ok(())
@@ -3022,8 +3334,35 @@ impl Layer {
     /// layer without an effect rather than panicking.
     pub fn set_effect(&self, effect: Option<ShaderEffect>) {
         let mut inner = self.0.borrow_mut();
+        // Same effect, different numbers: patch the uniform and keep every
+        // texture and bind group already built for it. This is what makes
+        // an animated parameter — a wipe's radius, a matrix easing in —
+        // cost a buffer write per frame instead of a surface-sized texture
+        // per frame. See `LayerInner::update_effect_uniforms`.
+        if let Some(effect) = &effect
+            && inner.update_effect_uniforms(effect)
+        {
+            inner.effect = Some(effect.clone());
+            return;
+        }
         inner.effect = effect;
         inner.rebuild_effect_gpu();
+    }
+
+    /// Whether this layer is holding a captured frame rather than its own
+    /// drawing — see [`super::Renderer::capture_into`].
+    pub fn is_frozen(&self) -> bool {
+        self.0.borrow().frozen
+    }
+
+    /// Release a captured frame and let the layer draw itself again. The
+    /// captured pixels are gone from the next frame on; the layer's own
+    /// `draw_*` content (still queued, for a `Manual` layer) comes back.
+    ///
+    /// Dropping the layer does the same thing and frees the texture with
+    /// it, which is what a one-shot transition should do instead.
+    pub fn thaw(&self) {
+        self.0.borrow_mut().frozen = false;
     }
 
     /// Restrict this layer's rendering to an axis-aligned rectangle

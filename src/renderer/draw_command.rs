@@ -42,6 +42,12 @@ pub(super) enum DrawCommand {
         d: String,
         position: [f32; 2],
         scale: f32,
+        /// Radians, clockwise on screen, about the scaled path's own
+        /// bounding-box centre — applied after `scale` and before
+        /// `position`, so a rotated icon spins in place instead of
+        /// orbiting the origin. Zero from the plain
+        /// `draw_path`/`draw_svg_icon` entry points.
+        rotation: f32,
         paint: PathPaint,
     },
     /// Re-uploaded to the GPU on every rebuild, same as every other
@@ -125,12 +131,14 @@ impl Hash for DrawCommand {
                 d,
                 position,
                 scale,
+                rotation,
                 paint,
             } => {
                 state.write_u8(3);
                 d.hash(state);
                 hash_f32_pair(position, state);
                 state.write_u32(scale.to_bits());
+                state.write_u32(rotation.to_bits());
                 hash_path_paint(paint, state);
             }
             DrawCommand::Image {

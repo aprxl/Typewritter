@@ -29,6 +29,7 @@ pub mod sidenotes;
 pub mod slash_menu;
 pub mod status_line;
 pub mod tab_strip;
+pub mod theme_switch;
 pub mod title_bar;
 pub mod topics;
 

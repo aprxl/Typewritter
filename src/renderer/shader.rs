@@ -30,6 +30,29 @@ pub enum ShaderEffect {
     Blur { radius: f32 },
     /// A 4x5 color transform applied to every pixel — see [`ColorMatrix`].
     ColorMatrix(ColorMatrix),
+    /// A soft-edged circular wipe: the layer keeps its pixels on one side
+    /// of a circle and fades to fully transparent on the other, so
+    /// whatever is composited *under* the layer shows through there.
+    ///
+    /// `center` is in logical pixels, in the same top-left origin every
+    /// `draw_*` call uses; `radius` and `feather` are logical pixels too
+    /// (like [`ShaderEffect::Blur`]'s radius), scaled to physical
+    /// internally. The boundary is not a hard cut: coverage ramps across a
+    /// band `feather` wide, centred on `radius`, which is what keeps an
+    /// animated wipe from showing a stair-stepped edge as it sweeps.
+    /// `keep_inside` picks which side survives — `false` erases a growing
+    /// hole outward from `center`, `true` keeps a growing disc and erases
+    /// everything around it.
+    ///
+    /// Animating `radius` is the intended use, and is cheap: only the
+    /// uniform changes, so `Layer::set_effect` patches it in place rather
+    /// than rebuilding the effect's textures (see that method).
+    RadialWipe {
+        center: (f32, f32),
+        radius: f32,
+        feather: f32,
+        keep_inside: bool,
+    },
     /// A caller-supplied WGSL module, compiled against a fixed contract:
     ///
     /// ```wgsl
@@ -185,11 +208,7 @@ impl ColorMatrix {
         let keep = 1.0 - amount;
         // Linear-light, like every other colour that reaches a shader —
         // this one blends against pixels that are already in that space.
-        let target = [
-            to_linear(rgba[0]),
-            to_linear(rgba[1]),
-            to_linear(rgba[2]),
-        ];
+        let target = [to_linear(rgba[0]), to_linear(rgba[1]), to_linear(rgba[2])];
         Self([
             keep,
             0.0,

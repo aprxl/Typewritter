@@ -93,6 +93,9 @@ pub struct Context {
     /// Something is drawn over the whole window — the onboarding splash or
     /// a dialog. Everything underneath is a picture until it closes.
     pub overlay_open: bool,
+    /// A palette swap is still running. The switch refuses clicks until it
+    /// finishes, and says so by holding itself at rest.
+    pub theme_locked: bool,
 }
 
 impl Context {
