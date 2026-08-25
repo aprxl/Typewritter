@@ -466,64 +466,79 @@ fn big_op(
 /// The integral sign's shape, in a design space where x is a fraction of the
 /// sign's width and y a fraction of its height measured from the centre.
 ///
-/// Three cubics, not one: a hook, a near-straight spine, and the hook again.
-/// One cubic can only bow — it cannot hold a straight middle and turn
-/// tightly at both ends, which is the whole silhouette of an integral.
+/// Three cubics: a hook, a straight spine, and the hook again. One cubic can
+/// only bow — it cannot hold a straight middle and turn at both ends, which
+/// is the whole silhouette of an integral.
+///
+/// Two things make it read as one continuous stroke rather than three
+/// pieces. The spine is exactly straight, so the eye follows it. And each
+/// hook leaves the join along the spine's own direction, so the tangent is
+/// continuous and there is no corner where they meet — that join is where a
+/// hand-built integral looks broken, and it is enforced here by construction
+/// rather than by choosing control points that happen to line up.
+///
+/// The hooks turn *outward* — right at the top, left at the bottom — the way
+/// the notation does. Arcing back over the spine instead gives a flat shelf
+/// and puts the terminal on the wrong side.
 ///
 /// The sign is point-symmetric about `(0.5, 0)`, so only the top half is
 /// written down here and [`integral_points`] mirrors it. Mirroring a point
-/// is `(1 - x, -y)`, and mirroring a *segment* also reverses its two
-/// controls, which is why the bottom hook reads backwards against the top.
+/// is `(1 - x, -y)`.
 mod integral {
-    /// The hook's share of the height, measured from the very top.
-    pub const HOOK: f32 = 0.21;
-    /// Where the terminal sits across the width, and how far down inside the
-    /// hook it hangs as a share of [`HOOK`]. The tip points back down and
-    /// inwards, the way a pen leaves the stroke — it is the hang that tells
-    /// an integral from a plain swash, so it is most of the hook's depth.
-    pub const TIP_X: f32 = 0.34;
-    pub const TIP_DROP: f32 = 0.78;
-    /// How far sideways the hook throws its control. Past the edge on
-    /// purpose: a cubic's extreme lies well inside its controls, so this is
-    /// what gives the hook a real shoulder instead of a lazy curve.
-    pub const SWEEP: f32 = 1.30;
-    /// Where the spine leaves the hook, and its own control — close to
-    /// `SPINE_X` so the middle stays near-vertical rather than bulging.
-    pub const SPINE_X: f32 = 0.62;
-    pub const LEAN: f32 = 0.55;
-    /// How far along the spine its controls sit. A third keeps it straight.
-    pub const LEAN_ALONG: f32 = 0.34;
+    /// The hook's share of the height, measured from the very top. The rest
+    /// is spine.
+    pub const HOOK: f32 = 0.22;
+    /// How far the spine's top end sits right of centre. Deliberately small:
+    /// the sign should read as a barely-slanted vertical with something
+    /// hanging off each end, not as a diagonal.
+    pub const LEAN: f32 = 0.10;
+    /// How far the hook's first control runs back up the spine's own line,
+    /// as a share of the spine's length. This is the whole reason the stroke
+    /// reads as continuous: the hook leaves the join along exactly the
+    /// direction the spine arrives on, so there is no corner to see. Any
+    /// positive value is smooth; the size decides how tight the curl is.
+    pub const CONTINUE: f32 = 0.34;
+    /// The terminal, and the control that carries the stroke up over the
+    /// apex and back down into it. The tip sits outboard of the spine and
+    /// *below* the apex — that overhang is the hang, and it is what tells an
+    /// integral from a long s.
+    pub const TIP: (f32, f32) = (0.99, -0.38);
+    pub const CURL: (f32, f32) = (0.92, -0.58);
 }
 
 /// The ten points of the integral's three cubics, in design space:
 /// `[start, c1, c2, end, c1, c2, end, c1, c2, end]`.
+///
+/// Travel runs top tip → spine → bottom tip, so the top hook is written
+/// backwards against the direction it was designed in (out from the spine),
+/// which is why its two controls appear swapped.
 fn integral_points() -> [(f32, f32); 10] {
     use integral::*;
-    // Only the top is written down; `mirror` supplies the rest.
-    let top = -0.5;
     let mirror = |(x, y): (f32, f32)| (1.0 - x, -y);
 
-    let tip = (TIP_X, top + HOOK * TIP_DROP);
-    let hook_c1 = (TIP_X, top);
-    let hook_c2 = (SWEEP, top);
-    let spine_top = (SPINE_X, top + HOOK);
+    let spine_top = (0.5 + LEAN, -0.5 + HOOK);
     let spine_bottom = mirror(spine_top);
-    let along = (spine_bottom.1 - spine_top.1) * LEAN_ALONG;
-    let spine_c1 = (LEAN, spine_top.1 + along);
+    let down = (spine_bottom.0 - spine_top.0, spine_bottom.1 - spine_top.1);
+    let along = |from: (f32, f32), share: f32| (from.0 + down.0 * share, from.1 + down.1 * share);
+
+    // Controls a third and two thirds down make the spine exactly straight:
+    // four collinear, evenly spaced points are a line, not a curve.
+    let spine_c1 = along(spine_top, 1.0 / 3.0);
+    // Backwards along the same line, so the hook and the spine share a
+    // tangent at the join.
+    let hook_c1 = along(spine_top, -CONTINUE);
 
     [
-        tip,
+        TIP,
+        CURL,
         hook_c1,
-        hook_c2,
         spine_top,
         spine_c1,
         mirror(spine_c1),
         spine_bottom,
-        // The top hook mirrored *and* reversed: a segment's controls swap
-        // when the direction of travel does.
-        mirror(hook_c2),
         mirror(hook_c1),
-        mirror(tip),
+        mirror(CURL),
+        mirror(TIP),
     ]
 }
 
@@ -2595,11 +2610,43 @@ mod tests {
         )
     }
 
+    /// "One continuous thing" is a measurable property: the direction the
+    /// stroke travels must never jump. Three cubics joined carelessly corner
+    /// where they meet, and that corner is exactly what reads as the spine
+    /// stopping and a hook starting. Walks the sampled curve and bounds the
+    /// turn between consecutive steps.
+    #[test]
+    fn the_integral_never_corners() {
+        let sign = integral_sign(false, 0, 1.0);
+        let BoxKind::Primitive(MathPrimitive::Stroke { path, .. }) = &sign.kind else {
+            panic!("integral must be a stroked primitive");
+        };
+        let samples = stroke_samples(path);
+        let mut sharpest: f32 = 0.0;
+        for window in samples.windows(3) {
+            let (a, b, c) = (window[0], window[1], window[2]);
+            let (u, v) = ((b.0 - a.0, b.1 - a.1), (c.0 - b.0, c.1 - b.1));
+            let (mu, mv) = (u.0.hypot(u.1), v.0.hypot(v.1));
+            if mu < 1e-6 || mv < 1e-6 {
+                continue;
+            }
+            let cos = ((u.0 * v.0 + u.1 * v.1) / (mu * mv)).clamp(-1.0, 1.0);
+            sharpest = sharpest.max(cos.acos().to_degrees());
+        }
+        // Each step is a two-hundredth of a segment, so a smooth curve turns
+        // a fraction of a degree per step. A tangent break at a join shows up
+        // here as several degrees at once.
+        assert!(
+            sharpest < 3.0,
+            "the stroke corners by {sharpest:.1}° somewhere; it must flow"
+        );
+    }
+
     /// The silhouette that makes an integral an integral, and the reason it
-    /// is three cubics rather than one: a long near-straight spine through
-    /// the middle, and at each end a hook that reaches *wider* than the spine
-    /// ever does and then hangs back down past its own widest point. One
-    /// cubic can only bow, which reads as a parenthesis.
+    /// is three cubics rather than one: a straight spine through the middle,
+    /// and at each end a hook turning outward past the spine and hanging back
+    /// below its own apex. One cubic can only bow, which reads as a
+    /// parenthesis.
     #[test]
     fn the_integral_has_a_straight_spine_and_a_hooked_terminal() {
         let sign = integral_sign(false, 0, 1.0);
@@ -2628,35 +2675,31 @@ mod tests {
             })
             .fold(0.0, f32::max);
         assert!(
-            drift < sign.width * 0.06,
-            "spine bows {drift:.2}px, more than a straight stroke should"
+            drift < sign.width * 0.02,
+            "spine bows {drift:.2}px; it is meant to be straight"
+        );
+        // Barely slanted, not diagonal.
+        assert!(
+            (last.0 - first.0).abs() < sign.width * 0.35,
+            "the spine leans {:.2}px across the sign; it should read vertical",
+            (last.0 - first.0).abs()
         );
 
-        // The hook reaches wider than the spine does, and its tip then hangs
-        // back *below* the point where it was widest — that hang is the
-        // terminal, and a plain bow has none.
+        // The hook turns outward past the spine, and its tip hangs back
+        // below the apex it just came over. That overhang is the hang, and a
+        // plain bow has none.
         let spine_max_x = spine.iter().fold(f32::MIN, |m, &(x, _)| m.max(x));
-        let (widest_x, widest_y) =
-            samples.iter().copied().fold(
-                (f32::MIN, 0.0),
-                |best, (x, y)| {
-                    if x > best.0 { (x, y) } else { best }
-                },
-            );
-        assert!(
-            widest_x > spine_max_x + sign.width * 0.15,
-            "the hook must reach past the spine: {widest_x:.2} vs {spine_max_x:.2}"
-        );
         let tip = samples[0];
         assert!(
-            tip.1 > widest_y,
-            "the top tip must hang below the hook's shoulder: {:.2} vs {:.2}",
-            tip.1,
-            widest_y
+            tip.0 > spine_max_x + sign.width * 0.2,
+            "the hook must turn outward past the spine: {:.2} vs {spine_max_x:.2}",
+            tip.0
         );
+        let apex = samples.iter().fold(f32::MAX, |m, &(_, y)| m.min(y));
         assert!(
-            tip.1 - (-sign.ascent) > height * 0.08,
-            "the hang is too shallow to read as a terminal"
+            tip.1 - apex > height * 0.06,
+            "the tip must hang below the apex; hang was {:.2}px",
+            tip.1 - apex
         );
     }
 
