@@ -628,6 +628,22 @@ pub fn vertical_rule(layer: &Layer, at: (f32, f32), length: f32, thickness: f32,
     layer.draw_rectangle(at, (thickness, length), color, Rounding::NONE);
 }
 
+/// Draws a filled glyph from the Material Symbols set — these are filled
+/// shapes authored in a `0 -960 960 960` viewbox, not the stroked feather
+/// glyphs [`icon`] draws, so they need their own helper rather than a pen.
+/// `at` is the top-left corner of the `size`-square the glyph fills.
+pub fn material(layer: &Layer, d: &str, at: (f32, f32), size: f32, color: Color) {
+    layer
+        .draw_svg_icon(
+            d,
+            (0.0, -960.0, 960.0, 960.0),
+            (size, size),
+            at,
+            crate::renderer::PathPaint::fill(color),
+        )
+        .expect("material icon paths are constants — a parse failure is a typo, not input");
+}
+
 /// A 1px outline, drawn as four rules.
 pub fn outline(layer: &Layer, rect: Rect, color: Color) {
     rule(layer, rect.position(), rect.width, 1.0, color.clone());

@@ -4,10 +4,13 @@
 //! Unlike the generic [`ContextMenu`](super::ContextMenu), which is a list,
 //! this is a horizontal strip of affordances — a text-editor style format
 //! bar. The iconic options (Bold, Italic) are letterform buttons; the rest
-//! are drawn with the very effect they would apply, so "Highlight" sits on
-//! a highlight wash, "Inline code" on a code slab, and "Badge" in a badge
-//! chip. The tool feels alive on purpose: the bar fades up from the clicked
-//! word, and the hovered cell's pill *slides* across as the pointer moves.
+//! are Material Symbol icons drawn with the very effect they would apply,
+//! so "Highlight" is a marker on a highlight wash, "Inline code" a
+//! `</>` on a code slab, and "Badge" a badge glyph in its own ink. A close
+//! affordance sits at the far edge. The tool feels alive on purpose: the
+//! bar fades up from the clicked word, the hovered cell's pill *slides*
+//! across as the pointer moves, and the word's active formats get a bright
+//! accent ring around their cell.
 //!
 //! Same snapshot relationship as the palette and the context menu: the
 //! shell owns the live selection, checked states, and keystrokes; this
@@ -32,12 +35,14 @@ pub enum Kind {
     Bold,
     /// The letter I drawn italic — the icon for italic.
     Italic,
-    /// The text on a highlight wash, drawn using the highlight effect.
+    /// A highlighter marker, drawn on a highlight wash.
     Highlight,
-    /// The text on a code slab, drawn like an inline code span.
+    /// A `</>` glyph, drawn on a code slab.
     InlineCode,
-    /// The text as a badge chip.
+    /// A badge glyph, drawn in the badge ink.
     Badge,
+    /// The close affordance at the bar's far edge.
+    Dismiss,
 }
 
 /// Map a formatting command id (from the shell's `WORD_MENU`) to its cell.
@@ -61,36 +66,54 @@ pub struct Item {
     pub checked: bool,
 }
 
+/// The Material Symbols this bar draws, read from `resources/`. Kept here —
+/// next to the widget that owns them — rather than in the shared icon set,
+/// because they are filled glyphs only this bar uses.
+mod glyphs {
+    /// The highlighter marker — the icon for Highlight.
+    pub const MARKER: &str = "m272-104-38-38-42 42q-19 19-46.5 19.5T100-100q-19-19-19-46t19-46l42-42-38-40 554-554q12-12 29-12t29 12l112 112q12 12 12 29t-12 29L272-104Zm172-396L216-274l58 58 226-228-56-56Z";
+    /// The `</>` code icon — the icon for Inline code.
+    pub const CODE: &str = "M320-240 80-480l240-240 57 57-184 184 183 183-56 56Zm320 0-57-57 184-184-183-183 56-56 240 240-240 240Z";
+    /// The badge tag — the icon for Badge.
+    pub const BADGE: &str = "M160-160q-33 0-56.5-23.5T80-240v-480q0-33 23.5-56.5T160-800h440q19 0 36 8.5t28 23.5l216 288-216 288q-11 15-28 23.5t-36 8.5H160Zm0-80h440l180-240-180-240H160v480Zm220-240Z";
+    /// The close X — the dismiss affordance.
+    pub const CLOSE: &str = "m336-280-56-56 144-144-144-143 56-56 144 144 143-144 56 56-144 143 144 144-56 56-143-144-144 144Z";
+}
+
 const CARD_PAD_X: f32 = 6.0;
 const CARD_PAD_Y: f32 = 5.0;
 const CELL_H: f32 = 24.0;
 const ICON_W: f32 = 30.0;
+const CHIP_W: f32 = 38.0;
 const GAP: f32 = 4.0;
-/// The wider channel between the icon buttons and the effect chips; a thin
-/// rule sits in it so the two ranks read as groups rather than one row.
+/// The wider channel where a divider rule sits — between the letterforms
+/// and the effect chips, and between the chips and the close affordance.
 const DIV_GAP: f32 = 10.0;
 /// Corner radius of the card and of each cell — a bar reads as modern when
 /// its shoulders are soft rather than square.
 const RADIUS: f32 = 9.0;
-/// Height of the accent bar under a checked affordance.
-const CHECK_BAR: f32 = 2.5;
+/// Thickness of the bright accent ring around a checked/active cell.
+const RING: f32 = 1.6;
 
-fn is_icon(kind: Kind) -> bool {
-    kind == Kind::Bold || kind == Kind::Italic
+/// Which visual rank a cell belongs to, for the divider placement — 0 the
+/// letterforms, 1 the effect chips, 2 the dismiss. Moving between ranks
+/// takes the wider channel.
+fn rank(kind: Kind) -> u8 {
+    match kind {
+        Kind::Bold | Kind::Italic => 0,
+        Kind::Highlight | Kind::InlineCode | Kind::Badge => 1,
+        Kind::Dismiss => 2,
+    }
 }
 
-/// How wide a cell is, by kind. Icon cells are squares; a text chip is wide
-/// enough for its label in the bar's own fonts. Deliberately a constant
-/// rather than a measure: the drawing and the shell's hit-test share these
-/// numbers, and two pieces of geometry can disagree only if one of them
-/// measures text and the other doesn't.
+/// How wide a cell is, by kind. Deliberately a constant rather than a
+/// measure: the drawing and the shell's hit-test share these numbers, and
+/// two pieces of geometry can disagree only if one of them measures text
+/// and the other doesn't.
 fn cell_width(kind: Kind) -> f32 {
     match kind {
-        Kind::Bold => ICON_W,
-        Kind::Italic => ICON_W,
-        Kind::Highlight => 84.0,
-        Kind::InlineCode => 114.0,
-        Kind::Badge => 78.0,
+        Kind::Bold | Kind::Italic | Kind::Dismiss => ICON_W,
+        Kind::Highlight | Kind::InlineCode | Kind::Badge => CHIP_W,
     }
 }
 
@@ -99,7 +122,7 @@ fn content_width(items: &[Item]) -> f32 {
     let mut x = 0.0;
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
-            x += if is_icon(items[index - 1].kind) && !is_icon(item.kind) {
+            x += if rank(items[index - 1].kind) != rank(item.kind) {
                 DIV_GAP
             } else {
                 GAP
@@ -138,7 +161,7 @@ pub fn cell_rects(card: Rect, items: &[Item]) -> Vec<Rect> {
     let mut x = card.x + CARD_PAD_X;
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
-            x += if is_icon(items[index - 1].kind) && !is_icon(item.kind) {
+            x += if rank(items[index - 1].kind) != rank(item.kind) {
                 DIV_GAP
             } else {
                 GAP
@@ -169,12 +192,12 @@ struct Slide {
 }
 
 impl Slide {
-    /// A fresh slide parked on top of `rect` — used the frame the bar opens
-    /// so the hover pill does not glide in from nowhere.
+    /// A fresh slide parked on top of `rect`. Snappy on purpose: a hover
+    /// chase should feel immediate, not laggy.
     fn park(&mut self, rect: Rect) {
         self.from = rect;
         self.to = rect;
-        self.animation = Animation::new(Duration::from_millis(160), Easing::EaseInOut);
+        self.animation = Animation::new(Duration::from_millis(80), Easing::EaseOut);
     }
 
     /// Point the slide at `rect`, leaving from wherever it currently is so
@@ -236,7 +259,7 @@ impl FormatBar {
             hovered: None,
             started: false,
             slide: Slide {
-                animation: Animation::new(Duration::from_millis(160), Easing::EaseInOut),
+                animation: Animation::new(Duration::from_millis(80), Easing::EaseOut),
                 from: Rect::default(),
                 to: Rect::default(),
             },
@@ -254,7 +277,7 @@ impl FormatBar {
             hovered: None,
             started: false,
             slide: Slide {
-                animation: Animation::new(Duration::from_millis(160), Easing::EaseInOut),
+                animation: Animation::new(Duration::from_millis(80), Easing::EaseOut),
                 from: Rect::default(),
                 to: Rect::default(),
             },
@@ -338,17 +361,19 @@ impl Component for FormatBar {
             Rounding::uniform(RADIUS),
         );
 
-        // The divider between the icon buttons and the effect chips.
+        // The divider(s) separating the ranks.
         let rects = cell_rects(card, &self.items);
-        if rects.len() > 2 {
-            let divider_x = (rects[1].right() + rects[2].x) / 2.0;
-            theme::vertical_rule(
-                layer,
-                (divider_x, card.y + CARD_PAD_Y + 3.0),
-                CELL_H - 6.0,
-                1.0,
-                theme::fade(theme::non_text(), e),
-            );
+        for index in 1..rects.len() {
+            if rank(self.items[index - 1].kind) != rank(self.items[index].kind) {
+                let x = (rects[index - 1].right() + rects[index].x) / 2.0;
+                theme::vertical_rule(
+                    layer,
+                    (x, card.y + CARD_PAD_Y + 3.0),
+                    CELL_H - 6.0,
+                    1.0,
+                    theme::fade(theme::non_text(), e),
+                );
+            }
         }
 
         // Each effect chip carries its own slab (highlight wash, code tint,
@@ -365,7 +390,7 @@ impl Component for FormatBar {
         }
 
         // The hover pill slides under the active cell, dimming whatever
-        // slab it lands on without hiding the label drawn on top of it.
+        // slab it lands on without hiding the glyph drawn on top of it.
         let pill = self.slide.rect();
         layer.draw_rectangle(
             pill.position(),
@@ -374,43 +399,57 @@ impl Component for FormatBar {
             Rounding::uniform(RADIUS),
         );
 
+        // The bright accent ring around each checked/active affordance —
+        // the one unambiguous "this format is on" cue.
+        for (index, item) in self.items.iter().enumerate() {
+            if item.checked {
+                ring(layer, rects[index], item.kind, e);
+            }
+        }
+
         for (index, item) in self.items.iter().enumerate() {
             paint(layer, rects[index], item.kind, item.checked, e);
-            if item.checked {
-                // The one persistent "on" cue, shared by every affordance:
-                // a short accent bar under the cell.
-                theme::rule(
-                    layer,
-                    (
-                        rects[index].x + 4.0,
-                        rects[index].bottom() - CHECK_BAR - 1.0,
-                    ),
-                    rects[index].width - 8.0,
-                    CHECK_BAR,
-                    theme::fade(theme::accent(), e),
-                );
-            }
         }
     }
 }
 
-/// The translucent fill a chip sits on, or `None` for the icon letters which
-/// need no backing slab. `e` is the entrance weight — the slab fades in too.
+/// A rounded ring of `RING` px in the theme accent around `cell` — drawn
+/// as a slightly larger rounded fill with the cell's own fill (its effect
+/// slab, if any, else the card background) cut back over its centre, so the
+/// border reads crisp without hiding the chip's effect behind it.
+fn ring(layer: &Layer, cell: Rect, kind: Kind, e: f32) {
+    let border = theme::fade(theme::accent(), e);
+    layer.draw_rectangle(
+        (cell.x - RING, cell.y - RING),
+        (cell.width + RING * 2.0, cell.height + RING * 2.0),
+        border,
+        Rounding::uniform(RADIUS + RING),
+    );
+    layer.draw_rectangle(
+        cell.position(),
+        cell.size(),
+        chip_fill(kind, e).unwrap_or_else(|| theme::fade(theme::popup(), e)),
+        Rounding::uniform(RADIUS),
+    );
+}
+
+/// The translucent fill a chip sits on, or `None` for cells that need no
+/// backing slab. `e` is the entrance weight — the slab fades in too.
 fn chip_fill(kind: Kind, e: f32) -> Option<Color> {
     match kind {
-        Kind::Bold => None,
-        Kind::Italic => None,
+        Kind::Bold | Kind::Italic | Kind::Dismiss => None,
         Kind::Highlight => Some(theme::fade(theme::highlight(), 0.30 * e)),
         Kind::InlineCode => Some(theme::fade(theme::code(), e)),
         Kind::Badge => Some(theme::fade(theme::badge_ink(BadgeColor::Orange), 0.16 * e)),
     }
 }
 
-/// Draws one cell's content — the B/I letterform or the effect label.
+/// Draws one cell's content — the B/I letterform, the effect glyph, or the
+/// close X.
 fn paint(layer: &Layer, cell: Rect, kind: Kind, checked: bool, e: f32) {
     let middle = cell.y + cell.height / 2.0;
-    let center = (cell.x + cell.width / 2.0, middle);
-    let color = theme::fade(
+    let cx = cell.x + cell.width / 2.0;
+    let ink = theme::fade(
         if checked {
             theme::accent()
         } else {
@@ -423,8 +462,8 @@ fn paint(layer: &Layer, cell: Rect, kind: Kind, checked: bool, e: f32) {
             theme::draw(
                 layer,
                 "B",
-                center,
-                &TextStyle::serif(15.0, color).bold(),
+                (cx, middle),
+                &TextStyle::serif(15.0, ink).bold(),
                 theme::CENTER,
             );
         }
@@ -432,38 +471,58 @@ fn paint(layer: &Layer, cell: Rect, kind: Kind, checked: bool, e: f32) {
             theme::draw(
                 layer,
                 "I",
-                center,
-                &TextStyle::serif(15.0, color).italic(),
+                (cx, middle),
+                &TextStyle::serif(15.0, ink).italic(),
                 theme::CENTER,
             );
         }
-        Kind::Highlight => theme::draw(
-            layer,
-            "Highlight",
-            center,
-            &TextStyle::serif(12.0, theme::fade(theme::ink(), e)),
-            theme::CENTER,
-        ),
-        Kind::InlineCode => theme::draw(
-            layer,
-            "Inline code",
-            center,
-            &TextStyle::mono(12.0, theme::fade(theme::ink(), e)),
-            theme::CENTER,
-        ),
-        Kind::Badge => theme::draw(
-            layer,
-            "Badge",
-            center,
-            &TextStyle::serif(11.5, theme::fade(theme::badge_ink(BadgeColor::Orange), e)),
-            theme::CENTER,
-        ),
+        Kind::Highlight => {
+            theme::material(layer, glyphs::MARKER, (cx - 9.0, middle - 9.0), 18.0, ink);
+        }
+        Kind::InlineCode => {
+            theme::material(layer, glyphs::CODE, (cx - 9.0, middle - 9.0), 18.0, ink);
+        }
+        Kind::Badge => {
+            let color = theme::fade(theme::badge_ink(BadgeColor::Orange), e);
+            theme::material(layer, glyphs::BADGE, (cx - 9.0, middle - 9.0), 18.0, color);
+        }
+        Kind::Dismiss => {
+            theme::material(layer, glyphs::CLOSE, (cx - 8.0, middle - 8.0), 16.0, ink);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every icon this widget draws is a constant in this file; a path that
+    /// fails to parse would panic at draw time, so they are all checked
+    /// here — before any has reached a live menu — through the same
+    /// `lyon_extra` parser the renderer uses.
+    #[test]
+    fn every_builtin_icon_parses_as_svg() {
+        fn parses(d: &str) -> bool {
+            let mut parser = lyon_extra::parser::PathParser::new();
+            let mut builder = lyon::path::Path::builder();
+            let mut source = lyon_extra::parser::Source::new(d.chars());
+            parser
+                .parse(
+                    &lyon_extra::parser::ParserOptions::DEFAULT,
+                    &mut source,
+                    &mut builder,
+                )
+                .is_ok()
+        }
+        for (name, d) in [
+            ("MARKER", glyphs::MARKER),
+            ("CODE", glyphs::CODE),
+            ("BADGE", glyphs::BADGE),
+            ("CLOSE", glyphs::CLOSE),
+        ] {
+            assert!(parses(d), "{name} failed to parse: {d}");
+        }
+    }
 
     fn word_items() -> Vec<Item> {
         vec![
@@ -541,19 +600,24 @@ mod tests {
     }
 
     #[test]
-    fn the_icon_group_is_separated_from_the_chips() {
-        let rects = cell_rects(Rect::new(0.0, 0.0, 800.0, 600.0), &word_items());
-        assert_eq!(rects[0].width, ICON_W, "bold is an icon square");
-        assert_eq!(rects[1].width, ICON_W, "italic is an icon square");
-        // The divider channel between the icons and the first chip is wider
-        // than a plain gap — the two ranks read as groups.
+    fn the_letterforms_chips_and_dismiss_are_separated() {
+        let items = word_items();
+        let mut items = items;
+        items.push(Item {
+            kind: Kind::Dismiss,
+            checked: false,
+        });
+        let rects = cell_rects(Rect::new(0.0, 0.0, 800.0, 600.0), &items);
+        // The divider channel between the letterforms and the first chip,
+        // and between the last chip and the dismiss, is wider than a gap.
         assert!(rects[2].x - rects[1].right() > GAP);
+        assert!(rects[5].x - rects[4].right() > GAP);
     }
 
     #[test]
     fn the_slide_travels_to_its_new_target() {
         let mut slide = Slide {
-            animation: Animation::new(Duration::from_millis(160), Easing::EaseInOut),
+            animation: Animation::new(Duration::from_millis(80), Easing::EaseOut),
             from: Rect::default(),
             to: Rect::default(),
         };
@@ -564,7 +628,7 @@ mod tests {
         // Same target again is not a move.
         assert!(!slide.slide_to(first));
 
-        let second = Rect::new(40.0, 0.0, 84.0, 24.0);
+        let second = Rect::new(40.0, 0.0, 38.0, 24.0);
         assert!(slide.slide_to(second));
         assert!(slide.advancing());
         slide.animation.advance(Duration::from_millis(200));

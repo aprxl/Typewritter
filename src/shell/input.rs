@@ -2038,9 +2038,10 @@ impl Shell {
         self.rebuild_views();
     }
 
-    /// The bar's affordances as the drawing sees them. `checked` is left
-    /// false — it never changes a cell's size, so geometry and hit-testing
-    /// can ignore it.
+    /// The bar's affordances as the drawing and hit-testing see them, with
+    /// each one's live checked state read off the document. A `Dismiss`
+    /// cell is appended last — it is the bar's own close affordance, not a
+    /// format command, so it maps to no `format_bar::from_id`.
     fn format_bar_geometry(&self) -> Vec<format_bar::Item> {
         let mut items = Vec::new();
         if let Some(state) = &self.format_bar {
@@ -2048,10 +2049,14 @@ impl Shell {
                 if let Some(kind) = format_bar::from_id(command.id) {
                     items.push(format_bar::Item {
                         kind,
-                        checked: false,
+                        checked: self.context_command_checked(command.id),
                     });
                 }
             }
+            items.push(format_bar::Item {
+                kind: format_bar::Kind::Dismiss,
+                checked: false,
+            });
         }
         items
     }
@@ -2060,6 +2065,14 @@ impl Shell {
     /// several formats in one pass; the refreshed snapshot shows the new
     /// checked state.
     fn toggle_format(&mut self, cell: usize) {
+        // The last cell is the close affordance; pressing or clicking it
+        // dismisses the bar rather than toggling a format.
+        if let Some(state) = &self.format_bar
+            && cell == state.items.len()
+        {
+            self.close_format_bar();
+            return;
+        }
         let command = self
             .format_bar
             .as_ref()
