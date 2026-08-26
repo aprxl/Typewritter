@@ -90,6 +90,13 @@ pub struct Context {
     /// Debug aid: draw each row's hit band so hit-testing can be checked
     /// against what is on screen.
     pub debug_rows: bool,
+    /// The entrance reveal of an overlay that opened, 0..1 — 1.0 when none
+    /// is in flight. The shell owns the animation so a refreshed overlay
+    /// snapshot (a new `Component`) never re-triggers the pop: the value is
+    /// a matter of elapsed time, not of which component instance reads it.
+    /// The first consumer is the format bar, which fades and lifts as this
+    /// climbs from 0.
+    pub reveal: f32,
     /// Something is drawn over the whole window — the onboarding splash or
     /// a dialog. Everything underneath is a picture until it closes.
     pub overlay_open: bool,

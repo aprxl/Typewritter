@@ -15,9 +15,9 @@ use super::commands;
 use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
-    ContextMenu, Dialog, FileFinder, FileTree, MathMenu, Onboarding, Palette, SlashMenu,
-    context_menu, editor, file_finder, file_tree, math_menu, onboarding, sidenotes, theme_switch,
-    title_bar,
+    ContextMenu, Dialog, FileFinder, FileTree, FormatBar, MathMenu, Onboarding, Palette, SlashMenu,
+    context_menu, editor, file_finder, file_tree, format_bar, math_menu, onboarding, sidenotes,
+    theme_switch, title_bar,
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind};
@@ -39,7 +39,9 @@ use crate::vim::{
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{ContextMenuState, MathMenuState, PaletteState, Shell, SlashMenuState};
+use super::{
+    ContextMenuState, MathMenuState, PaletteState, Shell, SlashMenuState, WordFormatState,
+};
 
 impl Shell {
     /// Choosing a vault is a shell job: the picker persists the config and
@@ -86,6 +88,12 @@ impl Shell {
         }
         // The context menu swallows input while it is open.
         if self.context_menu.is_some() && self.handle_context_menu_input(input, viewport) {
+            return;
+        }
+        // The word-format bar swallows input while open, like the context
+        // menu; an outside click closes it and keeps routing so Normal mode
+        // can immediately target what was clicked.
+        if self.format_bar.is_some() && self.handle_format_bar_input(input, viewport) {
             return;
         }
         // Onboarding has exactly one live command — opening a vault — and the
@@ -283,6 +291,9 @@ impl Shell {
         if self.context_menu.is_some() {
             self.close_context_menu();
         }
+        if self.format_bar.is_some() {
+            self.close_format_bar();
+        }
         let Some((x, y)) = self.editor_point(rect, point) else {
             return true;
         };
@@ -358,8 +369,20 @@ impl Shell {
                 if self.click_anchor(rect, mouse) {
                     // The click focused a note; nothing else to do with it.
                 } else if let Some(target) = self.context_at(rect, mouse) {
-                    let ids = self.context_ids(&target);
-                    self.open_context_target(&ids, mouse, Some(target));
+                    if matches!(
+                        target,
+                        ContextHit::Range {
+                            kind: RangeKind::Word,
+                            ..
+                        }
+                    ) {
+                        // A word opens the format bar; any other target
+                        // keeps the classic list menu.
+                        self.open_format_bar(&target, mouse);
+                    } else {
+                        let ids = self.context_ids(&target);
+                        self.open_context_target(&ids, mouse, Some(target));
+                    }
                 }
             } else if let Some((block, inline, cursor)) = self.math_at(rect, mouse) {
                 self.goal_x = None;
@@ -1601,29 +1624,44 @@ impl Shell {
         }
     }
 
+    /// Which document target the open formatting surface — the classic
+    /// context menu or the word-format bar — is operating on. Both keep
+    /// their target in the shell, so the two surfaces cannot disagree about
+    /// what a toggle applies to.
+    fn context_target(&self) -> Option<ContextHit> {
+        match self
+            .context_menu
+            .as_ref()
+            .and_then(|state| state.target.clone())
+        {
+            Some(target) => Some(target),
+            None => self
+                .format_bar
+                .as_ref()
+                .and_then(|state| state.target.clone()),
+        }
+    }
+
     fn context_range(&self) -> Option<FlatRange> {
-        match self.context_menu.as_ref()?.target.as_ref()? {
-            ContextHit::Range { range, .. } => Some(*range),
-            ContextHit::Math { .. } => None,
+        match self.context_target() {
+            Some(ContextHit::Range { range, .. }) => Some(range),
+            _ => None,
         }
     }
 
     fn context_math_target(&self) -> Option<(usize, usize, NodeAddress)> {
-        match self.context_menu.as_ref()?.target.as_ref()? {
-            ContextHit::Math {
+        match self.context_target() {
+            Some(ContextHit::Math {
                 block,
                 inline,
                 node: Some(address),
-            } => Some((*block, *inline, address.clone())),
+            }) => Some((block, inline, address.clone())),
             _ => None,
         }
     }
 
     fn context_command_checked(&self, id: &str) -> bool {
-        let target = self
-            .context_menu
-            .as_ref()
-            .and_then(|state| state.target.clone());
+        let target = self.context_target();
         let Some(target) = target else {
             return false;
         };
@@ -1904,6 +1942,7 @@ impl Shell {
         anchor: (f32, f32),
         target: Option<crate::document::layout::ContextHit>,
     ) {
+        self.format_bar = None;
         let items = commands::menu(ids);
         if items.is_empty() {
             return;
@@ -1943,6 +1982,163 @@ impl Shell {
         self.context_menu = None;
         self.refresh_context_menu();
         self.rebuild_views();
+    }
+
+    // ---- word-format bar ---------------------------------------------------
+
+    /// Opens the format bar over `target` (a word range) at `anchor`. The
+    /// bar keeps its target so toggles keep applying to the same word while
+    /// it stays open — the whole point of a toolbar over a one-shot menu.
+    fn open_format_bar(&mut self, target: &ContextHit, anchor: (f32, f32)) {
+        let ids = self.context_ids(target);
+        let items = commands::menu(&ids);
+        if items.is_empty() {
+            return;
+        }
+        // The two surfaces are mutually exclusive; the click that opened
+        // this bar could not have left the menu claimed, so clear the field
+        // directly rather than through the menu's rebuild path.
+        self.context_menu = None;
+        self.format_bar = Some(WordFormatState {
+            items,
+            selected: 0,
+            anchor,
+            target: Some(target.clone()),
+        });
+        // A fresh pop every time the bar opens, driven from the shell so
+        // the per-toggle refresh below never replays it.
+        self.format_reveal.restart();
+        self.refresh_format_bar();
+        self.rebuild_views();
+    }
+
+    /// Rebuilds the drawn snapshot from the live shell state — the checked
+    /// flags come from the document, so a toggle lands on the next frame.
+    fn refresh_format_bar(&mut self) {
+        let view = match &self.format_bar {
+            Some(state) => {
+                let items = self.format_bar_geometry();
+                if items.is_empty() {
+                    FormatBar::closed()
+                } else {
+                    FormatBar::open(items, state.selected, state.anchor)
+                }
+            }
+            None => FormatBar::closed(),
+        };
+        self.regions[self.format_region].set_component(Box::new(view));
+    }
+
+    fn close_format_bar(&mut self) {
+        if self.format_bar.is_none() {
+            return;
+        }
+        self.format_bar = None;
+        self.refresh_format_bar();
+        self.rebuild_views();
+    }
+
+    /// The bar's affordances as the drawing sees them. `checked` is left
+    /// false — it never changes a cell's size, so geometry and hit-testing
+    /// can ignore it.
+    fn format_bar_geometry(&self) -> Vec<format_bar::Item> {
+        let mut items = Vec::new();
+        if let Some(state) = &self.format_bar {
+            for command in &state.items {
+                if let Some(kind) = format_bar::from_id(command.id) {
+                    items.push(format_bar::Item {
+                        kind,
+                        checked: false,
+                    });
+                }
+            }
+        }
+        items
+    }
+
+    /// Runs the bar cell's command, keeping the bar open so a word can take
+    /// several formats in one pass; the refreshed snapshot shows the new
+    /// checked state.
+    fn toggle_format(&mut self, cell: usize) {
+        let command = self
+            .format_bar
+            .as_ref()
+            .and_then(|state| state.items.get(cell))
+            .copied();
+        let Some(command) = command else {
+            return;
+        };
+        if let Some(state) = &mut self.format_bar {
+            state.selected = cell;
+        }
+        (command.run)(self);
+        self.refresh_format_bar();
+    }
+
+    /// `false` means an outside click closed the bar and should keep
+    /// routing so Normal mode can immediately target what was clicked.
+    fn handle_format_bar_input(&mut self, input: &Input, viewport: Rect) -> bool {
+        if input.is_key_pressed(KeyCode::Escape) {
+            self.close_format_bar();
+            return true;
+        }
+        if input.is_key_typed(KeyCode::ArrowRight) {
+            let changed = if let Some(state) = &mut self.format_bar {
+                let next = (state.selected + 1).min(state.items.len() - 1);
+                let changed = next != state.selected;
+                state.selected = next;
+                changed
+            } else {
+                false
+            };
+            if changed {
+                self.refresh_format_bar();
+                self.rebuild_views();
+            }
+            return true;
+        }
+        if input.is_key_typed(KeyCode::ArrowLeft) {
+            let changed = if let Some(state) = &mut self.format_bar {
+                let next = state.selected.saturating_sub(1);
+                let changed = next != state.selected;
+                state.selected = next;
+                changed
+            } else {
+                false
+            };
+            if changed {
+                self.refresh_format_bar();
+                self.rebuild_views();
+            }
+            return true;
+        }
+        if input.is_key_pressed(KeyCode::Enter) {
+            if let Some(state) = &self.format_bar {
+                self.toggle_format(state.selected);
+            }
+            return true;
+        }
+
+        let Some(state) = &self.format_bar else {
+            return true;
+        };
+        let geometry = self.format_bar_geometry();
+        if geometry.is_empty() {
+            return true;
+        }
+        let card = format_bar::card_anchored(viewport, state.anchor, &geometry);
+        let point = input.mouse_position();
+        if input.is_cursor_in_window() {
+            if let Some(cell) = format_bar::cell_at(card, &geometry, point) {
+                if input.is_mouse_pressed(MouseButton::Left) {
+                    self.toggle_format(cell);
+                }
+            } else if input.is_mouse_pressed(MouseButton::Left) && !card.contains(point) {
+                self.close_format_bar();
+                return false;
+            }
+        }
+        true
     }
 
     /// `false` means an outside left click closed the popup and should keep

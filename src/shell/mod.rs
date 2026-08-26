@@ -38,9 +38,9 @@ use crate::components::sidenotes::Note;
 use crate::components::tab_strip::TabView;
 use crate::components::topics::Entry;
 use crate::components::{
-    Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileFinder, FileTree, MathMenu, Onboarding,
-    Palette, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics, breadcrumb, editor,
-    file_tree, sidenotes, status_line, tab_strip, title_bar, topics,
+    Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileFinder, FileTree, FormatBar, MathMenu,
+    Onboarding, Palette, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics,
+    breadcrumb, editor, file_tree, sidenotes, status_line, tab_strip, title_bar, topics,
 };
 use crate::config::Config;
 use crate::document::Caret;
@@ -96,6 +96,17 @@ struct SlashMenuState {
 /// resolved commands rather than ids so running one cannot re-look-up a
 /// different entry than the one that was drawn.
 struct ContextMenuState {
+    items: Vec<&'static commands::Command>,
+    selected: usize,
+    anchor: (f32, f32),
+    target: Option<ContextHit>,
+}
+
+/// The open word-format bar's resolved commands, selection, anchor, and
+/// target — the same shape as the context menu's state, but for the bar
+/// that opens over a word in Normal mode. Lives in the shell for the same
+/// reason the menu's does: the shell owns the keystrokes while it is open.
+struct WordFormatState {
     items: Vec<&'static commands::Command>,
     selected: usize,
     anchor: (f32, f32),
@@ -227,6 +238,8 @@ pub struct Shell {
     slash_menu: Option<SlashMenuState>,
     /// The open context menu's rows, selection, and anchor point, if open.
     context_menu: Option<ContextMenuState>,
+    /// The open word-format bar, if any — see [`WordFormatState`].
+    format_bar: Option<WordFormatState>,
     /// Persistent Ctrl-brush selection, plus the targets currently under the
     /// brush so a held stroke toggles each target only on entry.
     brush_selected: Vec<ContextHit>,
@@ -256,11 +269,17 @@ pub struct Shell {
     #[allow(dead_code)] // wired up in a later task
     slash_region: usize,
     menu_region: usize,
+    format_region: usize,
     math_menu_region: usize,
     /// Blinks the caret in the editor and the name prompt.
     caret: Stepped,
     /// Fades the writing indicator.
     pulse: Stepped,
+    /// The entrance-reveal clock for whichever overlay is opening — the
+    /// format bar fades and lifts as this weight climbs. Owned by the shell
+    /// so a refreshed bar snapshot never re-triggers the pop; see
+    /// `Context::reveal`.
+    format_reveal: Animation,
     /// When the next animation step is due, for the frames the shell does
     /// *not* ask for. A stepped animation reports nothing through the flat
     /// middle of a step, so without this the loop would sleep past the
@@ -482,6 +501,11 @@ impl Shell {
         let menu_region = regions.len() - 1;
         regions.push(Region::detached(Layout::ROOT, Box::new(MathMenu::closed())));
         let math_menu_region = regions.len() - 1;
+        regions.push(Region::detached(
+            Layout::ROOT,
+            Box::new(FormatBar::closed()),
+        ));
+        let format_region = regions.len() - 1;
 
         Self {
             layout,
@@ -501,6 +525,7 @@ impl Shell {
             finder: None,
             slash_menu: None,
             context_menu: None,
+            format_bar: None,
             brush_selected: Vec::new(),
             brush_inside: Vec::new(),
             brush_point: None,
@@ -523,6 +548,7 @@ impl Shell {
             finder_region,
             slash_region,
             menu_region,
+            format_region,
             math_menu_region,
             // Two steps, because a caret is on or off: every frame between
             // two flips repaints the same pixels. The writing indicator is
@@ -530,6 +556,7 @@ impl Shell {
             // sixteen steps is every value that reaches the screen.
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
             pulse: Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16).ping_pong(),
+            format_reveal: Animation::new(Duration::from_millis(140), Easing::EaseOut),
             wake_at: None,
             autosave_last_attempt: Instant::now(),
             autosave_revision: 0,
@@ -606,6 +633,9 @@ impl Shell {
         // cannot drive something that sleeps longer than the clamp.
         animating |= self.caret.advance();
         animating |= self.pulse.advance();
+        if self.format_bar.is_some() {
+            animating |= self.format_reveal.advance(dt);
+        }
         let animation_wake = Instant::now() + self.caret.wake_in().min(self.pulse.wake_in());
         // A pending autosave is a deadline too: it must wake the loop from
         // its sleep even though no animation is asking for a frame. Without
@@ -651,11 +681,13 @@ impl Shell {
             self_rect: Rect::default(),
             divider_hover: self.divider_hover.value(),
             debug_rows: self.debug_rows,
+            reveal: self.format_reveal.weight(),
             overlay_open: self.dialog.is_some()
                 || self.onboarding
                 || self.palette.is_some()
                 || self.slash_menu.is_some()
                 || self.context_menu.is_some()
+                || self.format_bar.is_some()
                 || self.math_menu.is_some()
                 || self.finder.is_some(),
             theme_locked: self.theme_swap.is_some(),
@@ -794,6 +826,7 @@ impl Shell {
             (self.slash_region, self.slash_menu.is_some()),
             (self.finder_region, self.finder.is_some()),
             (self.menu_region, self.context_menu.is_some()),
+            (self.format_region, self.format_bar.is_some()),
             (self.math_menu_region, self.math_menu.is_some()),
         ];
         for (index, open) in overlays {
