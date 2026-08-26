@@ -14,8 +14,8 @@ use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 use crate::document::BadgeColor;
 use crate::layout::Rect;
 use crate::renderer::{
-    Alignment, Color, Font, FontParameters, HorizontalAlign, Layer, LineCap, LineJoin, PathPaint,
-    Rounding, Stroke, VerticalAlign,
+    Alignment, Color, Font, FontParameters, GradientDirection, HorizontalAlign, Layer, LineCap,
+    LineJoin, PathPaint, Rounding, Stroke, VerticalAlign,
 };
 
 /// Whether a palette is a light one or a dark one.
@@ -656,6 +656,60 @@ pub fn outline(layer: &Layer, rect: Rect, color: Color) {
     );
     vertical_rule(layer, rect.position(), rect.height, 1.0, color.clone());
     vertical_rule(layer, (rect.right() - 1.0, rect.y), rect.height, 1.0, color);
+}
+
+/// The ink a floating surface's shadow is drawn in — one value for every
+/// popup, tuned per palette: dark themes need a heavier shadow to read
+/// against their own low-contrast surround.
+pub fn shadow_ink() -> Color {
+    match mode() {
+        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x5C),
+        Mode::Dark => Color::rgb(0x00, 0x00, 0x00),
+    }
+}
+
+/// An elevated floating card's surface: [`Theme::popup`]'s hue lifted into
+/// a vertical gradient — a touch lighter above the content, settling back
+/// to the flat colour below it. Reads as one raised object with light on it
+/// rather than a tinted slab. `e` is an entrance weight; the stops' shared
+/// alpha carries it, so a gradient fades without per-pixel work.
+pub fn elevated_popup(e: f32) -> Color {
+    let base = popup();
+    let lift = if mode() == Mode::Light { 6 } else { 9 };
+    let Color::Solid([r, g, b, _]) = base.clone() else {
+        return fade(base, e);
+    };
+    let a = (e.clamp(0.0, 1.0) * 255.0) as u8;
+    // The lift is small enough that no palette channel can overflow —
+    // clippy knows it too, so there is deliberately no `.min(255)` here.
+    assert!(lift <= 15);
+    let up = |c: u8| c + lift;
+    Color::gradient(
+        [up(r), up(g), up(b), a],
+        [r, g, b, a],
+        GradientDirection::Vertical,
+    )
+}
+
+/// Draw `rect` as a rounded-rectangle outline by stroking its border path —
+/// corners join round, unlike [`outline`]'s four axis-aligned rules, which
+/// square off any radius they are drawn around. One path, one pen; parse
+/// failures are impossible because the geometry is generated here.
+pub fn rounded_outline(layer: &Layer, rect: Rect, radius: f32, width: f32, color: Color) {
+    let d = format!(
+        "M{fx} {fy} H{tx} V{by} H{lx} V{cy} Z",
+        fx = rect.x + radius,
+        fy = rect.y,
+        tx = rect.right() - radius,
+        by = rect.bottom() - radius,
+        lx = rect.x,
+        cy = rect.y + radius,
+    );
+    let mut pen = Stroke::new(color, width);
+    pen.join = LineJoin::Round;
+    layer
+        .draw_path(&d, (0.0, 0.0), PathPaint::Stroke(pen))
+        .expect("rounded_outline generates its own path data");
 }
 
 /// The hover surface every interactive row and button shares: one tint, one

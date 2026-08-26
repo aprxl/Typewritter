@@ -40,7 +40,8 @@ use crate::components::topics::Entry;
 use crate::components::{
     Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileFinder, FileTree, FormatBar, MathMenu,
     Onboarding, Palette, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics,
-    breadcrumb, editor, file_tree, sidenotes, status_line, tab_strip, title_bar, topics,
+    breadcrumb, editor, file_tree, format_bar, sidenotes, status_line, tab_strip, title_bar,
+    topics,
 };
 use crate::config::Config;
 use crate::document::Caret;
@@ -276,7 +277,9 @@ pub struct Shell {
     /// Fades the writing indicator.
     pulse: Stepped,
     /// The entrance-reveal clock for whichever overlay is opening — the
-    /// format bar fades and lifts as this weight climbs. Owned by the shell
+    /// format bar grows out of its word as this weight climbs (the spring
+    /// itself lives in the drawing: `format_bar::REVEAL_EASING`). Owned by
+    /// the shell
     /// so a refreshed bar snapshot never re-triggers the pop; see
     /// `Context::reveal`.
     format_reveal: Animation,
@@ -348,6 +351,13 @@ pub struct Shell {
     /// here because `rebuild_views` swaps the editor component out and the
     /// layer has to outlive that.
     glow: Layer,
+    /// The blurred layer under every overlay, carrying floating surfaces'
+    /// drop shadows — today only the word-format bar paints one (its
+    /// snapshot paints into this in its own `sync`; see
+    /// `FormatBar::paint_shadow`). Held from creation so it composites
+    /// above the page but below every overlay that opens after it, because
+    /// a shadow must fall on the page, never on a popup.
+    bar_shadow: Layer,
     /// The palette swap in flight, if there is one — see [`ThemeSwap`].
     /// `Some` is also what locks the switch: a swap cannot be spammed,
     /// because a second one would capture a frame mid-wipe and hold *that*
@@ -429,6 +439,15 @@ impl Shell {
         let glow = renderer.new_layer_top(LayerInvalidation::Manual);
         glow.set_effect(Some(ShaderEffect::Blur {
             radius: editor::GLOW_RADIUS,
+        }));
+
+        // Same shape as the glow: blur set once at creation, never changed.
+        // A wider radius than the highlight's — a popup floats further above
+        // the page than a bar of ink sits under it, so its shadow spreads
+        // softer before it lands.
+        let bar_shadow = renderer.new_layer_top(LayerInvalidation::Manual);
+        bar_shadow.set_effect(Some(ShaderEffect::Blur {
+            radius: format_bar::SHADOW_BLUR_RADIUS,
         }));
 
         regions.extend([
@@ -556,7 +575,7 @@ impl Shell {
             // sixteen steps is every value that reaches the screen.
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
             pulse: Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16).ping_pong(),
-            format_reveal: Animation::new(Duration::from_millis(140), Easing::EaseOut),
+            format_reveal: Animation::new(format_bar::REVEAL_DURATION, format_bar::REVEAL_EASING),
             wake_at: None,
             autosave_last_attempt: Instant::now(),
             autosave_revision: 0,
@@ -594,6 +613,7 @@ impl Shell {
             insert_prefix: None,
             last_width: 0.0,
             glow,
+            bar_shadow,
             theme_swap: None,
         }
     }
@@ -633,7 +653,7 @@ impl Shell {
         // cannot drive something that sleeps longer than the clamp.
         animating |= self.caret.advance();
         animating |= self.pulse.advance();
-        if self.format_bar.is_some() {
+        if self.format_bar.is_some() || self.format_reveal.is_playing() {
             animating |= self.format_reveal.advance(dt);
         }
         let animation_wake = Instant::now() + self.caret.wake_in().min(self.pulse.wake_in());

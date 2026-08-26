@@ -12,6 +12,12 @@
 //! across as the pointer moves, and the word's active formats get a bright
 //! accent ring around their cell.
 //!
+//! The drop shadow is not drawn into the card's own layer either: shader
+//! effects apply per layer, so the shell owns one extra blurred layer (the
+//! same trick as the editor's highlight glow), hands it to every snapshot,
+//! and [`FormatBar::paint_shadow`] fills it from [`Component::sync`] — one
+//! fat faint slab the blur turns into a halo.
+//!
 //! Same snapshot relationship as the palette and the context menu: the
 //! shell owns the live selection, checked states, and keystrokes; this
 //! component holds a snapshot and draws it. The one animation it cannot own
@@ -94,6 +100,14 @@ const DIV_GAP: f32 = 10.0;
 const RADIUS: f32 = 9.0;
 /// Thickness of the bright accent ring around a checked/active cell.
 const RING: f32 = 1.6;
+/// How far the shadow slab spreads past the resting card on every side,
+/// before its blur. Wide enough that the blurred halo fades out before its
+/// own edge arrives — a shadow with a visible border reads as a second
+/// card behind the first.
+pub const SHADOW_SPREAD: f32 = 6.0;
+/// The blur radius the shell sets on the bar-shadow layer at creation and
+/// never touches again — see `Shell::new`.
+pub const SHADOW_BLUR_RADIUS: f32 = 9.0;
 
 /// Which visual rank a cell belongs to, for the divider placement — 0 the
 /// letterforms, 1 the effect chips, 2 the dismiss. Moving between ranks
@@ -154,6 +168,43 @@ pub fn card_anchored(viewport: Rect, anchor: (f32, f32), items: &[Item]) -> Rect
     Rect::new(x, y, width, height)
 }
 
+/// How long the entrance spring takes to settle, and its curve: a fast
+/// ease that overshoots by ~6% and swings back — a materialize with a
+/// little life in it, not a linear grow. `CubicBezier`'s y is unclamped,
+/// which is exactly what an overshoot needs.
+pub const REVEAL_DURATION: Duration = Duration::from_millis(180);
+pub const REVEAL_EASING: Easing = Easing::CubicBezier(0.34, 1.32, 0.64, 1.0);
+
+/// The pill's hover chase: nearly the same spring as the entrance, shorter
+/// and with a subtler overshoot — fast enough to feel attached to the
+/// pointer. A function rather than a constant: `Animation::new` is not
+/// `const`, and each caller needs a fresh timer anyway.
+fn slide_animation() -> Animation {
+    Animation::new(
+        Duration::from_millis(110),
+        Easing::CubicBezier(0.3, 1.18, 0.5, 1.0),
+    )
+}
+
+/// The card as it is *revealed*: `card` scaled from 88% up to full size
+/// around the anchor point (the clicked word) while `e` climbs, so the bar
+/// grows out of the word it serves instead of appearing beside it.
+///
+/// Shared by the drawing and the shell's shadow layer — one function, so
+/// the two can never disagree about where the floating surface sits.
+pub fn revealed_card(card: Rect, anchor: (f32, f32), e: f32) -> Rect {
+    let e = e.clamp(0.0, 1.0);
+    let scale = 0.88 + 0.12 * e;
+    let lift = (1.0 - e) * 7.0;
+    let cx = anchor.0;
+    let cy = anchor.1;
+    let x = cx + (card.x - cx) * scale - (1.0 - e) * 4.0;
+    let y = cy + (card.y - cy) * scale - lift;
+    let width = card.width * scale;
+    let height = card.height * scale;
+    Rect::new(x, y, width, height)
+}
+
 /// The cell each item occupies inside `card` — the drawing and the shell's
 /// hit-test are one geometry.
 pub fn cell_rects(card: Rect, items: &[Item]) -> Vec<Rect> {
@@ -193,11 +244,12 @@ struct Slide {
 
 impl Slide {
     /// A fresh slide parked on top of `rect`. Snappy on purpose: a hover
-    /// chase should feel immediate, not laggy.
+    /// chase should feel immediate, not laggy — an ease-out with a whisper
+    /// of overshoot lands like a magnet, not like a fade.
     fn park(&mut self, rect: Rect) {
         self.from = rect;
         self.to = rect;
-        self.animation = Animation::new(Duration::from_millis(80), Easing::EaseOut);
+        self.animation = slide_animation();
     }
 
     /// Point the slide at `rect`, leaving from wherever it currently is so
@@ -255,6 +307,10 @@ pub struct FormatBar {
     selected: usize,
     anchor: (f32, f32),
     open: bool,
+    /// The shell-owned blurred layer the drop shadow paints into, if the
+    /// bar has been given one. `None` draws no shadow — a bar without its
+    /// halo is correct everywhere the shell hasn't wired one.
+    shadow: Option<Layer>,
     dirty: Dirty,
     /// Which cell the pointer is over, if any — the pointer drives the
     /// slide; the shell's `selected` is the keyboard fallback.
@@ -275,11 +331,12 @@ impl FormatBar {
             selected,
             anchor,
             open: true,
+            shadow: None,
             dirty: Dirty::new(),
             hovered: None,
             started: false,
             slide: Slide {
-                animation: Animation::new(Duration::from_millis(80), Easing::EaseOut),
+                animation: slide_animation(),
                 from: Rect::default(),
                 to: Rect::default(),
             },
@@ -293,16 +350,67 @@ impl FormatBar {
             selected: 0,
             anchor: (0.0, 0.0),
             open: false,
+            shadow: None,
             dirty: Dirty::new(),
             hovered: None,
             started: false,
             slide: Slide {
-                animation: Animation::new(Duration::from_millis(80), Easing::EaseOut),
+                animation: slide_animation(),
                 from: Rect::default(),
                 to: Rect::default(),
             },
             reveal: 1.0,
         }
+    }
+
+    /// Attaches the shell's blurred layer for `self` to paint its drop
+    /// shadow into. Same shape as the editor's `with_glow`: the layer is
+    /// created once by the shell (its blur is set at creation and never
+    /// changes) and handed over here.
+    pub fn with_shadow(mut self, shadow: Layer) -> Self {
+        self.shadow = Some(shadow);
+        self
+    }
+
+    /// Paints the bar's shadow onto the blurred layer: one fat, faint
+    /// rounded slab spread past the card, from which the layer's blur makes
+    /// a soft halo. Runs from [`Component::sync`] — which has this frame's
+    /// viewport and runs whether or not `draw` will — clearing first, so a
+    /// bar that closes takes its shadow with it without help from anyone.
+    ///
+    /// This component is recreated on every shell refresh; whatever a dead
+    /// snapshot drew stays in the Manual-mode layer until a live one
+    /// clears here, which is why the clear is unconditional.
+    fn paint_shadow(&mut self, viewport: Rect) {
+        let Some(shadow) = self.shadow.clone() else {
+            return;
+        };
+        shadow.clear();
+        if !self.open || self.items.is_empty() || self.reveal <= 0.0 {
+            return;
+        }
+        // The entrance weight after the spring curve — the halo swells in
+        // step with the card rather than fading in ahead of it. The slab
+        // tracks the *resting* card: blur already softens what it lands
+        // on, and chasing the overshoot visually doubles it.
+        let e = REVEAL_EASING.apply(self.reveal).clamp(0.0, 1.0);
+        let card = revealed_card(
+            card_anchored(viewport, self.anchor, &self.items),
+            self.anchor,
+            1.0,
+        );
+        if card.is_empty() {
+            return;
+        }
+        shadow.draw_rectangle(
+            (card.x - SHADOW_SPREAD, card.y - SHADOW_SPREAD),
+            (
+                card.width + SHADOW_SPREAD * 2.0,
+                card.height + SHADOW_SPREAD * 2.0,
+            ),
+            theme::fade(theme::shadow_ink(), e),
+            Rounding::uniform(RADIUS + SHADOW_SPREAD),
+        );
     }
 }
 
@@ -312,12 +420,15 @@ impl Component for FormatBar {
     }
 
     fn sync(&mut self, context: &Context) {
-        if !self.open {
-            return;
-        }
+        // Shadow upkeep precedes every other decision — a closing bar must
+        // still reach the blurred layer to take its halo with it.
         if self.reveal != context.reveal {
             self.reveal = context.reveal;
             self.dirty.set();
+        }
+        self.paint_shadow(context.self_rect);
+        if !self.open {
+            return;
         }
         let card = card_anchored(context.self_rect, self.anchor, &self.items);
         let rects = cell_rects(card, &self.items);
@@ -371,23 +482,34 @@ impl Component for FormatBar {
             return;
         }
 
-        // The whole card fades up from the word it serves and lifts a few
-        // pixels into place — a materialize, not a pop.
-        let e = self.reveal;
-        let card = card_anchored(rect, self.anchor, &self.items);
-        let card = Rect::new(card.x, card.y - (1.0 - e) * 6.0, card.width, card.height);
+        // The whole card grows out of the word it serves: the reveal weight
+        // runs through the spring curve, so the scale overshoots ~6% before
+        // it settles, and every alpha in what follows rides the same fade.
+        let e = REVEAL_EASING.apply(self.reveal);
+        let resting = card_anchored(rect, self.anchor, &self.items);
+        let card = revealed_card(resting, self.anchor, e);
+        // The floor of the shadow sandwich goes to the shell-owned blurred
+        // layer (see `paint_shadow`) — a slab here would be a hard rim.
 
+        // An elevated surface with light on it: popup hue lifted at the top,
+        // settling to the flat colour below — see `theme::elevated_popup`.
         layer.draw_rectangle(
             card.position(),
             card.size(),
-            theme::fade(theme::popup(), e),
+            theme::elevated_popup(e.clamp(0.0, 1.0)),
             Rounding::uniform(RADIUS),
         );
 
-        // A hairline outline a touch brighter than the card itself, so the
-        // popup reads as a raised surface rather than a tinted slab. Drawn
-        // with the same entrance fade as the card.
-        theme::outline(layer, card, theme::fade(theme::dim(), 0.22 * e));
+        // A hairline stroke around the gradient: round joins keep the
+        // corners as soft as the fill's radius, which four axis-aligned
+        // rules squared off before.
+        theme::rounded_outline(
+            layer,
+            card.inset(0.5),
+            RADIUS - 0.5,
+            1.0,
+            theme::fade(theme::non_text(), e.clamp(0.0, 1.0)),
+        );
 
         // The divider(s) separating the ranks.
         let rects = cell_rects(card, &self.items);
@@ -405,9 +527,10 @@ impl Component for FormatBar {
         }
 
         // Each effect chip carries its own slab (highlight wash, code tint,
-        // badge fill) so it reads as the very form it would apply.
+        // badge fill) so it reads as the very form it would apply. A checked
+        // cell warms its slab toward the accent before any ring lands on it.
         for (index, item) in self.items.iter().enumerate() {
-            if let Some(fill) = chip_fill(item.kind, e) {
+            if let Some(fill) = chip_fill(item.kind, item.checked, e) {
                 layer.draw_rectangle(
                     rects[index].position(),
                     rects[index].size(),
@@ -417,13 +540,18 @@ impl Component for FormatBar {
             }
         }
 
-        // The hover pill slides under the active cell, dimming whatever
-        // slab it lands on without hiding the glyph drawn on top of it.
+        // The hover pill slides under the active cell: warm ink at low
+        // weight, not a grey veil — hovering should feel like heat, and it
+        // sits under whatever slab or ring it lands on without hiding the
+        // glyph drawn on top of it.
         let pill = self.slide.rect();
         layer.draw_rectangle(
             pill.position(),
             pill.size(),
-            theme::fade(theme::selection(), 0.30 * e),
+            theme::fade(
+                theme::mix(theme::selection(), theme::accent(), 0.35),
+                0.26 * e,
+            ),
             Rounding::uniform(RADIUS),
         );
 
@@ -431,7 +559,7 @@ impl Component for FormatBar {
         // the one unambiguous "this format is on" cue.
         for (index, item) in self.items.iter().enumerate() {
             if item.checked {
-                ring(layer, rects[index], item.kind, e);
+                ring(layer, rects[index], e);
             }
         }
 
@@ -441,34 +569,40 @@ impl Component for FormatBar {
     }
 }
 
-/// A rounded ring of `RING` px in the theme accent around `cell` — drawn
-/// as a slightly larger rounded fill with the cell's own fill (its effect
-/// slab, if any, else the card background) cut back over its centre, so the
-/// border reads crisp without hiding the chip's effect behind it.
-fn ring(layer: &Layer, cell: Rect, kind: Kind, e: f32) {
-    let border = theme::fade(theme::accent(), e);
-    layer.draw_rectangle(
-        (cell.x - RING, cell.y - RING),
-        (cell.width + RING * 2.0, cell.height + RING * 2.0),
-        border,
-        Rounding::uniform(RADIUS + RING),
-    );
-    layer.draw_rectangle(
-        cell.position(),
-        cell.size(),
-        chip_fill(kind, e).unwrap_or_else(|| theme::fade(theme::popup(), e)),
-        Rounding::uniform(RADIUS),
+/// A rounded accent ring of `RING` px stroked just inside `cell`'s edge —
+/// a real pen with round joins (see [`theme::rounded_outline`]), not a fill
+/// cut back over its centre, so it stays crisp over any slab and there is
+/// no chance of the card showing through a seam.
+fn ring(layer: &Layer, cell: Rect, e: f32) {
+    theme::rounded_outline(
+        layer,
+        cell.inset(RING / 2.0),
+        RADIUS - RING / 2.0,
+        RING,
+        theme::fade(theme::accent(), e),
     );
 }
 
 /// The translucent fill a chip sits on, or `None` for cells that need no
 /// backing slab. `e` is the entrance weight — the slab fades in too.
-fn chip_fill(kind: Kind, e: f32) -> Option<Color> {
-    match kind {
+fn chip_fill(kind: Kind, checked: bool, e: f32) -> Option<Color> {
+    // A checked cell glows faintly of the accent even when its own effect
+    // has a slab, so the active state reads before the ring lands on it.
+    let checked_wash = if checked {
+        Some(theme::fade(theme::accent(), 0.10 * e))
+    } else {
+        None
+    };
+    let slab = match kind {
         Kind::Bold | Kind::Italic | Kind::Dismiss => None,
         Kind::Highlight => Some(theme::fade(theme::highlight(), 0.30 * e)),
         Kind::InlineCode => Some(theme::fade(theme::code(), e)),
         Kind::Badge => Some(theme::fade(theme::badge_ink(BadgeColor::Orange), 0.16 * e)),
+    };
+    match (slab, checked_wash) {
+        (None, None) => None,
+        (Some(c), None) | (None, Some(c)) => Some(c),
+        (Some(slab), Some(wash)) => Some(theme::mix(slab, wash, 0.35)),
     }
 }
 
@@ -663,7 +797,7 @@ mod tests {
     #[test]
     fn the_slide_travels_to_its_new_target() {
         let mut slide = Slide {
-            animation: Animation::new(Duration::from_millis(80), Easing::EaseOut),
+            animation: slide_animation(),
             from: Rect::default(),
             to: Rect::default(),
         };

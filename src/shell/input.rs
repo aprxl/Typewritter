@@ -2015,6 +2015,11 @@ impl Shell {
     /// Rebuilds the drawn snapshot from the live shell state — the checked
     /// flags come from the document, so a toggle lands on the next frame.
     fn refresh_format_bar(&mut self) {
+        // Every arm carries the blurred shadow layer, the closed ones
+        // included: `paint_shadow` clears it before anything else, so the
+        // snapshot that closes the bar is also the one that takes the
+        // halo off the screen. A closed bar without the layer would leave
+        // the last slab frozen in the Manual-mode blur forever.
         let view = match &self.format_bar {
             Some(state) => {
                 let items = self.format_bar_geometry();
@@ -2025,7 +2030,8 @@ impl Shell {
                 }
             }
             None => FormatBar::closed(),
-        };
+        }
+        .with_shadow(self.bar_shadow.clone());
         self.regions[self.format_region].set_component(Box::new(view));
     }
 
