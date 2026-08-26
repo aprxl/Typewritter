@@ -230,6 +230,26 @@ fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
     )
 }
 
+/// Which cell the hover pill should sit on — `None` meaning "hold where it
+/// is", not "go to a default". A hovered cell always wins; the keyboard
+/// `selected` only applies once the pointer has left the bar (`over_bar`
+/// false). When the pointer is over the bar but in a gap between cells, the
+/// pill holds rather than snapping back to the selection — that snap read
+/// as a twitch when the pointer crossed the wide divider channels.
+fn slide_target(
+    hovered: Option<usize>,
+    over_bar: bool,
+    selected: usize,
+    len: usize,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    hovered
+        .map(|h| h.min(len - 1))
+        .or_else(|| (!over_bar).then(|| selected.min(len - 1)))
+}
+
 pub struct FormatBar {
     items: Vec<Item>,
     selected: usize,
@@ -302,7 +322,8 @@ impl Component for FormatBar {
         let card = card_anchored(context.self_rect, self.anchor, &self.items);
         let rects = cell_rects(card, &self.items);
 
-        let hovered = if context.mouse.in_window && card.contains(context.mouse.position) {
+        let over_bar = context.mouse.in_window && card.contains(context.mouse.position);
+        let hovered = if over_bar {
             cell_at(card, &self.items, context.mouse.position)
         } else {
             None
@@ -312,11 +333,13 @@ impl Component for FormatBar {
             self.dirty.set();
         }
 
-        // The keyboard selection is the fallback; a hovered cell wins. The
-        // highlight travels to the focused cell rather than jumping.
-        if !rects.is_empty() {
-            let focused = hovered.unwrap_or(self.selected).min(rects.len() - 1);
-            let target = rects[focused];
+        // Where the pill should sit. A hovered cell wins. When the pointer
+        // is over the bar but in a gap between cells (the 10px divider
+        // channels), the pill holds where it is — snapping back to the
+        // keyboard selection across a gap reads as a twitch. The keyboard
+        // selection only drives the pill once the pointer leaves the bar.
+        let target = slide_target(hovered, over_bar, self.selected, rects.len()).map(|h| rects[h]);
+        if let Some(target) = target {
             if !self.started {
                 self.slide.park(target);
                 self.started = true;
@@ -324,11 +347,11 @@ impl Component for FormatBar {
             } else if self.slide.slide_to(target) {
                 self.dirty.set();
             }
-            if self.slide.advancing() {
-                self.dirty.set();
-            }
-            self.slide.animation.advance(context.animation_dt);
         }
+        if self.slide.advancing() {
+            self.dirty.set();
+        }
+        self.slide.animation.advance(context.animation_dt);
     }
 
     fn is_dirty(&self) -> bool {
@@ -360,6 +383,11 @@ impl Component for FormatBar {
             theme::fade(theme::popup(), e),
             Rounding::uniform(RADIUS),
         );
+
+        // A hairline outline a touch brighter than the card itself, so the
+        // popup reads as a raised surface rather than a tinted slab. Drawn
+        // with the same entrance fade as the card.
+        theme::outline(layer, card, theme::fade(theme::dim(), 0.22 * e));
 
         // The divider(s) separating the ranks.
         let rects = cell_rects(card, &self.items);
@@ -612,6 +640,24 @@ mod tests {
         // and between the last chip and the dismiss, is wider than a gap.
         assert!(rects[2].x - rects[1].right() > GAP);
         assert!(rects[5].x - rects[4].right() > GAP);
+    }
+
+    #[test]
+    fn the_pill_holds_in_a_gap_instead_of_snapping_to_the_selection() {
+        // Hovering a cell always wins.
+        assert_eq!(slide_target(Some(3), true, 0, 6), Some(3));
+        // Over the bar but in a gap (no hover): hold, don't snap to Bold.
+        assert_eq!(slide_target(None, true, 0, 6), None);
+        assert_eq!(slide_target(None, true, 2, 6), None);
+        // Off the bar: the keyboard selection drives the pill.
+        assert_eq!(slide_target(None, false, 2, 6), Some(2));
+        assert_eq!(slide_target(None, false, 0, 6), Some(0));
+        // An empty bar has no pill at all.
+        assert_eq!(slide_target(None, false, 0, 0), None);
+        assert_eq!(slide_target(Some(2), true, 0, 0), None);
+        // Bound the selection.
+        assert_eq!(slide_target(None, false, 99, 6), Some(5));
+        assert_eq!(slide_target(Some(99), true, 0, 6), Some(5));
     }
 
     #[test]
