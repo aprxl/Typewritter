@@ -124,7 +124,11 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
-                    // The one place physical pixels are correct.
+                    // The one place physical pixels are correct. This only
+                    // records the size; the swap chain is reconfigured on a
+                    // later frame, once the GPU queue has drained. See
+                    // `Renderer::resize` for the macOS hang that forbids
+                    // reconfiguring it from here.
                     r.resize(size.width, size.height);
                 }
                 // Neither resize nor rescale flows through `Input`.

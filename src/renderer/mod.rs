@@ -142,6 +142,10 @@ pub struct Renderer {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    // A window size that arrived since the last frame and has not been
+    // configured onto the surface yet — see `Renderer::resize` for why the
+    // configure cannot happen where the size arrives.
+    pending_surface_size: Option<(u32, u32)>,
     // GPU resources shared by every `Layer` (its pipelines, bind group
     // layouts, the composite quad) — built once here rather than per layer.
     layer_pipelines: layer::LayerPipelines,
@@ -542,6 +546,7 @@ impl Renderer {
             queue,
             surface,
             surface_config,
+            pending_surface_size: None,
             layer_pipelines,
             msaa_texture,
             msaa_view,
@@ -603,15 +608,34 @@ impl Renderer {
         self.scale_factor = scale_factor;
     }
 
-    /// Reconfigure the swap chain for a new window size. No-op on zero-sized
+    /// Record a new window size. The swap chain is reconfigured at the top of
+    /// a later [`Renderer::render`], never here. No-op on zero-sized
     /// (minimised) windows, which would otherwise produce invalid surfaces.
-    /// Live layers pick up the new size lazily, the next time they render
-    /// (see `layer::render_layers`).
+    /// Live layers pick up the new size lazily the next time they render (see
+    /// `layer::render_layers`), so a layer created between a resize and the
+    /// next frame is corrected on that frame like any other.
+    ///
+    /// Deferring is not tidiness, it is the fix for a macOS hang that took the
+    /// whole app with it. `Surface::configure` waits for every submission
+    /// still in flight, and wgpu-core waits *indefinitely* for them
+    /// (`maintain(PollType::wait_indefinitely())`, `Device::configure_surface`).
+    /// On Metal a drawable presented while the window is invisible — or is
+    /// being moved by a window manager — can sit forever waiting for a vsync
+    /// that never arrives (gfx-rs/wgpu#8309; wgpu carries a workaround for it
+    /// in `acquire_texture`, but `configure` has none). Its command buffer
+    /// never reports `Completed`, so the wait never returns: the last frame
+    /// stays stretched across the resized window and the process never
+    /// responds again. A tiling window manager resizing the window at launch
+    /// reproduced it in four starts out of six.
+    ///
+    /// `render` therefore configures only once the queue has actually drained,
+    /// which leaves the wait inside `configure` nothing to block on. A size
+    /// that arrives while work is in flight waits for a later frame — measured
+    /// at one to nine frames under a window manager resizing as fast as it
+    /// can, far too short to see.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
-            self.surface_config.width = width;
-            self.surface_config.height = height;
-            self.surface.configure(&self.device, &self.surface_config);
+            self.pending_surface_size = Some((width, height));
         }
     }
 
@@ -660,6 +684,21 @@ impl Renderer {
     /// (timeout, occlusion, suboptimal/outdated swap chain). The `Result`
     /// only carries genuinely unrecoverable surface errors.
     pub fn render(&mut self) -> Result<(), RenderError> {
+        // The one place the swap chain is reconfigured, before the frame is
+        // acquired and only once the queue has actually drained — see
+        // `Renderer::resize` for the macOS hang that rules out anywhere else.
+        if let Some((width, height)) = self.pending_surface_size
+            && matches!(
+                self.device.poll(wgpu::PollType::Poll),
+                Ok(wgpu::PollStatus::QueueEmpty)
+            )
+        {
+            self.pending_surface_size = None;
+            self.surface_config.width = width;
+            self.surface_config.height = height;
+            self.surface.configure(&self.device, &self.surface_config);
+        }
+
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => frame,
             // Still a valid, presentable frame — just not ideally sized.
@@ -671,13 +710,17 @@ impl Renderer {
             // it while still holding `frame` is exactly what's invalid. An
             // actual size change already reaches this renderer correctly
             // through `Renderer::resize` (called from
-            // `WindowEvent::Resized`), which runs between frames, never
-            // while one is held — so there's nothing to do here but use
-            // the frame as given.
+            // `WindowEvent::Resized`), which only records it; the configure
+            // happens at the top of this method, before a frame is acquired
+            // and so never while one is held — leaving nothing to do here
+            // but use the frame as given.
             CurrentSurfaceTexture::Suboptimal(frame) => frame,
             CurrentSurfaceTexture::Outdated => {
                 // The surface has changed; reconfigure and skip this frame.
-                self.surface.configure(&self.device, &self.surface_config);
+                // Queued rather than done here for the same reason the resize
+                // above is queued — see `Renderer::resize`.
+                self.pending_surface_size =
+                    Some((self.surface_config.width, self.surface_config.height));
                 return Ok(());
             }
             CurrentSurfaceTexture::Timeout
