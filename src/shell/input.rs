@@ -40,7 +40,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    ContextMenuState, MathMenuState, PaletteState, Shell, SlashMenuState, WordFormatState,
+    ContextMenuState, FormatDismiss, MathMenuState, PaletteState, Shell, SlashMenuState,
+    WordFormatState,
 };
 
 impl Shell {
@@ -1999,11 +2000,15 @@ impl Shell {
         // this bar could not have left the menu claimed, so clear the field
         // directly rather than through the menu's rebuild path.
         self.context_menu = None;
+        // An in-flight fade-out is superseded: the bar is back.
+        self.format_dismiss = None;
+        self.format_dismiss_clock = 0.0;
         self.format_bar = Some(WordFormatState {
             items,
             selected: 0,
             anchor,
             target: Some(target.clone()),
+            hover_cell: None,
         });
         // A fresh pop every time the bar opens, driven from the shell so
         // the per-toggle refresh below never replays it.
@@ -2020,26 +2025,66 @@ impl Shell {
         // snapshot that closes the bar is also the one that takes the
         // halo off the screen. A closed bar without the layer would leave
         // the last slab frozen in the Manual-mode blur forever.
+        //
+        // While a dismissal is in flight the region shows the ghost: dead
+        // placeholder cells at the bar's last geometry, whose reveal weight
+        // the shell is dropping back toward 0 — the fade-out.
         let view = match &self.format_bar {
             Some(state) => {
                 let items = self.format_bar_geometry();
                 if items.is_empty() {
                     FormatBar::closed()
                 } else {
-                    FormatBar::open(items, state.selected, state.anchor)
+                    let mut bar = FormatBar::open(items, state.selected, state.anchor);
+                    bar.set_pointer_cell(state.hover_cell);
+                    bar
                 }
             }
-            None => FormatBar::closed(),
+            None => match &self.format_dismiss {
+                Some(dismiss) => {
+                    let items = vec![format_bar::Item::placeholder(); dismiss.item_count];
+                    FormatBar::dismissing(items, dismiss.anchor, dismiss.pointer_cell)
+                }
+                None => FormatBar::closed(),
+            },
         }
         .with_shadow(self.bar_shadow.clone());
         self.regions[self.format_region].set_component(Box::new(view));
+        // The shell owns the pill memory across refreshes: ask the fresh
+        // snapshot where its pill is (it may have been seeded, and its
+        // first sync may already have moved it) and keep that.
+        if let Some(state) = &mut self.format_bar {
+            state.hover_cell = self.regions[self.format_region]
+                .component_as::<FormatBar>()
+                .and_then(|bar| bar.pointer_cell());
+        }
     }
 
     fn close_format_bar(&mut self) {
-        if self.format_bar.is_none() {
+        // The ghost's shape comes from the live state, so read the geometry
+        // before `take` empties it — afterwards `format_bar_geometry` sees
+        // `None` and would report an empty bar, killing every fade-out.
+        let item_count = self.format_bar_geometry().len();
+        let Some(state) = self.format_bar.take() else {
             return;
+        };
+        // Keep a ghost alive for the fade-out: the same item count and
+        // anchor, drawn from a falling clock. Nothing accepts input while
+        // it fades — `format_bar` is already `None`, so input routing sees
+        // a closed bar from this frame on.
+        if item_count > 0 {
+            // The ghost's pill parks on the keyboard selection — the same
+            // place a fresh open starts — and freezes there for the fade.
+            self.format_dismiss = Some(FormatDismiss {
+                item_count,
+                anchor: state.anchor,
+                pointer_cell: Some(state.selected.min(item_count - 1)),
+            });
+            self.format_dismiss_clock = 1.0;
+        } else {
+            self.format_dismiss = None;
+            self.format_dismiss_clock = 0.0;
         }
-        self.format_bar = None;
         self.refresh_format_bar();
         self.rebuild_views();
     }
@@ -2147,15 +2192,36 @@ impl Shell {
         }
         let card = format_bar::card_anchored(viewport, state.anchor, &geometry);
         let point = input.mouse_position();
-        if input.is_cursor_in_window() {
-            if let Some(cell) = format_bar::cell_at(card, &geometry, point) {
-                if input.is_mouse_pressed(MouseButton::Left) {
-                    self.toggle_format(cell);
-                }
-            } else if input.is_mouse_pressed(MouseButton::Left) && !card.contains(point) {
-                self.close_format_bar();
-                return false;
+        // Persistent hover lives in the shell: a touch of a cell moves the
+        // memory, and the move is applied to the state (and mirrored into a
+        // fresh snapshot) before anything else uses it.
+        let touched = input
+            .is_cursor_in_window()
+            .then(|| format_bar::cell_at(card, &geometry, point))
+            .flatten();
+        let click = input.is_mouse_pressed(MouseButton::Left);
+        let out_click = click && input.is_cursor_in_window() && !card.contains(point);
+        // `state`'s borrow ends here; everything below re-borrows `self`.
+
+        if let Some(cell) = touched {
+            let moved = self
+                .format_bar
+                .as_ref()
+                .is_some_and(|s| s.hover_cell != Some(cell));
+            if let Some(state) = &mut self.format_bar {
+                state.hover_cell = Some(cell);
             }
+            if moved {
+                self.refresh_format_bar();
+            }
+            if click {
+                self.toggle_format(cell);
+            }
+            return true;
+        }
+        if out_click {
+            self.close_format_bar();
+            return false;
         }
         true
     }

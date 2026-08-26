@@ -258,6 +258,14 @@ pub trait Component {
     fn is_animating(&self) -> bool {
         false
     }
+
+    /// Type-erased access for the shell, which owns regions but not the
+    /// concrete components inside them. The one use today is reading the
+    /// format bar's pill position back after a refresh; implementors that
+    /// never need it get the default for free.
+    fn as_any(&self) -> &dyn std::any::Any {
+        &()
+    }
 }
 
 /// A component bound to a layout node and, usually, its own layer.
@@ -352,6 +360,12 @@ impl Region {
 
     pub fn sync(&mut self, context: &Context) {
         self.component.sync(context);
+    }
+
+    /// The region's component, downcast to `T` — the shell's read-only
+    /// window into a snapshot's state (see [`Component::as_any`]).
+    pub fn component_as<T: 'static>(&self) -> Option<&T> {
+        self.component.as_any().downcast_ref()
     }
 
     pub fn is_animating(&self) -> bool {

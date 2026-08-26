@@ -112,6 +112,19 @@ struct WordFormatState {
     selected: usize,
     anchor: (f32, f32),
     target: Option<ContextHit>,
+    /// The cell the pill last sat on — the shell's copy of the bar's
+    /// persistent hover, fed back into every refreshed snapshot. Lives
+    /// here because snapshots are recreated per toggle; this survives.
+    hover_cell: Option<usize>,
+}
+
+/// A word-format bar animating out: the state is closed, but the drawing
+/// needs its last shape until the fade lands. Item count and anchor only —
+/// dead cells are fine, they fade with everything else.
+struct FormatDismiss {
+    item_count: usize,
+    anchor: (f32, f32),
+    pointer_cell: Option<usize>,
 }
 
 /// The in-math completion card while it is showing: the precise tree query,
@@ -282,7 +295,18 @@ pub struct Shell {
     /// the shell
     /// so a refreshed bar snapshot never re-triggers the pop; see
     /// `Context::reveal`.
+    ///
+    /// A closing bar does not touch this clock: its ghost runs on
+    /// `format_dismiss_clock` instead — see that field.
     format_reveal: Animation,
+    /// A dismissal in flight: the closing snapshot's geometry, held so the
+    /// region can keep drawing (and fading) a bar whose state is gone.
+    format_dismiss: Option<FormatDismiss>,
+    /// The dismissal clock, falling 1→0 over `format_bar::DISMISS_DURATION`
+    /// while `format_dismiss` is `Some`. `Context::reveal` reports it in
+    /// place of the reveal weight, so the ghost draws with the entrance's
+    /// own curve — the weight simply falls instead of climbing.
+    format_dismiss_clock: f32,
     /// When the next animation step is due, for the frames the shell does
     /// *not* ask for. A stepped animation reports nothing through the flat
     /// middle of a step, so without this the loop would sleep past the
@@ -545,6 +569,8 @@ impl Shell {
             slash_menu: None,
             context_menu: None,
             format_bar: None,
+            format_dismiss: None,
+            format_dismiss_clock: 0.0,
             brush_selected: Vec::new(),
             brush_inside: Vec::new(),
             brush_point: None,
@@ -656,6 +682,20 @@ impl Shell {
         if self.format_bar.is_some() || self.format_reveal.is_playing() {
             animating |= self.format_reveal.advance(dt);
         }
+        if self.format_dismiss.is_some() {
+            // The fall is wall-clock proportional, not the reveal animation
+            // run backwards: independent pacing, no shared state to reset.
+            self.format_dismiss_clock -=
+                dt.as_secs_f32() / crate::components::format_bar::DISMISS_DURATION.as_secs_f32();
+            if self.format_dismiss_clock <= 0.0 {
+                self.format_dismiss = None;
+                self.format_dismiss_clock = 0.0;
+                if let Some(region) = self.regions.get_mut(self.format_region) {
+                    region.set_component(Box::new(FormatBar::closed()));
+                }
+            }
+            animating = true;
+        }
         let animation_wake = Instant::now() + self.caret.wake_in().min(self.pulse.wake_in());
         // A pending autosave is a deadline too: it must wake the loop from
         // its sleep even though no animation is asking for a frame. Without
@@ -701,7 +741,14 @@ impl Shell {
             self_rect: Rect::default(),
             divider_hover: self.divider_hover.value(),
             debug_rows: self.debug_rows,
-            reveal: self.format_reveal.weight(),
+            // During a dismissal the ghost needs a *falling* weight: hand
+            // it the dismiss clock so `FormatBar::draw`'s entrance math
+            // doubles as the exit — at 0 the ghost is gone.
+            reveal: if self.format_dismiss.is_some() {
+                self.format_dismiss_clock
+            } else {
+                self.format_reveal.weight()
+            },
             overlay_open: self.dialog.is_some()
                 || self.onboarding
                 || self.palette.is_some()
@@ -846,7 +893,10 @@ impl Shell {
             (self.slash_region, self.slash_menu.is_some()),
             (self.finder_region, self.finder.is_some()),
             (self.menu_region, self.context_menu.is_some()),
-            (self.format_region, self.format_bar.is_some()),
+            (
+                self.format_region,
+                self.format_bar.is_some() || self.format_dismiss.is_some(),
+            ),
             (self.math_menu_region, self.math_menu.is_some()),
         ];
         for (index, open) in overlays {

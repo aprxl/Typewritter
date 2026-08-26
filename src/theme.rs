@@ -659,12 +659,15 @@ pub fn outline(layer: &Layer, rect: Rect, color: Color) {
 }
 
 /// The ink a floating surface's shadow is drawn in — one value for every
-/// popup, tuned per palette: dark themes need a heavier shadow to read
-/// against their own low-contrast surround.
+/// popup, tuned per palette. Deliberately translucent at full weight: the
+/// blur's falloff ring is half-transparent by nature, and an opaque core
+/// makes the page's own text ghost through that ring darkened — a grid of
+/// noise around every popup. A soft shadow reads as depth; a hard one
+/// reads as a smudge.
 pub fn shadow_ink() -> Color {
     match mode() {
-        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x5C),
-        Mode::Dark => Color::rgb(0x00, 0x00, 0x00),
+        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x38),
+        Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x59),
     }
 }
 
@@ -692,24 +695,38 @@ pub fn elevated_popup(e: f32) -> Color {
 }
 
 /// Draw `rect` as a rounded-rectangle outline by stroking its border path —
-/// corners join round, unlike [`outline`]'s four axis-aligned rules, which
-/// square off any radius they are drawn around. One path, one pen; parse
-/// failures are impossible because the geometry is generated here.
+/// straight edges joined by real quarter arcs, so the stroke's corners
+/// match a fill drawn at the same radius. ([`outline`]'s four axis-aligned
+/// rules cannot do this: they square off any radius they are drawn
+/// around.) One path, one pen; parse failures are impossible because the
+/// geometry is generated here — and pinned by a unit test anyway.
 pub fn rounded_outline(layer: &Layer, rect: Rect, radius: f32, width: f32, color: Color) {
-    let d = format!(
-        "M{fx} {fy} H{tx} V{by} H{lx} V{cy} Z",
-        fx = rect.x + radius,
-        fy = rect.y,
-        tx = rect.right() - radius,
-        by = rect.bottom() - radius,
-        lx = rect.x,
-        cy = rect.y + radius,
-    );
+    let d = rounded_rect_path(rect, radius);
     let mut pen = Stroke::new(color, width);
     pen.join = LineJoin::Round;
     layer
         .draw_path(&d, (0.0, 0.0), PathPaint::Stroke(pen))
         .expect("rounded_outline generates its own path data");
+}
+
+/// The SVG path data for `rect`'s rounded border, clockwise from the top
+/// edge — the exact shape [`rounded_outline`] strokes. The radius is
+/// clamped to half the shorter side, so degenerate rects come out as
+/// stadia rather than nonsense arcs.
+fn rounded_rect_path(rect: Rect, radius: f32) -> String {
+    let r = radius.max(0.0).min(rect.width / 2.0).min(rect.height / 2.0);
+    let (x, y) = rect.position();
+    let right = rect.right();
+    let bottom = rect.bottom();
+    // Arc flags: rx ry rotation large-arc sweep — quarter circles, the
+    // short way round, clockwise (sweep 1 in SVG's y-down space).
+    format!(
+        "M{mx} {y} H{tx} A{r} {r} 0 0 1 {right} {ty} V{by} A{r} {r} 0 0 1 {tx} {bottom} H{mx} A{r} {r} 0 0 1 {x} {by} V{ty} A{r} {r} 0 0 1 {mx} {y} Z",
+        mx = x + r,
+        tx = right - r,
+        ty = y + r,
+        by = bottom - r,
+    )
 }
 
 /// The hover surface every interactive row and button shares: one tint, one
@@ -826,6 +843,44 @@ pub mod icons {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rounded_outline` strokes generated path data with `.expect` — a
+    /// typo in the generator would panic at draw time, so the exact shape
+    /// it emits is parsed here through the same `lyon_extra` parser the
+    /// renderer uses.
+    #[test]
+    fn the_rounded_rect_path_parses_as_svg() {
+        fn parses(d: &str) -> bool {
+            let mut parser = lyon_extra::parser::PathParser::new();
+            let mut builder = lyon::path::Path::builder();
+            let mut source = lyon_extra::parser::Source::new(d.chars());
+            parser
+                .parse(
+                    &lyon_extra::parser::ParserOptions::DEFAULT,
+                    &mut source,
+                    &mut builder,
+                )
+                .is_ok()
+        }
+        // A normal card, a hairline-thin one, and the degenerate cases the
+        // clamp exists for.
+        assert!(parses(&rounded_rect_path(
+            Rect::new(10.0, 20.0, 200.0, 34.0),
+            9.0
+        )));
+        assert!(parses(&rounded_rect_path(
+            Rect::new(0.0, 0.0, 40.0, 2.0),
+            9.0
+        )));
+        assert!(parses(&rounded_rect_path(
+            Rect::new(0.0, 0.0, 8.0, 8.0),
+            9.0
+        )));
+        assert!(parses(&rounded_rect_path(
+            Rect::new(0.0, 0.0, 30.0, 24.0),
+            0.0
+        )));
+    }
 
     /// The palette a widget reads has to be the one that was set, or a
     /// theme switch is only half a switch.

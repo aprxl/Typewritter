@@ -67,9 +67,22 @@ pub fn from_id(id: &str) -> Option<Kind> {
 
 /// The one row the bar keeps for each affordance — a kind plus whether it
 /// is currently active on the clicked word.
+#[derive(Clone, Copy)]
 pub struct Item {
     pub kind: Kind,
     pub checked: bool,
+}
+
+impl Item {
+    /// A dead cell for a dismissing bar's ghost — every placeholder is the
+    /// same width, which is close enough: the ghost only has to shrink and
+    /// fade from roughly the shape it had, and it is gone in 140ms.
+    pub fn placeholder() -> Self {
+        Self {
+            kind: Kind::Bold,
+            checked: false,
+        }
+    }
 }
 
 /// The Material Symbols this bar draws, read from `resources/`. Kept here —
@@ -101,13 +114,13 @@ const RADIUS: f32 = 9.0;
 /// Thickness of the bright accent ring around a checked/active cell.
 const RING: f32 = 1.6;
 /// How far the shadow slab spreads past the resting card on every side,
-/// before its blur. Wide enough that the blurred halo fades out before its
-/// own edge arrives — a shadow with a visible border reads as a second
-/// card behind the first.
-pub const SHADOW_SPREAD: f32 = 6.0;
+/// before its blur. Generous on purpose: the halo must fade to nothing
+/// before the slab's own edge arrives, or the blur prints that edge as a
+/// visible ring — a shadow with a border reads as a second card.
+pub const SHADOW_SPREAD: f32 = 10.0;
 /// The blur radius the shell sets on the bar-shadow layer at creation and
 /// never touches again — see `Shell::new`.
-pub const SHADOW_BLUR_RADIUS: f32 = 9.0;
+pub const SHADOW_BLUR_RADIUS: f32 = 14.0;
 
 /// Which visual rank a cell belongs to, for the divider placement — 0 the
 /// letterforms, 1 the effect chips, 2 the dismiss. Moving between ranks
@@ -168,12 +181,19 @@ pub fn card_anchored(viewport: Rect, anchor: (f32, f32), items: &[Item]) -> Rect
     Rect::new(x, y, width, height)
 }
 
-/// How long the entrance spring takes to settle, and its curve: a fast
-/// ease that overshoots by ~6% and swings back — a materialize with a
-/// little life in it, not a linear grow. `CubicBezier`'s y is unclamped,
-/// which is exactly what an overshoot needs.
-pub const REVEAL_DURATION: Duration = Duration::from_millis(180);
-pub const REVEAL_EASING: Easing = Easing::CubicBezier(0.34, 1.32, 0.64, 1.0);
+/// How long the entrance spring takes to settle, and its curve: a quick
+/// rise with a small overshoot and a long tail — past 200ms the pop stops
+/// reading as snappy and starts reading as lag. `CubicBezier`'s y is
+/// unclamped, which is exactly what an overshoot needs.
+pub const REVEAL_DURATION: Duration = Duration::from_millis(220);
+pub const REVEAL_EASING: Easing = Easing::CubicBezier(0.3, 1.25, 0.5, 1.0);
+
+/// How long the dismissal takes. There is no dismiss *curve*: the shell
+/// feeds the same reveal weight falling 1→0, so [`REVEAL_EASING`] — run
+/// backwards by a falling input — is the exit, and the ghost leaves with
+/// exactly the motion it arrived with. Faster than the entrance, because
+/// leaving should never hold the eye longer than arriving.
+pub const DISMISS_DURATION: Duration = Duration::from_millis(140);
 
 /// The pill's hover chase: nearly the same spring as the entrance, shorter
 /// and with a subtler overshoot — fast enough to feel attached to the
@@ -186,20 +206,22 @@ fn slide_animation() -> Animation {
     )
 }
 
-/// The card as it is *revealed*: `card` scaled from 88% up to full size
-/// around the anchor point (the clicked word) while `e` climbs, so the bar
-/// grows out of the word it serves instead of appearing beside it.
+/// The card as it is *revealed*, `e` running 0→1: scaled from 88% up to
+/// full size around the anchor point (the clicked word) while sliding down
+/// a few pixels into place — the bar grows out of the word it serves and
+/// settles downward, gravity agreeing with the direction it opens in.
+/// Clamped, so an overshooting weight beyond 1 holds at rest.
 ///
 /// Shared by the drawing and the shell's shadow layer — one function, so
 /// the two can never disagree about where the floating surface sits.
 pub fn revealed_card(card: Rect, anchor: (f32, f32), e: f32) -> Rect {
     let e = e.clamp(0.0, 1.0);
     let scale = 0.88 + 0.12 * e;
-    let lift = (1.0 - e) * 7.0;
+    let travel = (1.0 - e) * -7.0; // starts 7px above, slides down into place
     let cx = anchor.0;
     let cy = anchor.1;
-    let x = cx + (card.x - cx) * scale - (1.0 - e) * 4.0;
-    let y = cy + (card.y - cy) * scale - lift;
+    let x = cx + (card.x - cx) * scale;
+    let y = cy + (card.y - cy) * scale + travel;
     let width = card.width * scale;
     let height = card.height * scale;
     Rect::new(x, y, width, height)
@@ -282,31 +304,33 @@ fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
     )
 }
 
-/// Which cell the hover pill should sit on — `None` meaning "hold where it
-/// is", not "go to a default". A hovered cell always wins; the keyboard
-/// `selected` only applies once the pointer has left the bar (`over_bar`
-/// false). When the pointer is over the bar but in a gap between cells, the
-/// pill holds rather than snapping back to the selection — that snap read
-/// as a twitch when the pointer crossed the wide divider channels.
-fn slide_target(
-    hovered: Option<usize>,
-    over_bar: bool,
-    selected: usize,
-    len: usize,
-) -> Option<usize> {
+/// Which cell the hover pill should sit on. The pointer's last touch wins,
+/// for good — the highlight is persistent, whether the pointer now sits in
+/// a divider channel or has left the bar for the document. An earlier rule
+/// handed the pill back to the keyboard `selected` whenever the pointer
+/// left; sweeping off toward the page dragged the highlight back to Bold
+/// every time, which read as a reset.
+fn slide_target(touched: Option<usize>, len: usize) -> Option<usize> {
     if len == 0 {
         return None;
     }
-    hovered
-        .map(|h| h.min(len - 1))
-        .or_else(|| (!over_bar).then(|| selected.min(len - 1)))
+    touched.map(|h| h.min(len - 1))
 }
 
 pub struct FormatBar {
     items: Vec<Item>,
-    selected: usize,
     anchor: (f32, f32),
     open: bool,
+    /// The cell the pill sits on — the last one the pointer touched, held
+    /// until another touch moves it (see [`slide_target`]). Seeded from the
+    /// keyboard selection at open and re-seeded by the shell on every
+    /// refresh through [`Self::set_pointer_cell`], because this snapshot is
+    /// recreated per toggle and must not forget where the user was.
+    pointer_cell: Option<usize>,
+    /// True while this snapshot is a dismissal ghost: the reveal weight it
+    /// receives is falling (1→0), input is dead, and the shell may hand it
+    /// a weight below 0 for the tail of the drop.
+    dismissing: bool,
     /// The shell-owned blurred layer the drop shadow paints into, if the
     /// bar has been given one. `None` draws no shadow — a bar without its
     /// halo is correct everywhere the shell hasn't wired one.
@@ -325,12 +349,15 @@ pub struct FormatBar {
 
 impl FormatBar {
     pub fn open(items: Vec<Item>, selected: usize, anchor: (f32, f32)) -> Self {
-        let selected = selected.min(items.len().saturating_sub(1));
+        // The pill opens parked on the keyboard selection; the first hover
+        // takes it from there and never gives it back (see `slide_target`).
+        let pointer_cell = Some(selected.min(items.len().saturating_sub(1)));
         Self {
             items,
-            selected,
             anchor,
             open: true,
+            pointer_cell,
+            dismissing: false,
             shadow: None,
             dirty: Dirty::new(),
             hovered: None,
@@ -344,12 +371,35 @@ impl FormatBar {
         }
     }
 
+    /// Seeds the pill position a fresh snapshot should open with — the
+    /// shell calls this between building the snapshot and installing it,
+    /// passing along whatever the previous snapshot's pill was doing.
+    pub fn set_pointer_cell(&mut self, cell: Option<usize>) {
+        self.pointer_cell = cell;
+    }
+
+    /// The pill position, for the shell to carry into the next snapshot.
+    pub fn pointer_cell(&self) -> Option<usize> {
+        self.pointer_cell
+    }
+
+    /// A bar animating out: geometry as usual, but the reveal weight it
+    /// receives is *falling* (1→0, see the shell's dismissal clock), input
+    /// is dead, and the pill is frozen wherever it starts.
+    pub fn dismissing(items: Vec<Item>, anchor: (f32, f32), pointer_cell: Option<usize>) -> Self {
+        let mut bar = Self::open(items, 0, anchor);
+        bar.dismissing = true;
+        bar.pointer_cell = pointer_cell;
+        bar
+    }
+
     pub fn closed() -> Self {
         Self {
             items: Vec::new(),
-            selected: 0,
             anchor: (0.0, 0.0),
             open: false,
+            pointer_cell: None,
+            dismissing: false,
             shadow: None,
             dirty: Dirty::new(),
             hovered: None,
@@ -386,7 +436,7 @@ impl FormatBar {
             return;
         };
         shadow.clear();
-        if !self.open || self.items.is_empty() || self.reveal <= 0.0 {
+        if !self.open || self.items.is_empty() || self.reveal < 0.0 {
             return;
         }
         // The entrance weight after the spring curve — the halo swells in
@@ -430,6 +480,10 @@ impl Component for FormatBar {
         if !self.open {
             return;
         }
+        if self.dismissing {
+            // A ghost tracks only its falling clock — no pointer, no pill.
+            return;
+        }
         let card = card_anchored(context.self_rect, self.anchor, &self.items);
         let rects = cell_rects(card, &self.items);
 
@@ -443,13 +497,23 @@ impl Component for FormatBar {
             self.hovered = hovered;
             self.dirty.set();
         }
+        // The pill is persistent: a fresh touch of a cell is remembered at
+        // the component level (and mirrored into the shell's context, so a
+        // refresh cannot forget it). In a gap or off the bar, the last
+        // touched cell simply keeps the highlight.
+        // This snapshot was seeded by the shell (`set_pointer_cell` at
+        // build time) with the pill position the previous snapshot held;
+        // from here the pointer is the only thing that moves it.
+        if let Some(cell) = hovered
+            && self.pointer_cell != Some(cell)
+        {
+            self.pointer_cell = Some(cell);
+            self.dirty.set();
+        }
 
-        // Where the pill should sit. A hovered cell wins. When the pointer
-        // is over the bar but in a gap between cells (the 10px divider
-        // channels), the pill holds where it is — snapping back to the
-        // keyboard selection across a gap reads as a twitch. The keyboard
-        // selection only drives the pill once the pointer leaves the bar.
-        let target = slide_target(hovered, over_bar, self.selected, rects.len()).map(|h| rects[h]);
+        // Where the pill should sit: the last touched cell, however long
+        // ago — persistent by design (see `slide_target`).
+        let target = slide_target(self.pointer_cell, rects.len()).map(|h| rects[h]);
         if let Some(target) = target {
             if !self.started {
                 self.slide.park(target);
@@ -477,14 +541,22 @@ impl Component for FormatBar {
         self.slide.advancing()
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        if !self.open || self.items.is_empty() {
+        if !self.open || self.items.is_empty() || self.reveal < 0.0 {
+            // A dismissal ghost past the end of its fade draws nothing —
+            // the region is about to be closed outright.
             return;
         }
 
         // The whole card grows out of the word it serves: the reveal weight
         // runs through the spring curve, so the scale overshoots ~6% before
         // it settles, and every alpha in what follows rides the same fade.
+        // During a dismissal the shell feeds the same clock falling 1→0,
+        // so this one line is both the entrance and the exit curve.
         let e = REVEAL_EASING.apply(self.reveal);
         let resting = card_anchored(rect, self.anchor, &self.items);
         let card = revealed_card(resting, self.anchor, e);
@@ -777,21 +849,19 @@ mod tests {
     }
 
     #[test]
-    fn the_pill_holds_in_a_gap_instead_of_snapping_to_the_selection() {
-        // Hovering a cell always wins.
-        assert_eq!(slide_target(Some(3), true, 0, 6), Some(3));
-        // Over the bar but in a gap (no hover): hold, don't snap to Bold.
-        assert_eq!(slide_target(None, true, 0, 6), None);
-        assert_eq!(slide_target(None, true, 2, 6), None);
-        // Off the bar: the keyboard selection drives the pill.
-        assert_eq!(slide_target(None, false, 2, 6), Some(2));
-        assert_eq!(slide_target(None, false, 0, 6), Some(0));
+    fn the_pill_is_persistent_once_a_cell_has_been_touched() {
+        // The last touched cell is the pill, whatever else is true.
+        assert_eq!(slide_target(Some(3), 6), Some(3));
+        // The pointer now sits in a gap: hold, don't snap anywhere.
+        assert_eq!(slide_target(Some(3), 6), Some(3));
+        // ... or has left the bar for the document: still hold.
+        assert_eq!(slide_target(Some(3), 6), Some(3));
+        // Nothing touched yet: no pill (the seed comes from the shell).
+        assert_eq!(slide_target(None, 6), None);
         // An empty bar has no pill at all.
-        assert_eq!(slide_target(None, false, 0, 0), None);
-        assert_eq!(slide_target(Some(2), true, 0, 0), None);
-        // Bound the selection.
-        assert_eq!(slide_target(None, false, 99, 6), Some(5));
-        assert_eq!(slide_target(Some(99), true, 0, 6), Some(5));
+        assert_eq!(slide_target(Some(2), 0), None);
+        // A touch beyond the bar's length is bounded.
+        assert_eq!(slide_target(Some(99), 6), Some(5));
     }
 
     #[test]
