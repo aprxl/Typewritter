@@ -293,7 +293,7 @@ pub struct Shell {
     pulse: Stepped,
     /// The entrance-reveal clock for whichever overlay is opening — the
     /// format bar grows out of its word as this weight climbs (the spring
-    /// itself lives in the drawing: `format_bar::REVEAL_EASING`). Owned by
+    /// itself lives in the drawing: `popup::MENU_SLIDE_EASING`). Owned by
     /// the shell
     /// so a refreshed bar snapshot never re-triggers the pop; see
     /// `Context::reveal`.
@@ -304,7 +304,7 @@ pub struct Shell {
     /// A dismissal in flight: the closing snapshot's geometry, held so the
     /// region can keep drawing (and fading) a bar whose state is gone.
     format_dismiss: Option<FormatDismiss>,
-    /// The dismissal clock, falling 1→0 over `format_bar::DISMISS_DURATION`
+    /// The dismissal clock, falling 1→0 over `popup::GHOST_DURATION`
     /// while `format_dismiss` is `Some`. `Context::reveal` reports it in
     /// place of the reveal weight, so the ghost draws with the entrance's
     /// own curve — the weight simply falls instead of climbing.
@@ -559,7 +559,7 @@ impl Shell {
         // ink sits under it, so its shadow spreads softer before it lands.
         let bar_shadow = renderer.new_layer_top(LayerInvalidation::Manual);
         bar_shadow.set_effect(Some(ShaderEffect::Blur {
-            radius: format_bar::SHADOW_BLUR_RADIUS,
+            radius: crate::components::popup::SHADOW_BLUR_RADIUS,
         }));
 
         Self {
@@ -613,7 +613,10 @@ impl Shell {
             // sixteen steps is every value that reaches the screen.
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
             pulse: Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16).ping_pong(),
-            format_reveal: Animation::new(format_bar::REVEAL_DURATION, format_bar::REVEAL_EASING),
+            format_reveal: Animation::new(
+                crate::components::popup::MENU_SLIDE_DURATION,
+                crate::components::popup::MENU_SLIDE_EASING,
+            ),
             wake_at: None,
             autosave_last_attempt: Instant::now(),
             autosave_revision: 0,
@@ -698,7 +701,7 @@ impl Shell {
             // The fall is wall-clock proportional, not the reveal animation
             // run backwards: independent pacing, no shared state to reset.
             self.format_dismiss_clock -=
-                dt.as_secs_f32() / crate::components::format_bar::DISMISS_DURATION.as_secs_f32();
+                dt.as_secs_f32() / crate::components::popup::GHOST_DURATION.as_secs_f32();
             if self.format_dismiss_clock <= 0.0 {
                 self.format_dismiss = None;
                 self.format_dismiss_clock = 0.0;

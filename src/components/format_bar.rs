@@ -25,9 +25,6 @@
 //! [`Context::reveal`](crate::ui::Context::reveal), so a refreshed snapshot
 //! never re-triggers the pop (see that field's comment).
 
-use std::time::Duration;
-
-use crate::animation::{Animation, Easing};
 use crate::document::BadgeColor;
 use crate::layout::Rect;
 use crate::renderer::{Color, Layer, Rounding};
@@ -96,19 +93,13 @@ const GAP: f32 = 4.0;
 /// The wider channel where a divider rule sits — between the letterforms
 /// and the effect chips, and between the chips and the close affordance.
 const DIV_GAP: f32 = 10.0;
-/// Corner radius of the card and of each cell — a bar reads as modern when
-/// its shoulders are soft rather than square.
-const RADIUS: f32 = 9.0;
+use super::popup::{MENU_SLIDE_EASING, Slide, paint_shadow_slab, revealed_card, slide_target};
+
+// The card's shoulders are the shared popup ones.
+const RADIUS: f32 = super::popup::CARD_RADIUS;
+
 /// Thickness of the bright accent ring around a checked/active cell.
 const RING: f32 = 1.6;
-/// How far the shadow slab spreads past the resting card on every side,
-/// before its blur. Generous on purpose: the halo must fade to nothing
-/// before the slab's own edge arrives, or the blur prints that edge as a
-/// visible ring — a shadow with a border reads as a second card.
-pub const SHADOW_SPREAD: f32 = 10.0;
-/// The blur radius the shell sets on the bar-shadow layer at creation and
-/// never touches again — see `Shell::new`.
-pub const SHADOW_BLUR_RADIUS: f32 = 14.0;
 
 /// Which visual rank a cell belongs to, for the divider placement — 0 the
 /// letterforms, 1 the effect chips, 2 the dismiss. Moving between ranks
@@ -169,52 +160,6 @@ pub fn card_anchored(viewport: Rect, anchor: (f32, f32), items: &[Item]) -> Rect
     Rect::new(x, y, width, height)
 }
 
-/// How long the entrance spring takes to settle, and its curve: a quick
-/// rise with a small overshoot and a long tail — past 200ms the pop stops
-/// reading as snappy and starts reading as lag. `CubicBezier`'s y is
-/// unclamped, which is exactly what an overshoot needs.
-pub const REVEAL_DURATION: Duration = Duration::from_millis(220);
-pub const REVEAL_EASING: Easing = Easing::CubicBezier(0.3, 1.25, 0.5, 1.0);
-
-/// How long the dismissal takes. There is no dismiss *curve*: the shell
-/// feeds the same reveal weight falling 1→0, so [`REVEAL_EASING`] — run
-/// backwards by a falling input — is the exit, and the ghost leaves with
-/// exactly the motion it arrived with. Faster than the entrance, because
-/// leaving should never hold the eye longer than arriving.
-pub const DISMISS_DURATION: Duration = Duration::from_millis(140);
-
-/// The pill's hover chase: nearly the same spring as the entrance, shorter
-/// and with a subtler overshoot — fast enough to feel attached to the
-/// pointer. A function rather than a constant: `Animation::new` is not
-/// `const`, and each caller needs a fresh timer anyway.
-fn slide_animation() -> Animation {
-    Animation::new(
-        Duration::from_millis(110),
-        Easing::CubicBezier(0.3, 1.18, 0.5, 1.0),
-    )
-}
-
-/// The card as it is *revealed*, `e` running 0→1: scaled from 88% up to
-/// full size around the anchor point (the clicked word) while sliding down
-/// a few pixels into place — the bar grows out of the word it serves and
-/// settles downward, gravity agreeing with the direction it opens in.
-/// Clamped, so an overshooting weight beyond 1 holds at rest.
-///
-/// Shared by the drawing and the shell's shadow layer — one function, so
-/// the two can never disagree about where the floating surface sits.
-pub fn revealed_card(card: Rect, anchor: (f32, f32), e: f32) -> Rect {
-    let e = e.clamp(0.0, 1.0);
-    let scale = 0.88 + 0.12 * e;
-    let travel = (1.0 - e) * -7.0; // starts 7px above, slides down into place
-    let cx = anchor.0;
-    let cy = anchor.1;
-    let x = cx + (card.x - cx) * scale;
-    let y = cy + (card.y - cy) * scale + travel;
-    let width = card.width * scale;
-    let height = card.height * scale;
-    Rect::new(x, y, width, height)
-}
-
 /// The cell each item occupies inside `card` — the drawing and the shell's
 /// hit-test are one geometry.
 pub fn cell_rects(card: Rect, items: &[Item]) -> Vec<Rect> {
@@ -242,67 +187,6 @@ pub fn cell_rects(card: Rect, items: &[Item]) -> Vec<Rect> {
 /// The item under `point`, if any, sharing [`cell_rects`] with the draw.
 pub fn cell_at(card: Rect, items: &[Item], point: (f32, f32)) -> Option<usize> {
     (0..items.len()).find(|index| cell_rects(card, items)[*index].contains(point))
-}
-
-/// A rounded rect that slides between its `from` and `to` targets as its
-/// [`Animation`] plays — the hover pill chasing the pointer across the bar.
-struct Slide {
-    animation: Animation,
-    from: Rect,
-    to: Rect,
-}
-
-impl Slide {
-    /// A fresh slide parked on top of `rect`. Snappy on purpose: a hover
-    /// chase should feel immediate, not laggy — an ease-out with a whisper
-    /// of overshoot lands like a magnet, not like a fade.
-    fn park(&mut self, rect: Rect) {
-        self.from = rect;
-        self.to = rect;
-        self.animation = slide_animation();
-    }
-
-    /// Point the slide at `rect`, leaving from wherever it currently is so
-    /// the pill travels rather than teleports. Returns whether it moved.
-    fn slide_to(&mut self, rect: Rect) -> bool {
-        if self.to == rect {
-            return false;
-        }
-        self.from = self.rect();
-        self.to = rect;
-        self.animation.restart();
-        true
-    }
-
-    fn rect(&self) -> Rect {
-        lerp_rect(self.from, self.to, self.animation.weight())
-    }
-
-    fn advancing(&self) -> bool {
-        self.animation.is_playing()
-    }
-}
-
-fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
-    Rect::new(
-        from.x + (to.x - from.x) * t,
-        from.y + (to.y - from.y) * t,
-        from.width + (to.width - from.width) * t,
-        from.height + (to.height - from.height) * t,
-    )
-}
-
-/// Which cell the hover pill should sit on. The pointer's last touch wins,
-/// for good — the highlight is persistent, whether the pointer now sits in
-/// a divider channel or has left the bar for the document. An earlier rule
-/// handed the pill back to the keyboard `selected` whenever the pointer
-/// left; sweeping off toward the page dragged the highlight back to Bold
-/// every time, which read as a reset.
-fn slide_target(touched: Option<usize>, len: usize) -> Option<usize> {
-    if len == 0 {
-        return None;
-    }
-    touched.map(|h| h.min(len - 1))
 }
 
 pub struct FormatBar {
@@ -350,11 +234,7 @@ impl FormatBar {
             dirty: Dirty::new(),
             hovered: None,
             started: false,
-            slide: Slide {
-                animation: slide_animation(),
-                from: Rect::default(),
-                to: Rect::default(),
-            },
+            slide: Slide::new(),
             reveal: 0.0,
         }
     }
@@ -392,11 +272,7 @@ impl FormatBar {
             dirty: Dirty::new(),
             hovered: None,
             started: false,
-            slide: Slide {
-                animation: slide_animation(),
-                from: Rect::default(),
-                to: Rect::default(),
-            },
+            slide: Slide::new(),
             reveal: 1.0,
         }
     }
@@ -423,32 +299,24 @@ impl FormatBar {
         let Some(shadow) = self.shadow.clone() else {
             return;
         };
-        shadow.clear();
+        // Always clear (the helper does it unconditionally): a snapshot
+        // replaced mid-flight is the last thing that can take this halo
+        // away, closed bars included.
         if !self.open || self.items.is_empty() || self.reveal < 0.0 {
+            paint_shadow_slab(&shadow, Rect::default(), -1.0);
             return;
         }
         // The entrance weight after the spring curve — the halo swells in
         // step with the card rather than fading in ahead of it. The slab
         // tracks the *resting* card: blur already softens what it lands
         // on, and chasing the overshoot visually doubles it.
-        let e = REVEAL_EASING.apply(self.reveal).clamp(0.0, 1.0);
+        let e = MENU_SLIDE_EASING.apply(self.reveal).clamp(0.0, 1.0);
         let card = revealed_card(
             card_anchored(viewport, self.anchor, &self.items),
             self.anchor,
             1.0,
         );
-        if card.is_empty() {
-            return;
-        }
-        shadow.draw_rectangle(
-            (card.x - SHADOW_SPREAD, card.y - SHADOW_SPREAD),
-            (
-                card.width + SHADOW_SPREAD * 2.0,
-                card.height + SHADOW_SPREAD * 2.0,
-            ),
-            theme::fade(theme::shadow_ink(), e),
-            Rounding::uniform(RADIUS + SHADOW_SPREAD),
-        );
+        paint_shadow_slab(&shadow, card, e);
     }
 }
 
@@ -514,7 +382,7 @@ impl Component for FormatBar {
         if self.slide.advancing() {
             self.dirty.set();
         }
-        self.slide.animation.advance(context.animation_dt);
+        self.slide.advance(context.animation_dt);
     }
 
     fn is_dirty(&self) -> bool {
@@ -549,7 +417,7 @@ impl Component for FormatBar {
         // it settles, and every alpha in what follows rides the same fade.
         // During a dismissal the shell feeds the same clock falling 1→0,
         // so this one line is both the entrance and the exit curve.
-        let e = REVEAL_EASING.apply(self.reveal);
+        let e = MENU_SLIDE_EASING.apply(self.reveal);
         let resting = card_anchored(rect, self.anchor, &self.items);
         let card = revealed_card(resting, self.anchor, e);
         // The floor of the shadow sandwich goes to the shell-owned blurred
@@ -858,11 +726,7 @@ mod tests {
 
     #[test]
     fn the_slide_travels_to_its_new_target() {
-        let mut slide = Slide {
-            animation: slide_animation(),
-            from: Rect::default(),
-            to: Rect::default(),
-        };
+        let mut slide = Slide::new();
         let first = Rect::new(0.0, 0.0, 30.0, 24.0);
         slide.park(first);
         assert_eq!(slide.rect(), first);
@@ -873,7 +737,7 @@ mod tests {
         let second = Rect::new(40.0, 0.0, 38.0, 24.0);
         assert!(slide.slide_to(second));
         assert!(slide.advancing());
-        slide.animation.advance(Duration::from_millis(200));
+        slide.advance(std::time::Duration::from_millis(200));
         assert!(!slide.advancing());
         assert_eq!(slide.rect(), second);
     }

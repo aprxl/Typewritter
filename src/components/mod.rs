@@ -26,6 +26,7 @@ pub mod format_bar;
 pub mod math_menu;
 pub mod onboarding;
 pub mod palette;
+pub mod popup;
 pub mod sidenotes;
 pub mod slash_menu;
 pub mod status_line;
