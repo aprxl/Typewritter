@@ -666,8 +666,12 @@ pub fn outline(layer: &Layer, rect: Rect, color: Color) {
 /// reads as a smudge.
 pub fn shadow_ink() -> Color {
     match mode() {
-        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x1E),
-        Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x2E),
+        // Halved alpha from the first pass: the halo was reading as a
+        // solid-edged slab rather than a barely-there detail. The colour
+        // stays; only the whole shadow sits further back, so the blur's
+        // falloff does the shaping and nothing draws a visible boundary.
+        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x0F),
+        Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x17),
     }
 }
 
