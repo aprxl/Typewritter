@@ -22,6 +22,7 @@ const CARD_H: f32 = 430.0;
 const MAX_ROWS: usize = ((CARD_H - QUERY_H - FOOTER_H) / ROW_HEIGHT) as usize;
 
 /// One command as the palette shows it.
+#[derive(Clone)]
 pub struct Entry {
     pub title: String,
     /// "File", "View", "Edit" — drawn dimmed after the title.
@@ -262,7 +263,12 @@ impl Palette {
             let middle = row.y + row.height / 2.0;
 
             if self.first_visible + offset == self.selected {
-                layer.draw_rectangle(row.position(), row.size(), theme::selection(), Rounding::NONE);
+                layer.draw_rectangle(
+                    row.position(),
+                    row.size(),
+                    theme::selection(),
+                    Rounding::NONE,
+                );
             }
 
             theme::draw(

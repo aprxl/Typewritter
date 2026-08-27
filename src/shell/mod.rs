@@ -142,6 +142,15 @@ enum MenuDismiss {
         anchor: (f32, f32),
         pointer_cell: Option<usize>,
     },
+    /// The slash menu: query, selection, scroll window, anchor — everything
+    /// the component needs to redraw itself exactly as it stood.
+    Slash {
+        state: crate::components::slash_menu::Snapshot,
+        /// Where the menu opened; re-fed to the ghost's geometry.
+        anchor: (f32, f32),
+        /// Which row the pill had parked on.
+        pointer_row: Option<usize>,
+    },
 }
 
 /// The in-math completion card while it is showing: the precise tree query,
@@ -723,7 +732,7 @@ impl Shell {
                 self.menu_dismiss_clock = 0.0;
                 match ended {
                     MenuDismiss::Format { .. } => self.refresh_format_bar(),
-                    // Slash/context/math arms land here with their tasks.
+                    MenuDismiss::Slash { .. } => self.refresh_slash_menu(),
                 }
             }
             animating = true;
@@ -928,7 +937,11 @@ impl Shell {
             (self.onboard_region, self.onboarding),
             (self.dialog_region, self.dialog.is_some()),
             (self.palette_region, self.palette.is_some()),
-            (self.slash_region, self.slash_menu.is_some()),
+            (
+                self.slash_region,
+                self.slash_menu.is_some()
+                    || matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })),
+            ),
             (self.finder_region, self.finder.is_some()),
             (self.menu_region, self.context_menu.is_some()),
             (

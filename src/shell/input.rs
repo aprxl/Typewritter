@@ -535,11 +535,17 @@ impl Shell {
         let text = input.text();
         if text == "/" {
             let anchor = self.compute_slash_anchor();
+            // An in-flight fade-out of THIS menu is superseded: it is back.
+            if matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })) {
+                self.menu_dismiss = None;
+                self.menu_dismiss_clock = 0.0;
+            }
             self.slash_menu = Some(SlashMenuState {
                 query: String::new(),
                 selected: 0,
                 anchor,
             });
+            self.popup_reveal.restart();
             self.refresh_slash_menu();
             return;
         }
@@ -719,11 +725,16 @@ impl Shell {
         for c in input.text().chars() {
             if !self.vim.command_active() && c == '/' && self.vim.visual_mode().is_some() {
                 let anchor = self.compute_slash_anchor();
+                if matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })) {
+                    self.menu_dismiss = None;
+                    self.menu_dismiss_clock = 0.0;
+                }
                 self.slash_menu = Some(SlashMenuState {
                     query: String::new(),
                     selected: 0,
                     anchor,
                 });
+                self.popup_reveal.restart();
                 self.refresh_slash_menu();
                 return;
             }
@@ -1570,7 +1581,10 @@ impl Shell {
         (screen_x, screen_y)
     }
 
-    fn refresh_slash_menu(&mut self) {
+    /// Every arm carries the blurred shadow layer — closed ghosts included:
+    /// `paint_shadow` clears it before anything else, so the snapshot that
+    /// closes the menu is also the one that takes the halo off the screen.
+    pub(super) fn refresh_slash_menu(&mut self) {
         let menu = match &self.slash_menu {
             Some(state) => SlashMenu::new(
                 commands::editor_entries(),
@@ -1578,8 +1592,16 @@ impl Shell {
                 state.selected,
                 state.anchor,
             ),
-            None => SlashMenu::closed(),
-        };
+            None => match &self.menu_dismiss {
+                Some(MenuDismiss::Slash {
+                    state,
+                    anchor,
+                    pointer_row,
+                }) => SlashMenu::dismissing(state, *anchor, *pointer_row),
+                _ => SlashMenu::closed(),
+            },
+        }
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.slash_region].set_component(Box::new(menu));
     }
 
@@ -2048,7 +2070,7 @@ impl Shell {
                     anchor,
                     pointer_cell,
                 }) => FormatBar::dismissing(items.clone(), *anchor, *pointer_cell),
-                None => FormatBar::closed(),
+                _ => FormatBar::closed(),
             },
         }
         .with_shadow(self.popup_shadow.clone());
@@ -2338,8 +2360,53 @@ impl Shell {
     }
 
     fn close_slash_menu(&mut self) {
+        // The ghost's shape comes from the live state, so read the snapshot
+        // before `take` empties it.
+        let snap = self
+            .slash_menu
+            .as_ref()
+            .map(|state| crate::components::slash_menu::Snapshot {
+                entries: commands::editor_entries(),
+                visible: palette::filter(&commands::editor_entries(), &state.query),
+                query: state.query.clone(),
+                selected: state.selected,
+                // Scroll window rule from `SlashMenu::new`: keep the
+                // selection visible at the bottom of the window.
+                first_visible: state
+                    .selected
+                    .saturating_sub(crate::components::slash_menu::MAX_ROWS.saturating_sub(1)),
+            });
+        let anchor = self.slash_menu.as_ref().map(|state| state.anchor);
+        // The pill parks where the keyboard selection is — the same place a
+        // fresh open starts (see `Format`'s equivalent).
+        let pointer_row = self
+            .slash_menu
+            .as_ref()
+            .and_then(|state| self.pill_row_of_slash(state));
         self.slash_menu = None;
+        if let (Some(snap), Some(anchor)) = (snap, anchor) {
+            if !snap.visible.is_empty() {
+                self.menu_dismiss = Some(MenuDismiss::Slash {
+                    state: snap,
+                    anchor,
+                    pointer_row,
+                });
+                self.menu_dismiss_clock = 1.0;
+            } else {
+                self.menu_dismiss = None;
+                self.menu_dismiss_clock = 0.0;
+            }
+        }
         self.refresh_slash_menu();
+    }
+
+    /// Which row the slash menu's pill sits on. The component holds the live
+    /// one after hover; fall back to the keyboard selection.
+    fn pill_row_of_slash(&self, _state: &SlashMenuState) -> Option<usize> {
+        self.regions[self.slash_region]
+            .component_as::<crate::components::slash_menu::SlashMenu>()
+            .and_then(crate::components::slash_menu::SlashMenu::pill_row)
+            .or(Some(_state.selected))
     }
 
     fn run_selected_slash_command(&mut self) {
