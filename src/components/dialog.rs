@@ -116,7 +116,10 @@ impl Dialog {
     }
 
     /// Paints the shadow slab from sync; closed clears unconditionally.
-    fn paint_shadow(&mut self) {
+    fn paint_shadow(&mut self, owns: bool) {
+        if !owns {
+            return;
+        }
         let Some(shadow) = self.shadow.clone() else {
             return;
         };
@@ -195,7 +198,7 @@ impl Component for Dialog {
             self.reveal = context.reveal;
             self.dirty.set();
         }
-        self.paint_shadow();
+        self.paint_shadow(context.owns_shadow);
         if self.prompt.is_some() {
             self.dirty.write(&mut self.caret_on, context.caret_on);
 

@@ -167,7 +167,10 @@ impl Palette {
     /// Paints the shadow slab from sync. A modal's halo fades in with the
     /// card; a closed palette clears the layer unconditionally so the last
     /// frame's halo always leaves with it.
-    fn paint_shadow(&mut self) {
+    fn paint_shadow(&mut self, owns: bool) {
+        if !owns {
+            return;
+        }
         let Some(shadow) = self.shadow.clone() else {
             return;
         };
@@ -194,7 +197,7 @@ impl Component for Palette {
             self.reveal = context.reveal;
             self.dirty.set();
         }
-        self.paint_shadow();
+        self.paint_shadow(context.owns_shadow);
         if self.open {
             self.dirty.write(&mut self.caret_on, context.caret_on);
 

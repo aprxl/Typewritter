@@ -295,7 +295,10 @@ impl FormatBar {
     /// This component is recreated on every shell refresh; whatever a dead
     /// snapshot drew stays in the Manual-mode layer until a live one
     /// clears here, which is why the clear is unconditional.
-    fn paint_shadow(&mut self, viewport: Rect) {
+    fn paint_shadow(&mut self, owns: bool, viewport: Rect) {
+        if !owns {
+            return;
+        }
         let Some(shadow) = self.shadow.clone() else {
             return;
         };
@@ -332,7 +335,7 @@ impl Component for FormatBar {
             self.reveal = context.reveal;
             self.dirty.set();
         }
-        self.paint_shadow(context.self_rect);
+        self.paint_shadow(context.owns_shadow, context.self_rect);
         if !self.open {
             return;
         }

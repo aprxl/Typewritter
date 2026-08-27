@@ -211,7 +211,10 @@ impl SlashMenu {
     /// whether or not draw does — so a closing ghost takes its halo with it.
     /// The slab tracks the resting card: blur already softens what it lands
     /// on, and chasing the overshoot visually doubles it.
-    fn paint_shadow(&mut self, viewport: Rect) {
+    fn paint_shadow(&mut self, owns: bool, viewport: Rect) {
+        if !owns {
+            return;
+        }
         let Some(shadow) = self.shadow.clone() else {
             return;
         };
@@ -237,7 +240,7 @@ impl Component for SlashMenu {
         if reveal_changed {
             self.reveal = context.reveal;
         }
-        self.paint_shadow(context.self_rect);
+        self.paint_shadow(context.owns_shadow, context.self_rect);
         if !self.open {
             return;
         }
