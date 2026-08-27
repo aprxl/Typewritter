@@ -419,6 +419,12 @@ pub struct Shell {
     /// above the page but below every overlay that opens after it, because
     /// a shadow must fall on the page, never on a popup.
     popup_shadow: Layer,
+    /// The region that owned `popup_shadow` on the previous frame. When
+    /// ownership changes — a modal closed instantly, ownership dropping to
+    /// `None` with nobody left to clear — the loser is granted one more
+    /// frame as owner specifically to clear the layer. Without this, a
+    /// modal's halo would freeze on screen forever.
+    last_shadow_owner: Option<usize>,
     /// The palette swap in flight, if there is one — see [`ThemeSwap`].
     /// `Some` is also what locks the switch: a swap cannot be spammed,
     /// because a second one would capture a frame mid-wipe and hold *that*
@@ -690,6 +696,7 @@ impl Shell {
             last_width: 0.0,
             glow,
             popup_shadow,
+            last_shadow_owner: None,
             theme_swap: None,
         }
     }
@@ -776,7 +783,25 @@ impl Shell {
             });
         }
 
+        // The popup shadow layer has ONE writer per frame: whichever region
+        // currently hosts the visible popup (or its falling ghost). Every
+        // other region's context denies ownership — a closed snapshot that
+        // cleared anyway would race and wipe a live halo (that bug shipped:
+        // popups lost their shadows after one format-bar use, because the
+        // bar region's sync ran after the other regions' draws).
+        let mut shadow_owner = self.shadow_owner_region();
+        if shadow_owner.is_none() {
+            // Instant modal close: ownership dropped with no ghost to catch
+            // the halo. The region that had it gets exactly one more frame
+            // as owner — its snapshot is closed by now, so the grant makes
+            // it clear and then release.
+            shadow_owner = self.last_shadow_owner;
+            self.last_shadow_owner = None;
+        } else {
+            self.last_shadow_owner = shadow_owner;
+        }
         let context = Context {
+            owns_shadow: false,
             frametime,
             animation_dt: dt,
             layouts: self.layouts,
@@ -807,11 +832,12 @@ impl Shell {
             overlay_open: self.any_overlay_open(),
             theme_locked: self.theme_swap.is_some(),
         };
-        for region in &mut self.regions {
+        for (index, region) in self.regions.iter_mut().enumerate() {
             let mut context = context;
             // A component hit-tests against its own rect; the shell is the
             // only one that knows where that rect is, so it hands it over.
             context.self_rect = self.layout.rect(region.node());
+            context.owns_shadow = Some(index) == shadow_owner;
             region.sync(&context);
             animating |= region.is_animating();
             region.measure_into(&mut self.layout);
@@ -862,6 +888,43 @@ impl Shell {
             self.rebuild_views();
         }
         animating
+    }
+
+    /// Which region draws this frame's halo onto `popup_shadow` — the one
+    /// hosting the live popup, else the one hosting its falling ghost, else
+    /// none. One writer; see `owns_shadow` on `Context`.
+    fn shadow_owner_region(&self) -> Option<usize> {
+        if self.dialog.is_some() {
+            return Some(self.dialog_region);
+        }
+        if self.onboarding {
+            return Some(self.onboard_region);
+        }
+        if self.palette.is_some() {
+            return Some(self.palette_region);
+        }
+        if self.slash_menu.is_some() {
+            return Some(self.slash_region);
+        }
+        if self.finder.is_some() {
+            return Some(self.finder_region);
+        }
+        if self.context_menu.is_some() {
+            return Some(self.menu_region);
+        }
+        if self.math_menu.is_some() {
+            return Some(self.math_menu_region);
+        }
+        if self.format_bar.is_some() {
+            return Some(self.format_region);
+        }
+        match &self.menu_dismiss {
+            Some(MenuDismiss::Format { .. }) => Some(self.format_region),
+            Some(MenuDismiss::Slash { .. }) => Some(self.slash_region),
+            Some(MenuDismiss::Context { .. }) => Some(self.menu_region),
+            Some(MenuDismiss::Math { .. }) => Some(self.math_menu_region),
+            None => None,
+        }
     }
 
     /// Is any popup showing? One disjunction, so the frame loop's "something

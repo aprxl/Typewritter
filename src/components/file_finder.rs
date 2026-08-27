@@ -56,6 +56,10 @@ pub struct FileFinder {
     /// The blurred layer this panel paints its shadow slab into.
     shadow: Option<Layer>,
     reveal: f32,
+    /// Whether the shell granted this snapshot ownership of the shared
+    /// shadow layer this frame (`Context::owns_shadow`); only an owner may
+    /// paint or clear.
+    owned: bool,
     dirty: Dirty,
 }
 
@@ -70,6 +74,7 @@ impl FileFinder {
             first_visible: selected.saturating_sub(MAX_ROWS.saturating_sub(1)),
             shadow: None,
             reveal: 0.0,
+            owned: false,
             dirty: Dirty::new(),
         }
     }
@@ -82,6 +87,7 @@ impl FileFinder {
             first_visible: 0,
             shadow: None,
             reveal: 1.0,
+            owned: false,
             dirty: Dirty::new(),
         }
     }
@@ -119,8 +125,12 @@ impl Component for FileFinder {
         if reveal_changed {
             self.reveal = context.reveal;
             self.dirty.set();
-            self.clear_shadow();
+            if context.owns_shadow {
+                self.clear_shadow();
+            }
         }
+        // Draw reads this — it paints the slab from measured geometry.
+        self.owned = context.owns_shadow;
     }
 
     fn is_dirty(&self) -> bool {
@@ -156,9 +166,11 @@ impl Component for FileFinder {
         );
 
         // Shadow from draw: this component's slab depends on the measured
-        // search-box geometry (see sync). The shell always attaches the
-        // layer via `with_shadow`.
-        if let Some(shadow) = &self.shadow {
+        // search-box geometry (see sync). Painted only while the shell has
+        // granted this region ownership of the shared layer.
+        if self.owned
+            && let Some(shadow) = &self.shadow
+        {
             paint_shadow_slab(shadow, panel, ea);
         }
 

@@ -79,6 +79,13 @@ pub struct Context {
     pub show_stats: bool,
     /// Mouse state, for components that handle clicks and hovers.
     pub mouse: Mouse,
+    /// Whether THIS region owns the shared popup shadow layer this frame —
+    /// exactly the region whose popup is on screen (or falling as a ghost).
+    /// Owners paint/clear it; everyone else must never touch it, or a
+    /// closed snapshot's unconditional clear would race a live halo (this
+    /// wiped popups' shadows once the format bar had been used: its closed
+    /// snapshot synced after other regions' paints and cleared their slabs).
+    pub owns_shadow: bool,
     /// Lines scrolled this frame (positive is up), for scrollable regions.
     pub scroll_y: f32,
     /// The region's own solved rect. The shell sets this per region each
