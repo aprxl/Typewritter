@@ -157,6 +157,12 @@ enum MenuDismiss {
         anchor: (f32, f32),
         pill_row: usize,
     },
+    /// The in-math completion card: rows, grid split, selection.
+    Math {
+        state: crate::components::math_menu::Snapshot,
+        anchor: (f32, f32),
+        pill_row: usize,
+    },
 }
 
 /// The in-math completion card while it is showing: the precise tree query,
@@ -740,6 +746,7 @@ impl Shell {
                     MenuDismiss::Format { .. } => self.refresh_format_bar(),
                     MenuDismiss::Slash { .. } => self.refresh_slash_menu(),
                     MenuDismiss::Context { .. } => self.refresh_context_menu(),
+                    MenuDismiss::Math { .. } => self.refresh_math_menu(),
                 }
             }
             animating = true;
@@ -959,7 +966,11 @@ impl Shell {
                 self.format_region,
                 self.format_bar.is_some() || self.menu_dismiss.is_some(),
             ),
-            (self.math_menu_region, self.math_menu.is_some()),
+            (
+                self.math_menu_region,
+                self.math_menu.is_some()
+                    || matches!(self.menu_dismiss, Some(MenuDismiss::Math { .. })),
+            ),
         ];
         for (index, open) in overlays {
             match (open, self.regions[index].is_attached()) {

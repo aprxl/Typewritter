@@ -2660,6 +2660,11 @@ impl Shell {
             || math_conversion::offers(&query).offers.is_empty()
         {
             if self.math_menu.take().is_some() {
+                // The card just closed with content on screen: leave a
+                // ghost falling away instead of popping to nothing. (An
+                // empty-offers close has no rows; the spawn check below
+                // covers it.)
+                self.spawn_math_ghost_from_live();
                 self.refresh_math_menu();
             }
             return;
@@ -2714,7 +2719,42 @@ impl Shell {
         (screen_x, screen_y)
     }
 
-    fn refresh_math_menu(&mut self) {
+    /// Captures the live math card's REAL state into `MenuDismiss::Math`
+    /// and arms the clock — call while `self.math_menu` still holds the
+    /// pre-close state and BEFORE refreshing the region.
+    fn spawn_math_ghost_from_live(&mut self) {
+        let snap = self.math_menu.as_ref().map(|state| {
+            let offers = math_conversion::offers(&state.query).offers;
+            crate::components::math_menu::Snapshot {
+                rows: math_menu_rows(&offers),
+                variant_start: math_menu_variant_start(&offers),
+                selected: state.selected,
+            }
+        });
+        let anchor = self.math_menu.as_ref().map(|state| state.anchor);
+        let pill_row = self.regions[self.math_menu_region]
+            .component_as::<MathMenu>()
+            .and_then(MathMenu::pill_row);
+        if let (Some(snap), Some(anchor)) = (snap, anchor)
+            && !snap.rows.is_empty()
+        {
+            // The live component clamps its selection; mirror it.
+            let pill_row = pill_row.unwrap_or(snap.selected.min(snap.rows.len() - 1));
+            self.menu_dismiss = Some(MenuDismiss::Math {
+                state: snap,
+                anchor,
+                pill_row,
+            });
+            self.menu_dismiss_clock = 1.0;
+            return;
+        }
+        self.menu_dismiss = None;
+        self.menu_dismiss_clock = 0.0;
+    }
+
+    /// Shadow layer rides every arm — ghosts included — so a closing card
+    /// always takes its halo away (see `refresh_slash_menu`).
+    pub(super) fn refresh_math_menu(&mut self) {
         let menu = match &self.math_menu {
             Some(state) => {
                 let offers = math_conversion::offers(&state.query).offers;
@@ -2725,8 +2765,16 @@ impl Shell {
                     state.anchor,
                 )
             }
-            None => MathMenu::closed(),
-        };
+            None => match &self.menu_dismiss {
+                Some(MenuDismiss::Math {
+                    state,
+                    anchor,
+                    pill_row,
+                }) => MathMenu::dismissing(state, *anchor, *pill_row),
+                _ => MathMenu::closed(),
+            },
+        }
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.math_menu_region].set_component(Box::new(menu));
     }
 
