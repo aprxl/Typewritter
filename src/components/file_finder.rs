@@ -125,12 +125,18 @@ impl Component for FileFinder {
         if reveal_changed {
             self.reveal = context.reveal;
             self.dirty.set();
-            if context.owns_shadow {
-                self.clear_shadow();
-            }
         }
         // Draw reads this — it paints the slab from measured geometry.
         self.owned = context.owns_shadow;
+        // An owner with an empty list is the CLOSED snapshot the shell
+        // builds when the finder closes — it exists purely to blank the
+        // layer this frame. Without this the last halo would linger
+        // forever: ownership normally pairs with a paint in draw, but an
+        // empty snapshot draws no panel at all, and reveal never changes
+        // again to re-arm the clear above.
+        if self.owned && self.visible.is_empty() {
+            self.clear_shadow();
+        }
     }
 
     fn is_dirty(&self) -> bool {
