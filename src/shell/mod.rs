@@ -151,6 +151,12 @@ enum MenuDismiss {
         /// Which row the pill had parked on.
         pointer_row: Option<usize>,
     },
+    /// The right-click context menu: rows and live checkmarks as they stood.
+    Context {
+        state: crate::components::context_menu::Snapshot,
+        anchor: (f32, f32),
+        pill_row: usize,
+    },
 }
 
 /// The in-math completion card while it is showing: the precise tree query,
@@ -733,6 +739,7 @@ impl Shell {
                 match ended {
                     MenuDismiss::Format { .. } => self.refresh_format_bar(),
                     MenuDismiss::Slash { .. } => self.refresh_slash_menu(),
+                    MenuDismiss::Context { .. } => self.refresh_context_menu(),
                 }
             }
             animating = true;
@@ -943,7 +950,11 @@ impl Shell {
                     || matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })),
             ),
             (self.finder_region, self.finder.is_some()),
-            (self.menu_region, self.context_menu.is_some()),
+            (
+                self.menu_region,
+                self.context_menu.is_some()
+                    || matches!(self.menu_dismiss, Some(MenuDismiss::Context { .. })),
+            ),
             (
                 self.format_region,
                 self.format_bar.is_some() || self.menu_dismiss.is_some(),

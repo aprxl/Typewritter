@@ -1966,6 +1966,11 @@ impl Shell {
         target: Option<crate::document::layout::ContextHit>,
     ) {
         self.format_bar = None;
+        // An in-flight fade-out of THIS menu is superseded: it is back.
+        if matches!(self.menu_dismiss, Some(MenuDismiss::Context { .. })) {
+            self.menu_dismiss = None;
+            self.menu_dismiss_clock = 0.0;
+        }
         let items = commands::menu(ids);
         if items.is_empty() {
             return;
@@ -1976,11 +1981,14 @@ impl Shell {
             anchor,
             target,
         });
+        self.popup_reveal.restart();
         self.refresh_context_menu();
         self.rebuild_views();
     }
 
-    fn refresh_context_menu(&mut self) {
+    /// Shadow layer rides every arm — ghosts included — so a closing menu
+    /// always takes its halo away (see `refresh_slash_menu`).
+    pub(super) fn refresh_context_menu(&mut self) {
         let menu = match &self.context_menu {
             Some(state) => {
                 let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
@@ -1996,13 +2004,53 @@ impl Shell {
                     state.anchor,
                 )
             }
-            None => ContextMenu::closed(),
-        };
+            None => match &self.menu_dismiss {
+                Some(MenuDismiss::Context {
+                    state,
+                    anchor,
+                    pill_row,
+                }) => ContextMenu::dismissing(state, *anchor, *pill_row),
+                _ => ContextMenu::closed(),
+            },
+        }
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.menu_region].set_component(Box::new(menu));
     }
 
     fn close_context_menu(&mut self) {
-        self.context_menu = None;
+        // Ghost fodder comes from the LIVE menu (rows with current checks +
+        // the pill's row) — read before `take` empties it.
+        let ghost = self.context_menu.take().map(|state| {
+            let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
+            let checked: Vec<bool> = state
+                .items
+                .iter()
+                .map(|command| self.context_command_checked(command.id))
+                .collect();
+            let entries = commands::menu_entries(&ids);
+            let snap = crate::components::context_menu::Snapshot { entries, checked };
+            let pill_row = self.regions[self.menu_region]
+                .component_as::<ContextMenu>()
+                .and_then(|m| m.pill_row())
+                .unwrap_or(state.selected.min(snap.entries.len().saturating_sub(1)));
+            MenuDismiss::Context {
+                state: snap,
+                anchor: state.anchor,
+                pill_row,
+            }
+        });
+        // Zero-row menus have no ghost to show.
+        let spawn = matches!(
+            &ghost,
+            Some(MenuDismiss::Context { state, .. }) if !state.entries.is_empty()
+        );
+        if spawn {
+            self.menu_dismiss = ghost;
+            self.menu_dismiss_clock = 1.0;
+        } else {
+            self.menu_dismiss = None;
+            self.menu_dismiss_clock = 0.0;
+        }
         self.refresh_context_menu();
         self.rebuild_views();
     }
