@@ -10,6 +10,9 @@ use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
 
+use super::popup::{Slide, paint_shadow_slab};
+
+const ROW_RADIUS: f32 = 6.0;
 const CARD_W: f32 = 560.0;
 /// Query line plus the rule beneath it.
 const QUERY_H: f32 = 56.0;
@@ -100,6 +103,11 @@ pub struct Palette {
     first_visible: usize,
     caret_on: bool,
     open: bool,
+    /// The blurred layer this card paints its shadow slab into.
+    shadow: Option<Layer>,
+    reveal: f32,
+    slide: Slide,
+    started: bool,
     dirty: Dirty,
 }
 
@@ -123,11 +131,16 @@ impl Palette {
             first_visible,
             caret_on: true,
             open: true,
+            shadow: None,
+            reveal: 0.0,
+            slide: Slide::new(),
+            started: false,
             dirty: Dirty::new(),
         }
     }
 
-    /// Closed. Draws nothing and never dirties itself.
+    /// Closed. Draws nothing and never dirties itself. Modals close
+    /// instantly — no ghost (see the toolkit's motion table).
     pub fn closed() -> Self {
         Self {
             entries: Vec::new(),
@@ -137,8 +150,32 @@ impl Palette {
             first_visible: 0,
             caret_on: true,
             open: false,
+            shadow: None,
+            reveal: 1.0,
+            slide: Slide::new(),
+            started: false,
             dirty: Dirty::new(),
         }
+    }
+
+    /// Attaches the shell's blurred shadow layer.
+    pub fn with_shadow(mut self, shadow: Layer) -> Self {
+        self.shadow = Some(shadow);
+        self
+    }
+
+    /// Paints the shadow slab from sync. A modal's halo fades in with the
+    /// card; a closed palette clears the layer unconditionally so the last
+    /// frame's halo always leaves with it.
+    fn paint_shadow(&mut self) {
+        let Some(shadow) = self.shadow.clone() else {
+            return;
+        };
+        if !self.open || !(0.0..=1.0).contains(&self.reveal) {
+            paint_shadow_slab(&shadow, Rect::default(), -1.0);
+            return;
+        }
+        paint_shadow_slab(&shadow, card(Rect::default()), self.reveal);
     }
 }
 
@@ -149,10 +186,36 @@ impl Component for Palette {
     }
 
     fn sync(&mut self, context: &Context) {
-        // A closed palette draws nothing, so tracking the caret would only
-        // ever mark it dirty for a redraw nobody sees.
+        // A closed palette still clears the shadow layer (the last halo has
+        // to leave with it), so paint_shadow runs unconditionally — but the
+        // caret is only tracked while anyone can see it.
+        let reveal_changed = self.reveal != context.reveal;
+        if reveal_changed {
+            self.reveal = context.reveal;
+            self.dirty.set();
+        }
+        self.paint_shadow();
         if self.open {
             self.dirty.write(&mut self.caret_on, context.caret_on);
+
+            // The pill follows the keyboard selection. The shell rebuilds
+            // this snapshot on every keystroke/move and `new` seeds the
+            // target from `selected`, so the pill parks once per snapshot
+            // and any selection change shows up as a fresh snapshot.
+            if !self.visible.is_empty() {
+                let row = self.selected.saturating_sub(self.first_visible);
+                let target = row_rect(card(Rect::default()), row);
+                if !self.started {
+                    self.slide.park(target);
+                    self.started = true;
+                } else if self.slide.slide_to(target) {
+                    self.dirty.set();
+                }
+            }
+        }
+        self.slide.advance(context.animation_dt);
+        if self.slide.advancing() {
+            self.dirty.set();
         }
     }
 
@@ -161,31 +224,59 @@ impl Component for Palette {
     }
 
     fn clear_dirty(&mut self) {
-        self.dirty.clear();
+        self.dirty.clear()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn is_animating(&self) -> bool {
+        // Never report a never-advanced Slide on a closed snapshot.
+        self.open && (self.slide.advancing() || (self.reveal > 0.0 && self.reveal < 1.0))
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
         if !self.open {
             return;
         }
+        // The dim sits under everything and fades in with the card.
+        let ea = self.reveal.clamp(0.0, 1.0);
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            theme::fade(theme::background(), 0.72),
+            theme::fade(theme::background(), 0.72 * ea),
             Rounding::NONE,
         );
 
-        let card = card(rect);
-        layer.draw_rectangle(card.position(), card.size(), theme::popup(), Rounding::NONE);
-        theme::outline(layer, card, theme::border());
+        let resting = card(rect);
+        // A modal does not scale or overshoot — a palette-sized surface
+        // wobbling reads as lag. It just fades up (and the rounded surface
+        // rises 4px into place on the same curve).
+        let travel = (1.0 - ea) * -4.0;
+        let card = Rect::new(resting.x, resting.y + travel, resting.width, resting.height);
 
-        self.draw_query(layer, card);
+        layer.draw_rectangle(
+            card.position(),
+            card.size(),
+            theme::elevated_popup(ea),
+            Rounding::uniform(super::popup::CARD_RADIUS),
+        );
+        theme::rounded_outline(
+            layer,
+            card.inset(0.5),
+            super::popup::CARD_RADIUS - 0.5,
+            1.0,
+            theme::fade(theme::non_text(), ea),
+        );
+
+        self.draw_query(layer, card, ea);
         theme::rule(
             layer,
             (card.x + 20.0, card.y + QUERY_H),
             card.width - 40.0,
             1.0,
-            theme::border(),
+            theme::fade(theme::border(), ea),
         );
 
         if self.visible.is_empty() {
@@ -193,33 +284,44 @@ impl Component for Palette {
                 layer,
                 "No matching command",
                 (card.x + card.width / 2.0, card.y + QUERY_H + 32.0),
-                &TextStyle::serif(13.5, theme::faint()),
+                &TextStyle::serif(13.5, theme::fade(theme::faint(), ea)),
                 theme::CENTER,
             );
         } else {
-            self.draw_rows(layer, card);
+            self.draw_rows(layer, card, ea);
         }
 
         theme::draw(
             layer,
             "\u{2191}\u{2193} select \u{b7} Enter runs \u{b7} Esc closes",
             (card.x + 20.0, card.bottom() - FOOTER_H / 2.0),
-            &TextStyle::mono(10.0, theme::faint()),
+            &TextStyle::mono(10.0, theme::fade(theme::faint(), ea)),
             theme::LEFT,
         );
     }
 }
 
+/// The rect of the `row`th drawn row inside `card` — shared by the pill and
+/// the row loop.
+fn row_rect(card: Rect, row: usize) -> Rect {
+    Rect::new(
+        card.x,
+        card.y + QUERY_H + row as f32 * ROW_HEIGHT,
+        card.width,
+        ROW_HEIGHT,
+    )
+}
+
 impl Palette {
-    fn draw_query(&self, layer: &Layer, card: Rect) {
-        let style = TextStyle::serif(16.0, theme::ink());
+    fn draw_query(&self, layer: &Layer, card: Rect, ea: f32) {
+        let style = TextStyle::serif(16.0, theme::fade(theme::ink(), ea));
         let middle = card.y + QUERY_H / 2.0;
         if self.query.is_empty() {
             theme::draw(
                 layer,
                 "Type a command",
                 (card.x + 20.0, middle),
-                &style.clone().color(theme::faint()),
+                &style.clone().color(theme::fade(theme::faint(), ea)),
                 theme::LEFT,
             );
         } else {
@@ -237,16 +339,29 @@ impl Palette {
             layer.draw_rectangle(
                 (x, middle - 10.0),
                 (2.0, 20.0),
-                theme::accent(),
+                theme::fade(theme::accent(), ea),
                 Rounding::NONE,
             );
         }
     }
 
-    fn draw_rows(&self, layer: &Layer, card: Rect) {
-        let title_style = TextStyle::serif(15.0, theme::ink());
-        let group_style = TextStyle::serif(11.5, theme::comment());
-        let hint_style = TextStyle::mono(10.5, theme::faint());
+    fn draw_rows(&self, layer: &Layer, card: Rect, ea: f32) {
+        let title_style = TextStyle::serif(15.0, theme::fade(theme::ink(), ea));
+        let group_style = TextStyle::serif(11.5, theme::fade(theme::comment(), ea));
+        let hint_style = TextStyle::mono(10.5, theme::fade(theme::faint(), ea));
+
+        // The slide pill rides under the selected row — arrow keys move it
+        // because each selection change rebuilds this snapshot with a new
+        // `selected`, and sync retargets from there.
+        if self.started && !self.visible.is_empty() {
+            let pill = row_rect(card, self.selected.saturating_sub(self.first_visible));
+            layer.draw_rectangle(
+                (pill.x + 4.0, pill.y + 2.0),
+                (pill.width - 8.0, pill.height - 4.0),
+                theme::fade(theme::selection(), ea),
+                Rounding::uniform(ROW_RADIUS),
+            );
+        }
 
         let window = self.visible[self.first_visible..]
             .iter()
@@ -254,22 +369,8 @@ impl Palette {
             .enumerate();
         for (offset, &entry_index) in window {
             let entry = &self.entries[entry_index];
-            let row = Rect::new(
-                card.x,
-                card.y + QUERY_H + offset as f32 * ROW_HEIGHT,
-                card.width,
-                ROW_HEIGHT,
-            );
+            let row = row_rect(card, offset);
             let middle = row.y + row.height / 2.0;
-
-            if self.first_visible + offset == self.selected {
-                layer.draw_rectangle(
-                    row.position(),
-                    row.size(),
-                    theme::selection(),
-                    Rounding::NONE,
-                );
-            }
 
             theme::draw(
                 layer,

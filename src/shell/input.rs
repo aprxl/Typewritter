@@ -1443,6 +1443,7 @@ impl Shell {
             query: String::new(),
             selected: 0,
         });
+        self.popup_reveal.restart();
         self.refresh_palette();
     }
 
@@ -1453,11 +1454,14 @@ impl Shell {
 
     /// Rebuilds the palette region from the live query/selection, the way
     /// `refresh_dialog` does for the dialog.
+    /// Shadow layer rides every arm; a closed snapshot clears the layer so
+    /// the halo leaves with the modal (see `refresh_slash_menu`).
     fn refresh_palette(&mut self) {
         let palette = match &self.palette {
             Some(state) => Palette::new(commands::entries(), state.query.clone(), state.selected),
             None => Palette::closed(),
-        };
+        }
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.palette_region].set_component(Box::new(palette));
     }
 
