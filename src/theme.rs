@@ -683,12 +683,11 @@ pub fn outline(layer: &Layer, rect: Rect, color: Color) {
 /// reads as a smudge.
 pub fn shadow_ink() -> Color {
     match mode() {
-        // Halved alpha from the first pass: the halo was reading as a
-        // solid-edged slab rather than a barely-there detail. The colour
-        // stays; only the whole shadow sits further back, so the blur's
-        // falloff does the shaping and nothing draws a visible boundary.
-        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x0F),
-        Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x17),
+        // 0x80 (50%) by ear: scale_alpha finally lets this byte through
+        // (see the slab painter), and the halved values from before read as
+        // barely-there now that they are actually applied.
+        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x80),
+        Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x80),
     }
 }
 
