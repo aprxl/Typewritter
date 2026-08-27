@@ -40,7 +40,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    ContextMenuState, FormatDismiss, MathMenuState, PaletteState, Shell, SlashMenuState,
+    ContextMenuState, MathMenuState, MenuDismiss, PaletteState, Shell, SlashMenuState,
     WordFormatState,
 };
 
@@ -2001,8 +2001,10 @@ impl Shell {
         // directly rather than through the menu's rebuild path.
         self.context_menu = None;
         // An in-flight fade-out is superseded: the bar is back.
-        self.format_dismiss = None;
-        self.format_dismiss_clock = 0.0;
+        if matches!(self.menu_dismiss, Some(MenuDismiss::Format { .. })) {
+            self.menu_dismiss = None;
+            self.menu_dismiss_clock = 0.0;
+        }
         self.format_bar = Some(WordFormatState {
             items,
             selected: 0,
@@ -2019,7 +2021,7 @@ impl Shell {
 
     /// Rebuilds the drawn snapshot from the live shell state — the checked
     /// flags come from the document, so a toggle lands on the next frame.
-    fn refresh_format_bar(&mut self) {
+    pub(super) fn refresh_format_bar(&mut self) {
         // Every arm carries the blurred shadow layer, the closed ones
         // included: `paint_shadow` clears it before anything else, so the
         // snapshot that closes the bar is also the one that takes the
@@ -2040,12 +2042,12 @@ impl Shell {
                     bar
                 }
             }
-            None => match &self.format_dismiss {
-                Some(dismiss) => FormatBar::dismissing(
-                    dismiss.items.clone(),
-                    dismiss.anchor,
-                    dismiss.pointer_cell,
-                ),
+            None => match &self.menu_dismiss {
+                Some(MenuDismiss::Format {
+                    items,
+                    anchor,
+                    pointer_cell,
+                }) => FormatBar::dismissing(items.clone(), *anchor, *pointer_cell),
                 None => FormatBar::closed(),
             },
         }
@@ -2077,15 +2079,15 @@ impl Shell {
             // The ghost's pill parks on the keyboard selection — the same
             // place a fresh open starts — and freezes there for the fade.
             let last = ghost_items.len() - 1;
-            self.format_dismiss = Some(FormatDismiss {
+            self.menu_dismiss = Some(MenuDismiss::Format {
                 items: ghost_items,
                 anchor: state.anchor,
                 pointer_cell: Some(state.selected.min(last)),
             });
-            self.format_dismiss_clock = 1.0;
+            self.menu_dismiss_clock = 1.0;
         } else {
-            self.format_dismiss = None;
-            self.format_dismiss_clock = 0.0;
+            self.menu_dismiss = None;
+            self.menu_dismiss_clock = 0.0;
         }
         self.refresh_format_bar();
         self.rebuild_views();

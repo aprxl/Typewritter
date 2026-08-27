@@ -123,10 +123,25 @@ struct WordFormatState {
 /// checked states included — placeholders of any kind would flash a row of
 /// substitutes for the bar's actual affordances, which reads as a glitch
 /// even at 140ms.
-struct FormatDismiss {
-    items: Vec<format_bar::Item>,
-    anchor: (f32, f32),
-    pointer_cell: Option<usize>,
+/// A popup dismissal in flight: whichever anchored menu just closed, held
+/// so its region can keep drawing one last faded frame while a wall-clock
+/// weight falls 1→0 over `popup::GHOST_DURATION`. The shell's refresh path
+/// turns the variant back into a `dismissing` snapshot of that menu's
+/// component.
+///
+/// Every variant carries clones of the menu's REAL state at close time,
+/// captured before the live state is `take()`n — a placeholder that merely
+/// resembles the content reads as a glitch even for 140ms, so placeholders
+/// are banned here by construction. Large modals have no variant: they
+/// close instantly.
+enum MenuDismiss {
+    /// The word-format bar: its cells with live checked states, where it
+    /// opened, and which cell the pill had parked on.
+    Format {
+        items: Vec<format_bar::Item>,
+        anchor: (f32, f32),
+        pointer_cell: Option<usize>,
+    },
 }
 
 /// The in-math completion card while it is showing: the precise tree query,
@@ -302,12 +317,12 @@ pub struct Shell {
     popup_reveal: Animation,
     /// A dismissal in flight: the closing snapshot's geometry, held so the
     /// region can keep drawing (and fading) a bar whose state is gone.
-    format_dismiss: Option<FormatDismiss>,
+    menu_dismiss: Option<MenuDismiss>,
     /// The dismissal clock, falling 1→0 over `popup::GHOST_DURATION`
-    /// while `format_dismiss` is `Some`. `Context::reveal` reports it in
+    /// while `menu_dismiss` is `Some`. `Context::reveal` reports it in
     /// place of the reveal weight, so the ghost draws with the entrance's
     /// own curve — the weight simply falls instead of climbing.
-    format_dismiss_clock: f32,
+    menu_dismiss_clock: f32,
     /// When the next animation step is due, for the frames the shell does
     /// *not* ask for. A stepped animation reports nothing through the flat
     /// middle of a step, so without this the loop would sleep past the
@@ -580,8 +595,8 @@ impl Shell {
             slash_menu: None,
             context_menu: None,
             format_bar: None,
-            format_dismiss: None,
-            format_dismiss_clock: 0.0,
+            menu_dismiss: None,
+            menu_dismiss_clock: 0.0,
             brush_selected: Vec::new(),
             brush_inside: Vec::new(),
             brush_point: None,
@@ -696,16 +711,19 @@ impl Shell {
         if self.any_overlay_open() || self.popup_reveal.is_playing() {
             animating |= self.popup_reveal.advance(dt);
         }
-        if self.format_dismiss.is_some() {
+        if self.menu_dismiss.is_some() {
             // The fall is wall-clock proportional, not the reveal animation
             // run backwards: independent pacing, no shared state to reset.
-            self.format_dismiss_clock -=
+            self.menu_dismiss_clock -=
                 dt.as_secs_f32() / crate::components::popup::GHOST_DURATION.as_secs_f32();
-            if self.format_dismiss_clock <= 0.0 {
-                self.format_dismiss = None;
-                self.format_dismiss_clock = 0.0;
-                if let Some(region) = self.regions.get_mut(self.format_region) {
-                    region.set_component(Box::new(FormatBar::closed()));
+            if self.menu_dismiss_clock <= 0.0 {
+                // Land on the closed snapshot of whichever menu fell away —
+                // each refresh_*_menu arm rebuilds its own region.
+                let ended = self.menu_dismiss.take().expect("checked above");
+                self.menu_dismiss_clock = 0.0;
+                match ended {
+                    MenuDismiss::Format { .. } => self.refresh_format_bar(),
+                    // Slash/context/math arms land here with their tasks.
                 }
             }
             animating = true;
@@ -758,8 +776,8 @@ impl Shell {
             // During a dismissal the ghost needs a *falling* weight: hand
             // it the dismiss clock so `FormatBar::draw`'s entrance math
             // doubles as the exit — at 0 the ghost is gone.
-            reveal: if self.format_dismiss.is_some() {
-                self.format_dismiss_clock
+            reveal: if self.menu_dismiss.is_some() {
+                self.menu_dismiss_clock
             } else {
                 self.popup_reveal.weight()
             },
@@ -915,7 +933,7 @@ impl Shell {
             (self.menu_region, self.context_menu.is_some()),
             (
                 self.format_region,
-                self.format_bar.is_some() || self.format_dismiss.is_some(),
+                self.format_bar.is_some() || self.menu_dismiss.is_some(),
             ),
             (self.math_menu_region, self.math_menu.is_some()),
         ];
