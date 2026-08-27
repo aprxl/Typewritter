@@ -526,7 +526,11 @@ impl Component for FormatBar {
     }
 
     fn is_animating(&self) -> bool {
-        self.slide.advancing()
+        // A closed bar's pill is frozen; a fresh snapshot's slide animation
+        // is constructed playing and would otherwise report `true` forever —
+        // sync returns before ever advancing it — pinning the frame loop
+        // open with a redraw every frame while the bar is closed.
+        self.open && self.slide.advancing()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

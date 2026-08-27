@@ -467,15 +467,6 @@ impl Shell {
             radius: editor::GLOW_RADIUS,
         }));
 
-        // Same shape as the glow: blur set once at creation, never changed.
-        // A wider radius than the highlight's — a popup floats further above
-        // the page than a bar of ink sits under it, so its shadow spreads
-        // softer before it lands.
-        let bar_shadow = renderer.new_layer_top(LayerInvalidation::Manual);
-        bar_shadow.set_effect(Some(ShaderEffect::Blur {
-            radius: format_bar::SHADOW_BLUR_RADIUS,
-        }));
-
         regions.extend([
             region(
                 renderer,
@@ -551,6 +542,25 @@ impl Shell {
             Box::new(FormatBar::closed()),
         ));
         let format_region = regions.len() - 1;
+
+        // The blur layer carrying popups' drop shadows. Created *here* —
+        // after every regular region, before any overlay opens — because
+        // layers composite in creation order and a shadow must fall on
+        // everything on the page, sidenotes and panels included. Beside the
+        // glow it was made before the panels, and the sidenote margin
+        // composited right over the halo, clipping it whenever a word near
+        // the editor's edge opened a bar. Overlays don't have this problem:
+        // they detach when closed and `new_layer_top` back above everything
+        // when they open, so this layer sits below every popup that will
+        // ever attach and above every panel that exists.
+        //
+        // Blur set once at creation, never changed. A wider radius than the
+        // highlight's — a popup floats further above the page than a bar of
+        // ink sits under it, so its shadow spreads softer before it lands.
+        let bar_shadow = renderer.new_layer_top(LayerInvalidation::Manual);
+        bar_shadow.set_effect(Some(ShaderEffect::Blur {
+            radius: format_bar::SHADOW_BLUR_RADIUS,
+        }));
 
         Self {
             layout,
