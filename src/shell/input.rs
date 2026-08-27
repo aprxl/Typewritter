@@ -2012,7 +2012,7 @@ impl Shell {
         });
         // A fresh pop every time the bar opens, driven from the shell so
         // the per-toggle refresh below never replays it.
-        self.format_reveal.restart();
+        self.popup_reveal.restart();
         self.refresh_format_bar();
         self.rebuild_views();
     }
@@ -2049,7 +2049,7 @@ impl Shell {
                 None => FormatBar::closed(),
             },
         }
-        .with_shadow(self.bar_shadow.clone());
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.format_region].set_component(Box::new(view));
         // The shell owns the pill memory across refreshes: ask the fresh
         // snapshot where its pill is (it may have been seeded, and its

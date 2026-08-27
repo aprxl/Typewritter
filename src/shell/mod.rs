@@ -291,16 +291,15 @@ pub struct Shell {
     caret: Stepped,
     /// Fades the writing indicator.
     pulse: Stepped,
-    /// The entrance-reveal clock for whichever overlay is opening — the
-    /// format bar grows out of its word as this weight climbs (the spring
-    /// itself lives in the drawing: `popup::MENU_SLIDE_EASING`). Owned by
-    /// the shell
-    /// so a refreshed bar snapshot never re-triggers the pop; see
-    /// `Context::reveal`.
+    /// The entrance-reveal clock for whichever popup is opening — a menu
+    /// grows out of its anchor as this weight climbs, a modal fades up with
+    /// it (the curves live in the drawing: `popup::MENU_SLIDE_EASING`,
+    /// `popup::MODAL_FADE_DURATION`). Owned by the shell so a refreshed
+    /// snapshot never re-triggers the pop; see `Context::reveal`.
     ///
     /// A closing bar does not touch this clock: its ghost runs on
     /// `format_dismiss_clock` instead — see that field.
-    format_reveal: Animation,
+    popup_reveal: Animation,
     /// A dismissal in flight: the closing snapshot's geometry, held so the
     /// region can keep drawing (and fading) a bar whose state is gone.
     format_dismiss: Option<FormatDismiss>,
@@ -383,7 +382,7 @@ pub struct Shell {
     /// `FormatBar::paint_shadow`). Held from creation so it composites
     /// above the page but below every overlay that opens after it, because
     /// a shadow must fall on the page, never on a popup.
-    bar_shadow: Layer,
+    popup_shadow: Layer,
     /// The palette swap in flight, if there is one — see [`ThemeSwap`].
     /// `Some` is also what locks the switch: a swap cannot be spammed,
     /// because a second one would capture a frame mid-wipe and hold *that*
@@ -557,8 +556,8 @@ impl Shell {
         // Blur set once at creation, never changed. A wider radius than the
         // highlight's — a popup floats further above the page than a bar of
         // ink sits under it, so its shadow spreads softer before it lands.
-        let bar_shadow = renderer.new_layer_top(LayerInvalidation::Manual);
-        bar_shadow.set_effect(Some(ShaderEffect::Blur {
+        let popup_shadow = renderer.new_layer_top(LayerInvalidation::Manual);
+        popup_shadow.set_effect(Some(ShaderEffect::Blur {
             radius: crate::components::popup::SHADOW_BLUR_RADIUS,
         }));
 
@@ -613,7 +612,7 @@ impl Shell {
             // sixteen steps is every value that reaches the screen.
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
             pulse: Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16).ping_pong(),
-            format_reveal: Animation::new(
+            popup_reveal: Animation::new(
                 crate::components::popup::MENU_SLIDE_DURATION,
                 crate::components::popup::MENU_SLIDE_EASING,
             ),
@@ -654,7 +653,7 @@ impl Shell {
             insert_prefix: None,
             last_width: 0.0,
             glow,
-            bar_shadow,
+            popup_shadow,
             theme_swap: None,
         }
     }
@@ -694,8 +693,8 @@ impl Shell {
         // cannot drive something that sleeps longer than the clamp.
         animating |= self.caret.advance();
         animating |= self.pulse.advance();
-        if self.format_bar.is_some() || self.format_reveal.is_playing() {
-            animating |= self.format_reveal.advance(dt);
+        if self.any_overlay_open() || self.popup_reveal.is_playing() {
+            animating |= self.popup_reveal.advance(dt);
         }
         if self.format_dismiss.is_some() {
             // The fall is wall-clock proportional, not the reveal animation
@@ -762,16 +761,9 @@ impl Shell {
             reveal: if self.format_dismiss.is_some() {
                 self.format_dismiss_clock
             } else {
-                self.format_reveal.weight()
+                self.popup_reveal.weight()
             },
-            overlay_open: self.dialog.is_some()
-                || self.onboarding
-                || self.palette.is_some()
-                || self.slash_menu.is_some()
-                || self.context_menu.is_some()
-                || self.format_bar.is_some()
-                || self.math_menu.is_some()
-                || self.finder.is_some(),
+            overlay_open: self.any_overlay_open(),
             theme_locked: self.theme_swap.is_some(),
         };
         for region in &mut self.regions {
@@ -829,6 +821,19 @@ impl Shell {
             self.rebuild_views();
         }
         animating
+    }
+
+    /// Is any popup showing? One disjunction, so the frame loop's "something
+    /// is open" decisions and `Context::overlay_open` can never disagree.
+    fn any_overlay_open(&self) -> bool {
+        self.dialog.is_some()
+            || self.onboarding
+            || self.palette.is_some()
+            || self.slash_menu.is_some()
+            || self.context_menu.is_some()
+            || self.format_bar.is_some()
+            || self.math_menu.is_some()
+            || self.finder.is_some()
     }
 
     /// The smallest the window may be before regions start overlapping.
