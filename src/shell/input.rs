@@ -2828,9 +2828,12 @@ impl Shell {
     }
 
     /// Rebuilds the dialog region from the current prompt.
+    /// Shadow layer rides every arm; a closed snapshot clears the layer so
+    /// the halo leaves with the dialog (see `refresh_slash_menu`).
     fn refresh_dialog(&mut self) {
         let prompt = self.dialog.clone();
-        self.regions[self.dialog_region].set_component(Box::new(Dialog::new(prompt)));
+        let dialog = Dialog::new(prompt).with_shadow(self.popup_shadow.clone());
+        self.regions[self.dialog_region].set_component(Box::new(dialog));
     }
 
     fn handle_dialog_input(&mut self, input: &Input, viewport: Rect) {
