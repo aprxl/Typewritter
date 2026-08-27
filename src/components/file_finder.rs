@@ -9,8 +9,16 @@ use crate::components::title_bar;
 use crate::layout::Rect;
 use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
-use crate::ui::Component;
+use crate::ui::{Component, Context, Dirty};
 use crate::vault::VaultFile;
+
+use super::popup::paint_shadow_slab;
+
+/// Corner radius of a row highlight and of the panel itself — the finder is
+/// a tall narrow card, so its shoulders round slightly less than a small
+/// popup's would (see `popup::CARD_RADIUS`).
+const PANEL_RADIUS: f32 = 8.0;
+const ROW_RADIUS: f32 = 6.0;
 
 const PANEL_WIDTH: f32 = 420.0;
 const ROW_HEIGHT: f32 = 28.0;
@@ -45,6 +53,10 @@ pub struct FileFinder {
     visible: Vec<usize>,
     selected: usize,
     first_visible: usize,
+    /// The blurred layer this panel paints its shadow slab into.
+    shadow: Option<Layer>,
+    reveal: f32,
+    dirty: Dirty,
 }
 
 impl FileFinder {
@@ -56,16 +68,84 @@ impl FileFinder {
             visible,
             selected,
             first_visible: selected.saturating_sub(MAX_ROWS.saturating_sub(1)),
+            shadow: None,
+            reveal: 0.0,
+            dirty: Dirty::new(),
         }
     }
 
     pub fn closed() -> Self {
-        Self::new(Vec::new(), String::new(), 0)
+        Self {
+            files: Vec::new(),
+            visible: Vec::new(),
+            selected: 0,
+            first_visible: 0,
+            shadow: None,
+            reveal: 1.0,
+            dirty: Dirty::new(),
+        }
+    }
+
+    /// Attaches the shell's blurred shadow layer.
+    pub fn with_shadow(mut self, shadow: Layer) -> Self {
+        self.shadow = Some(shadow);
+        self
+    }
+
+    /// Paints the shadow slab from sync. The finder is anchored to the
+    /// title bar's search box; its resting geometry depends on that box's
+    /// rect, so sync only clears here and draw paints after measuring. A
+    /// closed snapshot still clears unconditionally.
+    fn clear_shadow(&self) {
+        if let Some(shadow) = &self.shadow {
+            super::popup::paint_shadow_slab(shadow, Rect::default(), -1.0);
+        }
     }
 }
 
 impl Component for FileFinder {
+    fn measure(&mut self, _: &Layer) -> (f32, f32) {
+        // An overlay bound to the title bar; it asks the layout for nothing.
+        (0.0, 0.0)
+    }
+
+    fn sync(&mut self, context: &Context) {
+        // The finder's resting geometry needs the search box rect, which
+        // only draw can measure; sync therefore clears the shadow layer on
+        // every reveal change and lets draw paint the slab. A closed
+        // snapshot still clears unconditionally — the halo must leave with
+        // whoever last drew it.
+        let reveal_changed = self.reveal != context.reveal;
+        if reveal_changed {
+            self.reveal = context.reveal;
+            self.dirty.set();
+            self.clear_shadow();
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.get()
+    }
+
+    fn clear_dirty(&mut self) {
+        self.dirty.clear()
+    }
+
+    fn is_animating(&self) -> bool {
+        self.reveal > 0.0
+            && self.reveal < 1.0
+            && (!self.files.is_empty() || !self.visible.is_empty())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn draw(&mut self, layer: &Layer, rect: Rect) {
+        if self.files.is_empty() && self.visible.is_empty() && self.first_visible == 0 {
+            return;
+        }
+        let ea = self.reveal.clamp(0.0, 1.0);
         let title = Rect::new(rect.x, rect.y, rect.width, title_bar::HEIGHT);
         let search = title_bar::search_box_rect(layer, title);
         let panel = Rect::new(
@@ -75,10 +155,28 @@ impl Component for FileFinder {
             (self.visible.len().min(MAX_ROWS) as f32 * ROW_HEIGHT + 12.0).max(40.0),
         );
 
+        // Shadow from draw: this component's slab depends on the measured
+        // search-box geometry (see sync). The shell always attaches the
+        // layer via `with_shadow`.
+        if let Some(shadow) = &self.shadow {
+            paint_shadow_slab(shadow, panel, ea);
+        }
+
         layer.set_clip_rect(Some((panel.position(), panel.size())));
-        layer.draw_rectangle(panel.position(), panel.size(), theme::popup(), Rounding::NONE);
-        theme::outline(layer, panel, theme::border());
-        let row_style = TextStyle::serif(13.0, theme::ink());
+        layer.draw_rectangle(
+            panel.position(),
+            panel.size(),
+            theme::elevated_popup(ea),
+            Rounding::uniform(PANEL_RADIUS),
+        );
+        theme::rounded_outline(
+            layer,
+            panel.inset(0.5),
+            PANEL_RADIUS - 0.5,
+            1.0,
+            theme::fade(theme::non_text(), ea),
+        );
+        let row_style = TextStyle::serif(13.0, theme::fade(theme::ink(), ea));
         let row_content_width = (panel.width - 24.0).max(0.0);
         for (offset, &index) in self.visible[self.first_visible..]
             .iter()
@@ -92,7 +190,12 @@ impl Component for FileFinder {
                 ROW_HEIGHT,
             );
             if self.first_visible + offset == self.selected {
-                layer.draw_rectangle(row.position(), row.size(), theme::selection(), Rounding::NONE);
+                layer.draw_rectangle(
+                    (row.x + 3.0, row.y + 2.0),
+                    (row.width - 6.0, row.height - 4.0),
+                    theme::fade(theme::selection(), ea),
+                    Rounding::uniform(ROW_RADIUS),
+                );
             }
             let file = &self.files[index];
             let middle = row.y + row.height / 2.0;
@@ -110,7 +213,7 @@ impl Component for FileFinder {
                 layer,
                 "No matching file",
                 (panel.x + 12.0, panel.y + 20.0),
-                &TextStyle::serif(13.0, theme::faint()),
+                &TextStyle::serif(13.0, theme::fade(theme::faint(), ea)),
                 theme::LEFT,
             );
         }

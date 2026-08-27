@@ -1501,6 +1501,7 @@ impl Shell {
         let Some(vault) = &self.vault else {
             return;
         };
+        self.popup_reveal.restart();
         self.finder = Some(super::FileFinderState {
             files: vault.borrow().files(),
             query: String::new(),
@@ -1526,7 +1527,8 @@ impl Shell {
                 FileFinder::new(state.files.clone(), state.query.clone(), state.selected)
             }
             None => FileFinder::closed(),
-        };
+        }
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.finder_region].set_component(Box::new(finder));
     }
 
