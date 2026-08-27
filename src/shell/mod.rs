@@ -333,8 +333,8 @@ pub struct Shell {
     /// `popup::MODAL_FADE_DURATION`). Owned by the shell so a refreshed
     /// snapshot never re-triggers the pop; see `Context::reveal`.
     ///
-    /// A closing bar does not touch this clock: its ghost runs on
-    /// `format_dismiss_clock` instead — see that field.
+    /// A closing menu does not touch this clock: its ghost runs on
+    /// `menu_dismiss_clock` instead — see that field.
     popup_reveal: Animation,
     /// A dismissal in flight: the closing snapshot's geometry, held so the
     /// region can keep drawing (and fading) a bar whose state is gone.

@@ -10,6 +10,11 @@ use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty, Hover};
 
+use super::popup::CARD_RADIUS;
+
+/// Corner radius of the splash button — nested smaller things round less.
+const BUTTON_RADIUS: f32 = 6.0;
+
 const CARD_W: f32 = 440.0;
 const CARD_H: f32 = 250.0;
 const BUTTON_W: f32 = 210.0;
@@ -95,13 +100,29 @@ impl Component for Onboarding {
         );
 
         let card = card(rect);
-        layer.draw_rectangle(card.position(), card.size(), theme::popup(), Rounding::NONE);
-        theme::outline(layer, card, theme::border());
+        layer.draw_rectangle(
+            card.position(),
+            card.size(),
+            theme::elevated_popup(1.0),
+            Rounding::uniform(CARD_RADIUS),
+        );
+        theme::rounded_outline(
+            layer,
+            card.inset(0.5),
+            CARD_RADIUS - 0.5,
+            1.0,
+            theme::non_text(),
+        );
 
         // The mark, echoing the title bar's.
         let center_x = card.x + card.width / 2.0;
         let mark = Rect::new(center_x - 12.0, card.y + 32.0, 24.0, 24.0);
-        layer.draw_rectangle(mark.position(), mark.size(), theme::accent(), Rounding::NONE);
+        layer.draw_rectangle(
+            mark.position(),
+            mark.size(),
+            theme::accent(),
+            Rounding::NONE,
+        );
         theme::draw(
             layer,
             "T",
@@ -141,11 +162,13 @@ impl Component for Onboarding {
             button.position(),
             button.size(),
             theme::mix(theme::popup(), theme::accent(), weight),
-            Rounding::NONE,
+            Rounding::uniform(BUTTON_RADIUS),
         );
-        theme::outline(
+        theme::rounded_outline(
             layer,
-            button,
+            button.inset(0.5),
+            BUTTON_RADIUS - 0.5,
+            1.0,
             theme::mix(theme::accent(), theme::background(), weight),
         );
         theme::draw(
@@ -155,7 +178,10 @@ impl Component for Onboarding {
                 button.x + button.width / 2.0,
                 button.y + button.height / 2.0,
             ),
-            &TextStyle::serif(14.0, theme::mix(theme::accent(), theme::background(), weight)),
+            &TextStyle::serif(
+                14.0,
+                theme::mix(theme::accent(), theme::background(), weight),
+            ),
             theme::CENTER,
         );
         theme::draw(
