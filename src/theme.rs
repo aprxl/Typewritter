@@ -607,6 +607,23 @@ pub fn fade(color: Color, alpha: f32) -> Color {
     }
 }
 
+/// Scales a color's OWN alpha by `weight`, keeping its hue. Where [`fade`]
+/// replaces the alpha outright — the right tool when the caller knows the
+/// final opacity — this preserves how translucent the color already is,
+/// for weights applied ON TOP of an authored value: a shadow ink authored
+/// at 6% must still be 6% at rest, not 100% because its reveal weight is.
+pub fn scale_alpha(color: Color, weight: f32) -> Color {
+    match color {
+        Color::Solid([r, g, b, a]) => Color::rgba(
+            r,
+            g,
+            b,
+            ((a as f32 / 255.0) * weight.clamp(0.0, 1.0) * 255.0) as u8,
+        ),
+        other => other,
+    }
+}
+
 /// Linear blend between two solid colors, `t` in 0..=1. Non-solid inputs
 /// are returned as `from` — there is no single channel blend for a gradient.
 pub fn mix(from: Color, to: Color, t: f32) -> Color {
@@ -941,5 +958,38 @@ mod tests {
 
         assert!(server.take_change(), "a swap owes a redraw");
         assert!(!server.take_change(), "and only one");
+    }
+
+    /// The two alpha helpers are not interchangeable, and a popup's shadow
+    /// once shipped tuned-then-discarded because the slab painter reached
+    /// for `fade` (replace) where it meant `scale_alpha` (multiply): the
+    /// ink's authored byte never survived the reveal weight overwriting it.
+    #[test]
+    fn fade_replaces_but_scale_alpha_multiplies() {
+        // A fresh value per use: Color is not Copy.
+        let ink = || Color::rgba(0x3C, 0x38, 0x36, 0x20);
+        let weight = 0.5;
+
+        // fade answers "what is this color AT 50% opacity" — the authored
+        // byte is irrelevant.
+        let Color::Solid([r, g, b, _]) = fade(ink(), weight) else {
+            panic!("fade must pass solids through");
+        };
+        assert_eq!((r, g, b), (0x3C, 0x38, 0x36));
+        // (0.5 * 255) as u8 truncates to 127, not 128.
+        assert_eq!(fade(ink(), weight), Color::rgba(r, g, b, 127));
+
+        // scale_alpha answers "what is this color at HALF ITS authored
+        // opacity" — an authored 0x20 lands on 0x10, not 0x80.
+        assert_eq!(
+            scale_alpha(ink(), weight),
+            Color::rgba(0x3C, 0x38, 0x36, 0x10)
+        );
+        // The weight clamps and fully-transparent stays fully transparent.
+        assert_eq!(scale_alpha(ink(), 1.5), scale_alpha(ink(), 1.0));
+        assert_eq!(
+            scale_alpha(Color::rgba(1, 2, 3, 0), weight),
+            Color::rgba(1, 2, 3, 0)
+        );
     }
 }

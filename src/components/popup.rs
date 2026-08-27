@@ -203,7 +203,13 @@ pub fn paint_shadow_slab(shadow: &Layer, card: Rect, e: f32) {
             card.width + SHADOW_SPREAD * 2.0,
             card.height + SHADOW_SPREAD * 2.0,
         ),
-        theme::fade(theme::shadow_ink(), e),
+        // scale_alpha, not fade: the ink's own alpha is an authored TUNABLE
+        // (see `shadow_ink`), and the reveal weight must multiply it rather
+        // than replace it. `fade(shadow_ink(), e)` overwrote the byte with
+        // e×255 every frame — a resting popup's e sits at 1.0, so the slab
+        // rendered at full opacity and every alpha tuned into `shadow_ink`
+        // was silently discarded.
+        theme::scale_alpha(theme::shadow_ink(), e),
         crate::renderer::Rounding::uniform(CARD_RADIUS + SHADOW_SPREAD),
     );
 }
