@@ -73,18 +73,6 @@ pub struct Item {
     pub checked: bool,
 }
 
-impl Item {
-    /// A dead cell for a dismissing bar's ghost — every placeholder is the
-    /// same width, which is close enough: the ghost only has to shrink and
-    /// fade from roughly the shape it had, and it is gone in 140ms.
-    pub fn placeholder() -> Self {
-        Self {
-            kind: Kind::Bold,
-            checked: false,
-        }
-    }
-}
-
 /// The Material Symbols this bar draws, read from `resources/`. Kept here —
 /// next to the widget that owns them — rather than in the shared icon set,
 /// because they are filled glyphs only this bar uses.

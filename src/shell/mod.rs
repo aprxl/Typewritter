@@ -119,10 +119,12 @@ struct WordFormatState {
 }
 
 /// A word-format bar animating out: the state is closed, but the drawing
-/// needs its last shape until the fade lands. Item count and anchor only —
-/// dead cells are fine, they fade with everything else.
+/// needs its last shape until the fade lands. The real items, kinds and
+/// checked states included — placeholders of any kind would flash a row of
+/// substitutes for the bar's actual affordances, which reads as a glitch
+/// even at 140ms.
 struct FormatDismiss {
-    item_count: usize,
+    items: Vec<format_bar::Item>,
     anchor: (f32, f32),
     pointer_cell: Option<usize>,
 }

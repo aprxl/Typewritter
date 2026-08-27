@@ -2041,10 +2041,11 @@ impl Shell {
                 }
             }
             None => match &self.format_dismiss {
-                Some(dismiss) => {
-                    let items = vec![format_bar::Item::placeholder(); dismiss.item_count];
-                    FormatBar::dismissing(items, dismiss.anchor, dismiss.pointer_cell)
-                }
+                Some(dismiss) => FormatBar::dismissing(
+                    dismiss.items.clone(),
+                    dismiss.anchor,
+                    dismiss.pointer_cell,
+                ),
                 None => FormatBar::closed(),
             },
         }
@@ -2064,7 +2065,7 @@ impl Shell {
         // The ghost's shape comes from the live state, so read the geometry
         // before `take` empties it — afterwards `format_bar_geometry` sees
         // `None` and would report an empty bar, killing every fade-out.
-        let item_count = self.format_bar_geometry().len();
+        let ghost_items = self.format_bar_geometry();
         let Some(state) = self.format_bar.take() else {
             return;
         };
@@ -2072,13 +2073,14 @@ impl Shell {
         // anchor, drawn from a falling clock. Nothing accepts input while
         // it fades — `format_bar` is already `None`, so input routing sees
         // a closed bar from this frame on.
-        if item_count > 0 {
+        if !ghost_items.is_empty() {
             // The ghost's pill parks on the keyboard selection — the same
             // place a fresh open starts — and freezes there for the fade.
+            let last = ghost_items.len() - 1;
             self.format_dismiss = Some(FormatDismiss {
-                item_count,
+                items: ghost_items,
                 anchor: state.anchor,
-                pointer_cell: Some(state.selected.min(item_count - 1)),
+                pointer_cell: Some(state.selected.min(last)),
             });
             self.format_dismiss_clock = 1.0;
         } else {

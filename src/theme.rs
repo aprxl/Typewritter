@@ -666,8 +666,8 @@ pub fn outline(layer: &Layer, rect: Rect, color: Color) {
 /// reads as a smudge.
 pub fn shadow_ink() -> Color {
     match mode() {
-        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x38),
-        Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x59),
+        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x1E),
+        Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x2E),
     }
 }
 
