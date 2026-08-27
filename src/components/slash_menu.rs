@@ -126,7 +126,7 @@ impl SlashMenu {
     /// close time: same rows, same scroll, pill parked where it was. Input
     /// is dead; the reveal weight falls from outside.
     pub fn dismissing(snap: &Snapshot, anchor: (f32, f32), pointer_row: Option<usize>) -> Self {
-        let mut ghost = Self {
+        let ghost = Self {
             entries: snap.entries.clone(),
             visible: snap.visible.clone(),
             query: snap.query.clone(),
@@ -140,25 +140,12 @@ impl SlashMenu {
             shadow: None,
             reveal: 1.0,
             slide: Slide::new(),
-            started: true,
+            started: false,
             dirty: Dirty::new(),
         };
-        // The pill freezes for the fall — park it once so `started` draw
-        // path has a rect even though sync never advances it.
-        if let Some(row) = pointer_row {
-            let viewport = Rect::default();
-            let card = card_anchored(viewport, anchor);
-            let offset = row.saturating_sub(snap.first_visible);
-            if offset < MAX_ROWS {
-                let r = Rect::new(
-                    card.x,
-                    card.y + QUERY_H + offset as f32 * ROW_HEIGHT,
-                    card.width,
-                    ROW_HEIGHT,
-                );
-                ghost.slide.park(r);
-            }
-        }
+        // The pill is NOT parked here: `card_anchored(Rect::default(), ..)`
+        // panics its own clamp (zero-width viewport ⇒ clamp max −CARD_W).
+        // A ghost's first `sync` carries the region rect and parks it.
         ghost
     }
 
@@ -257,7 +244,34 @@ impl Component for SlashMenu {
         if reveal_changed && !(self.dismissing && self.reveal <= 0.0) {
             self.dirty.set();
         }
-        if !self.dismissing {
+        if self.dismissing {
+            // Ghost: one lazy park of the pill with the REAL region rect —
+            // the ctor couldn't (`dismissing`'s comment explains why) —
+            // then freeze; a ghost's slide never advances.
+            if !self.started && !self.visible.is_empty() {
+                let e = MENU_SLIDE_EASING.apply(self.reveal).clamp(0.0, 1.0);
+                let card = revealed_card(
+                    card_anchored(context.self_rect, self.anchor),
+                    self.anchor,
+                    e,
+                );
+                let offset = self
+                    .pointer_row
+                    .unwrap_or(self.selected)
+                    .saturating_sub(self.first_visible);
+                if offset < MAX_ROWS {
+                    let r = Rect::new(
+                        card.x,
+                        card.y + QUERY_H + offset as f32 * ROW_HEIGHT,
+                        card.width,
+                        ROW_HEIGHT,
+                    );
+                    self.slide.park(r);
+                    self.started = true;
+                    self.dirty.set();
+                }
+            }
+        } else {
             self.dirty.write(&mut self.caret_on, context.caret_on);
 
             // Two feeds, one pill. Keyboard: the shell rebuilds this

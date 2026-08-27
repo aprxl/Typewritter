@@ -134,7 +134,7 @@ impl ContextMenu {
     /// same rows, same checkmarks, pill parked on the selection. Input is
     /// dead; the reveal weight falls from outside.
     pub fn dismissing(snap: &Snapshot, anchor: (f32, f32), pill_row: usize) -> Self {
-        let mut ghost = Self {
+        let ghost = Self {
             entries: snap.entries.clone(),
             checked: snap.checked.clone(),
             selected: pill_row.min(snap.entries.len().saturating_sub(1)),
@@ -148,17 +148,10 @@ impl ContextMenu {
             started: true,
             dirty: Dirty::new(),
         };
-        // Park the pill where it was — sync never advances a ghost's slide.
-        if !snap.entries.is_empty() {
-            let card = card_anchored(Rect::default(), anchor, snap.entries.len());
-            let y = card.y + PAD_Y + pill_row as f32 * ROW_HEIGHT;
-            ghost.slide.park(Rect::new(
-                card.x + 4.0,
-                y + 2.0,
-                card.width - 8.0,
-                ROW_HEIGHT - 4.0,
-            ));
-        }
+        // The pill is NOT parked here: card placement needs the REAL
+        // viewport, and `card_anchored(Rect::default(), ..)` panics its own
+        // clamp (zero-width viewport ⇒ clamp max −CARD_W). A ghost's first
+        // `sync` carries the region rect and parks it.
         ghost
     }
 
@@ -232,7 +225,23 @@ impl Component for ContextMenu {
         if reveal_changed && !(self.dismissing && self.reveal <= 0.0) {
             self.dirty.set();
         }
-        if !self.dismissing {
+        if self.dismissing {
+            // Ghost: one lazy park of the pill with the REAL region rect —
+            // the ctor couldn't (`dismissing`'s comment explains why) — then
+            // freeze; a ghost's slide never advances.
+            if !self.started && !self.entries.is_empty() {
+                let card = card_anchored(context.self_rect, self.anchor, self.entries.len());
+                let y = card.y + PAD_Y + self.selected as f32 * ROW_HEIGHT;
+                self.slide.park(Rect::new(
+                    card.x + 4.0,
+                    y + 2.0,
+                    card.width - 8.0,
+                    ROW_HEIGHT - 4.0,
+                ));
+                self.started = true;
+                self.dirty.set();
+            }
+        } else {
             let viewport = context.self_rect;
             let e = MENU_SLIDE_EASING.apply(self.reveal).clamp(0.0, 1.0);
             let card = revealed_card(
