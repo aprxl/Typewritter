@@ -2131,6 +2131,127 @@ mod tests {
         assert_eq!(hit.style, Style::PLAIN);
     }
 
+    // ---- list item tests -------------------------------------------------
+
+    fn list_item(marker: ListMarker, t: &str) -> Block {
+        Block::ListItem {
+            marker,
+            content: vec![Inline::Text(Text {
+                text: t.into(),
+                style: Style::PLAIN,
+            })],
+        }
+    }
+
+    /// The hanging indent: every line of a list item's content starts at the
+    /// same left edge, so a wrapped line never slides back under the marker.
+    #[test]
+    fn a_list_item_wraps_with_a_true_hanging_indent() {
+        let d = doc_with(vec![list_item(
+            ListMarker::Bullet,
+            "aaaa bbbb cccc dddd eeee ffff gggg hhhh",
+        )]);
+        // Narrow enough to force at least one wrap at 10px/char.
+        let layout = layout(&d, 220.0, &fake_measure);
+        let block = &layout.blocks[0];
+        assert!(
+            block.lines.len() >= 2,
+            "expected a wrap: {}",
+            block.lines.len()
+        );
+        for line in &block.lines {
+            assert_eq!(
+                line.x, LIST_INDENT,
+                "every line hangs at the content column"
+            );
+        }
+        // The first wrapped line continues exactly where the flat text says:
+        // a click at the content column lands on its first char.
+        let second = line_flat_start(block, 1);
+        let caret = layout.hit(LIST_INDENT, block.lines[1].y + 1.0, &fake_measure);
+        assert_eq!(flat_of_caret(&layout.source, caret), second);
+        // The caret there sits at the content column, not at the gutter.
+        let (x, _, _) = layout.caret_pos(caret, &fake_measure);
+        assert_eq!(x, LIST_INDENT);
+    }
+
+    #[test]
+    fn non_list_lines_start_at_the_column_edge() {
+        let d = doc_with(vec![para("prose"), list_item(ListMarker::Bullet, "item")]);
+        let layout = layout(&d, 400.0, &fake_measure);
+        assert_eq!(layout.blocks[0].lines[0].x, 0.0);
+        assert_eq!(layout.blocks[1].lines[0].x, LIST_INDENT);
+    }
+
+    /// The checkbox is a control: one geometry answers both the drawing and
+    /// the click, sitting in the gutter left of the content column.
+    #[test]
+    fn a_task_checkbox_is_clickable_where_it_is_drawn() {
+        let d = doc_with(vec![
+            list_item(ListMarker::Task { done: false }, "buy milk"),
+            list_item(ListMarker::Bullet, "tea"),
+            list_item(ListMarker::Task { done: true }, "done thing"),
+        ]);
+        let layout = layout(&d, 400.0, &fake_measure);
+
+        let (x, y, w, h) = layout.task_box(0).expect("task item has a box");
+        assert_eq!(w, CHECK_SIZE);
+        assert_eq!(
+            x + w,
+            LIST_INDENT - CHECK_GAP,
+            "right edge clears the column"
+        );
+        let mid = layout.blocks[0].lines[0].y + layout.blocks[0].lines[0].height * 0.5;
+        assert_eq!(y + h * 0.5, mid, "centred on the line");
+
+        assert_eq!(
+            layout.task_at(x + w * 0.5, y + h * 0.5),
+            Some(0),
+            "centre of the box toggles item 0"
+        );
+        assert_eq!(layout.task_at(1.0, 1.0), None, "outside the box");
+        // A bullet is not a control, wherever the click lands.
+        let bullet_mid = layout.blocks[1].lines[0].y + layout.blocks[1].lines[0].height * 0.5;
+        assert_eq!(layout.task_at(2.0, bullet_mid), None);
+        assert!(layout.task_box(2).is_some(), "the done item keeps its box");
+    }
+
+    #[test]
+    fn list_items_sit_tighter_than_paragraphs() {
+        let gap = |blocks: Vec<Block>| {
+            let d = doc_with(blocks);
+            let layout = layout(&d, 400.0, &fake_measure);
+            layout.blocks[1].y - (layout.blocks[0].y + layout.blocks[0].height)
+        };
+        let items = gap(vec![
+            list_item(ListMarker::Bullet, "a"),
+            list_item(ListMarker::Bullet, "b"),
+        ]);
+        let paragraphs = gap(vec![para("a"), para("b")]);
+        assert_eq!(items, LIST_GAP);
+        assert_eq!(paragraphs, GAP_PARAGRAPH);
+        assert!(items < paragraphs);
+        // The last item of a run keeps the full paragraph gap below it.
+        let d = doc_with(vec![
+            list_item(ListMarker::Bullet, "a"),
+            list_item(ListMarker::Bullet, "b"),
+            para("after"),
+        ]);
+        let layout = layout(&d, 400.0, &fake_measure);
+        let after_items = layout.blocks[2].y - (layout.blocks[1].y + layout.blocks[1].height);
+        assert_eq!(after_items, GAP_PARAGRAPH);
+    }
+
+    #[test]
+    fn a_done_task_reads_dim_through_text_style() {
+        let done = list_item(ListMarker::Task { done: true }, "x");
+        let open = list_item(ListMarker::Task { done: false }, "x");
+        let dim = text_style(&done, Style::PLAIN, 1.0);
+        let plain = text_style(&open, Style::PLAIN, 1.0);
+        assert_ne!(dim.color, plain.color, "done tasks are dimmed");
+        assert_eq!(dim.size, plain.size, "same size — quiet, not smaller");
+    }
+
     #[test]
     fn a_rule_costs_less_vertical_space_than_a_blank_line() {
         let d = doc_with(vec![
