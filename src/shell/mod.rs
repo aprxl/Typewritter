@@ -38,7 +38,7 @@ use crate::components::sidenotes::Note;
 use crate::components::tab_strip::TabView;
 use crate::components::topics::Entry;
 use crate::components::{
-    Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileFinder, FileTree, FormatBar, MathMenu,
+    Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileTree, Finder, FormatBar, MathMenu,
     Onboarding, Palette, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics,
     breadcrumb, editor, file_tree, format_bar, sidenotes, status_line, tab_strip, title_bar,
     topics,
@@ -71,8 +71,13 @@ struct PaletteState {
     selected: usize,
 }
 
-struct FileFinderState {
-    files: Vec<crate::vault::VaultFile>,
+/// The open finder's ranked rows, query, and selection while it's open —
+/// the shell owns these (it's the one taking keystrokes), the same reason
+/// `PaletteState` lives here instead of in the component. The rows are the
+/// full ranked list (`search::search`), so picking row *n* is a direct
+/// index and `Ctrl+1..5` needs no re-filter.
+struct FinderState {
+    rows: Vec<crate::search::Row>,
     query: String,
     selected: usize,
 }
@@ -284,8 +289,8 @@ pub struct Shell {
     vim: Vim,
     /// The open palette's query and selection, if it's open.
     palette: Option<PaletteState>,
-    /// The open file finder's files, query, and selection, if it's open.
-    finder: Option<FileFinderState>,
+    /// The open finder's rows, query, and selection, if it's open.
+    finder: Option<FinderState>,
     /// The open slash menu's query, selection, and anchor point, if it's open.
     slash_menu: Option<SlashMenuState>,
     /// The open context menu's rows, selection, and anchor point, if open.
@@ -566,10 +571,7 @@ impl Shell {
             Box::new(SlashMenu::closed()),
         ));
         let slash_region = regions.len() - 1;
-        regions.push(Region::detached(
-            Layout::ROOT,
-            Box::new(FileFinder::closed()),
-        ));
+        regions.push(Region::detached(Layout::ROOT, Box::new(Finder::closed())));
         let finder_region = regions.len() - 1;
         regions.push(Region::detached(
             Layout::ROOT,

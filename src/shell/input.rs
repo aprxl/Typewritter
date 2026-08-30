@@ -15,9 +15,9 @@ use super::commands;
 use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
-    ContextMenu, Dialog, FileFinder, FileTree, FormatBar, MathMenu, Onboarding, Palette, SlashMenu,
-    context_menu, editor, file_finder, file_tree, format_bar, math_menu, onboarding, sidenotes,
-    theme_switch, title_bar,
+    ContextMenu, Dialog, FileTree, Finder, FormatBar, MathMenu, Onboarding, Palette, SlashMenu,
+    context_menu, editor, file_tree, format_bar, math_menu, onboarding, sidenotes, theme_switch,
+    title_bar,
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind};
@@ -1502,8 +1502,9 @@ impl Shell {
             return;
         };
         self.popup_reveal.restart();
-        self.finder = Some(super::FileFinderState {
-            files: vault.borrow().files(),
+        let files = vault.borrow().files();
+        self.finder = Some(super::FinderState {
+            rows: crate::search::search(&files, ""),
             query: String::new(),
             selected: 0,
         });
@@ -1523,18 +1524,43 @@ impl Shell {
             query,
         )));
         let finder = match &self.finder {
-            Some(state) => {
-                FileFinder::new(state.files.clone(), state.query.clone(), state.selected)
-            }
-            None => FileFinder::closed(),
+            Some(state) => Finder::new(state.rows.clone(), state.query.clone(), state.selected),
+            None => Finder::closed(),
         }
         .with_shadow(self.popup_shadow.clone());
         self.regions[self.finder_region].set_component(Box::new(finder));
     }
 
+    /// Picks one of the first five rows outright (Ctrl+1..5). The finder
+    /// is the only consumer of these chords: the view toggles that used to
+    /// hold them are gone.
+    fn finder_row_picked(&mut self, input: &Input) -> bool {
+        if !input.ctrl() {
+            return false;
+        }
+        const PICK_KEYS: [KeyCode; 5] = [
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+        ];
+        let Some(row) = PICK_KEYS.iter().position(|key| input.is_key_typed(*key)) else {
+            return false;
+        };
+        if let Some(state) = &mut self.finder {
+            state.selected = row.min(state.rows.len().saturating_sub(1));
+            self.open_selected_finder_file();
+        }
+        true
+    }
+
     fn handle_finder_input(&mut self, input: &Input) {
         if input.is_key_pressed(KeyCode::Escape) {
             self.close_finder();
+            return;
+        }
+        if self.finder_row_picked(input) {
             return;
         }
         if input.is_key_typed(KeyCode::Enter) {
@@ -1551,14 +1577,20 @@ impl Shell {
     }
 
     fn open_selected_finder_file(&mut self) {
-        let path = self
+        let picked = self
             .finder
             .as_ref()
-            .and_then(|state| file_finder::path_at(&state.files, &state.query, state.selected));
-        let Some(path) = path else {
+            .and_then(|state| state.rows.get(state.selected).cloned());
+        let Some(row) = picked else {
             return;
         };
-        self.docs.borrow_mut().open_preview(&path);
+        {
+            let mut docs = self.docs.borrow_mut();
+            docs.open_preview(row.path());
+            if let Some((block, offset)) = row.position() {
+                docs.touch(|doc| doc.set_flat_position(doc.position(block, offset)));
+            }
+        }
         self.close_finder();
     }
 
@@ -3502,7 +3534,7 @@ fn reset_brush_selection(
     changed
 }
 
-fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
+fn finder_input(state: &mut super::FinderState, input: &Input) -> bool {
     let mut changed = false;
     if !input.text().is_empty() {
         state.query.push_str(input.text());
@@ -3513,7 +3545,7 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
         state.selected = 0;
         changed = true;
     }
-    let visible = file_finder::filter(&state.files, &state.query).len();
+    let visible = state.rows.len();
     if input.is_key_typed(KeyCode::ArrowDown) && visible > 0 {
         state.selected = (state.selected + 1).min(visible - 1);
         changed = true;

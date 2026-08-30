@@ -192,46 +192,9 @@ pub const COMMANDS: &[Command] = &[
         }),
         run: |shell| shell.open_picker(),
     },
-    Command {
-        id: "view.tree",
-        title: "Toggle file tree",
-        group: "View",
-        chord: Some(Chord {
-            mods: CTRL,
-            key: KeyCode::Digit1,
-        }),
-        run: |shell| shell.panels_mut()[0].toggle(),
-    },
-    Command {
-        id: "view.sidenotes",
-        title: "Toggle sidenotes",
-        group: "View",
-        chord: Some(Chord {
-            mods: CTRL,
-            key: KeyCode::Digit2,
-        }),
-        run: |shell| shell.panels_mut()[1].toggle(),
-    },
-    Command {
-        id: "view.topics",
-        title: "Toggle topics",
-        group: "View",
-        chord: Some(Chord {
-            mods: CTRL,
-            key: KeyCode::Digit3,
-        }),
-        run: |shell| shell.panels_mut()[2].toggle(),
-    },
-    Command {
-        id: "view.status",
-        title: "Toggle status line",
-        group: "View",
-        chord: Some(Chord {
-            mods: CTRL,
-            key: KeyCode::Digit4,
-        }),
-        run: |shell| shell.panels_mut()[3].toggle(),
-    },
+    // The four region toggles keep their commands for the palette and the
+    // tree's context menu but hold no chords: Ctrl+1..5 now pick a row in
+    // the finder, which is the only thing those keys do.
     Command {
         id: "view.capture",
         title: "Capture mode",
