@@ -465,6 +465,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
             }
             blocks.push(Block::Heading {
                 level,
+                folded: false,
                 content: inlines,
             });
         } else if line.trim().is_empty() {
@@ -672,7 +673,7 @@ pub fn serialize(doc: &Document) -> String {
                 out.push_str("```");
                 i = j;
             }
-            Block::Heading { level, content } => {
+            Block::Heading { level, folded: _, content } => {
                 out.push_str(&"#".repeat(*level as usize));
                 out.push(' ');
                 out.push_str(&serialize_runs(content));
@@ -863,6 +864,7 @@ mod tests {
     fn head(level: u8, runs: Vec<Inline>) -> Block {
         Block::Heading {
             level,
+            folded: false,
             content: runs,
         }
     }
@@ -980,6 +982,7 @@ mod tests {
             parse(Path::new("x"), "#### x\n").body(),
             vec![Block::Heading {
                 level: 4,
+                folded: false,
                 content: vec![plain("x")]
             }]
         );

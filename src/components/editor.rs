@@ -1207,10 +1207,12 @@ mod tests {
             Block::Paragraph(vec![text("intro")]),
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![text("First")],
             },
             Block::Heading {
                 level: 2,
+                folded: false,
                 content: vec![text("Nested")],
             },
         ];
