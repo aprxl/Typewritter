@@ -16,6 +16,7 @@ pub mod config;
 pub mod document;
 pub mod layout;
 pub mod prose;
+pub mod search;
 pub mod shell;
 pub mod tabs;
 pub mod theme;
