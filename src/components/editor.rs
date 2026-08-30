@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::document::layout::{self, ContextHit, DocLayout, RangeKind};
 use crate::document::math::{MathCursor, NodeAddress, SymbolRole};
 use crate::document::math_layout::{self, BoxKind, MathBox, MathPrimitive};
-use crate::document::{ATOM, BadgeColor, Block, Caret, FlatRange, Inline, Style};
+use crate::document::{ATOM, BadgeColor, Block, Caret, FlatRange, Inline, ListMarker, Style};
 use crate::layout::Rect;
 use crate::renderer::{Layer, LineCap, LineJoin, PathPaint, Rounding, Stroke};
 use crate::theme::{self, TextStyle};
@@ -24,6 +24,19 @@ const NUMBER_GUTTER: f32 = 12.0;
 /// The auto-number's size. Constant rather than scaled per heading level:
 /// it is a margin annotation, not part of the heading's own typography.
 const NUMBER_SIZE: f32 = 11.0;
+/// A bullet's dot: inset from the content column and sized to read as a
+/// mark, not as a glyph. `BULLET_INSET` is from the column's left edge to
+/// the dot's centre.
+const BULLET_INSET: f32 = 11.0;
+const BULLET_RADIUS: f32 = 2.5;
+/// A task checkbox's corner radius — between the row radius and a code
+/// span's, so it reads as a control, not as a box of text.
+const CHECK_RADIUS: f32 = 4.5;
+const CHECK_ROUNDING: Rounding = Rounding::uniform(CHECK_RADIUS);
+/// How high a done task's strike sits above the line's centre — through
+/// the x-height, like a pen, not along the baseline.
+const STRIKE_RISE: f32 = 4.5;
+const STRIKE_THICKNESS: f32 = 1.4;
 /// The design's measure: the content column is never wider than this.
 pub const MEASURE: f32 = 634.0;
 /// Space kept past the right edge before a line may wrap.
@@ -242,6 +255,79 @@ fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: b
         BoxKind::Row { children } => {
             for (x, y, child) in children {
                 draw_math_inner(layer, child, (origin.0 + x, origin.1 - y), covered, slots);
+            }
+        }
+    }
+}
+
+/// A list item's marker, hung in the gutter left of the content column.
+/// Virtual like a heading's auto-number: drawn, never laid out, so the
+/// caret cannot reach it and it never shifts the text it labels. Bullets
+/// are drawn glyphs, numbers are right-aligned mono in a fixed column, and
+/// a task's box is a control — filled and ticked when done. `content_x` is
+/// the content column the item's text hangs from; `baseline` the line's
+/// vertical centre.
+fn draw_list_marker(layer: &Layer, marker: &ListMarker, content_x: f32, baseline: f32, scale: f32) {
+    match marker {
+        ListMarker::Bullet => {
+            // Optically centred: a dot a hair above the true centre reads
+            // as aligned with lowercase text.
+            layer.draw_circle(
+                (content_x - BULLET_INSET * scale, baseline - 1.0),
+                BULLET_RADIUS * scale,
+                theme::accent(),
+            );
+        }
+        ListMarker::Number(n) => {
+            theme::draw(
+                layer,
+                &n.to_string(),
+                (content_x - NUMBER_GUTTER, baseline),
+                &TextStyle::mono(NUMBER_SIZE, theme::non_text()),
+                theme::RIGHT,
+            );
+        }
+        ListMarker::Task { done } => {
+            let size = crate::document::layout::CHECK_SIZE * scale;
+            let gap = crate::document::layout::CHECK_GAP * scale;
+            let rect = Rect {
+                x: content_x - gap - size,
+                y: baseline - size * 0.5,
+                width: size,
+                height: size,
+            };
+            if *done {
+                layer.draw_rectangle(
+                    rect.position(),
+                    rect.size(),
+                    theme::fade(theme::accent(), 0.18),
+                    CHECK_ROUNDING,
+                );
+                theme::rounded_outline(
+                    layer,
+                    rect.inset(0.5),
+                    CHECK_RADIUS - 0.5,
+                    1.0,
+                    theme::accent(),
+                );
+                theme::polyline(
+                    layer,
+                    &[
+                        (rect.x + size * 0.24, rect.y + size * 0.52),
+                        (rect.x + size * 0.42, rect.y + size * 0.70),
+                        (rect.x + size * 0.76, rect.y + size * 0.30),
+                    ],
+                    theme::accent(),
+                    1.6,
+                );
+            } else {
+                theme::rounded_outline(
+                    layer,
+                    rect.inset(0.5),
+                    CHECK_RADIUS - 0.5,
+                    1.0,
+                    theme::non_text(),
+                );
             }
         }
     }
@@ -656,13 +742,31 @@ impl Component for Editor {
                 }
                 continue;
             }
+            // A done task is quiet twice over: dim ink (via `text_style`)
+            // and a real drawn rule through the run.
+            let done_task = matches!(
+                kind,
+                Block::ListItem {
+                    marker: ListMarker::Task { done: true },
+                    ..
+                }
+            );
             for (line_index, line) in block.lines.iter().enumerate() {
                 let top = content + line.y - self.scroll;
                 if top + line.height < rect.y || top > rect.bottom() {
                     continue;
                 }
                 let baseline = top + line.height * 0.5;
-                let mut cursor = x;
+                // The marker hangs in the gutter of the item's first line
+                // only; every wrapped line below keeps the indent.
+                if line_index == 0
+                    && let Block::ListItem { marker, .. } = kind
+                {
+                    draw_list_marker(layer, marker, x + line.x, baseline, self.layout.scale);
+                }
+                // The line's text starts at its own left edge — indented
+                // for a list item's content, the gutter for everything else.
+                let mut cursor = x + line.x;
                 pieces.clear();
                 for segment in &line.segments {
                     let run = &kind.inlines()[segment.inline];
@@ -841,6 +945,15 @@ impl Component for Editor {
                         );
                     }
                 }
+                if done_task && let (Some(first), Some(last)) = (pieces.first(), pieces.last()) {
+                    theme::rule(
+                        layer,
+                        (first.2 - 1.0, baseline - STRIKE_RISE),
+                        last.2 + last.3 - first.2 + 2.0,
+                        STRIKE_THICKNESS,
+                        theme::dim(),
+                    );
+                }
                 for ((text, style, at, _), segment) in pieces.iter().zip(&line.segments) {
                     if matches!(
                         kind.inlines()[segment.inline],
@@ -901,7 +1014,8 @@ impl Component for Editor {
             // legible. Falls back to a space's advance past the end of the
             // line, like the old line editor did.
             let sample = caret_char.map(String::from).unwrap_or_else(|| " ".into());
-            let width = theme::width(layer, &sample, &TextStyle::serif(17.5, theme::ink())).max(1.0);
+            let width =
+                theme::width(layer, &sample, &TextStyle::serif(17.5, theme::ink())).max(1.0);
             layer.draw_rectangle(
                 (screen_x, screen_y - caret_height * 0.5 + 2.0),
                 (width, caret_height - 4.0),
@@ -1011,7 +1125,7 @@ impl Editor {
                                 layer,
                             );
                             layer.draw_rectangle(
-                                (x + left, top),
+                                (x + line.x + left, top),
                                 ((right - left).max(1.0), line.height),
                                 theme::selection(),
                                 Rounding::NONE,
