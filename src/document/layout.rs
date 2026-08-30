@@ -66,8 +66,8 @@ pub const NUMBER_GUTTER: f32 = 12.0;
 pub const NUMBER_SIZE: f32 = 11.0;
 /// The chevron triangle: this wide and this tall, pointing down when the
 /// section is open and right when it is folded.
-pub const CHEVRON_WIDTH: f32 = 5.0;
-pub const CHEVRON_HEIGHT: f32 = 8.0;
+pub const CHEVRON_WIDTH: f32 = 7.0;
+pub const CHEVRON_HEIGHT: f32 = 6.0;
 /// Gap between the chevron's right edge and the auto-number's left edge, so
 /// the two gutter marks read as one aligned column, not one collision.
 pub const CHEVRON_GAP: f32 = 9.0;
@@ -3145,5 +3145,180 @@ mod tests {
         let single_height = layout(&doc_with(vec![single]), 300.0, &fake_measure).blocks[0].height;
         let nested_height = layout(&doc_with(vec![nested]), 300.0, &fake_measure).blocks[0].height;
         assert!(nested_height > single_height);
+    }
+
+    fn heading(level: u8, text: &str) -> Block {
+        Block::Heading {
+            level,
+            folded: false,
+            content: vec![Inline::Text(Text {
+                text: text.into(),
+                style: Style::PLAIN,
+            })],
+        }
+    }
+
+    fn folded_heading(level: u8, text: &str) -> Block {
+        let mut block = heading(level, text);
+        if let Block::Heading { folded, .. } = &mut block {
+            *folded = true;
+        }
+        block
+    }
+
+    const INDICATOR: f32 = FOLD_INDICATOR_HEIGHT;
+
+    #[test]
+    fn a_folded_heading_hides_its_body_up_to_the_next_heading_of_its_level() {
+        let blocks = vec![
+            folded_heading(1, "Top"),
+            para("body one"),
+            para("body two"),
+            heading(1, "Next"),
+            para("visible again"),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        let full = layout_blocks(
+            &[
+                heading(1, "Top"),
+                para("body one"),
+                para("body two"),
+                heading(1, "Next"),
+                para("visible again"),
+            ],
+            400.0,
+            1.0,
+            &fake_measure,
+        );
+
+        // Blocks 1 and 2 are hidden: zero height, no lines, owned by block 0.
+        assert_eq!(laid.blocks[1].hidden, Some(0));
+        assert_eq!(laid.blocks[2].hidden, Some(0));
+        assert!(laid.blocks[1].lines.is_empty());
+        assert_eq!(laid.blocks[1].height, 0.0);
+        // Everything from "Next" on is visible and sits exactly one heading's
+        // spacing below the folded heading — the hidden body contributes
+        // nothing, so the reflow is instant and leaves no residue. The folded
+        // heading itself is taller by exactly its indicator band.
+        assert_eq!(
+            laid.blocks[0].height,
+            full.blocks[0].height + INDICATOR
+        );
+        assert_eq!(
+            laid.blocks[3].y - (laid.blocks[0].y + laid.blocks[0].height),
+            GAP_AFTER_HEADING + GAP_HEADING,
+        );
+        assert!(laid.blocks[3].hidden.is_none());
+        assert!(laid.blocks[4].hidden.is_none());
+
+        // The folded heading's indicator carries the hidden line count.
+        let indicator = laid.blocks[0].indicator.as_ref().unwrap();
+        assert_eq!(indicator.lines, 2);
+    }
+
+    #[test]
+    fn a_folded_h3_inside_a_folded_h1_hides_with_it_and_keeps_its_own_fold() {
+        let blocks = vec![
+            folded_heading(1, "Top"),
+            para("inner body"),
+            folded_heading(3, "Sub"),
+            para("sub body"),
+            heading(1, "Next"),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        // Everything between the H1 and the next H1 is hidden by the H1.
+        for index in 1..4 {
+            assert_eq!(laid.blocks[index].hidden, Some(0));
+        }
+        // The hidden H3 emits no indicator of its own.
+        assert!(laid.blocks[2].indicator.is_none());
+        assert_eq!(laid.blocks[0].indicator.as_ref().unwrap().lines, 3);
+    }
+
+    #[test]
+    fn an_unfolded_h1_leaves_its_nested_folded_h3_folded_with_its_own_indicator() {
+        let blocks = vec![
+            heading(1, "Top"),
+            para("inner body"),
+            folded_heading(3, "Sub"),
+            para("sub body"),
+            heading(1, "Next"),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        assert!(laid.blocks[0].indicator.is_none());
+        assert!(laid.blocks[2].indicator.is_some());
+        assert!(laid.blocks[1].hidden.is_none());
+        assert_eq!(laid.blocks[3].hidden, Some(2));
+    }
+
+    #[test]
+    fn a_fold_with_no_body_gets_no_indicator() {
+        let blocks = vec![folded_heading(1, "Empty"), heading(1, "Next")];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        assert!(laid.blocks[0].indicator.is_none());
+    }
+
+    #[test]
+    fn the_indicator_band_and_hidden_ground_answer_clicks() {
+        let blocks = vec![
+            folded_heading(1, "Top"),
+            para("body one"),
+            para("body two"),
+            heading(1, "Next"),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        let indicator = laid.blocks[0].indicator.as_ref().unwrap();
+
+        // A click in the indicator band (any x — the whole column) unfolds.
+        let mid = indicator.y + INDICATOR * 0.5;
+        assert_eq!(laid.fold_indicator_at(mid), Some(0));
+        assert_eq!(laid.fold_indicator_at(indicator.y - 0.5), None);
+
+        // A click on the folded ground below lands on the owning heading.
+        let caret = laid.hit(100.0, indicator.y + 5.0, &fake_measure);
+        assert_eq!(caret.block, 0);
+
+        // The chevron hit band sits in the gutter and nowhere else.
+        let right = chevron_right(0.0, 1.0);
+        let band_mid_y = laid.blocks[0].lines[0].y + laid.blocks[0].lines[0].height * 0.5;
+        assert_eq!(
+            laid.fold_chevron_at(right - CHEVRON_WIDTH / 2.0, band_mid_y, &fake_measure),
+            Some(0)
+        );
+        // …but a click right of the gutter is a caret placement, not a fold.
+        assert_eq!(laid.fold_chevron_at(50.0, band_mid_y, &fake_measure), None);
+    }
+
+    #[test]
+    fn vertical_motion_skips_hidden_blocks() {
+        let blocks = vec![
+            folded_heading(1, "Top"),
+            para("hidden one"),
+            para("hidden two"),
+            heading(1, "Next"),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        let caret = Caret {
+            block: 0,
+            inline: 0,
+            offset: 0,
+            style: Style::PLAIN,
+        };
+        // Down from the folded heading lands past the hidden body.
+        let down = laid.line_down(caret, 0.0, &fake_measure).unwrap();
+        assert_eq!(down.block, 3);
+        // And back up returns to the heading, never to a hidden block.
+        let up = laid.line_up(down, 0.0, &fake_measure).unwrap();
+        assert_eq!(up.block, 0);
+    }
+
+    #[test]
+    fn chevron_right_clears_the_number_and_stays_in_the_gutter() {
+        // Wide auto-numbers push the chevron left, but never out of reach.
+        let wide = chevron_right(40.0, 1.0);
+        let bare = chevron_right(0.0, 1.0);
+        assert_eq!(bare, -(NUMBER_GUTTER + CHEVRON_GAP));
+        assert_eq!(wide, CHEVRON_RIGHT_FLOOR);
+        assert!(wide < bare);
     }
 }
