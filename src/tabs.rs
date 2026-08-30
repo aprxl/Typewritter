@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::document::{BadgeColor, Document, FlatRange, Style, math, math_conversion};
+use crate::document::{BadgeColor, Document, FlatRange, ListMarker, Style, math, math_conversion};
 
 pub struct Tab {
     pub document: Document,
@@ -447,6 +447,26 @@ impl Tabs {
 
     pub fn open_above(&mut self) {
         self.edit(Document::open_above);
+    }
+
+    /// Convert the caret's block to a list item of `marker` (`None` puts it
+    /// back to a paragraph; the same kind toggles off).
+    pub fn set_list(&mut self, marker: Option<ListMarker>) {
+        self.edit(move |doc| doc.set_list(marker));
+    }
+
+    /// Flip the checkbox of the task item the caret sits on.
+    pub fn toggle_task(&mut self) {
+        self.edit(|doc| {
+            doc.toggle_task_here();
+        });
+    }
+
+    /// Flip one block's checkbox — the click route.
+    pub fn toggle_task_at(&mut self, block: usize) {
+        self.edit(move |doc| {
+            doc.toggle_task_at(block);
+        });
     }
 
     /// Convert the caret's block: `None` → paragraph, `Some(1..=3)` →

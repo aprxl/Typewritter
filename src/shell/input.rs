@@ -366,7 +366,16 @@ impl Shell {
         }
 
         if has_tab && input.is_mouse_pressed(MouseButton::Left) && over_editor {
-            if self.vim.current_mode() == VimMode::Normal {
+            // A click on a task's checkbox toggles it, whatever the mode:
+            // it is a control, not a caret placement.
+            if let Some((local_x, local_y)) = self.editor_point(rect, mouse)
+                && let Some(block) = self
+                    .current_layout(editor::Editor::content_width(rect))
+                    .task_at(local_x, local_y)
+            {
+                self.goal_x = None;
+                self.docs.borrow_mut().toggle_task_at(block);
+            } else if self.vim.current_mode() == VimMode::Normal {
                 if self.click_anchor(rect, mouse) {
                     // The click focused a note; nothing else to do with it.
                 } else if let Some(target) = self.context_at(rect, mouse) {
