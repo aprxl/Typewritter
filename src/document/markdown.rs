@@ -22,7 +22,7 @@ use std::io;
 use std::path::Path;
 
 use super::math_notation;
-use super::{BadgeColor, Block, Caret, Document, Focus, Inline, Sidenote, Style, Text};
+use super::{BadgeColor, Block, Caret, Document, Focus, Inline, ListMarker, Sidenote, Style, Text};
 
 /// Scan for the next unescaped occurrence of `marker` at or after `start`.
 /// The char immediately before a match must be non-whitespace. Escaped
@@ -310,6 +310,24 @@ fn is_divider_line(line: &str) -> bool {
     line.len() >= 3 && line.chars().all(|c| c == '-')
 }
 
+/// Whether a serialized line would re-read as a list item's marker —
+/// `- `, `* `, `+ `, or `N.`/`N) ` — and so needs a leading escape. Only a
+/// line's *start* can claim it: mid-prose `-` and `1.` are ordinary text.
+fn reads_as_list_item(line: &str) -> bool {
+    if line.starts_with("- ") || line.starts_with("* ") || line.starts_with("+ ") {
+        return true;
+    }
+    let bytes = line.as_bytes();
+    let mut digits = 0;
+    while digits < bytes.len() && bytes[digits].is_ascii_digit() {
+        digits += 1;
+    }
+    digits > 0
+        && digits < bytes.len()
+        && (bytes[digits] == b'.' || bytes[digits] == b')')
+        && bytes.get(digits + 1) == Some(&b' ')
+}
+
 /// Parse a line as a heading `#{1,4}\s+...`. Returns `(level, content)`.
 fn parse_heading(line: &str) -> Option<(u8, &str)> {
     let bytes = line.as_bytes();
@@ -324,6 +342,46 @@ fn parse_heading(line: &str) -> Option<(u8, &str)> {
     }
     let rest = line[i + 1..].trim_start();
     Some((count as u8, rest))
+}
+
+/// The kinds of list marker a line can carry. The ordinal an ordered item
+/// was typed with is tolerated (`N.`/`N)`) but never stored — the item's
+/// place in its run is the only number there is, and serialization
+/// renumbers the run anyway.
+enum ListKind {
+    Bullet,
+    Ordered,
+    Task { done: bool },
+}
+
+/// Parse a line as a list item — one line, never an indented continuation:
+/// `- `/`* `/`+ ` bullets, `- [ ]` / `- [x]` tasks (also `* [ ]`, and either
+/// case of the check), or `N.`/`N)` ordered. Returns the marker kind and
+/// the content after it.
+fn parse_list_item(line: &str) -> Option<(ListKind, &str)> {
+    let (marker, rest) = line.split_once(' ')?;
+    if matches!(marker, "-" | "*" | "+") {
+        let rest = rest.trim_start();
+        if let Some(content) = rest.strip_prefix("[ ]") {
+            return Some((ListKind::Task { done: false }, content.trim_start()));
+        }
+        for (prefix, done) in [("[x]", true), ("[X]", true)] {
+            if let Some(content) = rest.strip_prefix(prefix) {
+                return Some((ListKind::Task { done }, content.trim_start()));
+            }
+        }
+        return Some((ListKind::Bullet, rest));
+    }
+    let last = marker.chars().last()?;
+    if marker.len() > 1
+        && (last == '.' || last == ')')
+        && marker[..marker.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_digit())
+    {
+        return Some((ListKind::Ordered, rest));
+    }
+    None
 }
 
 /// A footnote definition line `[^label]: body`. Returns `(label, body)` where
@@ -362,6 +420,10 @@ pub fn parse(path: &Path, text: &str) -> Document {
     let mut fence_math = false;
     let mut math_body = String::new();
     let mut definitions: Vec<(String, Block)> = Vec::new();
+    // The running ordinal of the ordered run being read. Reset by every
+    // non-ordered-item block, so a run numbers 1,2,3… the way serialization
+    // writes it.
+    let mut ordinal = 0u32;
 
     let flush_para = |blocks: &mut Vec<Block>, para: &mut Vec<String>| {
         if !para.is_empty() {
@@ -466,6 +528,38 @@ pub fn parse(path: &Path, text: &str) -> Document {
             blocks.push(Block::Heading {
                 level,
                 content: inlines,
+            });
+        } else if let Some((kind, content)) = parse_list_item(line) {
+            flush_para(&mut blocks, &mut para);
+            // An ordered run continues only through consecutive ordered
+            // items; a bullet or task item between them restarts it, as
+            // does any non-list block.
+            if !matches!(
+                blocks.last(),
+                Some(Block::ListItem {
+                    marker: ListMarker::Number(_),
+                    ..
+                })
+            ) {
+                ordinal = 0;
+            }
+            ordinal += 1;
+            let marker = match kind {
+                ListKind::Bullet => ListMarker::Bullet,
+                ListKind::Task { done } => ListMarker::Task { done },
+                ListKind::Ordered => ListMarker::Number(ordinal),
+            };
+            let mut runs = parse_inline(content);
+            if runs.is_empty() {
+                // Every block keeps at least one run, even if empty.
+                runs.push(Inline::Text(Text {
+                    text: String::new(),
+                    style: Style::PLAIN,
+                }));
+            }
+            blocks.push(Block::ListItem {
+                marker,
+                content: runs,
             });
         } else if line.trim().is_empty() {
             flush_para(&mut blocks, &mut para);
@@ -646,11 +740,24 @@ pub fn serialize(doc: &Document) -> String {
     let mut out = String::new();
     let mut i = 0;
     let mut first = true;
+    // The running ordinal of the ordered run being written, reset by every
+    // non-ordered-item block. The stored `Number` is never printed; the
+    // run's sequence is the number.
+    let mut ordinal = 0u32;
     while i < doc.body().len() {
         if !first {
             out.push_str("\n\n");
         }
         first = false;
+        if !matches!(
+            &doc.body()[i],
+            Block::ListItem {
+                marker: ListMarker::Number(_),
+                ..
+            }
+        ) {
+            ordinal = 0;
+        }
         match &doc.body()[i] {
             Block::CodeLine { lang, .. } => {
                 let opener = match lang {
@@ -692,6 +799,31 @@ pub fn serialize(doc: &Document) -> String {
                 out.push_str("\n```");
                 i += 1;
             }
+            Block::ListItem { marker, content } => {
+                let mut line = serialize_runs(content);
+                // A bullet whose content would read as a task box (or an
+                // empty one) is escaped so it re-reads as the bullet it is.
+                if matches!(marker, ListMarker::Bullet)
+                    && (line.starts_with("[ ]")
+                        || line.starts_with("[x]")
+                        || line.starts_with("[X]"))
+                {
+                    line.insert(0, '\\');
+                }
+                match marker {
+                    ListMarker::Bullet => out.push_str("- "),
+                    ListMarker::Task { done } => {
+                        out.push_str(if *done { "- [x] " } else { "- [ ] " });
+                    }
+                    ListMarker::Number(_) => {
+                        ordinal += 1;
+                        out.push_str(&ordinal.to_string());
+                        out.push_str(". ");
+                    }
+                }
+                out.push_str(&line);
+                i += 1;
+            }
             Block::Paragraph(runs) => {
                 let mut line = serialize_runs(runs);
                 // Guard a paragraph that would otherwise re-read as a
@@ -702,6 +834,10 @@ pub fn serialize(doc: &Document) -> String {
                 // Guard a paragraph that would otherwise re-read as a
                 // divider (e.g. text `---`).
                 if is_divider_line(&line) {
+                    line.insert(0, '\\');
+                }
+                // …or as a list item (e.g. text `- tea` or `1) note`).
+                if reads_as_list_item(&line) {
                     line.insert(0, '\\');
                 }
                 out.push_str(&line);
@@ -997,11 +1133,12 @@ mod tests {
             parse(Path::new("x"), "**no close\n").body(),
             vec![np("**no close")]
         );
-        // Opening marker must be followed by non-space: `* space*` is plain
-        // (a single literal `*`), and the trailing lone `*` is literal too.
+        // Opening marker must be followed by non-space — but a line-leading
+        // `* ` is now a bullet, so `* space*` reads as one item whose lone
+        // trailing `*` is literal text.
         assert_eq!(
             parse(Path::new("x"), "* space*\n").body(),
-            vec![np("* space*")]
+            vec![item(ListMarker::Bullet, "space*")]
         );
         // Escaped literal star.
         assert_eq!(
@@ -1538,6 +1675,168 @@ mod tests {
             ])]
         );
         assert_eq!(serialize(&d), text);
+    }
+
+    // ---- list item tests -------------------------------------------------
+
+    fn item(marker: ListMarker, t: &str) -> Block {
+        Block::ListItem {
+            marker,
+            content: vec![plain(t)],
+        }
+    }
+
+    /// Round trip is mandatory for every new spelling: parse then serialize
+    /// returns the same blocks, serialize is byte-stable, and the tolerant
+    /// variants all land on the one canonical spelling.
+    #[test]
+    fn list_spellings_parse_and_round_trip() {
+        let cases = [
+            // (source, expected marker of block 0, expected content)
+            ("- tea\n", ListMarker::Bullet, "tea"),
+            ("* tea\n", ListMarker::Bullet, "tea"),
+            ("+ tea\n", ListMarker::Bullet, "tea"),
+            (
+                "- [ ] buy milk\n",
+                ListMarker::Task { done: false },
+                "buy milk",
+            ),
+            (
+                "* [ ] buy milk\n",
+                ListMarker::Task { done: false },
+                "buy milk",
+            ),
+            (
+                "- [x] buy milk\n",
+                ListMarker::Task { done: true },
+                "buy milk",
+            ),
+            (
+                "- [X] buy milk\n",
+                ListMarker::Task { done: true },
+                "buy milk",
+            ),
+            ("1. tea\n", ListMarker::Number(1), "tea"),
+            ("12) tea\n", ListMarker::Number(1), "tea"),
+            ("- [ ]\n", ListMarker::Task { done: false }, ""),
+            ("1. \n", ListMarker::Number(1), ""),
+        ];
+        for (source, marker, content) in cases {
+            let d = parse(Path::new("x"), source);
+            assert_eq!(
+                d.body(),
+                vec![item(marker, content)],
+                "parse failed for {source:?}"
+            );
+            let text = serialize(&d);
+            assert_eq!(
+                parse(Path::new("x"), &text).body(),
+                d.body(),
+                "round-trip failed for {source:?}"
+            );
+            assert_eq!(
+                serialize(&parse(Path::new("x"), &text)),
+                text,
+                "canonical stability failed for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_markers_serialize_to_one_spelling() {
+        for source in ["* tea\n", "+ tea\n"] {
+            assert_eq!(serialize(&parse(Path::new("x"), source)), "- tea\n");
+        }
+        assert_eq!(
+            serialize(&parse(Path::new("x"), "- [X] done\n")),
+            "- [x] done\n"
+        );
+        // The typed ordinal is never stored: the run is renumbered.
+        let d = parse(Path::new("x"), "5. a\n6. b\n");
+        assert_eq!(
+            d.body(),
+            vec![
+                item(ListMarker::Number(1), "a"),
+                item(ListMarker::Number(2), "b"),
+            ]
+        );
+        assert_eq!(serialize(&d), "1. a\n\n2. b\n");
+    }
+
+    #[test]
+    fn an_ordered_run_restarts_after_a_non_list_block() {
+        let d = parse(Path::new("x"), "1. a\n\npara\n\n2. b\n");
+        assert_eq!(
+            d.body(),
+            vec![
+                item(ListMarker::Number(1), "a"),
+                para(vec![plain("para")]),
+                item(ListMarker::Number(1), "b"),
+            ]
+        );
+        assert_eq!(serialize(&d), "1. a\n\npara\n\n1. b\n");
+    }
+
+    #[test]
+    fn a_bullet_or_task_item_ends_an_ordered_run() {
+        let d = parse(Path::new("x"), "1. a\n- b\n2. c\n");
+        assert_eq!(
+            d.body(),
+            vec![
+                item(ListMarker::Number(1), "a"),
+                item(ListMarker::Bullet, "b"),
+                item(ListMarker::Number(1), "c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_content_keeps_its_inline_grammar() {
+        let d = parse(Path::new("x"), "- **bold** step and $a/b$\n");
+        assert_eq!(
+            d.body(),
+            vec![Block::ListItem {
+                marker: ListMarker::Bullet,
+                content: vec![bold("bold"), plain(" step and "), math("a/b")],
+            }]
+        );
+        assert_eq!(serialize(&d), "- **bold** step and $a/b$\n");
+    }
+
+    #[test]
+    fn list_like_paragraphs_are_escaped_on_the_way_out() {
+        // A paragraph whose text reads as a list item gets a leading
+        // escape, exactly like the `#` and `---` guards.
+        let d = doc_with(vec![para(vec![plain("- tea")])]);
+        let out = serialize(&d);
+        assert_eq!(out, "\\- tea\n");
+        assert_eq!(parse(Path::new("x"), &out).body(), d.body());
+
+        let d = doc_with(vec![para(vec![plain("1) note")])]);
+        let out = serialize(&d);
+        assert_eq!(out, "\\1) note\n");
+        assert_eq!(parse(Path::new("x"), &out).body(), d.body());
+    }
+
+    #[test]
+    fn a_bullet_whose_content_reads_as_a_task_box_is_escaped() {
+        let d = doc_with(vec![item(ListMarker::Bullet, "[ ] not a task")]);
+        let out = serialize(&d);
+        assert_eq!(out, "- \\[ ] not a task\n");
+        assert_eq!(parse(Path::new("x"), &out).body(), d.body());
+    }
+
+    #[test]
+    fn a_list_line_does_not_join_a_paragraph() {
+        let d = parse(Path::new("x"), "intro\n- tea\n\noutro\n");
+        assert_eq!(
+            d.body(),
+            vec![
+                para(vec![plain("intro")]),
+                item(ListMarker::Bullet, "tea"),
+                para(vec![plain("outro")]),
+            ]
+        );
     }
 
     #[test]
