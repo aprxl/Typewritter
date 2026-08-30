@@ -222,9 +222,16 @@ pub fn search_document(
 const MAX_HITS: usize = 50;
 
 /// The char offset of byte index `byte` in `text` — `fuzzy_indices` speaks
-/// bytes, everything downstream (highlighting, clipping) speaks chars.
+/// bytes, everything downstream (highlighting, clipping) speaks chars. The
+/// byte index can land mid-character for multi-byte text (an accented
+/// variable name, a symbol), so it is walked back to the nearest boundary
+/// before slicing; a raw `text[..byte]` panics there.
 fn chars_min_prefix(text: &str, byte: usize) -> usize {
-    text[..byte.min(text.len())].chars().count()
+    let mut byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    text[..byte].chars().count()
 }
 
 /// The hit's line starting at its first match char, capped so a
@@ -369,6 +376,19 @@ mod tests {
         // The offset the search reports is the offset `position` accepts.
         let flat = d.position(*block, *offset);
         assert_eq!(flat.block, 1);
+    }
+
+    #[test]
+    fn a_match_in_multibyte_text_does_not_panic_and_reports_a_char_offset() {
+        // "coût" is 5 chars but 6 bytes; a query matching the 't' puts the
+        // byte index inside 'ô' for the second 't'... the offset the search
+        // reports must always be a char count, never a raw byte index.
+        let d = doc("le coût et très haut\n");
+        let hits = search_document(&d, "coût");
+        assert_eq!(hits.len(), 1);
+        let (text, _, offset) = &hits[0];
+        assert_eq!(text.as_str(), "le coût et très haut");
+        assert_eq!(*offset, 3, "char offset of the match, not bytes");
     }
 
     #[test]
