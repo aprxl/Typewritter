@@ -64,6 +64,7 @@ fn block_text(block: &Block) -> String {
             Inline::Text(t) => t.text.as_str(),
             Inline::Math(_) => "\u{FFFC}",
             Inline::Note(_) => "\u{FFFC}",
+            Inline::EqRef(_) => "\u{FFFC}",
         })
         .collect()
 }
@@ -95,6 +96,7 @@ fn caret_pos(doc: &Document) -> (usize, usize) {
             Inline::Text(t) => t.text.chars().count(),
             Inline::Math(_) => 1,
             Inline::Note(_) => 1,
+            Inline::EqRef(_) => 1,
         })
         .sum();
     let offset = caret.offset.min(block_len(block) - prefix);
@@ -119,6 +121,7 @@ fn set_pos(doc: &mut Document, block: usize, flat: usize) {
             Inline::Text(t) => t.text.chars().count(),
             Inline::Math(_) => 1,
             Inline::Note(_) => 1,
+            Inline::EqRef(_) => 1,
         };
         if flat < acc + run_len {
             doc.set_caret(block, i, flat - acc);
@@ -132,6 +135,7 @@ fn set_pos(doc: &mut Document, block: usize, flat: usize) {
         Inline::Text(t) => t.text.chars().count(),
         Inline::Math(_) => 1,
         Inline::Note(_) => 1,
+        Inline::EqRef(_) => 1,
     };
     doc.set_caret(block, last, last_len);
 }

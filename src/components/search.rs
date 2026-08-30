@@ -441,6 +441,7 @@ impl Finder {
                             format!("${}$", crate::document::math_notation::print(list))
                         }
                         crate::document::Inline::Note(_) => String::new(),
+                        crate::document::Inline::EqRef(label) => format!("@{label}"),
                     })
                     .collect::<String>()
             })

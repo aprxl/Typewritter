@@ -2,6 +2,7 @@
 //! visible. The shell lays out the open document and hands it over as an
 //! [`Rc`]; this component only reads it.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::document::layout::{self, ContextHit, DocLayout, RangeKind};
@@ -24,6 +25,12 @@ const NUMBER_GUTTER: f32 = 12.0;
 /// The auto-number's size. Constant rather than scaled per heading level:
 /// it is a margin annotation, not part of the heading's own typography.
 const NUMBER_SIZE: f32 = 11.0;
+/// The equation number's size — the same margin-annotation register as the
+/// heading auto-number, never part of the math's own typography.
+const EQ_NUMBER_SIZE: f32 = 11.0;
+/// Room kept between the equation number and the band's right edge, so the
+/// widest reading of the band never crowds it.
+const EQ_NUMBER_INSET: f32 = 18.0;
 /// The design's measure: the content column is never wider than this.
 pub const MEASURE: f32 = 634.0;
 /// Space kept past the right edge before a line may wrap.
@@ -403,6 +410,7 @@ impl Editor {
                 scale: 1.0,
                 source: Vec::new(),
                 anchors: Vec::new(),
+                equation_numbers: HashMap::new(),
             }),
             metrics: Metrics::PAGE,
             caret: None,
@@ -581,6 +589,23 @@ impl Component for Editor {
                             theme::math_surface(),
                             CODE_ROUNDING,
                         );
+                        // The equation's number: virtual, hung flush right
+                        // in the band with room to spare, so it annotates
+                        // without ever crowding the expression. Only tagged
+                        // blocks have one; the caret cannot reach it and it
+                        // never reflows the math it labels.
+                        if let Some(number) = self.layout.equation_numbers.get(&bi) {
+                            theme::draw(
+                                layer,
+                                number,
+                                (
+                                    x + self.metrics.content_width(rect) - EQ_NUMBER_INSET,
+                                    content + first_line.y + first_line.height * 0.5 - self.scroll,
+                                ),
+                                &TextStyle::mono(EQ_NUMBER_SIZE, theme::non_text()),
+                                theme::RIGHT,
+                            );
+                        }
                     }
                 }
                 bi += 1;
@@ -668,6 +693,7 @@ impl Component for Editor {
                     let run = &kind.inlines()[segment.inline];
                     let is_math = matches!(run, Inline::Math(_));
                     let is_note = matches!(run, Inline::Note(_));
+                    let is_eq_ref = matches!(run, Inline::EqRef(_));
                     let text: String = match run {
                         Inline::Text(t) => t
                             .text
@@ -678,8 +704,11 @@ impl Component for Editor {
                         Inline::Math(_) => ATOM.to_string(),
                         // An anchor draws its derived number, not the label
                         // the author stored — carried on the segment, so the
-                        // drawing and `advance` read the same value.
+                        // drawing and `advance` read the same value. A
+                        // reference likewise draws its `(n)`, or its raw
+                        // spelling when nothing resolves.
                         Inline::Note(_) => segment.number.clone().unwrap_or_default(),
+                        Inline::EqRef(_) => segment.number.clone().unwrap_or_default(),
                     };
                     let width = layout::advance(
                         run,
@@ -699,6 +728,10 @@ impl Component for Editor {
                             &style,
                             theme::LEFT,
                         );
+                    }
+                    if is_eq_ref {
+                        let style = layout::eq_ref_style(&text, self.layout.scale);
+                        theme::draw(layer, &text, (cursor, baseline), &style, theme::LEFT);
                     }
                     let label_x = cursor
                         + if segment.style.badge {
@@ -844,7 +877,7 @@ impl Component for Editor {
                 for ((text, style, at, _), segment) in pieces.iter().zip(&line.segments) {
                     if matches!(
                         kind.inlines()[segment.inline],
-                        Inline::Math(_) | Inline::Note(_)
+                        Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_)
                     ) {
                         continue;
                     }
@@ -879,6 +912,7 @@ impl Component for Editor {
                     Inline::Text(t) => t.text.chars().nth(caret.offset),
                     Inline::Math(_) => Some(ATOM),
                     Inline::Note(_) => Some(ATOM),
+                    Inline::EqRef(_) => Some(ATOM),
                 })
         });
         let screen_x = x + caret_x;
@@ -901,7 +935,8 @@ impl Component for Editor {
             // legible. Falls back to a space's advance past the end of the
             // line, like the old line editor did.
             let sample = caret_char.map(String::from).unwrap_or_else(|| " ".into());
-            let width = theme::width(layer, &sample, &TextStyle::serif(17.5, theme::ink())).max(1.0);
+            let width =
+                theme::width(layer, &sample, &TextStyle::serif(17.5, theme::ink())).max(1.0);
             layer.draw_rectangle(
                 (screen_x, screen_y - caret_height * 0.5 + 2.0),
                 (width, caret_height - 4.0),
@@ -1045,6 +1080,7 @@ impl Editor {
                     .collect(),
                 Inline::Math(_) => ATOM.to_string(),
                 Inline::Note(_) => ATOM.to_string(),
+                Inline::EqRef(_) => ATOM.to_string(),
             };
             if flat >= cursor + segment.len {
                 x += layout::advance(
@@ -1290,7 +1326,7 @@ mod tests {
         let box_width = match &run {
             Inline::Math(list) => math_layout::layout(list, 0, 1.0, &measure).width,
             Inline::Text(_) => unreachable!(),
-            Inline::Note(_) => unreachable!(),
+            Inline::Note(_) | Inline::EqRef(_) => unreachable!(),
         };
         assert_eq!(width, box_width);
         assert!(width > measure(&atom, &TextStyle::serif(17.5, theme::ink())));

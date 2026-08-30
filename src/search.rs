@@ -132,6 +132,12 @@ fn text_rows(files: &[crate::vault::VaultFile], query: &str) -> Vec<Row> {
         let doc = crate::document::markdown::parse(&file.path, &text);
         for block in doc.body().iter().enumerate() {
             let (block_index, b) = block;
+            // A tagged equation is searchable by its tag as well as by its
+            // notation — the tag is part of what the equation "says".
+            let tag_prefix = match b {
+                crate::document::Block::Math { tag: Some(tag), .. } => format!("#{tag} "),
+                _ => String::new(),
+            };
             let mut offset = 0usize;
             for run in b.inlines() {
                 let (chars, text) = match run {
@@ -139,9 +145,14 @@ fn text_rows(files: &[crate::vault::VaultFile], query: &str) -> Vec<Row> {
                     // One flat position each, exactly as the editor counts.
                     crate::document::Inline::Math(list) => (
                         1,
-                        format!("${}$", crate::document::math_notation::print(list)),
+                        format!(
+                            "{}${}$",
+                            tag_prefix,
+                            crate::document::math_notation::print(list)
+                        ),
                     ),
                     crate::document::Inline::Note(_) => (1, String::new()),
+                    crate::document::Inline::EqRef(label) => (1, format!("@{label}")),
                 };
                 if let Some((score, indices)) = matcher.fuzzy_indices(&text, query) {
                     let at = chars_min_prefix(&text, indices[0]);
@@ -202,14 +213,23 @@ pub fn search_document(
     let matcher = SkimMatcherV2::default();
     let mut hits = Vec::new();
     for (block, b) in doc.body().iter().enumerate() {
+        let tag_prefix = match b {
+            crate::document::Block::Math { tag: Some(tag), .. } => format!("#{tag} "),
+            _ => String::new(),
+        };
         let mut offset = 0usize;
         for run in b.inlines() {
             let text = match run {
                 crate::document::Inline::Text(t) => t.text.clone(),
                 crate::document::Inline::Math(list) => {
-                    format!("${}$", crate::document::math_notation::print(list))
+                    format!(
+                        "{}${}$",
+                        tag_prefix,
+                        crate::document::math_notation::print(list)
+                    )
                 }
                 crate::document::Inline::Note(_) => String::new(),
+                crate::document::Inline::EqRef(label) => format!("@{label}"),
             };
             if let Some((_, indices)) = matcher.fuzzy_indices(&text, query) {
                 let start = chars_min_prefix(&text, indices[0]);
@@ -219,6 +239,7 @@ pub fn search_document(
                 crate::document::Inline::Text(t) => t.text.chars().count(),
                 crate::document::Inline::Math(_) => 1,
                 crate::document::Inline::Note(_) => 1,
+                crate::document::Inline::EqRef(_) => 1,
             };
         }
     }
@@ -422,6 +443,28 @@ mod tests {
         // The flat offset still points at the true position even though the
         // row text would have been clipped.
         assert!(*offset > 100);
+    }
+
+    #[test]
+    fn a_tagged_equation_is_searchable_by_its_tag() {
+        let mut d = crate::document::Document::new(Path::new("x"));
+        *d.body_mut() = vec![crate::document::Block::Math {
+            list: vec![crate::document::Inline::Math(
+                crate::document::math_notation::parse("1/2"),
+            )],
+            tag: Some("eq:gain".into()),
+        }];
+        let hits = search_document(&d, "gain");
+        assert_eq!(hits.len(), 1, "the tag finds the equation");
+        assert!(hits[0].0.starts_with("#eq:gain"));
+    }
+
+    #[test]
+    fn an_equation_reference_is_searchable_by_its_label() {
+        let d = crate::document::markdown::parse(Path::new("x"), "see @eq:gain above\n");
+        let hits = search_document(&d, "eq:gain");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "@eq:gain");
     }
 
     #[test]

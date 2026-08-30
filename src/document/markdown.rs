@@ -74,6 +74,50 @@ fn unescape(s: &[char]) -> String {
     out
 }
 
+/// Whether `name` is a legal equation-label name: `[A-Za-z0-9_-]+`.
+fn is_eq_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The length of an equation reference at the start of `chars`: `@eq:` plus
+/// a legal label name, or `None` when this `@` is ordinary text.
+fn eq_ref_at(chars: &[char]) -> Option<usize> {
+    if chars.len() < 5 || chars[1] != 'e' || chars[2] != 'q' || chars[3] != ':' {
+        return None;
+    }
+    let mut n = 4;
+    while n < chars.len()
+        && (chars[n].is_ascii_alphanumeric() || chars[n] == '_' || chars[n] == '-')
+    {
+        n += 1;
+    }
+    if n > 4 { Some(n) } else { None }
+}
+
+/// Parse a fence info string: `tw-math v1`, optionally followed by one
+/// equation tag `#eq:<name>`. Returns whether the fence is a math block and
+/// its label (`eq:<name>`, without the `#`). Any other spelling stays a
+/// code fence, so unknown versions and foreign files always open.
+fn parse_math_info(info: &str) -> (bool, Option<String>) {
+    let mut tokens = info.split_whitespace();
+    if tokens.next() != Some("tw-math") || tokens.next() != Some("v1") {
+        return (false, None);
+    }
+    let mut tag = None;
+    for token in tokens {
+        if let Some(name) = token.strip_prefix("#eq:")
+            && is_eq_name(name)
+            && tag.is_none()
+        {
+            tag = Some(format!("eq:{name}"));
+        }
+    }
+    (true, tag)
+}
+
 /// Parse the inline grammar into a `Vec<Inline>`. Runs are flat — markers
 /// found inside a matched run are literal content, never nested.
 fn parse_inline(s: &str) -> Vec<Inline> {
@@ -208,6 +252,7 @@ fn parse_inline(s: &str) -> Vec<Inline> {
                                 }
                                 Inline::Math(list) => runs.push(Inline::Math(list)),
                                 Inline::Note(label) => runs.push(Inline::Note(label)),
+                                Inline::EqRef(label) => runs.push(Inline::EqRef(label)),
                             }
                         }
                         i = cl + 2;
@@ -282,6 +327,22 @@ fn parse_inline(s: &str) -> Vec<Inline> {
                         text_buf.push_str("[[");
                         i += 2;
                     }
+                }
+            }
+            '@' => {
+                // An equation reference: `@eq:<name>`. Anything else after
+                // the `@` is literal text — no error path, like every other
+                // marker here.
+                if let Some(len) = eq_ref_at(&chars[i..]) {
+                    push_plain(&mut runs, &mut text_buf);
+                    // The label is everything after the `@`: `eq:<name>`, the
+                    // tag without its `#`.
+                    let label: String = chars[i + 1..i + len].iter().collect();
+                    runs.push(Inline::EqRef(label));
+                    i += len;
+                } else {
+                    text_buf.push('@');
+                    i += 1;
                 }
             }
             c => {
@@ -360,6 +421,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
     let mut fence_had_lines = false;
     let mut fence_lang: Option<String> = None;
     let mut fence_math = false;
+    let mut fence_tag: Option<String> = None;
     let mut math_body = String::new();
     let mut definitions: Vec<(String, Block)> = Vec::new();
 
@@ -376,9 +438,10 @@ pub fn parse(path: &Path, text: &str) -> Document {
         if in_fence {
             if line.trim() == "```" {
                 if fence_math {
-                    blocks.push(Block::Math(vec![Inline::Math(math_notation::parse(
-                        &math_body,
-                    ))]));
+                    blocks.push(Block::Math {
+                        list: vec![Inline::Math(math_notation::parse(&math_body))],
+                        tag: fence_tag.take(),
+                    });
                     math_body.clear();
                 } else if !fence_had_lines {
                     let empty = Inline::Text(Text {
@@ -398,6 +461,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
                 fence_had_lines = false;
                 fence_lang = None;
                 fence_math = false;
+                fence_tag = None;
             } else {
                 if fence_math {
                     math_body.push_str(line);
@@ -425,7 +489,9 @@ pub fn parse(path: &Path, text: &str) -> Document {
             flush_para(&mut blocks, &mut para);
             let info = line.trim()[3..].trim();
             // Unknown tw-math versions remain code so newer files always open.
-            fence_math = info == "tw-math v1";
+            let (math, tag) = parse_math_info(info);
+            fence_math = math;
+            fence_tag = tag;
             math_body.clear();
             fence_lang = if info.is_empty() {
                 None
@@ -478,9 +544,10 @@ pub fn parse(path: &Path, text: &str) -> Document {
     if in_fence {
         // Unterminated fences still produce their content; the file must open.
         if fence_math {
-            blocks.push(Block::Math(vec![Inline::Math(math_notation::parse(
-                &math_body,
-            ))]));
+            blocks.push(Block::Math {
+                list: vec![Inline::Math(math_notation::parse(&math_body))],
+                tag: fence_tag,
+            });
         }
     }
 
@@ -601,6 +668,7 @@ fn serialize_runs(runs: &[Inline]) -> String {
         }
         Inline::Math(list) => format!("${}$", math_notation::print(list)),
         Inline::Note(label) => format!("[^{label}]"),
+        Inline::EqRef(label) => format!("@{label}"),
     };
     let mut out = String::new();
     let mut i = 0;
@@ -682,12 +750,17 @@ pub fn serialize(doc: &Document) -> String {
                 out.push_str("---");
                 i += 1;
             }
-            Block::Math(runs) => {
+            Block::Math { list: runs, tag } => {
                 let list = match runs.as_slice() {
                     [Inline::Math(list)] => list,
                     _ => unreachable!("enforced math block invariant"),
                 };
-                out.push_str("```tw-math v1\n");
+                out.push_str("```tw-math v1");
+                if let Some(tag) = tag {
+                    out.push_str(" #");
+                    out.push_str(tag);
+                }
+                out.push('\n');
                 out.push_str(&math_notation::print(list));
                 out.push_str("\n```");
                 i += 1;
@@ -928,7 +1001,10 @@ mod tests {
 
     #[test]
     fn a_math_block_round_trips_through_its_fence() {
-        let d = doc_with(vec![Block::Math(vec![math("1/2")])]);
+        let d = doc_with(vec![Block::Math {
+            list: vec![math("1/2")],
+            tag: None,
+        }]);
         assert_eq!(serialize(&d), "```tw-math v1\n1/2\n```\n");
         assert_eq!(parse(Path::new("x"), &serialize(&d)).body(), d.body());
     }
@@ -1538,6 +1614,102 @@ mod tests {
             ])]
         );
         assert_eq!(serialize(&d), text);
+    }
+
+    // ---- equation tags and references ------------------------------------
+
+    #[test]
+    fn a_tagged_math_block_round_trips_through_its_fence() {
+        let text = "```tw-math v1 #eq:gain\n1/2\n```\n";
+        let d = parse(Path::new("x"), text);
+        assert!(matches!(
+            d.body()[0],
+            Block::Math {
+                tag: Some(ref tag),
+                ..
+            } if tag == "eq:gain"
+        ));
+        assert_eq!(serialize(&d), text);
+        assert_eq!(parse(Path::new("x"), &serialize(&d)).body(), d.body());
+    }
+
+    #[test]
+    fn a_tag_stays_put_through_the_editor_round_trip() {
+        let d = doc_with(vec![
+            Block::Math {
+                list: vec![math("1/2")],
+                tag: Some("eq:gain".into()),
+            },
+            para(vec![
+                plain("see "),
+                Inline::EqRef("eq:gain".into()),
+                plain(" here"),
+            ]),
+        ]);
+        let text = serialize(&d);
+        assert!(text.starts_with("```tw-math v1 #eq:gain\n"), "got {text:?}");
+        assert!(text.contains("@eq:gain"), "got {text:?}");
+        assert_eq!(parse(Path::new("x"), &text).body(), d.body());
+    }
+
+    #[test]
+    fn an_equation_reference_round_trips_through_its_at_spelling() {
+        let text = "by @eq:gain above\n";
+        let d = parse(Path::new("x"), text);
+        assert_eq!(
+            d.body(),
+            vec![para(vec![
+                plain("by "),
+                Inline::EqRef("eq:gain".into()),
+                plain(" above")
+            ])]
+        );
+        assert_eq!(serialize(&d), text);
+        assert_eq!(parse(Path::new("x"), &serialize(&d)).body(), d.body());
+    }
+
+    #[test]
+    fn an_at_sign_that_is_not_a_reference_is_literal() {
+        for text in [
+            "@eq: no space name\n", // `@eq:` alone then space
+            "@user mentioned\n",    // wrong keyword
+            "@ eq:gain spaced\n",   // space after @
+            "a lone @\n",           // bare @
+            "@eq:\n",               // no name at all
+        ] {
+            let d = parse(Path::new("x"), text);
+            assert!(
+                d.body()[0]
+                    .inlines()
+                    .iter()
+                    .all(|r| !matches!(r, Inline::EqRef(_))),
+                "{text:?} should not have produced a reference"
+            );
+            let out = serialize(&d);
+            assert_eq!(parse(Path::new("x"), &out).body(), d.body(), "{text:?}");
+        }
+        // A reference may carry digits, underscores, and dashes.
+        let d = parse(Path::new("x"), "@eq:Gain_2-x\n");
+        assert!(matches!(
+            d.body()[0].inlines()[0],
+            Inline::EqRef(ref l) if l == "eq:Gain_2-x"
+        ));
+    }
+
+    #[test]
+    fn a_fence_with_an_unknown_version_never_becomes_math() {
+        // A tag on an unknown version does not rescue it into math.
+        let d = parse(Path::new("x"), "```tw-math v2 #eq:gain\nx\n```\n");
+        assert!(d.body()[0].is_code());
+        assert_eq!(serialize(&d), "```tw-math v2 #eq:gain\nx\n```\n");
+    }
+
+    #[test]
+    fn a_tag_with_an_illegal_name_is_dropped_not_error() {
+        let d = parse(Path::new("x"), "```tw-math v1 #eq:bad!name\nx\n```\n");
+        assert!(matches!(d.body()[0], Block::Math { tag: None, .. }));
+        // Serializing writes the canonical spelling: no tag.
+        assert_eq!(serialize(&d), "```tw-math v1\nx\n```\n");
     }
 
     #[test]

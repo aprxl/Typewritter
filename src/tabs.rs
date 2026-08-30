@@ -487,6 +487,14 @@ impl Tabs {
         self.edit(Document::insert_math_block);
     }
 
+    /// Tags or untags the math block the caret sits in. A content change, so
+    /// it goes through `edit` and promotes a preview.
+    pub fn toggle_math_tag(&mut self) {
+        self.edit(|doc| {
+            doc.toggle_math_tag();
+        });
+    }
+
     pub fn math_type(&mut self, c: char) {
         self.edit(|doc| doc.math_insert_char(c));
     }

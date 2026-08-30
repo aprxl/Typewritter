@@ -916,6 +916,7 @@ impl Shell {
                             crate::document::Inline::Text(text) => text.text.as_str(),
                             crate::document::Inline::Math(_) => "\u{FFFC}",
                             crate::document::Inline::Note(_) => "\u{FFFC}",
+                            crate::document::Inline::EqRef(_) => "\u{FFFC}",
                         })
                         .collect::<String>()
                         .chars()
@@ -1684,6 +1685,7 @@ impl Shell {
                         Inline::Math(list) => math::node_at(list, address),
                         Inline::Text(_) => None,
                         Inline::Note(_) => None,
+                        Inline::EqRef(_) => None,
                     });
                 match node {
                     Some(MathNode::Sym(ch)) if ch.is_alphabetic() => symbol_context_ids(*ch),
@@ -1805,7 +1807,7 @@ impl Shell {
                     .and_then(|block| block.inlines().get(inline))
                     .and_then(|run| match run {
                         Inline::Math(list) => math::node_at(list, &address),
-                        Inline::Text(_) | Inline::Note(_) => None,
+                        Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
                     });
                 match (id, node) {
                     ("context.symbol.variable", Some(MathNode::Resolved { role, .. })) => {
@@ -3878,7 +3880,7 @@ mod tests {
             .iter()
             .map(|run| match run {
                 Inline::Text(text) => text.text.as_str(),
-                Inline::Math(_) | Inline::Note(_) => "\u{FFFC}",
+                Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => "\u{FFFC}",
             })
             .collect()
     }

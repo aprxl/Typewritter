@@ -322,6 +322,19 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.docs.borrow_mut().insert_math_block(),
     },
     Command {
+        // One command for both directions: a tagged equation loses its tag,
+        // an untagged one gains the next free `#eq:N`. The numbers on the
+        // page are derived at layout time in document order, so nothing
+        // stored here can drift from what the reader sees.
+        id: "format.math_tag",
+        title: "Equation tag",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell.docs.borrow_mut().toggle_math_tag();
+        },
+    },
+    Command {
         id: "format.inline_code",
         title: "Inline code",
         group: "Format",
@@ -824,6 +837,16 @@ mod tests {
             editor
                 .iter()
                 .any(|command| command.id == "format.math_block")
+        );
+    }
+
+    #[test]
+    fn equation_tag_appears_in_the_editors_slash_menu() {
+        assert!(
+            editor_commands()
+                .iter()
+                .any(|command| command.id == "format.math_tag"),
+            "tagging an equation is one keystroke away in Insert mode"
         );
     }
 

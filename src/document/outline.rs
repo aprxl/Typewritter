@@ -54,6 +54,7 @@ pub fn outline(blocks: &[Block]) -> Vec<Node> {
                 // Math is opaque and contributes no heading prose.
                 Inline::Math(_) => "",
                 Inline::Note(_) => "",
+                Inline::EqRef(_) => "",
             })
             .collect();
 

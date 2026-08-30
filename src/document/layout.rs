@@ -123,6 +123,11 @@ pub struct DocLayout {
     /// outline, they are derived from position so a number can never
     /// disagree with the anchor beside it.
     pub anchors: Vec<Anchor>,
+    /// Each tagged equation block's `(n)`, indexed like `source`. Derived in
+    /// the same pre-pass as the anchor numbers, so the number hung in a
+    /// band's margin can never disagree with what a `@eq:…` reference
+    /// resolves to.
+    pub equation_numbers: HashMap<usize, String>,
 }
 
 /// The smallest editable document node under a Normal-mode click.
@@ -175,7 +180,7 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
             theme::ink(),
         )
         .bold(),
-        Block::Paragraph(_) | Block::Divider(_) | Block::Math(_) => {
+        Block::Paragraph(_) | Block::Divider(_) | Block::Math { .. } => {
             TextStyle::serif(17.5 * scale, theme::ink())
         }
         Block::CodeLine { .. } => TextStyle::mono(17.5 * scale, theme::ink()),
@@ -194,6 +199,19 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
 /// opens something" rather than as a word in the sentence.
 pub fn anchor_style() -> TextStyle {
     TextStyle::serif(ANCHOR_SIZE, theme::accent())
+}
+
+/// The ink an inline equation reference draws with. Resolved, it takes the
+/// accent — a jump target, the way an anchor reads as "this opens
+/// something". Unresolved, its raw `@eq:label` text stays on the page, set
+/// small and muted: never vanishing, never an error, and never mistaken for
+/// a number.
+pub fn eq_ref_style(display: &str, scale: f32) -> TextStyle {
+    if display.starts_with('(') {
+        TextStyle::serif(17.5 * scale, theme::accent())
+    } else {
+        TextStyle::mono(theme::BADGE_SIZE * scale, theme::comment())
+    }
 }
 
 /// One word or whitespace stretch, with its source coordinates.
@@ -242,6 +260,13 @@ pub fn advance(
         // stamped onto the segment this run flows through; nothing measures
         // it from a guess.
         Inline::Note(_) => measure(number.unwrap_or("0"), &anchor_style()),
+        // A reference's display — `(n)` resolved, `@eq:label` not — is
+        // stamped by the numbering pass and carried on the segment, so the
+        // caret, the hit tests, and the drawing all measure the same text.
+        Inline::EqRef(_) => {
+            let display = number.unwrap_or_default();
+            measure(display, &eq_ref_style(display, scale))
+        }
     };
     let box_pad = if style.badge {
         theme::BADGE_PAD * 2.0 * scale
@@ -415,6 +440,44 @@ pub fn layout_blocks(
         }
     }
 
+    // Number the tagged equations in document order — one counter, one
+    // source of truth, exactly the anchor scheme above. Untagged math gets
+    // no number; a repeated tag takes the first occurrence's number, since
+    // one label naming two equations must still resolve somewhere.
+    let mut eq_of_label: HashMap<&str, usize> = HashMap::new();
+    let mut equation_numbers: HashMap<usize, String> = HashMap::new();
+    let mut equations = 0usize;
+    for (block, source) in blocks.iter().enumerate() {
+        if let Block::Math {
+            tag: Some(label), ..
+        } = source
+        {
+            eq_of_label.entry(label.as_str()).or_insert_with(|| {
+                equations += 1;
+                equations
+            });
+            if let Some(n) = eq_of_label.get(label.as_str()) {
+                equation_numbers.insert(block, format!("({n})"));
+            }
+        }
+    }
+    // Resolve every reference against that map now and stamp the display it
+    // will draw, the way an anchor's number is stamped onto its pieces: an
+    // unresolved label keeps its raw spelling, dimmed at draw time.
+    for (block, source) in blocks.iter().enumerate() {
+        for (inline, run) in source.inlines().iter().enumerate() {
+            if let Inline::EqRef(label) = run {
+                let display = match eq_of_label.get(label.as_str()) {
+                    Some(n) => format!("({n})"),
+                    // The label already carries its `eq:` prefix; the raw
+                    // spelling just puts the `@` back.
+                    None => format!("@{label}"),
+                };
+                number_of.insert((block, inline), display);
+            }
+        }
+    }
+
     let mut laid = Vec::with_capacity(blocks.len());
     let mut y = 0.0f32;
     let mut first_block = true;
@@ -442,7 +505,7 @@ pub fn layout_blocks(
             Block::Heading { level: 3, .. } => LINE_H3 * scale,
             Block::Heading { level: 4, .. } => LINE_H4 * scale,
             Block::Divider(_) => LINE_DIVIDER * scale,
-            Block::Math(runs) => {
+            Block::Math { list: runs, .. } => {
                 let Inline::Math(list) = &runs[0] else {
                     unreachable!("math block must contain one math atom")
                 };
@@ -468,7 +531,7 @@ pub fn layout_blocks(
                                 let expression = math_layout::layout(list, 0, scale, measure);
                                 Some(expression.ascent + expression.descent + MATH_LEADING * scale)
                             }
-                            Inline::Text(_) | Inline::Note(_) => None,
+                            Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
                         },
                     )
                     .fold(0.0, f32::max);
@@ -520,6 +583,7 @@ pub fn layout_blocks(
         height: y,
         scale,
         anchors,
+        equation_numbers,
     }
 }
 
@@ -540,6 +604,7 @@ fn run_text(run: &Inline) -> &str {
         Inline::Text(t) => &t.text,
         Inline::Math(_) => "\u{FFFC}",
         Inline::Note(_) => "\u{FFFC}",
+        Inline::EqRef(_) => "\u{FFFC}",
     }
 }
 
@@ -548,6 +613,7 @@ fn run_style(run: &Inline) -> Style {
         Inline::Text(t) => t.style,
         Inline::Math(_) => Style::PLAIN,
         Inline::Note(_) => Style::PLAIN,
+        Inline::EqRef(_) => Style::PLAIN,
     }
 }
 
@@ -816,7 +882,7 @@ fn caret_for_click(
         );
         // The label sits inside its box; skip the left edge so a click
         // lands on the character the user aimed at.
-        if matches!(run, Inline::Math(_) | Inline::Note(_)) {
+        if matches!(run, Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_)) {
             if x <= cum + width / 2.0 {
                 pos = seg_flat;
                 break 'segments;
@@ -1565,7 +1631,10 @@ mod tests {
     /// paragraph that happens to precede it.
     #[test]
     fn a_display_expression_is_inset_equally_above_and_below() {
-        let math = Block::Math(vec![Inline::Math(vec![MathNode::Sym('x')])]);
+        let math = Block::Math {
+            list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+            tag: None,
+        };
         let text = || {
             Block::Paragraph(vec![Inline::Text(Text {
                 text: "a".into(),
@@ -1605,7 +1674,10 @@ mod tests {
                     style: Style::PLAIN,
                 })],
             },
-            Block::Math(vec![Inline::Math(vec![MathNode::Sym('x')])]),
+            Block::Math {
+                list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+                tag: None,
+            },
         ];
         let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
         let above = laid.blocks[1].y - (laid.blocks[0].y + laid.blocks[0].height);
@@ -2908,16 +2980,115 @@ mod tests {
 
     #[test]
     fn a_display_math_block_is_as_tall_as_its_expression() {
-        let single = Block::Math(vec![Inline::Math(vec![MathNode::Sym('x')])]);
-        let nested = Block::Math(vec![Inline::Math(vec![MathNode::Frac {
-            num: vec![MathNode::Frac {
-                num: vec![MathNode::Sym('1')],
-                den: vec![MathNode::Sym('2')],
-            }],
-            den: vec![MathNode::Sym('3')],
-        }])]);
+        let single = Block::Math {
+            list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+            tag: None,
+        };
+        let nested = Block::Math {
+            list: vec![Inline::Math(vec![MathNode::Frac {
+                num: vec![MathNode::Frac {
+                    num: vec![MathNode::Sym('1')],
+                    den: vec![MathNode::Sym('2')],
+                }],
+                den: vec![MathNode::Sym('3')],
+            }])],
+            tag: None,
+        };
         let single_height = layout(&doc_with(vec![single]), 300.0, &fake_measure).blocks[0].height;
         let nested_height = layout(&doc_with(vec![nested]), 300.0, &fake_measure).blocks[0].height;
         assert!(nested_height > single_height);
+    }
+
+    fn tagged_eq(tag: Option<&str>) -> Block {
+        Block::Math {
+            list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+            tag: tag.map(str::to_string),
+        }
+    }
+
+    fn plain_run(t: &str) -> Inline {
+        Inline::Text(Text {
+            text: t.into(),
+            style: Style::PLAIN,
+        })
+    }
+
+    #[test]
+    fn tagged_equations_number_in_document_order() {
+        let d = doc_with(vec![
+            tagged_eq(Some("eq:a")),
+            tagged_eq(None),
+            tagged_eq(Some("eq:b")),
+            Block::Paragraph(vec![
+                plain_run("see "),
+                Inline::EqRef("eq:b".into()),
+                plain_run(" and "),
+                Inline::EqRef("eq:missing".into()),
+            ]),
+        ]);
+        let laid = layout(&d, 600.0, &fake_measure);
+        // Untagged math takes no number; the tagged ones count 1, 2.
+        assert_eq!(
+            laid.equation_numbers,
+            HashMap::from([(0, "(1)".to_string()), (2, "(2)".to_string())])
+        );
+        // A resolved reference draws the number it points at; an unresolved
+        // one keeps its raw spelling.
+        let segments = &laid.blocks[3].lines[0].segments;
+        let resolved = segments.iter().find(|s| s.inline == 1).unwrap();
+        assert_eq!(resolved.number.as_deref(), Some("(2)"));
+        let unresolved = segments.iter().find(|s| s.inline == 3).unwrap();
+        assert_eq!(unresolved.number.as_deref(), Some("@eq:missing"));
+    }
+
+    #[test]
+    fn a_repeated_tag_resolves_to_its_first_equation() {
+        let d = doc_with(vec![
+            tagged_eq(Some("eq:a")),
+            tagged_eq(Some("eq:a")),
+            Block::Paragraph(vec![plain_run("see "), Inline::EqRef("eq:a".into())]),
+        ]);
+        let laid = layout(&d, 600.0, &fake_measure);
+        assert_eq!(laid.equation_numbers[&0], "(1)");
+        assert_eq!(laid.equation_numbers[&1], "(1)");
+        let segments = &laid.blocks[2].lines[0].segments;
+        let reference = segments.iter().find(|s| s.inline == 1).unwrap();
+        assert_eq!(reference.number.as_deref(), Some("(1)"));
+    }
+
+    #[test]
+    fn a_reference_measures_as_the_number_it_draws() {
+        let d = doc_with(vec![
+            tagged_eq(Some("eq:a")),
+            Block::Paragraph(vec![plain_run("see "), Inline::EqRef("eq:a".into())]),
+        ]);
+        let plain_width = {
+            let run = plain_run("see ");
+            advance(
+                &run,
+                "see ",
+                &d.body()[1],
+                Style::PLAIN,
+                None,
+                1.0,
+                &fake_measure,
+            )
+        };
+        // "see " is four glyphs; the reference is one flat position whose
+        // width is the `(1)` it draws, not the placeholder atom.
+        let reference_width = {
+            let run = Inline::EqRef("eq:a".into());
+            advance(
+                &run,
+                "\u{FFFC}",
+                &d.body()[1],
+                Style::PLAIN,
+                Some("(1)"),
+                1.0,
+                &fake_measure,
+            )
+        };
+        assert_eq!(plain_width, 40.0);
+        assert_eq!(reference_width, 30.0);
     }
 }

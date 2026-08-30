@@ -79,8 +79,13 @@ pub enum Block {
     /// (see `prune_runs`). The rule itself is drawn by the editor — this
     /// block has no content of its own.
     Divider(Vec<Inline>),
-    /// A display math block: exactly one opaque math atom until math rendering lands.
-    Math(Vec<Inline>),
+    /// Display math. `tag` is the author's equation label (`eq:gain`, spelled
+    /// `#eq:gain` in the fence info string), used for numbering and for
+    /// `@eq:…` references. `list` holds exactly one math atom.
+    Math {
+        list: Vec<Inline>,
+        tag: Option<String>,
+    },
     Heading {
         level: u8,
         content: Vec<Inline>,
@@ -101,6 +106,10 @@ pub enum Inline {
     /// coordinates count it as exactly one position, so every motion,
     /// selection and offset in the document keeps working unchanged.
     Note(String),
+    /// A reference to a tagged display equation: `@eq:gain` on disk, the
+    /// referenced equation's number on the page. Opaque like an anchor: one
+    /// flat position, deleted as a whole, never split mid-label.
+    EqRef(String),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -210,7 +219,7 @@ impl Block {
         match self {
             Block::Paragraph(inlines)
             | Block::Divider(inlines)
-            | Block::Math(inlines)
+            | Block::Math { list: inlines, .. }
             | Block::Heading {
                 content: inlines, ..
             } => inlines,
@@ -222,7 +231,7 @@ impl Block {
         match self {
             Block::Paragraph(inlines)
             | Block::Divider(inlines)
-            | Block::Math(inlines)
+            | Block::Math { list: inlines, .. }
             | Block::Heading {
                 content: inlines, ..
             } => inlines,
@@ -239,7 +248,7 @@ impl Block {
     }
 
     pub fn is_math(&self) -> bool {
-        matches!(self, Block::Math(_))
+        matches!(self, Block::Math { .. })
     }
 
     pub fn is_code(&self) -> bool {
@@ -254,6 +263,7 @@ impl Inline {
             // U+FFFC gives every flat-text consumer exactly one position.
             Inline::Math(_) => "\u{FFFC}",
             Inline::Note(_) => "\u{FFFC}",
+            Inline::EqRef(_) => "\u{FFFC}",
         }
     }
 
@@ -265,6 +275,8 @@ impl Inline {
             // An anchor's label is fixed by the note it points at; the
             // reader edits the note body, not the anchor.
             Inline::Note(_) => None,
+            // A reference's label is fixed by the equation it points at.
+            Inline::EqRef(_) => None,
         }
     }
 
@@ -273,6 +285,7 @@ impl Inline {
             Inline::Text(t) => t.style,
             Inline::Math(_) => Style::PLAIN,
             Inline::Note(_) => Style::PLAIN,
+            Inline::EqRef(_) => Style::PLAIN,
         }
     }
 
@@ -281,6 +294,7 @@ impl Inline {
             Inline::Text(t) => t.style = style,
             Inline::Math(_) => {}
             Inline::Note(_) => {}
+            Inline::EqRef(_) => {}
         }
     }
 }
@@ -291,6 +305,7 @@ fn run_len(run: &Inline) -> usize {
         // Opaque math always costs one flat position.
         Inline::Math(_) => 1,
         Inline::Note(_) => 1,
+        Inline::EqRef(_) => 1,
     }
 }
 
@@ -300,13 +315,14 @@ fn merge_style(run: &Inline) -> Option<Style> {
         // An atom is never a prose merge target.
         Inline::Math(_) => None,
         Inline::Note(_) => None,
+        Inline::EqRef(_) => None,
     }
 }
 
 /// Whether a run is opaque — costs one flat position and is deleted as a
 /// whole rather than char by char. Math atoms and sidenote anchors both are.
 fn is_opaque(run: &Inline) -> bool {
-    matches!(run, Inline::Math(_) | Inline::Note(_))
+    matches!(run, Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_))
 }
 
 fn style_matches(style: Style, mask: Style) -> bool {
@@ -333,7 +349,10 @@ fn divider_block() -> Block {
 
 /// A display math block starts with one empty opaque atom.
 fn math_block() -> Block {
-    Block::Math(vec![Inline::Math(Vec::new())])
+    Block::Math {
+        list: vec![Inline::Math(Vec::new())],
+        tag: None,
+    }
 }
 
 /// Repair one block's runs: drop empty runs, merge equal adjacent prose runs,
@@ -394,7 +413,7 @@ fn prune_block(block: &mut Block) {
                 lang: lang.clone(),
             },
             Block::Divider(_) => divider_block(),
-            Block::Math(_) => math_block(),
+            Block::Math { .. } => math_block(),
             Block::Paragraph(_) => empty_block(),
         };
     }
@@ -460,6 +479,26 @@ fn split_run(run: Inline, at: usize) -> (Inline, Inline) {
                 )
             }
         }
+        Inline::EqRef(label) => {
+            // A reference cannot split either; the empty side is pruned.
+            if at == 0 {
+                (
+                    Inline::Text(Text {
+                        text: String::new(),
+                        style: Style::PLAIN,
+                    }),
+                    Inline::EqRef(label),
+                )
+            } else {
+                (
+                    Inline::EqRef(label),
+                    Inline::Text(Text {
+                        text: String::new(),
+                        style: Style::PLAIN,
+                    }),
+                )
+            }
+        }
         Inline::Note(label) => {
             // An anchor cannot split either; the empty side is pruned.
             if at == 0 {
@@ -515,6 +554,22 @@ fn inline_runs(text: &str, style: Style) -> Vec<Inline> {
                     i += 1;
                 }
             }
+            '@' => {
+                // `@eq:<name>` pasted back becomes a reference again, the
+                // same way `$…$` does. A reference the reader *typed* goes
+                // in one character at a time and never matches here.
+                if let Some(len) = eq_ref_at(&chars[i..]) {
+                    push_text(&mut runs, &mut buf, style);
+                    // The label is everything after the `@`: `eq:<name>`, the
+                    // tag without its `#`.
+                    let label: String = chars[i + 1..i + len].iter().collect();
+                    runs.push(Inline::EqRef(label));
+                    i += len;
+                } else {
+                    buf.push('@');
+                    i += 1;
+                }
+            }
             c => {
                 buf.push(c);
                 i += 1;
@@ -539,6 +594,21 @@ fn dollar_closer(chars: &[char], start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// The length of an equation reference at the start of `chars`: `@eq:` plus
+/// a `[A-Za-z0-9_-]+` name, or `None` when this `@` is ordinary text.
+fn eq_ref_at(chars: &[char]) -> Option<usize> {
+    if chars.len() < 5 || chars[1] != 'e' || chars[2] != 'q' || chars[3] != ':' {
+        return None;
+    }
+    let mut n = 4;
+    while n < chars.len()
+        && (chars[n].is_ascii_alphanumeric() || chars[n] == '_' || chars[n] == '-')
+    {
+        n += 1;
+    }
+    if n > 4 { Some(n) } else { None }
 }
 
 /// Append a pending text buffer as one text run, if it is non-empty.
@@ -717,6 +787,12 @@ impl Document {
                         out.push_str("[^");
                         out.push_str(label);
                         out.push(']');
+                    }
+                    Inline::EqRef(label) => {
+                        // The label carries its `eq:` prefix; the `@` is the
+                        // only spelling added back.
+                        out.push('@');
+                        out.push_str(label);
                     }
                 }
             }
@@ -1031,6 +1107,7 @@ impl Document {
                     // Slices cover the whole opaque atom or none of it.
                     Inline::Math(_) => result.push(run.clone()),
                     Inline::Note(_) => result.push(run.clone()),
+                    Inline::EqRef(_) => result.push(run.clone()),
                 }
             }
             cursor = run_end;
@@ -1055,7 +1132,10 @@ impl Document {
         match block {
             Block::Paragraph(_) => Block::Paragraph(runs),
             Block::Divider(_) => Block::Divider(runs),
-            Block::Math(_) => Block::Math(runs),
+            Block::Math { tag, .. } => Block::Math {
+                list: runs,
+                tag: tag.clone(),
+            },
             Block::Heading { level, .. } => Block::Heading {
                 level: *level,
                 content: runs,
@@ -1692,7 +1772,9 @@ impl Document {
             let len = match &self.scope()[b].inlines()[inline] {
                 Inline::Math(list) => list.len(),
                 Inline::Text(_) => unreachable!("math target was checked above"),
-                Inline::Note(_) => unreachable!("math target was checked above"),
+                Inline::Note(_) | Inline::EqRef(_) => {
+                    unreachable!("math target was checked above")
+                }
             };
             if len > 0 || self.scope()[b].is_math() {
                 self.set_caret(b, inline, 0);
@@ -1794,7 +1876,9 @@ impl Document {
             let empty = match &self.scope()[b].inlines()[inline] {
                 Inline::Math(list) => list.is_empty(),
                 Inline::Text(_) => unreachable!("math target was checked above"),
-                Inline::Note(_) => unreachable!("math target was checked above"),
+                Inline::Note(_) | Inline::EqRef(_) => {
+                    unreachable!("math target was checked above")
+                }
             };
             if !empty || self.scope()[b].is_math() {
                 self.set_caret(b, inline, 0);
@@ -2306,6 +2390,55 @@ impl Document {
         self.math = Some(math::MathCursor::default());
         self.dirty = true;
         self.enforce();
+    }
+
+    /// Tags the display math block the caret sits in with the next free
+    /// `#eq:N` label, or removes its tag when it already carries one. The
+    /// numbers themselves are derived at layout time in document order, so
+    /// what is stored here can never disagree with what the page shows.
+    /// Returns whether the caret was on a math block.
+    pub fn toggle_math_tag(&mut self) -> bool {
+        self.clamp_caret();
+        let b = self.caret.block;
+        if !matches!(self.scope()[b], Block::Math { .. }) {
+            return false;
+        }
+        let had_tag = matches!(&self.scope()[b], Block::Math { tag: Some(_), .. });
+        if had_tag {
+            if let Block::Math { tag, .. } = &mut self.scope_mut()[b] {
+                *tag = None;
+            }
+        } else {
+            let label = self.next_free_eq_label();
+            if let Block::Math { tag, .. } = &mut self.scope_mut()[b] {
+                *tag = Some(label);
+            }
+        }
+        self.dirty = true;
+        self.enforce();
+        true
+    }
+
+    /// The lowest `eq:N` label no equation block in the focused scope
+    /// carries yet.
+    fn next_free_eq_label(&self) -> String {
+        let mut used: Vec<u32> = self
+            .scope()
+            .iter()
+            .filter_map(|block| match block {
+                Block::Math {
+                    tag: Some(label), ..
+                } => label.strip_prefix("eq:").and_then(|n| n.parse().ok()),
+                _ => None,
+            })
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        let mut n = 1;
+        while used.binary_search(&n).is_ok() {
+            n += 1;
+        }
+        format!("eq:{n}")
     }
 
     /// The focused atom's tree and cursor, or None when focus is stale.
@@ -3458,7 +3591,10 @@ mod tests {
     fn backspace_from_prose_after_display_math_enters_without_merging_blocks() {
         let mut d = doc();
         *d.body_mut() = vec![
-            Block::Math(vec![Inline::Math(vec![math::MathNode::Sym('x')])]),
+            Block::Math {
+                list: vec![Inline::Math(vec![math::MathNode::Sym('x')])],
+                tag: None,
+            },
             Block::Paragraph(vec![plain_run("after")]),
         ];
         d.set_caret(1, 0, 0);
@@ -3466,8 +3602,9 @@ mod tests {
         d.backspace();
 
         assert_eq!(d.body().len(), 2);
-        assert!(matches!(d.body()[0], Block::Math(ref inlines)
-            if matches!(inlines.as_slice(), [Inline::Math(list)] if list.is_empty())));
+        assert!(matches!(d.body()[0], Block::Math {
+                list: ref inlines, ..
+            } if matches!(inlines.as_slice(), [Inline::Math(list)] if list.is_empty())));
         assert_eq!(d.block_text(1), "after");
         assert_eq!(d.caret.block, 0);
         assert_eq!(d.math, Some(math::MathCursor::default()));
@@ -3478,7 +3615,10 @@ mod tests {
         let mut d = doc();
         *d.body_mut() = vec![
             Block::Paragraph(vec![plain_run("before")]),
-            Block::Math(vec![Inline::Math(vec![math::MathNode::Sym('x')])]),
+            Block::Math {
+                list: vec![Inline::Math(vec![math::MathNode::Sym('x')])],
+                tag: None,
+            },
         ];
         d.set_caret(0, 0, 6);
 
@@ -3486,8 +3626,9 @@ mod tests {
 
         assert_eq!(d.body().len(), 2);
         assert_eq!(d.block_text(0), "before");
-        assert!(matches!(d.body()[1], Block::Math(ref inlines)
-            if matches!(inlines.as_slice(), [Inline::Math(list)] if list.is_empty())));
+        assert!(matches!(d.body()[1], Block::Math {
+                list: ref inlines, ..
+            } if matches!(inlines.as_slice(), [Inline::Math(list)] if list.is_empty())));
         assert_eq!(d.caret.block, 1);
         assert_eq!(d.math, Some(math::MathCursor::default()));
     }
@@ -3496,7 +3637,10 @@ mod tests {
     fn delete_after_display_math_retains_the_block_boundary() {
         let mut d = doc();
         *d.body_mut() = vec![
-            Block::Math(vec![Inline::Math(vec![math::MathNode::Sym('x')])]),
+            Block::Math {
+                list: vec![Inline::Math(vec![math::MathNode::Sym('x')])],
+                tag: None,
+            },
             Block::Paragraph(vec![plain_run("after")]),
         ];
         d.set_caret(0, 0, 1);
@@ -3514,13 +3658,67 @@ mod tests {
     #[test]
     fn a_math_block_that_gains_prose_demotes_to_a_paragraph() {
         let mut d = doc();
-        d.body_mut()[0] = Block::Math(vec![
-            Inline::Math(vec![math::MathNode::Sym('x')]),
-            plain_run(" prose"),
-        ]);
+        d.body_mut()[0] = Block::Math {
+            list: vec![
+                Inline::Math(vec![math::MathNode::Sym('x')]),
+                plain_run(" prose"),
+            ],
+            tag: None,
+        };
         d.enforce();
         assert!(matches!(d.body()[0], Block::Paragraph(_)));
         assert!(matches!(d.body()[0].inlines()[0], Inline::Math(_)));
+    }
+
+    #[test]
+    fn toggle_math_tag_assigns_the_next_free_label() {
+        let mut d = doc();
+        d.insert_math_block();
+        assert!(d.toggle_math_tag());
+        assert!(matches!(
+            &d.body()[0],
+            Block::Math { tag: Some(tag), .. } if tag == "eq:1"
+        ));
+
+        // A second tagged block never reuses the label; an untagged one in
+        // between takes no number and claims nothing.
+        d.insert_math_block();
+        d.toggle_math_tag();
+        assert!(matches!(
+            &d.body()[1],
+            Block::Math { tag: Some(tag), .. } if tag == "eq:2"
+        ));
+
+        // Toggling again removes the tag.
+        assert!(d.toggle_math_tag());
+        assert!(matches!(&d.body()[1], Block::Math { tag: None, .. }));
+
+        // The freed label is the next one handed out.
+        d.toggle_math_tag();
+        assert!(matches!(
+            &d.body()[1],
+            Block::Math { tag: Some(tag), .. } if tag == "eq:2"
+        ));
+    }
+
+    #[test]
+    fn toggle_math_tag_is_a_no_op_off_a_math_block() {
+        let mut d = doc();
+        assert!(!d.toggle_math_tag());
+        assert!(matches!(d.body()[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn a_pasted_reference_reopens_as_a_reference() {
+        let mut d = doc();
+        // Paste takes `insert_notation` — the copy path wrote this text.
+        d.insert_notation("by @eq:gain above");
+        assert!(
+            d.body()[0]
+                .inlines()
+                .iter()
+                .any(|run| matches!(run, Inline::EqRef(l) if l == "eq:gain"))
+        );
     }
 
     #[test]

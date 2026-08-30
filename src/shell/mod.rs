@@ -1229,6 +1229,7 @@ impl Shell {
                     scale: 1.0,
                     source: Vec::new(),
                     anchors: Vec::new(),
+                    equation_numbers: std::collections::HashMap::new(),
                 },
             }
         };
@@ -1381,6 +1382,7 @@ impl Shell {
                                 crate::document::Inline::Text(text) => text.text.chars().count(),
                                 crate::document::Inline::Math(_) => 1,
                                 crate::document::Inline::Note(_) => 1,
+                                crate::document::Inline::EqRef(_) => 1,
                             })
                             .sum();
                         crate::document::FlatRange::new(
