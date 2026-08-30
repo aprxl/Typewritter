@@ -192,9 +192,9 @@ pub const COMMANDS: &[Command] = &[
         }),
         run: |shell| shell.open_picker(),
     },
-    // The four region toggles keep their commands for the palette and the
-    // tree's context menu but hold no chords: Ctrl+1..5 now pick a row in
-    // the finder, which is the only thing those keys do.
+    // Ctrl+1..4 used to toggle the four regions. Those chords now pick a
+    // row in the finder (Ctrl+1..5), the only thing those keys do; the
+    // toggles themselves were reachable only from here and went with them.
     Command {
         id: "view.capture",
         title: "Capture mode",
