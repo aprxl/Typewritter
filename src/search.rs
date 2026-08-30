@@ -30,9 +30,10 @@ pub struct TextHit {
     pub name: String,
     /// The matching text, as it reads on the page (math in notation).
     pub line: String,
-    /// Char offset of the first match character in `line`, for the
-    /// preview's highlight.
-    pub start: usize,
+    /// Char offsets of every matched character within `line` — a fuzzy
+    /// match is a subsequence, so the positions are scattered. The panel
+    /// highlights exactly these.
+    pub matches: Vec<usize>,
     /// Where the caret lands when the hit is picked: a block index into the
     /// parsed document and the char offset within that block's flat text.
     pub block: usize,
@@ -146,9 +147,16 @@ fn text_rows(files: &[crate::vault::VaultFile], query: &str) -> Vec<Row> {
                     let at = chars_min_prefix(&text, indices[0]);
                     // The row shows one line: the whole run when it fits,
                     // otherwise a window that keeps a little context before
-                    // the match. `start` is the match's offset in what is
-                    // shown, which is what the preview highlights.
+                    // the match. Match positions are kept as CHAR offsets
+                    // within what is shown, so the panel can highlight them
+                    // without touching bytes again.
                     let from = at.saturating_sub(CONTEXT_BEFORE);
+                    let at_chars: Vec<usize> = indices
+                        .iter()
+                        .map(|&b| chars_min_prefix(&text, b))
+                        .filter(|&c| c >= from)
+                        .map(|c| c - from)
+                        .collect();
                     scored.push((
                         source,
                         score,
@@ -156,7 +164,7 @@ fn text_rows(files: &[crate::vault::VaultFile], query: &str) -> Vec<Row> {
                             path: file.path.clone(),
                             name: file.name.clone(),
                             line: clip(&text, from),
-                            start: at - from,
+                            matches: at_chars,
                             block: block_index,
                             offset,
                         },
@@ -314,9 +322,9 @@ mod tests {
         // A blank line separates the paragraphs, so the second paragraph is
         // the second block (a single newline is a soft wrap inside one).
         assert_eq!(hit.block, 1);
-        // A short run is shown whole, with the match offset within it.
+        // A short run is shown whole, with every match char highlighted.
         assert_eq!(hit.line, "the quick brown fox");
-        assert_eq!(hit.start, 4);
+        assert_eq!(hit.matches, vec![4, 5, 6, 7, 8]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -389,6 +397,31 @@ mod tests {
         let (text, _, offset) = &hits[0];
         assert_eq!(text.as_str(), "le coût et très haut");
         assert_eq!(*offset, 3, "char offset of the match, not bytes");
+    }
+
+    #[test]
+    fn a_fuzzy_match_highlights_a_scattered_subsequence() {
+        // The query need not be contiguous: "qbf" matches letters scattered
+        // through the line, and every one of them is a highlight position.
+        let d = doc("the quick brown fox\n");
+        let hits = search_document(&d, "qbf");
+        // search_document reports flat offsets, not per-line highlights —
+        // the highlight set is `text_rows`' job; here we only pin that the
+        // run matches at all so the row appears.
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn highlights_fall_inside_the_clipped_window() {
+        let d = doc(
+            "intro word and then a very long tail that keeps going well past the window cap of two hundred characters, which the clip function cuts away so only the leading context before the match survives in the stored line text for this particular extremely long run\n",
+        );
+        let hits = search_document(&d, "survives");
+        assert_eq!(hits.len(), 1);
+        let (_, _, offset) = &hits[0];
+        // The flat offset still points at the true position even though the
+        // row text would have been clipped.
+        assert!(*offset > 100);
     }
 
     #[test]

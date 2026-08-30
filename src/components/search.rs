@@ -21,16 +21,31 @@ use super::popup::{CARD_RADIUS, paint_shadow_slab};
 const ROW_RADIUS: f32 = 6.0;
 /// Query line plus the rule beneath it.
 const QUERY_H: f32 = 56.0;
-const ROW_HEIGHT: f32 = 34.0;
+const ROW_HEIGHT: f32 = 36.0;
+/// Space above the first row and below the last — the list column never
+/// touches the query rule or the footer.
+const LIST_PAD_Y: f32 = 10.0;
 /// The "↑↓ select · ↵ open · esc closes" line.
-const FOOTER_H: f32 = 34.0;
+const FOOTER_H: f32 = 38.0;
 /// The result list's width; the preview takes the rest of the card.
-const LIST_W: f32 = 340.0;
-/// Tall enough for about nine rows. `MAX_ROWS` is derived from this, not
-/// the other way round, so the two numbers cannot drift apart.
-const CARD_H: f32 = 420.0;
-const MAX_ROWS: usize = ((CARD_H - QUERY_H - FOOTER_H) / ROW_HEIGHT) as usize;
-const CARD_W: f32 = LIST_W + 360.0;
+const LIST_W: f32 = 360.0;
+/// Space left of the first row and right of the last — rows are inset from
+/// the card edge and from the divider, not flush against them.
+const LIST_PAD_X: f32 = 10.0;
+/// Width of the left label cell in a row: the "file" tag or the hit's
+/// file name. The content starts after it.
+const LABEL_W: f32 = 96.0;
+/// The preview pane's own margins: the same top pad as the list, an inset
+/// from the divider on the left and from the card edge on the right.
+const PREVIEW_PAD: f32 = 18.0;
+/// Line height of preview text; the blank half-line the preview inserts
+/// between blocks so a note's structure reads.
+const PREVIEW_LINE_H: f32 = 22.0;
+/// Tall enough for eight rows. `MAX_ROWS` is derived from this, not the
+/// other way round, so the two numbers cannot drift apart.
+const CARD_H: f32 = 430.0;
+const MAX_ROWS: usize = ((CARD_H - QUERY_H - FOOTER_H - 2.0 * LIST_PAD_Y) / ROW_HEIGHT) as usize;
+const CARD_W: f32 = LIST_W + 400.0;
 
 /// The rect the card rests at, centered in `viewport`.
 pub fn card(viewport: Rect) -> Rect {
@@ -223,12 +238,13 @@ impl Component for Finder {
 }
 
 /// The rect of the `row`th drawn row in the list column inside `card` —
-/// shared by the selection pill and the row loop.
+/// shared by the selection pill and the row loop. Inset by the list pads,
+/// so rows float inside the column instead of touching its edges.
 fn row_rect(card: Rect, row: usize) -> Rect {
     Rect::new(
-        card.x,
-        card.y + QUERY_H + row as f32 * ROW_HEIGHT,
-        LIST_W,
+        card.x + LIST_PAD_X,
+        card.y + QUERY_H + LIST_PAD_Y + row as f32 * ROW_HEIGHT,
+        LIST_W - 2.0 * LIST_PAD_X,
         ROW_HEIGHT,
     )
 }
@@ -278,6 +294,7 @@ impl Finder {
 
     fn draw_list(&self, layer: &Layer, card: Rect, ea: f32) {
         let name_style = TextStyle::serif(14.0, theme::fade(theme::ink(), ea));
+        let hit_style = TextStyle::serif(13.0, theme::fade(theme::ink(), ea));
         let kind_style = TextStyle::mono(10.0, theme::fade(theme::faint(), ea));
 
         // The selection highlight is a static band: the card is rebuilt
@@ -285,10 +302,10 @@ impl Finder {
         // every snapshot instead of gliding.
         if self.selected >= self.first_visible {
             let band = row_rect(card, self.selected - self.first_visible);
-            if band.y < card.y + CARD_H - FOOTER_H {
+            if band.y < card.bottom() - FOOTER_H {
                 layer.draw_rectangle(
-                    (band.x + 4.0, band.y + 2.0),
-                    (LIST_W - 12.0, band.height - 4.0),
+                    (band.x + 3.0, band.y + 2.0),
+                    (band.width - 6.0, band.height - 4.0),
                     theme::fade(theme::selection(), ea),
                     Rounding::uniform(ROW_RADIUS),
                 );
@@ -302,56 +319,58 @@ impl Finder {
         for (offset, row) in window {
             let row_rect = row_rect(card, self.first_visible + offset);
             let middle = row_rect.y + row_rect.height / 2.0;
-
-            // The name first, then a small annotation: "file" for a file
-            // row, the hit's parent folder for a text hit (the filename is
-            // usually repeated next to it in the list already).
+            // Left cell: the small label — "file", or the hit's file name.
+            // Labels on the left read as a column, and can never collide
+            // with the text they annotate.
+            let label_rect = Rect::new(row_rect.x, row_rect.y, LABEL_W, row_rect.height);
+            let label = match row {
+                Row::File { .. } => "file".to_string(),
+                Row::Text(hit) => compact(&hit.name, LABEL_W - 6.0, layer, &kind_style),
+            };
             theme::draw(
                 layer,
-                row.name(),
-                (row_rect.x + 12.0, middle),
-                &name_style,
+                &label,
+                (label_rect.x + 6.0, middle),
+                &kind_style,
                 theme::LEFT,
             );
-            let annotation = match row {
-                Row::File { .. } => "file".to_string(),
-                Row::Text(hit) => {
-                    let parent = hit
-                        .path
-                        .parent()
-                        .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "note".into());
-                    format!("{parent} \u{b7} text")
+
+            // Right cell: the content. A file row shows its name; a text
+            // hit shows the matching line, with every matched character in
+            // accent — that is what the row is about.
+            let text_x = row_rect.x + LABEL_W + 10.0;
+            let max_text = row_rect.right() - text_x;
+            match row {
+                Row::File { name, .. } => {
+                    let name = compact(name, max_text, layer, &name_style);
+                    theme::draw(layer, &name, (text_x, middle), &name_style, theme::LEFT);
                 }
-            };
-            let name_w = theme::width(layer, row.name(), &name_style);
-            let max_annotation = LIST_W - 12.0 - 8.0 - name_w;
-            let annotation = compact(&annotation, max_annotation, layer, &kind_style);
-            theme::draw(
-                layer,
-                &annotation,
-                (row_rect.right() - 12.0, middle),
-                &kind_style,
-                theme::RIGHT,
-            );
+                Row::Text(hit) => {
+                    let line = compact(&hit.line, max_text, layer, &hit_style);
+                    draw_highlighted(
+                        layer,
+                        &line,
+                        &hit.matches,
+                        (text_x, middle),
+                        &hit_style,
+                        &theme::fade(theme::accent(), ea),
+                    );
+                }
+            }
         }
     }
 
     /// The right pane: the selected row's content, rendered as it reads on
-    /// the page. A file row shows the note's first lines; a text hit shows
-    /// the line it matched.
+    /// the page. A file row shows the note's blocks — headings, blank lines
+    /// between paragraphs —; a text hit shows the line it matched with the
+    /// matched characters in accent, under the note's name.
     fn draw_preview(&self, layer: &Layer, card: Rect, ea: f32) {
         let title_style = TextStyle::serif(13.0, theme::fade(theme::comment(), ea));
         let body_style = TextStyle::serif(13.0, theme::fade(theme::ink(), ea));
-        let preview = Rect::new(
-            card.x + LIST_W + 16.0,
-            card.y + QUERY_H + 14.0,
-            card.width - LIST_W - 32.0,
-            0.0,
-        );
-        let max_width = preview.width - 8.0;
-        let mut y = preview.y;
+        let x = card.x + LIST_W + PREVIEW_PAD;
+        let max_width = card.right() - PREVIEW_PAD - x;
+        let bottom = card.bottom() - FOOTER_H - PREVIEW_PAD;
+        let mut y = card.y + QUERY_H + LIST_PAD_Y + 4.0;
 
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -360,20 +379,47 @@ impl Finder {
             Row::File { .. } => row.name().to_string(),
             Row::Text(hit) => hit.name.clone(),
         };
-        theme::draw(layer, &header, (preview.x, y), &title_style, theme::LEFT);
-        y += 26.0;
+        theme::draw(
+            layer,
+            &compact(&header, max_width, layer, &title_style),
+            (x, y),
+            &title_style,
+            theme::LEFT,
+        );
+        y += PREVIEW_LINE_H + 8.0;
 
-        let lines: Vec<String> = match row {
-            Row::File { .. } => self.file_lines(row),
-            Row::Text(hit) => vec![hit.line.clone()],
-        };
-        for line in lines {
-            if y > card.bottom() - FOOTER_H - 16.0 {
-                break;
+        match row {
+            Row::File { .. } => {
+                // A blank half-line between non-empty blocks, so a note's
+                // shape — where a paragraph ends and the next begins —
+                // survives the trip into the pane.
+                let mut previous_empty = true;
+                for block in self.file_lines(row) {
+                    if y > bottom {
+                        break;
+                    }
+                    if !previous_empty {
+                        y += PREVIEW_LINE_H / 2.0;
+                    }
+                    let block = compact(&block, max_width, layer, &body_style);
+                    theme::draw(layer, &block, (x, y), &body_style, theme::LEFT);
+                    y += PREVIEW_LINE_H;
+                    previous_empty = block.is_empty();
+                }
             }
-            let line = compact(&line, max_width, layer, &body_style);
-            theme::draw(layer, &line, (preview.x, y), &body_style, theme::LEFT);
-            y += 19.0;
+            Row::Text(hit) => {
+                if y <= bottom {
+                    let line = compact(&hit.line, max_width, layer, &body_style);
+                    draw_highlighted(
+                        layer,
+                        &line,
+                        &hit.matches,
+                        (x, y),
+                        &body_style,
+                        &theme::fade(theme::accent(), ea),
+                    );
+                }
+            }
         }
     }
 
@@ -400,6 +446,72 @@ impl Finder {
             })
             .collect()
     }
+}
+
+/// Draws `line` at `at`, with the characters whose positions appear in
+/// `matches` repainted in `accent`. Per-char width measurement makes the
+/// runs; contiguous positions merge into one stroke so a word highlights
+/// as a band, not thirteen disjoint pixels.
+fn draw_highlighted(
+    layer: &Layer,
+    line: &str,
+    matches: &[usize],
+    at: (f32, f32),
+    style: &TextStyle,
+    accent: &crate::renderer::Color,
+) {
+    theme::draw(layer, line, at, style, theme::LEFT);
+    if matches.is_empty() {
+        return;
+    }
+    let mut set: Vec<usize> = matches.to_vec();
+    set.sort_unstable();
+    set.dedup();
+    let chars: Vec<char> = line.chars().collect();
+    let mut x = at.0;
+    let mut run_start: Option<(f32, usize)> = None;
+    for (index, ch) in chars.iter().enumerate() {
+        let width = theme::width(layer, &ch.to_string(), style);
+        let highlighted = set.binary_search(&index).is_ok();
+        match (highlighted, run_start) {
+            (true, None) => run_start = Some((x, index)),
+            (false, Some((start, begin))) => {
+                paint_run(layer, &chars[begin..index], start, x, at.1, style, accent);
+                run_start = None;
+            }
+            _ => {}
+        }
+        x += width;
+    }
+    if let Some((start, begin)) = run_start {
+        paint_run(layer, &chars[begin..], start, x, at.1, style, accent);
+    }
+}
+
+/// One highlighted run: a faint accent wash under the text, then the text
+/// itself repainted in accent so it reads as lit, not smeared.
+fn paint_run(
+    layer: &Layer,
+    text: &[char],
+    from: f32,
+    to: f32,
+    middle: f32,
+    style: &TextStyle,
+    accent: &crate::renderer::Color,
+) {
+    let text: String = text.iter().collect();
+    if text.is_empty() || to <= from {
+        return;
+    }
+    layer.draw_rectangle(
+        (from, middle - style.size * 0.62),
+        (to - from, style.size * 1.24),
+        theme::fade(accent.clone(), 0.16),
+        crate::renderer::Rounding::uniform(2.0),
+    );
+    let mut accent_style = style.clone();
+    accent_style.color = accent.clone();
+    theme::draw(layer, &text, (from, middle), &accent_style, theme::LEFT);
 }
 
 /// `line` shortened to `max_width` pixels, an ellipsis taking the bite.
