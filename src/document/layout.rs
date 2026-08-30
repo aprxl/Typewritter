@@ -493,9 +493,14 @@ pub fn layout_blocks(
                 Block::Heading { level: next, .. } if *next <= level => fold_cover = None,
                 _ => {
                     hidden = true;
-                    *hidden_lines.entry(owner).or_insert(0) +=
-                        wrap(&tokens(block, source_index, &number_of), block, width, scale, measure)
-                            .len();
+                    *hidden_lines.entry(owner).or_insert(0) += wrap(
+                        &tokens(block, source_index, &number_of),
+                        block,
+                        width,
+                        scale,
+                        measure,
+                    )
+                    .len();
                     laid.push(BlockLayout {
                         y,
                         lines: Vec::new(),
@@ -576,7 +581,10 @@ pub fn layout_blocks(
         // is one layout, not a settle.
         let mut indicator = None;
         if block.is_folded() && fold_region_end(blocks, source_index) > source_index + 1 {
-            indicator = Some(FoldIndicator { y: y + height, lines: 0 });
+            indicator = Some(FoldIndicator {
+                y: y + height,
+                lines: 0,
+            });
             height += FOLD_INDICATOR_HEIGHT * scale;
             fold_cover = Some((source_index, heading_level(block)));
         }
@@ -1613,9 +1621,7 @@ impl DocLayout {
         if block_idx == 0 {
             return None;
         }
-        let Some(prev) = self.visible_before(block_idx) else {
-            return None;
-        };
+        let prev = self.visible_before(block_idx)?;
         let last_line = self.blocks[prev].lines.len() - 1;
         Some(caret_for_click(
             &self.source,
@@ -1638,8 +1644,7 @@ impl DocLayout {
     }
 
     fn visible_after(&self, block_idx: usize) -> Option<usize> {
-        (block_idx + 1..self.blocks.len())
-            .find(|&index| self.blocks[index].hidden.is_none())
+        (block_idx + 1..self.blocks.len()).find(|&index| self.blocks[index].hidden.is_none())
     }
 
     /// One visual line down from `caret`, aiming at `goal_x` pixels.
@@ -1665,9 +1670,7 @@ impl DocLayout {
                 measure,
             ));
         }
-        let Some(next) = self.visible_after(block_idx) else {
-            return None;
-        };
+        let next = self.visible_after(block_idx)?;
         Some(caret_for_click(
             &self.source,
             &self.blocks[next],
@@ -1722,12 +1725,9 @@ impl DocLayout {
     /// unfolds the fold.
     pub fn fold_indicator_at(&self, y: f32) -> Option<usize> {
         self.blocks.iter().position(|block| {
-            block
-                .indicator
-                .as_ref()
-                .is_some_and(|indicator| {
-                    y >= indicator.y && y < indicator.y + FOLD_INDICATOR_HEIGHT * self.scale
-                })
+            block.indicator.as_ref().is_some_and(|indicator| {
+                y >= indicator.y && y < indicator.y + FOLD_INDICATOR_HEIGHT * self.scale
+            })
         })
     }
 
@@ -3200,10 +3200,7 @@ mod tests {
         // spacing below the folded heading — the hidden body contributes
         // nothing, so the reflow is instant and leaves no residue. The folded
         // heading itself is taller by exactly its indicator band.
-        assert_eq!(
-            laid.blocks[0].height,
-            full.blocks[0].height + INDICATOR
-        );
+        assert_eq!(laid.blocks[0].height, full.blocks[0].height + INDICATOR);
         assert_eq!(
             laid.blocks[3].y - (laid.blocks[0].y + laid.blocks[0].height),
             GAP_AFTER_HEADING + GAP_HEADING,

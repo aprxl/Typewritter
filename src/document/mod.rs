@@ -267,9 +267,7 @@ pub fn fold_region_end(blocks: &[Block], heading: usize) -> usize {
     };
     let level = *level;
     (heading + 1..blocks.len())
-        .find(|&index| {
-            matches!(blocks[index], Block::Heading { level: next, .. } if next <= level)
-        })
+        .find(|&index| matches!(blocks[index], Block::Heading { level: next, .. } if next <= level))
         .unwrap_or(blocks.len())
 }
 
@@ -289,11 +287,7 @@ pub fn fold_owner_of(blocks: &[Block], target: usize) -> Option<usize> {
             end = fold_region_end(blocks, index);
         }
     }
-    if target < end {
-        owner
-    } else {
-        None
-    }
+    if target < end { owner } else { None }
 }
 
 impl Inline {

@@ -5,8 +5,8 @@
 use std::rc::Rc;
 
 use crate::document::layout::{
-    self, ContextHit, DocLayout, RangeKind, CHEVRON_WIDTH, FOLD_INDICATOR_HEIGHT, NUMBER_GUTTER,
-    NUMBER_SIZE,
+    self, CHEVRON_WIDTH, ContextHit, DocLayout, FOLD_INDICATOR_HEIGHT, NUMBER_GUTTER, NUMBER_SIZE,
+    RangeKind,
 };
 use crate::document::math::{MathCursor, NodeAddress, SymbolRole};
 use crate::document::math_layout::{self, BoxKind, MathBox, MathPrimitive};
@@ -884,12 +884,20 @@ impl Component for Editor {
                     });
                     let right = layout::chevron_right(number_width, scale);
                     let centre_x = x + right - CHEVRON_WIDTH * scale / 2.0;
-                    let colour = if folded { theme::dim() } else { theme::non_text() };
+                    let colour = if folded {
+                        theme::dim()
+                    } else {
+                        theme::non_text()
+                    };
                     layer
                         .draw_path_rotated(
                             CHEVRON,
                             (centre_x, baseline),
-                            if folded { -std::f32::consts::FRAC_PI_2 } else { 0.0 },
+                            if folded {
+                                -std::f32::consts::FRAC_PI_2
+                            } else {
+                                0.0
+                            },
                             PathPaint::fill(colour),
                         )
                         .expect("chevron path parses");
@@ -920,12 +928,24 @@ impl Component for Editor {
                         theme::faint(),
                     );
                 }
-                theme::draw(layer, &label, (x + 22.0 * scale, mid + 4.5 * scale), &style, theme::LEFT);
+                theme::draw(
+                    layer,
+                    &label,
+                    (x + 22.0 * scale, mid + 4.5 * scale),
+                    &style,
+                    theme::LEFT,
+                );
                 let text_width = theme::width(layer, &label, &style);
                 let rule_x = x + 22.0 * scale + text_width + 12.0;
                 let rule_end = x + self.metrics.content_width(rect);
                 if rule_end > rule_x {
-                    theme::rule(layer, (rule_x, mid), rule_end - rule_x, 1.0, theme::border());
+                    theme::rule(
+                        layer,
+                        (rule_x, mid),
+                        rule_end - rule_x,
+                        1.0,
+                        theme::border(),
+                    );
                 }
             }
         }
@@ -962,7 +982,8 @@ impl Component for Editor {
             // legible. Falls back to a space's advance past the end of the
             // line, like the old line editor did.
             let sample = caret_char.map(String::from).unwrap_or_else(|| " ".into());
-            let width = theme::width(layer, &sample, &TextStyle::serif(17.5, theme::ink())).max(1.0);
+            let width =
+                theme::width(layer, &sample, &TextStyle::serif(17.5, theme::ink())).max(1.0);
             layer.draw_rectangle(
                 (screen_x, screen_y - caret_height * 0.5 + 2.0),
                 (width, caret_height - 4.0),
@@ -1367,9 +1388,16 @@ mod tests {
         let mut builder = lyon::path::Path::builder();
         let mut source = lyon_extra::parser::Source::new(CHEVRON.chars());
         let ok = parser
-            .parse(&lyon_extra::parser::ParserOptions::DEFAULT, &mut source, &mut builder)
+            .parse(
+                &lyon_extra::parser::ParserOptions::DEFAULT,
+                &mut source,
+                &mut builder,
+            )
             .is_ok();
-        assert!(ok, "the chevron path must parse or every heading draw panics");
+        assert!(
+            ok,
+            "the chevron path must parse or every heading draw panics"
+        );
     }
 
     /// `math_rect` is what a whole-expression selection is drawn to now that

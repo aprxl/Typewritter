@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::document::{
-    BadgeColor, Block, Document, FlatRange, Style, fold_owner_of, math, math_conversion,
+    BadgeColor, Block, Document, FlatRange, Focus, Style, fold_owner_of, math, math_conversion,
 };
 
 pub struct Tab {
@@ -799,10 +799,15 @@ impl Tabs {
     }
 
     /// Jumps the caret to a flat position, unfolding over it on the way —
-    /// every search and finder landing goes through here.
+    /// every search and finder landing goes through here. A jump is a
+    /// body-scoped landing: focus leaves any note first, so the match can
+    /// never be applied to a note by accident.
     pub fn jump_to_flat(&mut self, block: usize, offset: usize) {
         self.reveal_block(block);
-        self.touch(|doc| doc.set_flat_position(doc.position(block, offset)));
+        self.touch(|doc| {
+            doc.focus = Focus::Body;
+            doc.set_flat_position(doc.position(block, offset));
+        });
     }
 }
 

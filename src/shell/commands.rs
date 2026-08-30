@@ -227,6 +227,27 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.debug_rows = !shell.debug_rows,
     },
     Command {
+        id: "fold.toggle",
+        title: "Toggle fold at heading",
+        group: "Fold",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().toggle_fold(),
+    },
+    Command {
+        id: "fold.open_all",
+        title: "Open all folds",
+        group: "Fold",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().open_all_folds(),
+    },
+    Command {
+        id: "fold.close_all",
+        title: "Close all folds",
+        group: "Fold",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().close_all_folds(),
+    },
+    Command {
         id: "format.body",
         title: "Body text",
         group: "Format",

@@ -39,6 +39,15 @@ pub struct Topics {
 }
 
 impl Topics {
+    /// The outline row `point` is over, hit-tested against the rects `draw`
+    /// recorded — the same geometry the hover reads, so a click can never
+    /// land on a row the eye was not over.
+    pub fn entry_at(&self, point: (f32, f32)) -> Option<usize> {
+        self.entry_rects
+            .iter()
+            .position(|rect| rect.contains(point))
+    }
+
     pub fn new(entries: Vec<Entry>, active: usize) -> Self {
         Self {
             entries,
@@ -118,7 +127,12 @@ impl Component for Topics {
             let row = Rect::new(rect.x + 1.0, y - 11.0, rect.width - 1.0, 22.0);
             self.entry_rects.push(row);
             if active {
-                layer.draw_rectangle(row.position(), row.size(), theme::selection(), Rounding::NONE);
+                layer.draw_rectangle(
+                    row.position(),
+                    row.size(),
+                    theme::selection(),
+                    Rounding::NONE,
+                );
             }
             // Same rule as the file tree: the active row's treatment wins
             // over the hover surface.
@@ -133,8 +147,10 @@ impl Component for Topics {
             } else {
                 theme::comment()
             };
-            let number_style =
-                TextStyle::mono(size - 3.0, if active { theme::dim() } else { theme::faint() });
+            let number_style = TextStyle::mono(
+                size - 3.0,
+                if active { theme::dim() } else { theme::faint() },
+            );
             theme::draw(layer, &entry.number, (x, y), &number_style, theme::LEFT);
             // Measure number so long values do not collide with heading text.
             let name_x = x + theme::width(layer, &entry.number, &number_style) + 10.0;

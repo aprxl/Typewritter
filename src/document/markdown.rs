@@ -673,7 +673,11 @@ pub fn serialize(doc: &Document) -> String {
                 out.push_str("```");
                 i = j;
             }
-            Block::Heading { level, folded: _, content } => {
+            Block::Heading {
+                level,
+                folded: _,
+                content,
+            } => {
                 out.push_str(&"#".repeat(*level as usize));
                 out.push(' ');
                 out.push_str(&serialize_runs(content));
@@ -879,7 +883,11 @@ mod tests {
         if let Block::Heading { folded: state, .. } = &mut folded.body_mut()[0] {
             *state = true;
         }
-        assert_eq!(serialize(&folded), printed_plain, "the flag is editor state only");
+        assert_eq!(
+            serialize(&folded),
+            printed_plain,
+            "the flag is editor state only"
+        );
         // And re-parsing the file opens unfolded, whatever was on disk.
         assert!(!parse(Path::new("x"), &printed_plain).body()[0].is_folded());
     }
