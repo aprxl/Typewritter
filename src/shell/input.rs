@@ -1516,6 +1516,22 @@ impl Shell {
         self.refresh_finder();
     }
 
+    /// Re-ranks the rows against the current query. The shell owns the
+    /// ranked list (the component only draws a snapshot), so every query
+    /// change re-runs `search::search` here — the vault is a few hundred
+    /// kilobytes, well inside the §11 search budget.
+    fn rerank_finder(&mut self) {
+        let Some(state) = self.finder.as_mut() else {
+            return;
+        };
+        let files = self.vault.as_ref().map(|v| v.borrow().files());
+        let Some(files) = files else {
+            return;
+        };
+        state.rows = crate::search::search(&files, &state.query);
+        state.selected = state.selected.min(state.rows.len().saturating_sub(1));
+    }
+
     fn refresh_finder(&mut self) {
         let query = self.finder.as_ref().map(|state| state.query.clone());
         self.regions[self.title_region].set_component(Box::new(title_bar::TitleBar::new(
@@ -1572,6 +1588,7 @@ impl Shell {
             None => false,
         };
         if changed {
+            self.rerank_finder();
             self.refresh_finder();
         }
     }
