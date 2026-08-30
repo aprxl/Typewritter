@@ -6,7 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::document::{BadgeColor, Document, FlatRange, Style, math, math_conversion};
+use crate::document::{
+    BadgeColor, Block, Document, FlatRange, Style, fold_owner_of, math, math_conversion,
+};
 
 pub struct Tab {
     pub document: Document,
@@ -734,6 +736,94 @@ impl Tabs {
     pub fn move_caret_to(&mut self, block: usize, inline: usize, offset: usize) {
         self.touch(|doc| doc.set_caret(block, inline, offset));
     }
+
+    // ---- folds -------------------------------------------------------------
+
+    // Fold state is editor state, never content: everything here goes
+    // through `touch`, so no undo snapshot is taken, no preview tab is
+    // promoted, and nothing new reaches disk — `serialize` ignores the flag.
+
+    /// Toggles the fold on the heading at — or, from a body block, nearest
+    /// above — the caret. A body block folds the section it sits in.
+    pub fn toggle_fold(&mut self) {
+        let target = self.active().and_then(|tab| {
+            let body = tab.document.body();
+            let caret = tab.document.caret.block;
+            if body.get(caret).is_some_and(|block| block.is_heading()) {
+                Some(caret)
+            } else {
+                (0..caret).rev().find(|&index| body[index].is_heading())
+            }
+        });
+        if let Some(block) = target {
+            self.toggle_fold_at(block);
+        }
+    }
+
+    /// Toggles one heading's fold. If the caret was inside the folded body
+    /// it moves up to the heading — folded ground holds no caret.
+    pub fn toggle_fold_at(&mut self, block: usize) {
+        self.touch(|doc| {
+            if let Some(Block::Heading { folded, .. }) = doc.body_mut().get_mut(block) {
+                *folded = !*folded;
+            }
+            snap_caret_out_of_folded_ground(doc);
+        });
+    }
+
+    pub fn open_all_folds(&mut self) {
+        self.touch(|doc| set_all_folds(doc, false));
+    }
+
+    pub fn close_all_folds(&mut self) {
+        self.touch(|doc| set_all_folds(doc, true));
+    }
+
+    /// Unfolds every fold hiding `block` — the rule every caret jump obeys:
+    /// search, the finder, and the topics panel land on visible ground.
+    pub fn reveal_block(&mut self, block: usize) {
+        self.touch(|doc| {
+            while let Some(owner) = fold_owner_of(doc.body(), block) {
+                match doc.body_mut().get_mut(owner) {
+                    Some(Block::Heading { folded, .. }) if *folded => *folded = false,
+                    _ => break,
+                }
+            }
+        });
+    }
+
+    /// Jumps the caret to a block's start, unfolding over it on the way.
+    pub fn jump_to_block(&mut self, block: usize) {
+        self.reveal_block(block);
+        self.touch(|doc| doc.set_caret(block, 0, 0));
+    }
+
+    /// Jumps the caret to a flat position, unfolding over it on the way —
+    /// every search and finder landing goes through here.
+    pub fn jump_to_flat(&mut self, block: usize, offset: usize) {
+        self.reveal_block(block);
+        self.touch(|doc| doc.set_flat_position(doc.position(block, offset)));
+    }
+}
+
+/// Folds or unfolds every heading in the document.
+fn set_all_folds(doc: &mut Document, folded: bool) {
+    for block in doc.body_mut() {
+        if let Block::Heading { folded: state, .. } = block {
+            *state = folded;
+        }
+    }
+    snap_caret_out_of_folded_ground(doc);
+}
+
+/// A caret on folded ground is a caret pointing at nothing; it moves to the
+/// end of the innermost visible fold covering it — the heading the reader
+/// actually collapsed.
+fn snap_caret_out_of_folded_ground(doc: &mut Document) {
+    if let Some(owner) = fold_owner_of(doc.body(), doc.caret.block) {
+        let end = doc.block_len(owner);
+        doc.set_flat_position(doc.position(owner, end));
+    }
 }
 
 impl Tab {
@@ -749,6 +839,85 @@ impl Tab {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// A tab holding two sections, the outer one with a nested heading.
+    fn fold_tabs(tag: &str) -> Tabs {
+        let path = temp_file(
+            tag,
+            "# Top\n\nbody one\n\n## Sub\n\nsub body\n\n# Next\n\nafter\n",
+        );
+        let mut tabs = Tabs::new();
+        tabs.open_preview(&path);
+        tabs
+    }
+
+    fn folded_of(tabs: &Tabs, block: usize) -> bool {
+        match &tabs.active().unwrap().document.body()[block] {
+            Block::Heading { folded, .. } => *folded,
+            other => panic!("block {block} is not a heading: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggling_a_fold_never_promotes_a_preview_or_takes_an_undo_step() {
+        let mut tabs = fold_tabs("fkeep");
+        tabs.toggle_fold_at(0);
+        assert!(folded_of(&tabs, 0));
+        assert!(
+            tabs.active().unwrap().preview,
+            "fold state is editor state: a preview stays a preview"
+        );
+        // And the body is byte-identical apart from the flag.
+        assert_eq!(tabs.active().unwrap().document.body()[1].inlines().len(), 1);
+    }
+
+    #[test]
+    fn folding_the_section_the_caret_sits_in_snaps_the_caret_to_the_heading() {
+        let mut tabs = fold_tabs("fsnap");
+        // The caret rests in "sub body" (block 3); folding its section hides it.
+        tabs.touch(|doc| doc.set_caret(3, 0, 0));
+        tabs.toggle_fold(); // nearest heading above block 3 is "## Sub" (block 2)
+        assert!(folded_of(&tabs, 2));
+        let caret = tabs.active().unwrap().document.caret.block;
+        assert_eq!(
+            caret, 2,
+            "the caret moves up to the heading that was folded"
+        );
+    }
+
+    #[test]
+    fn close_all_folds_every_heading_and_the_caret_stays_visible() {
+        let mut tabs = fold_tabs("fall");
+        tabs.close_all_folds();
+        assert!(folded_of(&tabs, 0));
+        assert!(folded_of(&tabs, 2));
+        assert!(folded_of(&tabs, 4));
+        let doc = &tabs.active().unwrap().document;
+        assert!(
+            fold_owner_of(doc.body(), doc.caret.block).is_none(),
+            "the caret never rests on folded ground"
+        );
+    }
+
+    #[test]
+    fn reveal_block_unfolds_every_fold_covering_it_from_the_outermost_down() {
+        let mut tabs = fold_tabs("freveal");
+        tabs.close_all_folds();
+        tabs.reveal_block(3);
+        assert!(!folded_of(&tabs, 0), "the covering outer fold is unfolded");
+        assert!(!folded_of(&tabs, 2), "and so is the nested one");
+        assert!(folded_of(&tabs, 4), "an unrelated fold is left alone");
+    }
+
+    #[test]
+    fn jump_to_flat_lands_the_caret_exactly_and_unfolds_over_it() {
+        let mut tabs = fold_tabs("fjump");
+        tabs.close_all_folds();
+        tabs.jump_to_flat(3, 0);
+        assert!(!folded_of(&tabs, 0));
+        assert!(!folded_of(&tabs, 2));
+        assert_eq!(tabs.active().unwrap().document.caret.block, 3);
+    }
 
     fn temp_file(tag: &str, text: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("tw-tabs-{tag}-{}.md", std::process::id()));

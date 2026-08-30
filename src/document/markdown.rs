@@ -870,6 +870,21 @@ mod tests {
     }
 
     #[test]
+    fn folded_state_never_reaches_disk() {
+        let text = "# Top\n\nbody\n";
+        let plain = parse(Path::new("x"), text);
+        let printed_plain = serialize(&plain);
+
+        let mut folded = parse(Path::new("x"), text);
+        if let Block::Heading { folded: state, .. } = &mut folded.body_mut()[0] {
+            *state = true;
+        }
+        assert_eq!(serialize(&folded), printed_plain, "the flag is editor state only");
+        // And re-parsing the file opens unfolded, whatever was on disk.
+        assert!(!parse(Path::new("x"), &printed_plain).body()[0].is_folded());
+    }
+
+    #[test]
     fn ast_round_trip() {
         let fixtures = vec![
             doc_with(vec![empty_paragraph()]),
