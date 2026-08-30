@@ -265,6 +265,22 @@ mod tests {
     }
 
     #[test]
+    fn a_list_item_is_indexed_like_prose() {
+        // List items are flat blocks, so search indexing falls out of the
+        // existing machinery — verified, not assumed: the hit must land in
+        // the item's block with a caret-placeable offset.
+        let d = doc("- buy $R_2$ resistors\n- [x] file the report\n");
+        let hits = search_document(&d, "resistors");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, 0, "block 0 — the item is an ordinary flat block");
+        // `buy ` is four chars, the math atom one flat position.
+        assert_eq!(hits[0].2, 6, "offset counts the math atom as one position");
+        let hits = search_document(&d, "report");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, 1, "the task item is indexed too");
+    }
+
+    #[test]
     fn an_empty_query_lists_files_only_in_vault_order() {
         let files = vec![file("b.md"), file("a.md")];
         assert_eq!(
