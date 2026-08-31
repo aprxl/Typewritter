@@ -504,7 +504,7 @@ fn prune_block(block: &mut Block) {
             },
             Block::Divider(_) => divider_block(),
             Block::Math { .. } => math_block(),
-                        Block::ListItem { marker, .. } => list_block(*marker),
+            Block::ListItem { marker, .. } => list_block(*marker),
             Block::Paragraph(_) => empty_block(),
         };
     }

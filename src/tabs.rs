@@ -11,7 +11,6 @@ use crate::document::{
     math_conversion,
 };
 
-
 pub struct Tab {
     pub document: Document,
     /// Transient preview tabs are replaced by the next open.

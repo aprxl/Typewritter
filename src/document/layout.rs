@@ -15,7 +15,8 @@ use std::collections::HashMap;
 
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::{
-    Block, Caret, Document, FlatPos, FlatRange, Inline, ListMarker, Style, fold_region_end, math_layout, outline,
+    Block, Caret, Document, FlatPos, FlatRange, Inline, ListMarker, Style, fold_region_end,
+    math_layout, outline,
 };
 use crate::theme::{self, TextStyle};
 
