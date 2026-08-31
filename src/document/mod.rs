@@ -89,6 +89,12 @@ pub enum Block {
     Heading {
         level: u8,
         content: Vec<Inline>,
+        /// Editor state, not content: whether the heading's body — every
+        /// block up to the next heading of level <= its own — is folded
+        /// away. `parse` sets it false and `serialize` ignores it; it lives
+        /// on the block so fold state survives edits above it and rides the
+        /// same undo snapshots as everything else.
+        folded: bool,
     }, // level 1..=4
     CodeLine {
         content: Vec<Inline>,
@@ -265,6 +271,10 @@ impl Block {
         matches!(self, Block::Heading { .. })
     }
 
+    pub fn is_folded(&self) -> bool {
+        matches!(self, Block::Heading { folded: true, .. })
+    }
+
     pub fn is_divider(&self) -> bool {
         matches!(self, Block::Divider(_))
     }
@@ -276,6 +286,39 @@ impl Block {
     pub fn is_code(&self) -> bool {
         matches!(self, Block::CodeLine { .. })
     }
+}
+
+/// The extent of a folded heading's body: every block up to — but not
+/// including — the next heading of level <= its own, or the end of the
+/// document. The same extent `TextObject::InnerHeading` gives, so folding
+/// and `ih` can never disagree about what a section is.
+pub fn fold_region_end(blocks: &[Block], heading: usize) -> usize {
+    let Some(Block::Heading { level, .. }) = blocks.get(heading) else {
+        return heading + 1;
+    };
+    let level = *level;
+    (heading + 1..blocks.len())
+        .find(|&index| matches!(blocks[index], Block::Heading { level: next, .. } if next <= level))
+        .unwrap_or(blocks.len())
+}
+
+/// The folded heading whose body hides `block`, if any — the innermost
+/// *visible* fold covering it. A heading folded inside an already-hidden
+/// region is not reported: it draws nothing, so nothing can point at it;
+/// unfolding its visible ancestor exposes it with its own fold intact.
+pub fn fold_owner_of(blocks: &[Block], target: usize) -> Option<usize> {
+    let mut owner = None;
+    let mut end = 0;
+    for index in 0..target {
+        if index == end {
+            owner = None;
+        }
+        if blocks[index].is_folded() && index >= end {
+            owner = Some(index);
+            end = fold_region_end(blocks, index);
+        }
+    }
+    if target < end { owner } else { None }
 }
 
 impl Inline {
@@ -440,8 +483,9 @@ fn prune_block(block: &mut Block) {
     }
     if block.inlines().is_empty() {
         *block = match block {
-            Block::Heading { level, .. } => Block::Heading {
+            Block::Heading { level, folded, .. } => Block::Heading {
                 level: *level,
+                folded: *folded,
                 content: vec![Inline::Text(Text {
                     text: String::new(),
                     style: Style::PLAIN,
@@ -1183,8 +1227,9 @@ impl Document {
                 list: runs,
                 tag: tag.clone(),
             },
-            Block::Heading { level, .. } => Block::Heading {
+            Block::Heading { level, folded, .. } => Block::Heading {
                 level: *level,
+                folded: *folded,
                 content: runs,
             },
             Block::CodeLine { first, lang, .. } => Block::CodeLine {
@@ -2309,6 +2354,7 @@ impl Document {
             }
             self.scope_mut()[b] = Block::Heading {
                 level,
+                folded: false,
                 content: inlines,
             };
         } else {
@@ -2353,6 +2399,7 @@ impl Document {
         self.body[block] = match level {
             Some(level) => Block::Heading {
                 level,
+                folded: false,
                 content: inlines,
             },
             None => Block::Paragraph(inlines),
@@ -3107,6 +3154,7 @@ mod tests {
             ]),
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![Inline::Text(Text {
                     text: "big note".into(),
                     style: Style::PLAIN,
@@ -3135,6 +3183,7 @@ mod tests {
         assert!(
             Block::Heading {
                 level: 2,
+                folded: false,
                 content: vec![]
             }
             .is_heading()
@@ -3379,6 +3428,7 @@ mod tests {
         let mut d = doc();
         d.body_mut()[0] = Block::Heading {
             level: 1,
+            folded: false,
             content: vec![plain_run("title")],
         };
         d.set_caret(0, 0, 5);
@@ -4390,7 +4440,7 @@ mod tests {
         assert!(d.set_block_heading_at(0, Some(2)));
         assert!(matches!(
             &d.body()[0],
-            Block::Heading { level: 2, content: actual } if actual == &content
+            Block::Heading { level: 2, content: actual, .. } if actual == &content
         ));
         assert_eq!(d.caret, caret);
 
@@ -4455,6 +4505,7 @@ mod tests {
         assert!(
             !Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![]
             }
             .is_code()
@@ -4660,16 +4711,19 @@ mod tests {
         *d.body_mut() = vec![
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![plain_run("Top")],
             },
             Block::Paragraph(vec![plain_run("body (inside) and \"quoted\"")]),
             Block::Heading {
                 level: 2,
+                folded: false,
                 content: vec![plain_run("Nested")],
             },
             Block::Paragraph(vec![plain_run("child")]),
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![plain_run("Next")],
             },
         ];

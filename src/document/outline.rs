@@ -114,6 +114,7 @@ mod tests {
     fn heading(level: u8, text: &str) -> Block {
         Block::Heading {
             level,
+            folded: false,
             content: vec![Inline::Text(Text {
                 text: text.to_owned(),
                 style: Style::PLAIN,

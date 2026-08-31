@@ -16,8 +16,8 @@ use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
     ContextMenu, Dialog, FileTree, Finder, FormatBar, MathMenu, Onboarding, Palette, SlashMenu,
-    context_menu, editor, file_tree, format_bar, math_menu, onboarding, sidenotes, theme_switch,
-    title_bar,
+    Topics, context_menu, editor, file_tree, format_bar, math_menu, onboarding, sidenotes,
+    theme_switch, title_bar,
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind};
@@ -141,6 +141,17 @@ impl Shell {
             return;
         }
 
+        // The topics panel jumps the caret to its heading — through the
+        // fold-aware jump, so a row that lists a folded heading (folds never
+        // leave the outline) unfolds over it instead of landing nowhere.
+        if input.is_mouse_pressed(MouseButton::Left)
+            && input.is_cursor_in_window()
+            && let Some(block) = self.topics_row_at(input.mouse_position())
+        {
+            self.docs.borrow_mut().jump_to_block(block);
+            return;
+        }
+
         // The tree owns its row hit-test. Consume its request first so a
         // right-click cannot also be interpreted as an editor menu request.
         if let Some((at, target)) = self.tree_menu_request.take() {
@@ -198,6 +209,56 @@ impl Shell {
         if let Some(index) = index {
             focus_note(&mut self.docs.borrow_mut(), index);
         }
+    }
+
+    /// A Normal-mode click on an anchor opens that note. Resolves the click
+    /// to its caret, then asks whether that caret sits on an anchor — the
+    /// Whether a click landed on a fold affordance — a gutter chevron or a
+    /// collapsed-body indicator — and toggled/unfolded it. Runs before caret
+    /// placement in either mode: these are controls, not text.
+    fn fold_click(&mut self, rect: Rect, mouse: (f32, f32)) -> bool {
+        {
+            let docs = self.docs.borrow();
+            if docs.active().is_none() {
+                return false;
+            }
+        }
+        let (local_x, local_y) = {
+            // Unclamped x on purpose: the chevron lives in the gutter left
+            // of the text column, where a clamped point would read as the
+            // text's own left edge. y keeps the page's scroll like clicks.
+            let scroll = self.docs.borrow().editor_scroll;
+            (
+                mouse.0 - (rect.x + editor::INSET),
+                mouse.1 - rect.y - editor::TOP + scroll,
+            )
+        };
+        let layout = self.current_layout(editor::Editor::content_width(rect));
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+        if let Some(block) = layout.fold_chevron_at(local_x, local_y, &measure) {
+            self.docs.borrow_mut().toggle_fold_at(block);
+            return true;
+        }
+        if local_x >= 0.0
+            && let Some(block) = layout.fold_indicator_at(local_y)
+        {
+            self.docs.borrow_mut().reveal_block(block);
+            return true;
+        }
+        false
+    }
+
+    /// The outline heading a click on the topics panel landed on, if any —
+    /// the same rects the hover reads, so click and highlight cannot drift.
+    fn topics_row_at(&self, point: (f32, f32)) -> Option<usize> {
+        if !self.topics.open || !self.layout.rect(self.topics.node).contains(point) {
+            return None;
+        }
+        let index = self.regions[self.topics_region]
+            .component_as::<Topics>()
+            .and_then(|panel| panel.entry_at(point))?;
+        self.outline().get(index).map(|node| node.block)
     }
 
     /// A Normal-mode click on an anchor opens that note. Resolves the click
@@ -366,6 +427,12 @@ impl Shell {
         }
 
         if has_tab && input.is_mouse_pressed(MouseButton::Left) && over_editor {
+            // Fold affordances claim their clicks first: the gutter chevron
+            // and the collapsed-body indicator are controls, not text, in
+            // either mode.
+            if self.fold_click(rect, mouse) {
+                return;
+            }
             // A click on a task's checkbox toggles it, whatever the mode:
             // it is a control, not a caret placement.
             if let Some((local_x, local_y)) = self.editor_point(rect, mouse)
@@ -966,7 +1033,9 @@ impl Shell {
             None => (matches.len() - 1).wrapping_sub(count.max(1) - 1) % matches.len(),
         };
         let position = matches[index];
-        set_body_coordinate_caret(&mut self.docs.borrow_mut(), BodyCoordinate::Flat(position));
+        self.docs
+            .borrow_mut()
+            .jump_to_flat(position.block, position.offset);
     }
 
     fn start_insert(&mut self) {
@@ -1615,7 +1684,7 @@ impl Shell {
             let mut docs = self.docs.borrow_mut();
             docs.open_preview(row.path());
             if let Some((block, offset)) = row.position() {
-                docs.touch(|doc| doc.set_flat_position(doc.position(block, offset)));
+                docs.jump_to_flat(block, offset);
             }
         }
         self.close_finder();
@@ -3220,13 +3289,14 @@ fn enter_insert(docs: &mut Tabs, vim: &mut Vim) {
     vim.set_mode(Mode::Insert);
 }
 
-/// A coordinate resolved against the page's body layout. Both exact hit-test
-/// carets and flat search positions must reset focus before they touch the
-/// document, so a body coordinate can never be applied to a note by accident.
+/// A caret resolved against the page's body layout. Exact hit-test carets
+/// must reset focus before they touch the document, so a body coordinate can
+/// never be applied to a note by accident. Flat positions — search and finder
+/// landings — go through [`Tabs::jump_to_flat`], which owns the same rule
+/// plus the unfold-over-the-landing one.
 #[derive(Clone, Copy)]
 enum BodyCoordinate {
     Caret(Caret),
-    Flat(FlatPos),
 }
 
 /// Applies a body coordinate as one operation: focus body, then place caret.
@@ -3237,7 +3307,6 @@ fn set_body_coordinate_caret(docs: &mut Tabs, coordinate: BodyCoordinate) {
         doc.focus = Focus::Body;
         match coordinate {
             BodyCoordinate::Caret(caret) => doc.set_caret(caret.block, caret.inline, caret.offset),
-            BodyCoordinate::Flat(position) => doc.set_flat_position(position),
         }
     });
 }
@@ -4062,13 +4131,7 @@ mod tests {
     fn a_search_jump_while_a_note_is_focused_returns_focus_to_the_body_at_the_match() {
         let mut tabs = note_tabs("search-note");
         focus_note(&mut tabs, 0);
-        set_body_coordinate_caret(
-            &mut tabs,
-            BodyCoordinate::Flat(FlatPos {
-                block: 0,
-                offset: 5,
-            }),
-        );
+        tabs.jump_to_flat(0, 5);
 
         let doc = &tabs.active().unwrap().document;
         assert_eq!(doc.focus, Focus::Body);

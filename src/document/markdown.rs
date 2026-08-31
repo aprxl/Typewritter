@@ -593,6 +593,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
             }
             blocks.push(Block::Heading {
                 level,
+                folded: false,
                 content: inlines,
             });
         } else if let Some((kind, content)) = parse_list_item(line) {
@@ -847,7 +848,11 @@ pub fn serialize(doc: &Document) -> String {
                 out.push_str("```");
                 i = j;
             }
-            Block::Heading { level, content } => {
+            Block::Heading {
+                level,
+                folded: _,
+                content,
+            } => {
                 out.push_str(&"#".repeat(*level as usize));
                 out.push(' ');
                 out.push_str(&serialize_runs(content));
@@ -1072,8 +1077,28 @@ mod tests {
     fn head(level: u8, runs: Vec<Inline>) -> Block {
         Block::Heading {
             level,
+            folded: false,
             content: runs,
         }
+    }
+
+    #[test]
+    fn folded_state_never_reaches_disk() {
+        let text = "# Top\n\nbody\n";
+        let plain = parse(Path::new("x"), text);
+        let printed_plain = serialize(&plain);
+
+        let mut folded = parse(Path::new("x"), text);
+        if let Block::Heading { folded: state, .. } = &mut folded.body_mut()[0] {
+            *state = true;
+        }
+        assert_eq!(
+            serialize(&folded),
+            printed_plain,
+            "the flag is editor state only"
+        );
+        // And re-parsing the file opens unfolded, whatever was on disk.
+        assert!(!parse(Path::new("x"), &printed_plain).body()[0].is_folded());
     }
 
     #[test]
@@ -1192,6 +1217,7 @@ mod tests {
             parse(Path::new("x"), "#### x\n").body(),
             vec![Block::Heading {
                 level: 4,
+                folded: false,
                 content: vec![plain("x")]
             }]
         );

@@ -5,7 +5,10 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::document::layout::{self, ContextHit, DocLayout, RangeKind};
+use crate::document::layout::{
+    self, CHEVRON_WIDTH, ContextHit, DocLayout, FOLD_INDICATOR_HEIGHT, NUMBER_GUTTER, NUMBER_SIZE,
+    RangeKind,
+};
 use crate::document::math::{MathCursor, NodeAddress, SymbolRole};
 use crate::document::math_layout::{self, BoxKind, MathBox, MathPrimitive};
 use crate::document::{ATOM, BadgeColor, Block, Caret, FlatRange, Inline, ListMarker, Style};
@@ -18,13 +21,6 @@ use crate::ui::{Component, Context, Dirty};
 /// document's own H1 is the title).
 pub const TOP: f32 = 28.0;
 pub const INSET: f32 = 56.0;
-/// The gutter between a heading's auto-number and the text it belongs to.
-/// The number is drawn right-aligned against this, so numbers of different
-/// depths line up on their right edge instead of ragging.
-const NUMBER_GUTTER: f32 = 12.0;
-/// The auto-number's size. Constant rather than scaled per heading level:
-/// it is a margin annotation, not part of the heading's own typography.
-const NUMBER_SIZE: f32 = 11.0;
 /// The equation number's size — the same margin-annotation register as the
 /// heading auto-number, never part of the math's own typography.
 const EQ_NUMBER_SIZE: f32 = 11.0;
@@ -84,6 +80,11 @@ pub const OVERSCROLL: f32 = 0.5;
 /// The numbers an editor draws with. The page has one value for each; a
 /// note embedded in the margin has its own. Both are named, so the two
 /// sites never drift into a shared "the" size that only one of them wants.
+/// The fold chevron's path: a filled triangle pointing down (the section
+/// is open), centred on the origin so [`Layer::draw_path_rotated`] turns it
+/// about its own centre — a quarter turn and it points right (folded).
+const CHEVRON: &str = "M0 3 L-3.5 -3 L3.5 -3 Z";
+
 pub struct Metrics {
     /// Left padding of the content area.
     pub inset: f32,
@@ -747,6 +748,12 @@ impl Component for Editor {
         let mut pieces: Vec<Painted> = Vec::new();
         for (bi, block) in self.layout.blocks.iter().enumerate() {
             let kind = &self.layout.source[bi];
+            // Folded ground draws nothing at all — not the runs, not the
+            // slabs, not a hint of what is hidden. The folded heading's own
+            // indicator is the only trace.
+            if block.hidden.is_some() {
+                continue;
+            }
             // A rule has no runs to paint, so it is drawn here rather than
             // in the text pass below: a hairline centred in its own short
             // band, spanning the text column and nothing more.
@@ -1000,16 +1007,90 @@ impl Component for Editor {
                 // The auto-number, hung in the margin: virtual, so it is
                 // drawn rather than laid out — the caret cannot reach it and
                 // it never shifts the heading it labels.
-                if line_index == 0
-                    && kind.is_heading()
-                    && let Some(number) = &self.numbers[bi]
-                {
-                    theme::draw(
+                if line_index == 0 && kind.is_heading() {
+                    if let Some(number) = &self.numbers[bi] {
+                        theme::draw(
+                            layer,
+                            number,
+                            (x - NUMBER_GUTTER, baseline),
+                            &TextStyle::mono(NUMBER_SIZE, theme::non_text()),
+                            theme::RIGHT,
+                        );
+                    }
+                    // The fold chevron, just left of the number: down while
+                    // the section is open, turned to point right when it is
+                    // folded. The turn itself is instant — a component
+                    // recreated on every rebuild cannot hold a clock, and
+                    // §11 forbids the *reflow* from animating anyway; the
+                    // state change is the statement.
+                    let folded = kind.is_folded();
+                    let scale = self.layout.scale;
+                    let number_width = self.numbers[bi].as_deref().map_or(0.0, |number| {
+                        theme::width(layer, number, &TextStyle::mono(NUMBER_SIZE, theme::ink()))
+                    });
+                    let right = layout::chevron_right(number_width, scale);
+                    let centre_x = x + right - CHEVRON_WIDTH * scale / 2.0;
+                    let colour = if folded {
+                        theme::dim()
+                    } else {
+                        theme::non_text()
+                    };
+                    layer
+                        .draw_path_rotated(
+                            CHEVRON,
+                            (centre_x, baseline),
+                            if folded {
+                                -std::f32::consts::FRAC_PI_2
+                            } else {
+                                0.0
+                            },
+                            PathPaint::fill(colour),
+                        )
+                        .expect("chevron path parses");
+                }
+            }
+
+            // The collapsed-body indicator: one quiet italic line standing
+            // in for everything folded away, riding a hairline rule that
+            // runs out to the column's right edge. The three midline dots
+            // are drawn, not typed — Georgia has no U+22EF, and a missing
+            // glyph would break the quiet this line exists to keep. The
+            // whole band is a click target (see `DocLayout::
+            // fold_indicator_at`): touching it unfolds the fold.
+            if let Some(indicator) = &block.indicator {
+                let scale = self.layout.scale;
+                let height = FOLD_INDICATOR_HEIGHT * scale;
+                let mid = content + indicator.y + height * 0.5 - self.scroll;
+                let label = if indicator.lines == 1 {
+                    "1 line hidden".to_string()
+                } else {
+                    format!("{} lines hidden", indicator.lines)
+                };
+                let style = TextStyle::serif(12.5 * scale, theme::comment()).italic();
+                for dot in 0..3 {
+                    layer.draw_circle(
+                        (x + 4.0 + dot as f32 * 4.5 * scale, mid),
+                        1.2 * scale,
+                        theme::faint(),
+                    );
+                }
+                theme::draw(
+                    layer,
+                    &label,
+                    (x + 22.0 * scale, mid + 4.5 * scale),
+                    &style,
+                    theme::LEFT,
+                );
+                let text_width = theme::width(layer, &label, &style);
+                let rule_x = x + 22.0 * scale + text_width + 12.0;
+                let rule_end = x + self.metrics.content_width(rect);
+                if rule_end > rule_x {
+                    theme::rule(
                         layer,
-                        number,
-                        (x - NUMBER_GUTTER, baseline),
-                        &TextStyle::mono(NUMBER_SIZE, theme::non_text()),
-                        theme::RIGHT,
+                        (rule_x, mid),
+                        rule_end - rule_x,
+                        1.0,
+                        theme::border(),
                     );
                 }
             }
@@ -1356,10 +1437,12 @@ mod tests {
             Block::Paragraph(vec![text("intro")]),
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![text("First")],
             },
             Block::Heading {
                 level: 2,
+                folded: false,
                 content: vec![text("Nested")],
             },
         ];
@@ -1443,6 +1526,26 @@ mod tests {
         };
         assert_eq!(width, box_width);
         assert!(width > measure(&atom, &TextStyle::serif(17.5, theme::ink())));
+    }
+
+    /// The fold chevron's path is parsed by the renderer at draw time; the
+    /// exact string the editor draws is pinned here.
+    #[test]
+    fn the_fold_chevron_path_parses() {
+        let mut parser = lyon_extra::parser::PathParser::new();
+        let mut builder = lyon::path::Path::builder();
+        let mut source = lyon_extra::parser::Source::new(CHEVRON.chars());
+        let ok = parser
+            .parse(
+                &lyon_extra::parser::ParserOptions::DEFAULT,
+                &mut source,
+                &mut builder,
+            )
+            .is_ok();
+        assert!(
+            ok,
+            "the chevron path must parse or every heading draw panics"
+        );
     }
 
     /// `math_rect` is what a whole-expression selection is drawn to now that
