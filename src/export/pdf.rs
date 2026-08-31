@@ -17,14 +17,18 @@ use krilla::paint::{Fill, Stroke};
 use krilla::surface::Surface;
 use krilla::text::{Font, GlyphId, KrillaGlyph};
 
+use lyon::path::Event as PathEvent;
+use lyon_extra::parser::{ParserOptions, PathParser, Source};
+
 use crate::renderer::{
-    Alignment, Color, FaceId, HorizontalAlign, Layer, PathPaint, Rounding, VerticalAlign,
+    Alignment, Color, FaceId, FillRule, HorizontalAlign, Layer, LineCap, LineJoin, PathPaint,
+    Rounding, VerticalAlign,
 };
 use crate::theme::TextStyle;
 
-use super::canvas::Canvas;
 use super::geometry::PageGeometry;
 use super::text::Shaper;
+use crate::canvas::Canvas;
 
 /// Bézier approximation of a quarter circle: the control points sit this
 /// fraction of the radius along the tangents. Written as its derivation
@@ -109,12 +113,104 @@ fn solid(color: &Color) -> (rgb::Color, f32) {
 }
 
 fn fill(color: &Color) -> Fill {
+    fill_with(color, FillRule::NonZero)
+}
+
+fn fill_with(color: &Color, rule: FillRule) -> Fill {
     let (rgb, alpha) = solid(color);
     Fill {
         paint: rgb.into(),
         opacity: NormalizedF32::new(alpha).unwrap_or(NormalizedF32::ONE),
-        ..Fill::default()
+        rule: match rule {
+            FillRule::NonZero => krilla::paint::FillRule::NonZero,
+            FillRule::EvenOdd => krilla::paint::FillRule::EvenOdd,
+        },
     }
+}
+
+/// A [`Stroke`](crate::renderer::Stroke) as krilla's. The width is left in
+/// the path's own units — `draw_path` scales the whole thing by one
+/// transform, so a stroke thickens with the shape it outlines rather than
+/// staying a fixed number of points.
+fn pen(stroke: &crate::renderer::Stroke) -> Stroke {
+    let (rgb, alpha) = solid(&stroke.color);
+    Stroke {
+        paint: rgb.into(),
+        width: stroke.width,
+        miter_limit: stroke.miter_limit,
+        line_cap: match stroke.cap {
+            LineCap::Butt => krilla::paint::LineCap::Butt,
+            LineCap::Round => krilla::paint::LineCap::Round,
+            LineCap::Square => krilla::paint::LineCap::Square,
+        },
+        line_join: match stroke.join {
+            LineJoin::Miter => krilla::paint::LineJoin::Miter,
+            LineJoin::Round => krilla::paint::LineJoin::Round,
+            LineJoin::Bevel => krilla::paint::LineJoin::Bevel,
+        },
+        opacity: NormalizedF32::new(alpha).unwrap_or(NormalizedF32::ONE),
+        dash: None,
+    }
+}
+
+/// One SVG path `d` string as krilla geometry, with its bounding box in
+/// its own units — the centre a rotation turns about.
+///
+/// Parsed with the same lyon parser `Layer::draw_path` uses, so the two
+/// backends agree about what a `d` means, then replayed into a
+/// `PathBuilder`. Lyon is already the project's path vocabulary; a second
+/// parser here would be a second opinion.
+///
+/// The box is taken from every endpoint *and* control point, which is
+/// slightly looser than the tightest fit for curves — the same
+/// approximation `Layer` rotates by, and the point of matching it is that
+/// a rotated icon lands identically on both.
+fn svg_path(d: &str) -> Option<(Path, (f32, f32))> {
+    let mut source = Source::new(d.chars());
+    let mut lyon = lyon::path::Path::builder();
+    PathParser::new()
+        .parse(&ParserOptions::DEFAULT, &mut source, &mut lyon)
+        .ok()?;
+
+    let mut min = (f32::MAX, f32::MAX);
+    let mut max = (f32::MIN, f32::MIN);
+    let mut seen = |x: f32, y: f32| {
+        min = (min.0.min(x), min.1.min(y));
+        max = (max.0.max(x), max.1.max(y));
+    };
+
+    let mut path = PathBuilder::new();
+    for event in lyon.build().iter() {
+        match event {
+            PathEvent::Begin { at } => {
+                seen(at.x, at.y);
+                path.move_to(at.x, at.y);
+            }
+            PathEvent::Line { to, .. } => {
+                seen(to.x, to.y);
+                path.line_to(to.x, to.y);
+            }
+            PathEvent::Quadratic { ctrl, to, .. } => {
+                seen(ctrl.x, ctrl.y);
+                seen(to.x, to.y);
+                path.quad_to(ctrl.x, ctrl.y, to.x, to.y);
+            }
+            PathEvent::Cubic {
+                ctrl1, ctrl2, to, ..
+            } => {
+                seen(ctrl1.x, ctrl1.y);
+                seen(ctrl2.x, ctrl2.y);
+                seen(to.x, to.y);
+                path.cubic_to(ctrl1.x, ctrl1.y, ctrl2.x, ctrl2.y, to.x, to.y);
+            }
+            // Lyon ends every sub-path with an `End`, `close` saying whether
+            // it was a real `Z` or just the end of an open run.
+            PathEvent::End { close: true, .. } => path.close(),
+            PathEvent::End { close: false, .. } => {}
+        }
+    }
+    let centre = ((min.0 + max.0) * 0.5, (min.1 + max.1) * 0.5);
+    Some((path.finish()?, centre))
 }
 
 /// A rounded rectangle, already in points.
@@ -219,17 +315,63 @@ impl Canvas for PdfCanvas<'_, '_> {
         }
     }
 
-    fn draw_path(
-        &mut self,
-        _d: &str,
-        _at: (f32, f32),
-        _scale: f32,
-        _rotation: f32,
-        _paint: &PathPaint,
-    ) {
-        // Arrives with the first element that needs one. The divider's rule
-        // is a rectangle, and the fold chevron is chrome a page never
-        // shows, so nothing painted today reaches here. See `PDF.md` §6.
+    fn draw_path(&mut self, d: &str, at: (f32, f32), rotation: f32, paint: &PathPaint) {
+        let Some((path, centre)) = svg_path(d) else {
+            debug_assert!(false, "a drawn path parses: {d}");
+            return;
+        };
+        // The path's own units are logical pixels, so the page's scale rides
+        // in the transform rather than being baked into the coordinates —
+        // that keeps a stroke's width scaling with the shape it outlines,
+        // exactly as `Layer` does with the DPI factor.
+        //
+        // Pushed rather than composed: krilla keeps `Transform::pre_concat`
+        // to itself, and a surface concatenates each push onto the last, so
+        // a stack of three says the same thing as one product would.
+        let at = self.geometry.point(at);
+        let turned = rotation != 0.0;
+        self.surface
+            .push_transform(&Transform::from_translate(at.0, at.1));
+        self.surface.push_transform(&Transform::from_scale(
+            self.geometry.scale,
+            self.geometry.scale,
+        ));
+        if turned {
+            self.surface.push_transform(&Transform::from_rotate_at(
+                rotation.to_degrees(),
+                centre.0,
+                centre.1,
+            ));
+        }
+        match paint {
+            PathPaint::Fill { color, rule } => {
+                self.surface.set_stroke(None);
+                self.surface.set_fill(Some(fill_with(color, *rule)));
+                self.surface.draw_path(&path);
+            }
+            PathPaint::Stroke(stroke) => {
+                self.surface.set_fill(None);
+                self.surface.set_stroke(Some(pen(stroke)));
+                self.surface.draw_path(&path);
+                self.surface.set_stroke(None);
+            }
+            PathPaint::FillAndStroke {
+                fill_color,
+                fill_rule,
+                stroke,
+            } => {
+                self.surface
+                    .set_fill(Some(fill_with(fill_color, *fill_rule)));
+                self.surface.set_stroke(Some(pen(stroke)));
+                self.surface.draw_path(&path);
+                self.surface.set_stroke(None);
+            }
+        }
+        if turned {
+            self.surface.pop();
+        }
+        self.surface.pop();
+        self.surface.pop();
     }
 
     fn draw_text(&mut self, text: &str, at: (f32, f32), style: &TextStyle, align: Alignment) {

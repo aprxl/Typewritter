@@ -15,7 +15,6 @@
 //! the screen break their lines in the same places rather than merely in
 //! similar ones.
 
-mod canvas;
 mod geometry;
 mod paginate;
 mod paint;

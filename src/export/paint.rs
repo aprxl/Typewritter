@@ -11,14 +11,16 @@
 //! Read `PDF.md` §6 before adding to this file; it is four steps and the
 //! first one is "don't touch `canvas.rs`".
 
-use crate::components::editor::VIEW_CAP;
+use crate::components::editor::{
+    BLOCK_PAD, CODE_ROUNDING, EQ_NUMBER_INSET, EQ_NUMBER_SIZE, VIEW_CAP,
+};
 use crate::document::layout::{self, DocLayout, NUMBER_GUTTER, NUMBER_SIZE};
-use crate::document::{ATOM, Block, Inline};
+use crate::document::{ATOM, Block, Inline, math_layout, math_paint};
 use crate::renderer::Rounding;
 use crate::theme::{self, TextStyle};
 
-use super::canvas::Canvas;
 use super::paginate::{Page, Piece};
+use crate::canvas::Canvas;
 
 /// A divider's hairline. Not rounded to a whole pixel the way the editor
 /// rounds it: that is a defence against a 1px rule smearing across two rows
@@ -90,15 +92,44 @@ fn block(
                 Rounding::NONE,
             );
         }
+        // Display math: one slab under the block, and the equation's number
+        // hung flush right inside it.
+        //
+        // Measured from the *piece*, not the block. `paginate` keeps a math
+        // block atomic, so the two are the same slab in every ordinary case
+        // — but its guard against an unfittable block splits one anyway
+        // rather than hang, and a band drawn from the block's own extent
+        // would then run off both pages it appears on.
+        Block::Math { .. } => {
+            let Some(last) = laid.lines.get(piece.lines.end.saturating_sub(1)) else {
+                return;
+            };
+            let top = first.y + dy;
+            let bottom = last.y + last.height + dy;
+            canvas.draw_rectangle(
+                (-BLOCK_PAD.0, top - BLOCK_PAD.1),
+                (width + BLOCK_PAD.0 * 2.0, bottom - top + BLOCK_PAD.1 * 2.0),
+                theme::math_surface(),
+                CODE_ROUNDING,
+            );
+            // Virtual, like a heading's: only tagged blocks have one, the
+            // caret cannot reach it, and it never reflows the math it
+            // labels.
+            if let Some(number) = layout.equation_numbers.get(&piece.block) {
+                canvas.draw_text(
+                    number,
+                    (width - EQ_NUMBER_INSET, top + first.height * 0.5),
+                    &TextStyle::mono(EQ_NUMBER_SIZE, theme::non_text()),
+                    theme::RIGHT,
+                );
+            }
+        }
         // Everything below draws its text and, for now, none of its own
-        // furniture — the tints, the markers, the bands. Each is one arm
-        // here and one row of `PDF.md` §6's table; until then a code block
-        // prints as correctly-styled code without its slab, which is
-        // incomplete rather than wrong.
-        Block::Paragraph(_)
-        | Block::Math { .. }
-        | Block::CodeLine { .. }
-        | Block::ListItem { .. } => {}
+        // furniture — the tints, the markers. Each is one arm here and one
+        // row of `PDF.md` §6's table; until then a code block prints as
+        // correctly-styled code without its slab, which is incomplete
+        // rather than wrong.
+        Block::Paragraph(_) | Block::CodeLine { .. } | Block::ListItem { .. } => {}
     }
 
     for index in piece.lines.clone() {
@@ -155,11 +186,25 @@ fn line(
                 let style = layout::text_style(kind, segment.style, layout.scale);
                 canvas.draw_text(&text, (cursor, baseline), &style, theme::LEFT);
             }
-            // Notation, anchors and references each have their own drawing
-            // and their own decorations — see `PDF.md` §6. Their width is
-            // already reserved above, so the runs around them sit where the
-            // editor puts them even before they draw anything.
-            Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => {}
+            // Notation, drawn through the painter the editor draws it with
+            // — see `document::math_paint`. `slots` is false: an empty slot
+            // says where the next character lands, and nothing lands on a
+            // page. Its geometry is reserved either way, so an expression
+            // is the same width here as on screen.
+            //
+            // An inline expression gets no tint of its own; the notation is
+            // already distinct from the words around it. A display block
+            // keeps its slab, drawn above.
+            Inline::Math(list) => {
+                let box_ = math_layout::layout(list, 0, layout.scale, &|text, style| {
+                    canvas.measure(text, style)
+                });
+                math_paint::draw(canvas, &box_, (cursor, baseline), false);
+            }
+            // Anchors and references have their own drawing — `PDF.md` §6.
+            // Their width is already reserved above, so the runs around
+            // them sit where the editor puts them even before they draw.
+            Inline::Note(_) | Inline::EqRef(_) => {}
         }
         cursor += width;
     }
@@ -171,6 +216,7 @@ mod tests {
 
     use super::*;
     use crate::document::layout::VisLine;
+    use crate::document::math::MathNode;
     use crate::document::{Document, Style, Text};
     use crate::renderer::{Alignment, Color, HorizontalAlign, PathPaint, VerticalAlign};
 
@@ -223,7 +269,7 @@ mod tests {
 
         fn draw_circle(&mut self, _: (f32, f32), _: f32, _: Color) {}
 
-        fn draw_path(&mut self, _: &str, _: (f32, f32), _: f32, _: f32, _: &PathPaint) {}
+        fn draw_path(&mut self, _: &str, _: (f32, f32), _: f32, _: &PathPaint) {}
 
         fn draw_text(&mut self, text: &str, at: (f32, f32), style: &TextStyle, align: Alignment) {
             self.calls.push(Call::Text {
@@ -383,6 +429,83 @@ mod tests {
         };
         assert_eq!(at.0, 0.0);
         assert_eq!(*size, (500.0, RULE_THICKNESS));
+    }
+
+    /// The tagged display block `(1)`, with one symbol in it.
+    fn equation() -> Block {
+        Block::Math {
+            list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+            tag: Some("eq:one".into()),
+        }
+    }
+
+    #[test]
+    fn display_math_gets_a_band_wider_than_the_column() {
+        let layout = laid_out(vec![equation()], 500.0);
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let Some(Call::Rectangle { at, size }) = painted
+            .calls
+            .iter()
+            .find(|call| matches!(call, Call::Rectangle { .. }))
+        else {
+            panic!("a display block draws its slab, got {:?}", painted.calls);
+        };
+        // The slab overhangs the column by the block padding on both sides,
+        // exactly as the editor's does.
+        assert_eq!(at.0, -BLOCK_PAD.0);
+        assert_eq!(size.0, 500.0 + BLOCK_PAD.0 * 2.0);
+    }
+
+    #[test]
+    fn a_tagged_equations_number_hangs_inside_the_band() {
+        let layout = laid_out(vec![equation()], 500.0);
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let Some(Call::Text { at, align, .. }) = painted.saying("(1)") else {
+            panic!("a tagged block is numbered, got {:?}", painted.calls);
+        };
+        assert_eq!(at.0, 500.0 - EQ_NUMBER_INSET);
+        assert_eq!(align.horizontal, HorizontalAlign::Right);
+    }
+
+    #[test]
+    fn an_untagged_equation_gets_no_number() {
+        let layout = laid_out(
+            vec![Block::Math {
+                list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+                tag: None,
+            }],
+            500.0,
+        );
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        assert!(painted.saying("(1)").is_none());
+    }
+
+    #[test]
+    fn notation_is_drawn_where_its_run_sits() {
+        // An expression inline in prose: the word before it reserves its
+        // own width, and the notation starts where that leaves off rather
+        // than at the column's edge.
+        let layout = laid_out(
+            vec![Block::Paragraph(vec![
+                text("ab "),
+                Inline::Math(vec![MathNode::Sym('x')]),
+            ])],
+            500.0,
+        );
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let notation = painted
+            .texts()
+            .into_iter()
+            .find(|call| matches!(call, Call::Text { text, .. } if text == "x"))
+            .expect("the expression's glyph is painted");
+        let Call::Text { at, .. } = notation else {
+            unreachable!()
+        };
+        assert!(
+            at.0 >= 3.0 * GLYPH,
+            "notation must start past the run before it, not at {}",
+            at.0
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@
 
 use std::ops::Range;
 
+use crate::document::Block;
 use crate::document::layout::DocLayout;
 
 use super::geometry::PageGeometry;
@@ -83,10 +84,17 @@ pub fn paginate(layout: &DocLayout, geometry: &PageGeometry) -> Vec<Page> {
             // Doesn't fit whole. How many of its lines do? Never all of
             // them: the last line's bottom is the block's, which is what
             // just failed to fit.
-            let mut fits = block.lines[line..]
-                .iter()
-                .take_while(|l| l.y + l.height - page_top <= height)
-                .count();
+            let mut fits = if atomic(&layout.source[index]) {
+                // A block that must not be split takes none of this page
+                // and all of the next. Notation broken across a sheet is
+                // not a smaller equation, it is two wrong ones.
+                0
+            } else {
+                block.lines[line..]
+                    .iter()
+                    .take_while(|l| l.y + l.height - page_top <= height)
+                    .count()
+            };
 
             // A line taller than an entire page fits nowhere, and breaking
             // to a fresh one would come straight back here — the export
@@ -121,12 +129,25 @@ pub fn paginate(layout: &DocLayout, geometry: &PageGeometry) -> Vec<Page> {
     pages
 }
 
+/// Whether a block moves to the next page whole rather than splitting.
+///
+/// Display math only, for now. A fenced code block wants the same rule but
+/// is a *run* of `CodeLine` blocks rather than one block, so it needs the
+/// run found first — that lands with the code row of `PDF.md` §6.
+///
+/// The guard that keeps this from hanging is the one already in `paginate`:
+/// a block too tall for any page takes the page it is on and overflows,
+/// atomic or not, because the alternative is asking for a fresh page
+/// forever.
+fn atomic(block: &Block) -> bool {
+    matches!(block, Block::Math { .. })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::document::Block;
     use crate::document::layout::{BlockLayout, VisLine};
 
     /// A layout of `heights`-tall single-line blocks stacked flush.
@@ -245,6 +266,44 @@ mod tests {
         let pages = paginate(&tall(9, 30.0), &geometry(90.0));
         assert_eq!(pages.len(), 3);
         assert!(pages.iter().all(|page| !page.pieces.is_empty()));
+    }
+
+    #[test]
+    fn display_math_moves_to_the_next_page_whole() {
+        // Three 30px lines of notation, with 40px of the page left under
+        // them: two lines would fit, and a split equation is two wrong ones.
+        let mut layout = tall(3, 30.0);
+        layout.source = vec![Block::Math {
+            list: Vec::new(),
+            tag: None,
+        }];
+        for (index, line) in layout.blocks[0].lines.iter_mut().enumerate() {
+            line.y = 40.0 + index as f32 * 30.0;
+        }
+        layout.blocks[0].y = 40.0;
+
+        let pages = paginate(&layout, &geometry(100.0));
+        assert_eq!(pages.len(), 2);
+        assert!(
+            pages[0].pieces.is_empty(),
+            "the equation must not leave two of its lines behind"
+        );
+        assert_eq!(pages[1].pieces[0].lines, 0..3);
+    }
+
+    #[test]
+    fn a_paragraph_in_the_same_place_does_split() {
+        // The mirror of the test above, differing only in the block kind:
+        // what keeps the equation together is the rule, not the geometry.
+        let mut layout = tall(3, 30.0);
+        for (index, line) in layout.blocks[0].lines.iter_mut().enumerate() {
+            line.y = 40.0 + index as f32 * 30.0;
+        }
+        layout.blocks[0].y = 40.0;
+
+        let pages = paginate(&layout, &geometry(100.0));
+        assert_eq!(pages[0].pieces[0].lines, 0..2);
+        assert_eq!(pages[1].pieces[0].lines, 2..3);
     }
 
     #[test]

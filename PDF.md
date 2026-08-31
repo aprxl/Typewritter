@@ -67,17 +67,37 @@ something is* is shared; only *what gets ink* differs, and it differs by
 subtraction — editor chrome is state about a session, not content of a
 document, and a PDF has no session.
 
-### Why not a `Canvas` trait that `Layer` also implements
+### Two painters, and the third thing between them
 
-Considered and deferred. It would let `editor.rs` and `paint.rs` be one
-function, which sounds like the strongest possible 1:1 guarantee. It is
-not worth it yet: `Editor::draw` is 600 lines of caret, selection,
-brush, math cursor and scroll culling, none of which a page has, and
-threading all of it through a trait to then branch it off again buys
-nothing. The `Canvas` trait exists anyway (§3) and its methods are named
-and shaped **exactly** like `Layer`'s, so `impl Canvas for Layer` stays a
-one-file change if we ever want it, and `paint.rs` reads as a diff against
-`editor.rs` in the meantime.
+`editor.rs` and `paint.rs` are not one function, and should not become
+one: `Editor::draw` is 600 lines of caret, selection, brush, math cursor
+and scroll culling, none of which a page has. Threading all of that
+through a trait to branch it off again buys nothing.
+
+But they are not simply two, either. There is a middle case — an element
+whose *drawing* is intricate enough that two painters would drift, even
+though neither the caret nor the scroll is anywhere near it. Math is the
+first: `math_paint::draw` is a recursive walk over a `MathBox` tree
+deciding where a fraction's bar, a radical's vinculum and a script's
+offsets land, and two walks that agreed on the day they were written
+would not stay agreeing.
+
+So the rule is by element, not by file:
+
+- **Chrome** (caret, selection, band, hover, chevron) — `editor.rs`, on a
+  `Layer`. A page has none of it, so there is nothing to share.
+- **Simple document furniture** (a rule, a tint, a bullet) — one arm in
+  each painter. A rectangle at a computed y is not something two files
+  can disagree about, and duplicating it keeps both readable.
+- **Intricate drawing** (math, and whatever else earns it) — a shared
+  painter over `Canvas`, called by both. `document::math_paint` is the
+  pattern.
+
+`Canvas` is implemented for `&Layer` as well as for the PDF backend,
+which is what makes the third case possible. Its methods are named and
+shaped exactly like `Layer`'s, so a shared painter reads like the editor
+code it came from and `paint.rs` still reads as a diff against
+`editor.rs`.
 
 ---
 
@@ -150,19 +170,25 @@ Everything lives in `src/export/`. One concern per file, per AGENTS.md.
 
 | File | Owns |
 |---|---|
-| `mod.rs` | `Options`, `export_pdf` — the whole public surface, one call |
-| `geometry.rs` | `Paper`, `PageGeometry`, px → pt. The only file that says `pt` |
-| `canvas.rs` | The `Canvas` trait. Backend-agnostic, `Layer`-shaped |
-| `text.rs` | `Shaper`: measurement and shaped glyph runs from the app's text stack |
-| `paginate.rs` | `Piece`, `Page`, `paginate`. Where a page breaks and what lands on it |
-| `paint.rs` | `DocLayout` → `Canvas` calls. **The extension point** |
-| `pdf.rs` | `PdfCanvas` — the krilla backend, and the font cache that feeds it |
+| `export/mod.rs` | `Options`, `export_pdf` — the whole public surface, one call |
+| `export/geometry.rs` | `Paper`, `PageGeometry`, px → pt. The only file that says `pt` |
+| `export/text.rs` | `Shaper`: measurement and shaped glyph runs from the app's text stack |
+| `export/paginate.rs` | `Piece`, `Page`, `paginate`. Where a page breaks and what lands on it |
+| `export/paint.rs` | `DocLayout` → `Canvas` calls. **The extension point** |
+| `export/pdf.rs` | `PdfCanvas` — the krilla backend, and the font cache that feeds it |
+
+Two of them are not under `export/`, because they are not the exporter's:
+
+| File | Owns |
+|---|---|
+| `src/canvas.rs` | The `Canvas` trait, `impl` for `&Layer`, and the `rule`/`outline` helpers |
+| `src/document/math_paint.rs` | Drawing a `MathBox`. Called by the editor *and* the page |
 
 Plus, in the vendored platform:
 
 | File | Addition |
 |---|---|
-| `renderer/text_stack.rs` | `shape` — the glyphs behind a measurement |
+| `renderer/text_stack.rs` | `shape_run` — the glyphs behind a measurement |
 | `renderer/layer.rs` | `Layer::shape_text`, `Layer::face_data` |
 
 ### `Canvas`
@@ -171,14 +197,21 @@ Plus, in the vendored platform:
 pub trait Canvas {
     fn draw_rectangle(&mut self, at: (f32, f32), size: (f32, f32), color: Color, r: Rounding);
     fn draw_circle(&mut self, center: (f32, f32), radius: f32, color: Color);
-    fn draw_path(&mut self, d: &str, at: (f32, f32), scale: f32, paint: &PathPaint);
+    fn draw_path(&mut self, d: &str, at: (f32, f32), rotation: f32, paint: &PathPaint);
     fn draw_text(&mut self, text: &str, at: (f32, f32), style: &TextStyle, align: Alignment);
+    fn measure(&self, text: &str, style: &TextStyle) -> f32;
 }
 ```
 
-Four methods, all in logical pixels, all named and shaped like `Layer`'s.
-That is the entire abstraction. A new backend is a new `impl`; a new
-element never touches this file.
+Four drawing methods and the measurement they depend on, all in logical
+pixels, all named and shaped like `Layer`'s. That is the entire
+abstraction. A new backend is a new `impl`; a new element never touches
+this file.
+
+`measure` sits here rather than being passed alongside because whatever
+draws the glyphs is the only thing that can say how wide they are — and
+because it lets a painter be tested against a recording canvas with no GPU
+behind it, which is how every test in `paint.rs` runs.
 
 ---
 
@@ -265,16 +298,23 @@ Rules, in order:
 2. A block taller than a whole page splits between its `VisLine`s.
    Paragraphs, list items and code may split; nothing else reaches this
    rule.
-3. **Keep-together**: `Block::Math`, and a run of `Block::CodeLine` with
-   one `first: true` at its head, are atomic. They move to the next page
-   whole rather than split.
+3. **Keep-together** (`atomic`): `Block::Math` moves to the next page
+   whole rather than split — notation broken across a sheet is not a
+   smaller equation, it is two wrong ones. A fenced code block wants the
+   same rule but is a *run* of `CodeLine` blocks rather than one block, so
+   it needs the run found first.
 4. **Keep-with-next**: a `Block::Heading` never ends a page. If the block
    after it does not fit, the heading goes with it.
 5. Inter-block gaps (`GAP_PARAGRAPH` and friends) are swallowed at a page
    break — a page never opens with leading whitespace.
 
-Only rules 1 and 2 exist today; 3–5 arrive with the elements they protect,
-and each is a few lines in one function.
+Rules 1–3 and 5 exist today; 4 arrives next, and the code half of 3 with
+the code row of §6.
+
+Rule 3 yields to the loop's own hang guard: a block too tall for any page
+takes the page it is on and overflows, atomic or not, because the
+alternative is asking for a fresh page forever. `paint` therefore measures
+a math band from the *piece*, not the block — see the arm's comment.
 
 Folded blocks are expanded before pagination (decision 3), so
 `BlockLayout::hidden` is ignored and `indicator` is never painted. **This
@@ -291,8 +331,7 @@ The recipe, and the reason the structure is shaped the way it is.
 1. **Nothing in `canvas.rs`, `geometry.rs`, `pdf.rs`, or `text.rs`.** If
    an element makes you want to add a `Canvas` method, check first whether
    the editor draws it with the four that exist. It does — those four are
-   everything `editor.rs` uses (`draw_path_rotated` is `draw_path` with an
-   angle; add the parameter, not a method).
+   everything `editor.rs` uses.
 2. **One arm in `paint::block`.** Its decorations: the tint behind code,
    the bullet beside a list item, the band behind math, the rule of a
    divider. Read the corresponding stretch of `editor.rs` and drop the
@@ -301,8 +340,13 @@ The recipe, and the reason the structure is shaped the way it is.
 3. **Inline runs, if it has any, go in `paint::line`** — the shared loop
    every block's text passes through. A new `Inline` variant is an arm
    there.
-4. **A keep-together rule in `paginate`, if it must not split.**
-5. **A test.** `paint` against a recording `Canvas` — assert the calls,
+4. **Ask whether it needs a shared painter** (§1, "Two painters"). If the
+   drawing is a rectangle or two, no. If it is a recursive walk or a dozen
+   interdependent offsets, extract it over `Canvas` the way
+   `document::math_paint` is, and have `editor.rs` call it too — in the
+   same commit, so the two are never briefly duplicated.
+5. **A keep-together rule in `paginate::atomic`, if it must not split.**
+6. **A test.** `paint` against a recording `Canvas` — assert the calls,
    not the bytes. `pdf.rs` is exercised once, by the smoke test; asserting
    on PDF output is asserting on krilla.
 
@@ -319,10 +363,10 @@ thing would be indirection with no reader.
 | Heading (+ auto-number) | ✅ shared | ✅ | keep-with-next ⬜ |
 | bold / italic / plain runs | ✅ shared | ✅ | — |
 | Divider | ✅ shared | ✅ | ✅ |
+| Math, inline and display | ✅ shared | ✅ shared | ✅ |
+| Equation numbers | ✅ shared | ✅ | — |
 | Inline code, code blocks | ✅ shared | ⬜ | keep-together ⬜ |
 | Lists: bullet, number, task | ✅ shared | ⬜ | ✅ |
-| Math, inline and display | ✅ shared | ⬜ | keep-together ⬜ |
-| Equation numbers | ✅ shared | ⬜ | — |
 | Badges | ✅ shared | ⬜ | — |
 | Highlights | ✅ shared | ⬜ | — |
 | Sidenotes | ✅ shared | ⬜ | repaginate ⬜ |
@@ -347,6 +391,12 @@ product works at every step, and each row above is one commit.
 - **`text_style` reads the theme while laying out.** Set the theme before
   `layout`, not between layout and paint.
 - **Do not reimplement `effect_advance_delta`.** §4.
+- **A missing font is not a bug in the export.** `theme::mono` asks for
+  "Essential PragmataPro" and `theme::math` for JuliaMono; where neither is
+  installed, cosmic-text falls back per glyph and the PDF embeds whichever
+  face it actually fell back to. That is correct — the page matches the
+  screen, including when the screen is wrong. If notation looks like prose
+  in an export, check the font is installed before reading any code.
 - **`equation_numbers` and `anchors` are derived by `layout`, and heading
   numbers by `outline::outline`.** Export derives all three the same way
   the editor does. Never store them.

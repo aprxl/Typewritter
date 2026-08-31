@@ -9,11 +9,12 @@ use crate::document::layout::{
     self, CHEVRON_WIDTH, ContextHit, DocLayout, FOLD_INDICATOR_HEIGHT, NUMBER_GUTTER, NUMBER_SIZE,
     RangeKind,
 };
-use crate::document::math::{MathCursor, NodeAddress, SymbolRole};
-use crate::document::math_layout::{self, BoxKind, MathBox, MathPrimitive};
+use crate::document::math::{MathCursor, NodeAddress};
+use crate::document::math_layout::{self, MathBox};
+use crate::document::math_paint;
 use crate::document::{ATOM, BadgeColor, Block, Caret, FlatRange, Inline, ListMarker, Style};
 use crate::layout::Rect;
-use crate::renderer::{Layer, LineCap, LineJoin, PathPaint, Rounding, Stroke};
+use crate::renderer::{Layer, PathPaint, Rounding};
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
 
@@ -23,10 +24,10 @@ pub const TOP: f32 = 28.0;
 pub const INSET: f32 = 56.0;
 /// The equation number's size — the same margin-annotation register as the
 /// heading auto-number, never part of the math's own typography.
-const EQ_NUMBER_SIZE: f32 = 11.0;
+pub const EQ_NUMBER_SIZE: f32 = 11.0;
 /// Room kept between the equation number and the band's right edge, so the
 /// widest reading of the band never crowds it.
-const EQ_NUMBER_INSET: f32 = 18.0;
+pub const EQ_NUMBER_INSET: f32 = 18.0;
 /// A bullet's dot: inset from the content column and sized to read as a
 /// mark, not as a glyph. `BULLET_INSET` is from the column's left edge to
 /// the dot's centre.
@@ -48,9 +49,9 @@ pub const BRUSH_RADIUS: f32 = 9.0;
 /// Padding of the tint behind code: a fenced block gets the generous one,
 /// an inline span the tight one, so a `` `run` `` mid-sentence doesn't push
 /// the line apart.
-const BLOCK_PAD: (f32, f32) = (10.0, 6.0);
+pub const BLOCK_PAD: (f32, f32) = (10.0, 6.0);
 const INLINE_PAD: (f32, f32) = (8.0, 4.0);
-const CODE_ROUNDING: Rounding = Rounding::uniform(6.0);
+pub const CODE_ROUNDING: Rounding = Rounding::uniform(6.0);
 const MATH_SELECTION_ROUNDING: Rounding = Rounding::uniform(4.0);
 /// The highlight bar: an underline, not a wash, so the glyphs keep the
 /// page's own contrast. `DROP` is measured down from the line's centre.
@@ -121,29 +122,9 @@ impl Metrics {
 /// One measured piece of a visual line: `(text, style, x, width)`.
 type Painted = (String, Style, f32, f32);
 
-/// Draws a laid-out expression. `origin` is the box's baseline-left point
-/// on screen; child offsets are baseline-relative with y positive upward,
-/// so descending into a child subtracts its y.
-///
-/// `slots` draws the empty-slot placeholders. They are typing affordances —
-/// they say where the next character lands — so they appear only while the
-/// caret is actually inside this expression in Insert mode; read back later,
-/// an expression shows its notation and nothing else. Their geometry is
-/// reserved either way, so an expression never resizes as the caret enters
-/// or leaves it.
-fn draw_math(layer: &Layer, box_: &MathBox, origin: (f32, f32), slots: bool) {
-    draw_math_inner(layer, box_, origin, false, slots);
-}
-
-fn math_rect(box_: &MathBox, origin: (f32, f32)) -> Rect {
-    Rect {
-        x: origin.0,
-        y: origin.1 - box_.ascent,
-        width: box_.width,
-        height: box_.ascent + box_.descent,
-    }
-}
-
+/// The wash behind a selected expression, or behind one addressed node of
+/// it. Editor-only: a page has no selection, which is why this stayed here
+/// while the notation itself moved to [`math_paint`].
 fn draw_math_selection(
     layer: &Layer,
     list: &crate::document::math::MathList,
@@ -165,7 +146,7 @@ fn draw_math_selection(
             height: bounds.top - bounds.bottom + PAD * 2.0,
         }
     } else {
-        let rect = math_rect(box_, origin);
+        let rect = math_paint::rect(box_, origin);
         Rect {
             x: rect.x - PAD,
             y: rect.y - PAD,
@@ -183,88 +164,6 @@ fn draw_math_selection(
 
 fn draw_brush(layer: &Layer, center: (f32, f32)) {
     layer.draw_circle(center, BRUSH_RADIUS, theme::fade(theme::accent(), 0.14));
-}
-
-fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: bool, slots: bool) {
-    if let Some(role) = box_.highlight.filter(|_| !covered) {
-        let height = box_.ascent + box_.descent;
-        let color = match role {
-            SymbolRole::Variable => theme::variable(),
-            SymbolRole::Constant => theme::constant(),
-            SymbolRole::Function => theme::function(),
-        };
-        layer.draw_rectangle(
-            (origin.0, origin.1 - box_.ascent),
-            (box_.width, height),
-            color,
-            Rounding::uniform(box_.width.min(height) * 0.45),
-        );
-    }
-    let covered = covered || box_.highlight.is_some();
-    match &box_.kind {
-        BoxKind::Glyph {
-            text,
-            size,
-            offset_x,
-            offset_y,
-            condense,
-        } => {
-            // Math boxes use glyph centers as their baseline for now; LEFT's
-            // vertical centering therefore matches the prose baseline draw.
-            theme::draw(
-                layer,
-                text,
-                (origin.0 + offset_x, origin.1 - offset_y),
-                &TextStyle::math(*size, theme::ink()).condensed(*condense),
-                theme::LEFT,
-            );
-        }
-        BoxKind::Bar { thickness } => {
-            // A fractional one-pixel rule smears across adjacent rows.
-            theme::rule(
-                layer,
-                (origin.0, (origin.1 - thickness * 0.5).round()),
-                box_.width,
-                *thickness,
-                theme::ink(),
-            );
-        }
-        BoxKind::Slot { visible, .. } => {
-            // `visible` is structural — an integral's unasked-for limits are
-            // never drawn. `slots` is the mode gate on top of it.
-            if !visible || !slots {
-                return;
-            }
-            let rect = Rect {
-                x: origin.0,
-                y: origin.1 - box_.ascent,
-                width: box_.width,
-                height: box_.ascent + box_.descent,
-            };
-            layer.draw_rectangle(rect.position(), rect.size(), theme::alt(), Rounding::NONE);
-            theme::outline(layer, rect, theme::non_text());
-        }
-        BoxKind::Primitive(primitive) => match primitive {
-            MathPrimitive::Stroke { path, thickness } => {
-                let mut stroke = Stroke::new(theme::ink(), *thickness);
-                stroke.cap = LineCap::Round;
-                stroke.join = LineJoin::Round;
-                layer
-                    .draw_path(path, origin, PathPaint::Stroke(stroke))
-                    .expect("math paths are generated by layout");
-            }
-            MathPrimitive::Dots { centers, radius } => {
-                for &(x, y) in centers {
-                    layer.draw_circle((origin.0 + x, origin.1 + y), *radius, theme::ink());
-                }
-            }
-        },
-        BoxKind::Row { children } => {
-            for (x, y, child) in children {
-                draw_math_inner(layer, child, (origin.0 + x, origin.1 - y), covered, slots);
-            }
-        }
-    }
 }
 
 /// A list item's marker, hung in the gutter left of the content column.
@@ -911,8 +810,14 @@ impl Component for Editor {
                             (Some(_), Some(caret))
                                 if bi == caret.block && segment.inline == caret.inline
                         );
-                        draw_math(
-                            layer,
+                        // The notation itself is drawn by `math_paint`, the
+                        // one copy an export runs too — so a fraction's bar
+                        // cannot land differently on a page than on screen.
+                        // A layer is a handle, so a `Canvas` over it is a
+                        // rebinding, not a conversion.
+                        let mut canvas = layer;
+                        math_paint::draw(
+                            &mut canvas,
                             &box_,
                             (cursor, baseline),
                             typing_here && !self.block_caret,
@@ -1340,6 +1245,7 @@ pub fn max_scroll(content_height: f32, view_height: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::document::math::MathNode;
+    use crate::document::math_layout::BoxKind;
     use crate::document::{Document, Text};
     use std::path::Path;
 
@@ -1560,7 +1466,7 @@ mod tests {
             kind: BoxKind::Row { children: vec![] },
         };
         assert_eq!(
-            math_rect(&box_, (7.0, 31.0)),
+            math_paint::rect(&box_, (7.0, 31.0)),
             Rect {
                 x: 7.0,
                 y: 12.0,
