@@ -211,8 +211,6 @@ impl Shell {
         }
     }
 
-    /// A Normal-mode click on an anchor opens that note. Resolves the click
-    /// to its caret, then asks whether that caret sits on an anchor — the
     /// Whether a click landed on a fold affordance — a gutter chevron or a
     /// collapsed-body indicator — and toggled/unfolded it. Runs before caret
     /// placement in either mode: these are controls, not text.

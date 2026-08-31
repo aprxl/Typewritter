@@ -1068,7 +1068,7 @@ impl Component for Editor {
                 let style = TextStyle::serif(12.5 * scale, theme::comment()).italic();
                 for dot in 0..3 {
                     layer.draw_circle(
-                        (x + 4.0 + dot as f32 * 4.5 * scale, mid),
+                        (x + 4.0 * scale + dot as f32 * 4.5 * scale, mid),
                         1.2 * scale,
                         theme::faint(),
                     );
@@ -1081,7 +1081,7 @@ impl Component for Editor {
                     theme::LEFT,
                 );
                 let text_width = theme::width(layer, &label, &style);
-                let rule_x = x + 22.0 * scale + text_width + 12.0;
+                let rule_x = x + 22.0 * scale + text_width + 12.0 * scale;
                 let rule_end = x + self.metrics.content_width(rect);
                 if rule_end > rule_x {
                     theme::rule(

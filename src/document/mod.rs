@@ -1641,18 +1641,23 @@ impl Document {
     // ---- caret movement (never dirt) ------------------------------------
 
     /// Click placement / jump. Clamps into bounds; the style context is the
-    /// style-before rule (§3).
+    /// style-before rule (§3). A block hidden by a fold holds no caret: the
+    /// placement lands on the fold's heading instead, the ground the reader
+    /// can actually see.
     pub fn set_caret(&mut self, block: usize, inline: usize, offset: usize) {
         self.clamp_caret();
-        let b = block.min(self.scope().len() - 1);
-        self.caret.block = b;
-        let runs = self.scope()[b].inlines();
+        let mut block = block.min(self.scope().len() - 1);
+        if let Some(owner) = fold_owner_of(self.scope(), block) {
+            block = owner;
+        }
+        self.caret.block = block;
+        let runs = self.scope()[block].inlines();
         let i = inline.min(runs.len().saturating_sub(1));
         let len = run_len(&runs[i]);
         self.caret.inline = i;
         self.caret.offset = offset.min(len);
         self.caret.style = self
-            .style_before(b, self.caret_flat(b))
+            .style_before(block, self.caret_flat(block))
             .unwrap_or(Style::PLAIN);
     }
 
@@ -2142,6 +2147,9 @@ impl Document {
         self.caret.block = b + 1;
         self.caret.inline = 0;
         self.caret.offset = 0;
+        // A paragraph born from Enter wants to be typed into: a fold that
+        // would hide it opens instead of swallowing the caret.
+        self.reveal_block(b + 1);
         // Style context preserved: you keep typing in the same style.
         self.enforce();
     }
@@ -2211,11 +2219,24 @@ impl Document {
         self.enforce();
     }
 
+    /// Unfold every fold covering `block`: an edit about to place the caret
+    /// there wants visible ground. The heading's own flag is the only state
+    /// touched; the content never changes.
+    pub fn reveal_block(&mut self, block: usize) {
+        while let Some(owner) = fold_owner_of(&self.body, block) {
+            match self.body.get_mut(owner) {
+                Some(Block::Heading { folded, .. }) if *folded => *folded = false,
+                _ => break,
+            }
+        }
+    }
+
     /// vim `o`: an empty Paragraph below the caret's block — or, on a list
     /// item, the next item of the same kind.
     pub fn open_below(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        self.reveal_block(b + 1);
         let marker = match self.scope()[b] {
             Block::ListItem { marker, .. } => Some(continued(marker)),
             _ => None,
@@ -2235,6 +2256,7 @@ impl Document {
     pub fn open_above(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        self.reveal_block(b);
         let marker = match self.scope()[b] {
             Block::ListItem { marker, .. } => Some(marker),
             _ => None,
@@ -4129,6 +4151,51 @@ mod tests {
         d.enforce();
         assert!(matches!(d.body()[0], Block::Paragraph(_)));
         assert!(matches!(d.body()[0].inlines()[0], Inline::Math(_)));
+    }
+
+    #[test]
+    fn a_caret_placed_on_folded_ground_lands_on_the_fold() {
+        let mut d = doc();
+        d.insert_text("intro");
+        d.newline();
+        d.set_heading(Some(1));
+        d.insert_text("Section");
+        d.newline();
+        d.insert_text("body one");
+        d.newline();
+        d.insert_text("body two");
+        // Fold the heading (block 1); blocks 2 and 3 become hidden ground.
+        if let Block::Heading { folded, .. } = &mut d.body_mut()[1] {
+            *folded = true;
+        }
+        let owner = fold_owner_of(d.body(), 3).expect("block 3 is folded ground");
+        assert_eq!(owner, 1);
+        // A jump (vim G, gg, {, } all land here) must not park the caret
+        // where nothing is visible.
+        d.set_caret(3, 0, 0);
+        assert_eq!(d.caret.block, 1, "the caret lands on the fold's heading");
+    }
+
+    #[test]
+    fn opening_below_a_folded_heading_reveals_the_body() {
+        let mut d = doc();
+        d.set_heading(Some(1));
+        d.insert_text("Section");
+        d.newline();
+        d.insert_text("body");
+        if let Block::Heading { folded, .. } = &mut d.body_mut()[0] {
+            *folded = true;
+        }
+        // vim `o` ON the folded heading (the reviewer's repro): the caret
+        // sits on the heading, so the new paragraph would be born at block
+        // 1 — inside the fold. The fold must open instead of hiding it.
+        d.set_caret(0, 0, 0);
+        d.open_below();
+        assert!(
+            !d.body()[0].is_folded(),
+            "the fold opened to give the new paragraph light"
+        );
+        assert!(!fold_owner_of(d.body(), d.caret.block).is_some());
     }
 
     #[test]
