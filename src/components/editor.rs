@@ -36,9 +36,8 @@ const BULLET_RADIUS: f32 = 2.5;
 /// span's, so it reads as a control, not as a box of text.
 const CHECK_RADIUS: f32 = 4.5;
 const CHECK_ROUNDING: Rounding = Rounding::uniform(CHECK_RADIUS);
-/// How high a done task's strike sits above the line's centre — through
-/// the x-height, like a pen, not along the baseline.
-const STRIKE_RISE: f32 = 4.5;
+/// A done task's strike: centred on the line's own centre — the text is
+/// drawn v-centred on the same point, so the rule crosses the x-height.
 const STRIKE_THICKNESS: f32 = 1.4;
 /// The design's measure: the content column is never wider than this.
 pub const MEASURE: f32 = 634.0;
@@ -988,7 +987,7 @@ impl Component for Editor {
                 if done_task && let (Some(first), Some(last)) = (pieces.first(), pieces.last()) {
                     theme::rule(
                         layer,
-                        (first.2 - 1.0, baseline - STRIKE_RISE),
+                        (first.2 - 1.0, baseline - STRIKE_THICKNESS * 0.5),
                         last.2 + last.3 - first.2 + 2.0,
                         STRIKE_THICKNESS,
                         theme::dim(),

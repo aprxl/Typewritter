@@ -1750,8 +1750,29 @@ impl Document {
             return;
         }
         self.clamp_caret();
-        let s = self.caret.style;
         let b = self.caret.block;
+        // A display block is one atom: there is no prose beside it to type
+        // into, so typed characters enter the tree at the side of the atom
+        // the caret rests on. Splicing prose here would demote the whole
+        // block in `prune_block` — the expression would vanish under the
+        // next keystroke.
+        if matches!(self.scope()[b], Block::Math { .. }) {
+            let len = match self.scope()[b].inlines() {
+                [Inline::Math(list)] => list.len(),
+                _ => unreachable!("display math must contain exactly one math atom"),
+            };
+            let index = if self.caret.offset > 0 { len } else { 0 };
+            self.set_caret(b, 0, 0);
+            self.math = Some(math::MathCursor {
+                path: Vec::new(),
+                index,
+            });
+            for c in text.chars() {
+                self.math_insert_char(c);
+            }
+            return;
+        }
+        let s = self.caret.style;
         let i = self.caret.inline;
         let o = self.caret.offset;
         let flat = self.caret_flat(b);
@@ -1851,6 +1872,12 @@ impl Document {
             return;
         }
         self.clamp_caret();
+        // Notation markers carry no meaning inside a display atom; the
+        // characters join the tree like any typed ones.
+        if matches!(self.scope()[self.caret.block], Block::Math { .. }) {
+            self.insert_text(text);
+            return;
+        }
         let s = self.caret.style;
         let b = self.caret.block;
         let i = self.caret.inline;
@@ -4102,6 +4129,44 @@ mod tests {
         d.enforce();
         assert!(matches!(d.body()[0], Block::Paragraph(_)));
         assert!(matches!(d.body()[0].inlines()[0], Inline::Math(_)));
+    }
+
+    #[test]
+    fn typing_at_a_display_atom_joins_the_tree_instead_of_demoting_it() {
+        let mut d = doc();
+        d.insert_math_block();
+        d.math_insert_char('x');
+        // Exit to the right, then type: the characters must enter the atom
+        // after `x`, not splice prose beside it and demote the block.
+        d.math_exit_after();
+        d.insert_text("+y");
+        assert!(
+            matches!(d.body()[0], Block::Math { .. }),
+            "the display block must survive typing at its edge"
+        );
+        let list = match &d.body()[0].inlines()[0] {
+            Inline::Math(list) => list,
+            other => panic!("expected math, got {other:?}"),
+        };
+        let printed = math_notation::print(list);
+        assert!(printed.contains('x') && printed.contains('y'), "{printed}");
+    }
+
+    #[test]
+    fn typing_at_a_display_atom_rests_the_caret_on_the_side_it_had() {
+        let mut d = doc();
+        d.insert_math_block();
+        d.math_insert_char('a');
+        d.math_exit_before();
+        // Caret before the atom: new characters go to the front.
+        d.insert_text("b");
+        match &d.body()[0].inlines()[0] {
+            Inline::Math(list) => {
+                let printed = math_notation::print(list);
+                assert!(printed.starts_with('b'), "{printed}");
+            }
+            other => panic!("expected math, got {other:?}"),
+        }
     }
 
     #[test]
