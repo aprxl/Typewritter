@@ -15,8 +15,8 @@ use winit::keyboard::{KeyCode, ModifiersState};
 use super::Shell;
 use crate::components::dialog::Prompt;
 use crate::components::palette;
-use crate::document::BadgeColor;
 use crate::document::math::{AccentKind, BigOp, SymbolRole};
+use crate::document::{BadgeColor, ListMarker};
 use crate::input::Input;
 
 #[derive(Clone, Copy)]
@@ -288,6 +288,45 @@ pub const COMMANDS: &[Command] = &[
         group: "Format",
         chord: None,
         run: |shell| shell.docs.borrow_mut().insert_divider(),
+    },
+    Command {
+        id: "format.bullet_list",
+        title: "Bulleted list",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().set_list(Some(ListMarker::Bullet)),
+    },
+    Command {
+        id: "format.numbered_list",
+        title: "Numbered list",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell
+                .docs
+                .borrow_mut()
+                .set_list(Some(ListMarker::Number(1)))
+        },
+    },
+    Command {
+        id: "format.task_list",
+        title: "Task list",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell
+                .docs
+                .borrow_mut()
+                .set_list(Some(ListMarker::Task { done: false }))
+        },
+    },
+    Command {
+        // The checkbox is also clickable; this is the keyboard route.
+        id: "format.task_toggle",
+        title: "Toggle task",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().toggle_task(),
     },
     Command {
         // Spec §5: a sidenote is a block like the rest, reachable from the

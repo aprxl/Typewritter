@@ -14,7 +14,9 @@
 use std::collections::HashMap;
 
 use crate::document::math::{MathCursor, NodeAddress};
-use crate::document::{Block, Caret, Document, FlatPos, FlatRange, Inline, Style, math_layout};
+use crate::document::{
+    Block, Caret, Document, FlatPos, FlatRange, Inline, ListMarker, Style, math_layout,
+};
 use crate::theme::{self, TextStyle};
 
 /// Visual line heights, in logical pixels.
@@ -49,6 +51,19 @@ pub const GAP_HEADING: f32 = 26.0;
 pub const GAP_AFTER_HEADING: f32 = 8.0;
 /// Space below a rule — tighter than a paragraph's, for the same reason.
 pub const GAP_DIVIDER: f32 = 8.0;
+/// Space below a list item that has another item right after it — tighter
+/// than a paragraph's, because the items are one thought. The last item of
+/// a run keeps the full paragraph gap below it.
+pub const LIST_GAP: f32 = 6.0;
+/// A list item's content column, hung once for the whole block: the marker
+/// lives in the gutter to its left, and every wrapped line aligns here —
+/// under the content, never under the marker (the hanging indent).
+pub const LIST_INDENT: f32 = 26.0;
+/// A task checkbox's edge, and the gap between its right side and the
+/// item's content column. One geometry for the drawing and the click
+/// hit-test, both reading [`DocLayout::task_box`].
+pub const CHECK_SIZE: f32 = 15.0;
+pub const CHECK_GAP: f32 = 9.0;
 /// The size of an anchor's raised number. Matches the heading's auto-number:
 /// both are margin annotations, not part of the prose they annotate.
 pub const ANCHOR_SIZE: f32 = 11.0;
@@ -78,6 +93,11 @@ pub struct Segment {
 pub struct VisLine {
     /// Top of the line, relative to content top.
     pub y: f32,
+    /// Left edge of the line's text, relative to the content column —
+    /// nonzero only for a list item's content, which is indented once for
+    /// every line of the block. The caret, the click hit-tests, and the
+    /// drawing all add it, so they cannot drift apart.
+    pub x: f32,
     /// Actual line height: the block's floor or its tallest content.
     pub height: f32,
     pub segments: Vec<Segment>,
@@ -183,6 +203,14 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
         Block::Paragraph(_) | Block::Divider(_) | Block::Math { .. } => {
             TextStyle::serif(17.5 * scale, theme::ink())
         }
+        // A done task's text is dimmed: the drawn strike through it says
+        // "done", the muted ink says "past tense". Together they quiet the
+        // item without hiding it.
+        Block::ListItem {
+            marker: ListMarker::Task { done: true },
+            ..
+        } => TextStyle::serif(17.5 * scale, theme::dim()),
+        Block::ListItem { .. } => TextStyle::serif(17.5 * scale, theme::ink()),
         Block::CodeLine { .. } => TextStyle::mono(17.5 * scale, theme::ink()),
     };
     if style.bold {
@@ -515,10 +543,19 @@ pub fn layout_blocks(
             Block::Heading { .. } | Block::Paragraph(_) | Block::CodeLine { .. } => {
                 LINE_BODY * scale
             }
+            Block::ListItem { .. } => LINE_BODY * scale,
         };
 
+        // A list item's content column is indented once for the whole
+        // block — first line and wraps alike — so the marker hangs in the
+        // gutter and wrapped lines align under the content, never under
+        // the marker.
+        let indent = match block {
+            Block::ListItem { .. } => LIST_INDENT * scale,
+            _ => 0.0,
+        };
         let pieces = tokens(block, source_index, &number_of);
-        let grouped = wrap(&pieces, block, width, scale, measure);
+        let grouped = wrap(&pieces, block, width - indent, scale, measure);
         let mut line_y = y;
         let lines = grouped
             .iter()
@@ -538,6 +575,7 @@ pub fn layout_blocks(
                 let height = base_line_height.max(content_height);
                 let line = VisLine {
                     y: line_y,
+                    x: indent,
                     height,
                     segments: segments_for(&pieces, line_pieces),
                 };
@@ -564,6 +602,12 @@ pub fn layout_blocks(
             GAP_AFTER_HEADING * scale
         } else if block.is_divider() {
             GAP_DIVIDER * scale
+        } else if matches!(block, Block::ListItem { .. }) {
+            if matches!(blocks.get(source_index + 1), Some(Block::ListItem { .. })) {
+                LIST_GAP * scale
+            } else {
+                GAP_PARAGRAPH * scale
+            }
         } else {
             GAP_PARAGRAPH * scale
         };
@@ -860,6 +904,9 @@ fn caret_for_click(
 ) -> Caret {
     let block = &scan_source[block_idx];
     let line = &layout_block.lines[line_idx];
+    // Clicks arrive in content coordinates; a list item's text starts at
+    // its own indent, so the aim is against the line's left edge.
+    let x = x - line.x;
     let start = line_flat_start(layout_block, line_idx);
 
     // The clicked char's offset within the line's flat text, defaulting to
@@ -942,6 +989,37 @@ impl DocLayout {
             .collect()
     }
 
+    /// A task item's checkbox, in content coordinates: `(x, y, w, h)` with
+    /// x from the content column's left edge and y in document coordinates.
+    /// `None` for every block that is not a task item. The drawing and the
+    /// click hit-test both read this one geometry, so they cannot drift.
+    pub fn task_box(&self, block_idx: usize) -> Option<(f32, f32, f32, f32)> {
+        if !matches!(
+            self.source.get(block_idx),
+            Some(Block::ListItem {
+                marker: ListMarker::Task { .. },
+                ..
+            })
+        ) {
+            return None;
+        }
+        let line = self.blocks.get(block_idx)?.lines.first()?;
+        let mid = line.y + line.height * 0.5;
+        let size = CHECK_SIZE * self.scale;
+        let gap = CHECK_GAP * self.scale;
+        let indent = LIST_INDENT * self.scale;
+        Some((indent - gap - size, mid - size * 0.5, size, size))
+    }
+
+    /// The task item whose checkbox contains the point, if any. The frame
+    /// is the same one [`Self::hit`] reads: x from the content column's
+    /// left edge, y in document coordinates.
+    pub fn task_at(&self, x: f32, y: f32) -> Option<usize> {
+        let block_idx = block_of_y(self, y);
+        let (bx, by, w, h) = self.task_box(block_idx)?;
+        (x >= bx && x <= bx + w && y >= by && y <= by + h).then_some(block_idx)
+    }
+
     /// (x, baseline-y, line-height) of a model caret, relative to content top.
     pub fn caret_pos(
         &self,
@@ -955,7 +1033,7 @@ impl DocLayout {
         let line = &layout_block.lines[line_idx];
         let line_start = line_flat_start(layout_block, line_idx);
         let x = x_of_flat(block, line, line_start, flat, self.scale, measure);
-        (x, line.y + line.height / 2.0, line.height)
+        (x + line.x, line.y + line.height / 2.0, line.height)
     }
 
     /// Nearest caret position for a click at (x, y) — y relative to content
@@ -998,6 +1076,7 @@ impl DocLayout {
 
         let line = &layout_block.lines[line_idx];
         let block = &self.source[block_idx];
+        let x = x - line.x;
 
         if block.is_code() {
             let mut first = block_idx;
@@ -1163,6 +1242,7 @@ impl DocLayout {
                 .flat_map(|run| run_text(run).chars())
                 .collect();
             for line in &layout_block.lines {
+                let point = (x - line.x, y);
                 let baseline = line.y + line.height * 0.5;
                 let mut advance_x = 0.0;
                 for segment in &line.segments {
@@ -1392,6 +1472,7 @@ impl DocLayout {
     ) -> Option<(usize, usize, Option<NodeAddress>)> {
         let line = &self.blocks[block_idx].lines[line_idx];
         let block = &self.source[block_idx];
+        let x = x - line.x;
         let mut advance_x = 0.0;
         for segment in &line.segments {
             let run = &block.inlines()[segment.inline];
@@ -1467,6 +1548,7 @@ impl DocLayout {
     ) -> Option<(usize, usize, MathCursor)> {
         let line = &self.blocks[block_idx].lines[line_idx];
         let block = &self.source[block_idx];
+        let x = x - line.x;
         let mut advance_x = 0.0;
 
         for segment in &line.segments {
@@ -2119,6 +2201,127 @@ mod tests {
         assert_eq!(hit.block, 0);
         assert_eq!(hit.offset, 0);
         assert_eq!(hit.style, Style::PLAIN);
+    }
+
+    // ---- list item tests -------------------------------------------------
+
+    fn list_item(marker: ListMarker, t: &str) -> Block {
+        Block::ListItem {
+            marker,
+            content: vec![Inline::Text(Text {
+                text: t.into(),
+                style: Style::PLAIN,
+            })],
+        }
+    }
+
+    /// The hanging indent: every line of a list item's content starts at the
+    /// same left edge, so a wrapped line never slides back under the marker.
+    #[test]
+    fn a_list_item_wraps_with_a_true_hanging_indent() {
+        let d = doc_with(vec![list_item(
+            ListMarker::Bullet,
+            "aaaa bbbb cccc dddd eeee ffff gggg hhhh",
+        )]);
+        // Narrow enough to force at least one wrap at 10px/char.
+        let layout = layout(&d, 220.0, &fake_measure);
+        let block = &layout.blocks[0];
+        assert!(
+            block.lines.len() >= 2,
+            "expected a wrap: {}",
+            block.lines.len()
+        );
+        for line in &block.lines {
+            assert_eq!(
+                line.x, LIST_INDENT,
+                "every line hangs at the content column"
+            );
+        }
+        // The first wrapped line continues exactly where the flat text says:
+        // a click at the content column lands on its first char.
+        let second = line_flat_start(block, 1);
+        let caret = layout.hit(LIST_INDENT, block.lines[1].y + 1.0, &fake_measure);
+        assert_eq!(flat_of_caret(&layout.source, caret), second);
+        // The caret there sits at the content column, not at the gutter.
+        let (x, _, _) = layout.caret_pos(caret, &fake_measure);
+        assert_eq!(x, LIST_INDENT);
+    }
+
+    #[test]
+    fn non_list_lines_start_at_the_column_edge() {
+        let d = doc_with(vec![para("prose"), list_item(ListMarker::Bullet, "item")]);
+        let layout = layout(&d, 400.0, &fake_measure);
+        assert_eq!(layout.blocks[0].lines[0].x, 0.0);
+        assert_eq!(layout.blocks[1].lines[0].x, LIST_INDENT);
+    }
+
+    /// The checkbox is a control: one geometry answers both the drawing and
+    /// the click, sitting in the gutter left of the content column.
+    #[test]
+    fn a_task_checkbox_is_clickable_where_it_is_drawn() {
+        let d = doc_with(vec![
+            list_item(ListMarker::Task { done: false }, "buy milk"),
+            list_item(ListMarker::Bullet, "tea"),
+            list_item(ListMarker::Task { done: true }, "done thing"),
+        ]);
+        let layout = layout(&d, 400.0, &fake_measure);
+
+        let (x, y, w, h) = layout.task_box(0).expect("task item has a box");
+        assert_eq!(w, CHECK_SIZE);
+        assert_eq!(
+            x + w,
+            LIST_INDENT - CHECK_GAP,
+            "right edge clears the column"
+        );
+        let mid = layout.blocks[0].lines[0].y + layout.blocks[0].lines[0].height * 0.5;
+        assert_eq!(y + h * 0.5, mid, "centred on the line");
+
+        assert_eq!(
+            layout.task_at(x + w * 0.5, y + h * 0.5),
+            Some(0),
+            "centre of the box toggles item 0"
+        );
+        assert_eq!(layout.task_at(1.0, 1.0), None, "outside the box");
+        // A bullet is not a control, wherever the click lands.
+        let bullet_mid = layout.blocks[1].lines[0].y + layout.blocks[1].lines[0].height * 0.5;
+        assert_eq!(layout.task_at(2.0, bullet_mid), None);
+        assert!(layout.task_box(2).is_some(), "the done item keeps its box");
+    }
+
+    #[test]
+    fn list_items_sit_tighter_than_paragraphs() {
+        let gap = |blocks: Vec<Block>| {
+            let d = doc_with(blocks);
+            let layout = layout(&d, 400.0, &fake_measure);
+            layout.blocks[1].y - (layout.blocks[0].y + layout.blocks[0].height)
+        };
+        let items = gap(vec![
+            list_item(ListMarker::Bullet, "a"),
+            list_item(ListMarker::Bullet, "b"),
+        ]);
+        let paragraphs = gap(vec![para("a"), para("b")]);
+        assert_eq!(items, LIST_GAP);
+        assert_eq!(paragraphs, GAP_PARAGRAPH);
+        assert!(items < paragraphs);
+        // The last item of a run keeps the full paragraph gap below it.
+        let d = doc_with(vec![
+            list_item(ListMarker::Bullet, "a"),
+            list_item(ListMarker::Bullet, "b"),
+            para("after"),
+        ]);
+        let layout = layout(&d, 400.0, &fake_measure);
+        let after_items = layout.blocks[2].y - (layout.blocks[1].y + layout.blocks[1].height);
+        assert_eq!(after_items, GAP_PARAGRAPH);
+    }
+
+    #[test]
+    fn a_done_task_reads_dim_through_text_style() {
+        let done = list_item(ListMarker::Task { done: true }, "x");
+        let open = list_item(ListMarker::Task { done: false }, "x");
+        let dim = text_style(&done, Style::PLAIN, 1.0);
+        let plain = text_style(&open, Style::PLAIN, 1.0);
+        assert_ne!(dim.color, plain.color, "done tasks are dimmed");
+        assert_eq!(dim.size, plain.size, "same size — quiet, not smaller");
     }
 
     #[test]
