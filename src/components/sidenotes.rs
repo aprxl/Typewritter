@@ -160,7 +160,13 @@ impl Component for SidenoteMargin {
             theme::background(),
             Rounding::NONE,
         );
-        theme::vertical_rule(layer, (rect.x, rect.y), rect.height, 1.0, theme::selection());
+        theme::vertical_rule(
+            layer,
+            (rect.x, rect.y),
+            rect.height,
+            1.0,
+            theme::selection(),
+        );
 
         // Document coordinates become screen coordinates the same way the
         // editor does: content top, minus the shared scroll.

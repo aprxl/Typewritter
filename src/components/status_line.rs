@@ -88,8 +88,11 @@ impl Component for StatusLine {
         } else {
             theme::width(layer, &self.math_path, &body) + 32.0
         };
-        let left = theme::width(layer, &self.mode, &TextStyle::mono(10.0, theme::background()))
-            + theme::width(layer, note, &body)
+        let left = theme::width(
+            layer,
+            &self.mode,
+            &TextStyle::mono(10.0, theme::background()),
+        ) + theme::width(layer, note, &body)
             + math_width
             + 90.0;
         let right = theme::width(layer, &self.saved, &body)
