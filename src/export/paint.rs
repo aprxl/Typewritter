@@ -14,13 +14,16 @@
 use crate::components::editor::{
     BLOCK_PAD, CODE_ROUNDING, EQ_NUMBER_INSET, EQ_NUMBER_SIZE, VIEW_CAP,
 };
+use crate::components::sidenotes;
 use crate::document::layout::{self, DocLayout, NUMBER_GUTTER, NUMBER_SIZE};
 use crate::document::{ATOM, Block, Inline, math_layout, math_paint};
 use crate::renderer::Rounding;
 use crate::theme::{self, TextStyle};
 
+use super::geometry::NOTE_COLUMN;
+use super::notes::Placed;
 use super::paginate::{Page, Piece};
-use crate::canvas::Canvas;
+use crate::canvas::{self, Canvas, Offset};
 
 /// A divider's hairline. Not rounded to a whole pixel the way the editor
 /// rounds it: that is a defence against a 1px rule smearing across two rows
@@ -38,6 +41,78 @@ pub fn page(
 ) {
     for piece in &page.pieces {
         block(canvas, layout, piece, numbers, width);
+    }
+}
+
+/// The margin column: every note this page carries, beside the line that
+/// anchored it. Where each sits is [`super::notes::place`]'s decision; this
+/// only draws them.
+///
+/// The screen's margin also fills a background and rules its left edge.
+/// Neither is drawn here: they are the *panel's* — full height whether or
+/// not a note is near, and a page has no panels. The tick beside each note
+/// is the document's own cue, and that one stays.
+pub fn notes(canvas: &mut dyn Canvas, notes: &[Placed]) {
+    for note in notes {
+        canvas::rule(
+            canvas,
+            (NOTE_COLUMN, note.y + sidenotes::TICK_TOP),
+            sidenotes::TICK_LENGTH,
+            sidenotes::TICK_THICKNESS,
+            // The margin tints the focused note's tick with the accent. A
+            // page has no focus, so every tick is the quiet one.
+            theme::border(),
+        );
+        canvas.draw_text(
+            &note.marker,
+            (
+                NOTE_COLUMN + sidenotes::MARKER_X,
+                note.y + sidenotes::MARKER_TOP,
+            ),
+            &sidenotes::marker_style(),
+            theme::LEFT,
+        );
+
+        // The body is a document in its own right — its own `DocLayout`, at
+        // the margin's width and scale, starting at (0, 0) — so it draws
+        // through the same painter the page does, on a canvas whose origin
+        // has been moved to the note. Nothing below here knows it is in a
+        // margin, which is why a note can hold anything the page can.
+        let body = whole(&note.layout);
+        // A heading inside a note is not a section of the document, so it
+        // gets no auto-number. Notes are one paragraph today; this is what
+        // stays right on the day they are not.
+        let numbers = vec![None; note.layout.source.len()];
+        let mut inner = Offset::new(canvas, (NOTE_COLUMN + sidenotes::NOTE_INSET, note.y));
+        page(
+            &mut inner,
+            &note.layout,
+            &body,
+            &numbers,
+            sidenotes::NOTE_WIDTH,
+        );
+    }
+}
+
+/// A whole layout as one page: every block, all of its lines, where its own
+/// layout put them.
+///
+/// What a sidenote's body is — a small document that never paginates,
+/// because the page it belongs to was settled by its anchor. Expressing it
+/// as a `Page` is what lets it reuse [`page`] rather than needing a second
+/// walk over `DocLayout`.
+fn whole(layout: &DocLayout) -> Page {
+    Page {
+        pieces: layout
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(block, laid)| Piece {
+                block,
+                lines: 0..laid.lines.len(),
+                y: laid.lines.first().map_or(laid.y, |line| line.y),
+            })
+            .collect(),
     }
 }
 
@@ -201,10 +276,26 @@ fn line(
                 });
                 math_paint::draw(canvas, &box_, (cursor, baseline), false);
             }
-            // Anchors and references have their own drawing — `PDF.md` §6.
-            // Their width is already reserved above, so the runs around
-            // them sit where the editor puts them even before they draw.
-            Inline::Note(_) | Inline::EqRef(_) => {}
+            // A sidenote's anchor: the raised number, matching the marker
+            // beside the note itself out in the margin. Raised rather than
+            // superscripted — it is the line's own text set small and
+            // lifted, which is what `advance` reserved room for.
+            Inline::Note(_) => {
+                canvas.draw_text(
+                    &text,
+                    (cursor, baseline - layout::ANCHOR_RISE),
+                    &layout::anchor_style(),
+                    theme::LEFT,
+                );
+            }
+            // An equation reference: `(n)` when it resolves, and the raw
+            // `@eq:label` set small and muted when it does not. Never
+            // silently absent — an unresolved reference on a page is a
+            // typo the reader can see rather than a hole they cannot.
+            Inline::EqRef(_) => {
+                let style = layout::eq_ref_style(&text, layout.scale);
+                canvas.draw_text(&text, (cursor, baseline), &style, theme::LEFT);
+            }
         }
         cursor += width;
     }
@@ -299,23 +390,6 @@ mod tests {
         layout::layout(&document, width, &|value, _| {
             value.chars().count() as f32 * GLYPH
         })
-    }
-
-    /// Every block on one page, the way `paginate` hands them over when the
-    /// whole document fits.
-    fn whole(layout: &DocLayout) -> Page {
-        Page {
-            pieces: layout
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(block, laid)| Piece {
-                    block,
-                    lines: 0..laid.lines.len(),
-                    y: laid.lines.first().map_or(0.0, |line| line.y),
-                })
-                .collect(),
-        }
     }
 
     fn paint(layout: &DocLayout, page: &Page, width: f32) -> Recorder {
@@ -535,5 +609,157 @@ mod tests {
             layout.blocks[0].lines[1].height * 0.5,
             "the piece's first line sits at the page's top, not the document's"
         );
+    }
+
+    #[test]
+    fn an_anchor_draws_its_number_raised_above_the_line() {
+        let layout = laid_out(
+            vec![Block::Paragraph(vec![
+                text("see"),
+                Inline::Note("aside".into()),
+            ])],
+            500.0,
+        );
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let (Some(Call::Text { at: word, .. }), Some(Call::Text { at, size, .. })) =
+            (painted.saying("see"), painted.saying("1"))
+        else {
+            panic!("the anchor draws its number, got {:?}", painted.calls);
+        };
+        assert_eq!(
+            at.1,
+            word.1 - layout::ANCHOR_RISE,
+            "an anchor is lifted off the line it sits on"
+        );
+        assert!(*size < 17.5, "an anchor is set smaller than the prose");
+        assert_eq!(
+            at.0,
+            3.0 * GLYPH,
+            "the anchor starts where the run before it ends"
+        );
+    }
+
+    #[test]
+    fn a_resolved_equation_reference_draws_its_number_in_the_prose() {
+        let layout = laid_out(
+            vec![
+                equation(),
+                Block::Paragraph(vec![text("by "), Inline::EqRef("eq:one".into())]),
+            ],
+            500.0,
+        );
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        // Twice: once hung in the band's margin, once in the sentence — and
+        // the sentence's is the one on the baseline of the prose after it.
+        let refs: Vec<&Call> = painted
+            .texts()
+            .into_iter()
+            .filter(|call| matches!(call, Call::Text { text, .. } if text == "(1)"))
+            .collect();
+        assert_eq!(refs.len(), 2, "band number and inline reference");
+        assert!(
+            refs.iter().any(
+                |call| matches!(call, Call::Text { at, align, .. } if at.0 == 3.0 * GLYPH && *align == theme::LEFT)
+            ),
+            "the reference sits after the words it follows, got {:?}",
+            painted.calls
+        );
+    }
+
+    #[test]
+    fn an_unresolved_equation_reference_keeps_its_raw_spelling() {
+        // Never silently absent: a typo a reader can see beats a hole they
+        // cannot.
+        let layout = laid_out(
+            vec![Block::Paragraph(vec![Inline::EqRef("eq:nope".into())])],
+            500.0,
+        );
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        assert!(
+            painted.saying("@eq:nope").is_some(),
+            "got {:?}",
+            painted.calls
+        );
+    }
+
+    /// One note in the margin, with `body` as its text, placed at `y`.
+    fn placed(body: &str, y: f32) -> Placed {
+        Placed {
+            marker: "1".into(),
+            layout: layout::layout_blocks(
+                &[Block::Paragraph(vec![text(body)])],
+                sidenotes::NOTE_WIDTH,
+                sidenotes::SCALE,
+                &|value, _| value.chars().count() as f32 * GLYPH,
+            ),
+            y,
+        }
+    }
+
+    fn paint_notes(notes: &[Placed]) -> Recorder {
+        let mut recorder = Recorder::default();
+        super::notes(&mut recorder, notes);
+        recorder
+    }
+
+    #[test]
+    fn a_notes_body_is_drawn_out_in_the_margin_column() {
+        let painted = paint_notes(&[placed("aside", 100.0)]);
+        let Some(Call::Text { at, .. }) = painted.saying("aside") else {
+            panic!("the note's body is painted, got {:?}", painted.calls);
+        };
+        assert_eq!(
+            at.0,
+            NOTE_COLUMN + sidenotes::NOTE_INSET,
+            "the body is inset inside the margin, past the marker"
+        );
+        assert!(
+            at.0 > crate::components::editor::MEASURE,
+            "the margin is beside the text column, not inside it"
+        );
+    }
+
+    #[test]
+    fn a_notes_marker_and_tick_sit_at_the_margins_edge() {
+        let painted = paint_notes(&[placed("aside", 100.0)]);
+        let Some(Call::Text { at, .. }) = painted.saying("1") else {
+            panic!("the note's marker is painted, got {:?}", painted.calls);
+        };
+        assert_eq!(
+            at,
+            &(
+                NOTE_COLUMN + sidenotes::MARKER_X,
+                100.0 + sidenotes::MARKER_TOP
+            )
+        );
+        assert!(
+            painted.calls.contains(&Call::Rectangle {
+                at: (NOTE_COLUMN, 100.0 + sidenotes::TICK_TOP),
+                size: (sidenotes::TICK_LENGTH, sidenotes::TICK_THICKNESS),
+            }),
+            "the tick beside the note is drawn, got {:?}",
+            painted.calls
+        );
+    }
+
+    #[test]
+    fn a_note_draws_where_it_was_placed_and_nowhere_else() {
+        // The body's own layout starts at zero; what puts it beside its
+        // anchor is the offset canvas, so moving the note must move every
+        // line of it by exactly the same amount.
+        let high = paint_notes(&[placed("aside", 100.0)]);
+        let low = paint_notes(&[placed("aside", 340.0)]);
+        let (Some(Call::Text { at: a, .. }), Some(Call::Text { at: b, .. })) =
+            (high.saying("aside"), low.saying("aside"))
+        else {
+            panic!("both are painted");
+        };
+        assert!((b.1 - a.1 - 240.0).abs() < 0.001, "moved by {}", b.1 - a.1);
+        assert_eq!(a.0, b.0, "moving a note down must not move it across");
+    }
+
+    #[test]
+    fn a_page_with_no_notes_draws_no_margin() {
+        assert!(paint_notes(&[]).calls.is_empty());
     }
 }

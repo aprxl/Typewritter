@@ -36,6 +36,33 @@ const NOTE_RIGHT_MARGIN: f32 = 16.0;
 /// The note text column's width — what each note's layout is laid out at.
 pub const NOTE_WIDTH: f32 = WIDTH - NOTE_INSET - NOTE_RIGHT_MARGIN;
 
+// The tick beside a note, and the marker above it. Short and small enough to
+// read as punctuation rather than as a rule — the rule is the vertical one at
+// the margin's own edge. The page draws both from these too, so a note in an
+// export sits where a note on screen sits.
+
+/// How far below the note's top the tick starts.
+pub const TICK_TOP: f32 = 8.0;
+pub const TICK_LENGTH: f32 = 14.0;
+pub const TICK_THICKNESS: f32 = 1.0;
+
+/// The marker's left edge, from the margin column's.
+pub const MARKER_X: f32 = 20.0;
+/// The marker's top, from the note's.
+pub const MARKER_TOP: f32 = 4.0;
+const MARKER_SIZE: f32 = 10.0;
+
+/// The ink a note's marker draws with. The accent, matching the anchor in
+/// the prose it answers, so the eye pairs the two without counting.
+///
+/// A function rather than a constant because the colour is the theme's, and
+/// the theme is read when it is drawn — the same shape as
+/// [`layout::anchor_style`](crate::document::layout::anchor_style), which is
+/// the other half of this pair.
+pub fn marker_style() -> TextStyle {
+    TextStyle::serif(MARKER_SIZE, theme::accent())
+}
+
 /// The editor metrics a note draws with: the margin's own insets and measure,
 /// no page furniture. An editor embedded in the margin fills no background;
 /// its container already painted. The focused note's editor still draws the
@@ -181,12 +208,18 @@ impl Component for SidenoteMargin {
             } else {
                 theme::border()
             };
-            theme::rule(layer, (rect.x, y + 8.0), 14.0, 1.0, tick);
+            theme::rule(
+                layer,
+                (rect.x, y + TICK_TOP),
+                TICK_LENGTH,
+                TICK_THICKNESS,
+                tick,
+            );
             theme::draw(
                 layer,
                 &note.marker,
-                (rect.x + 20.0, y + 4.0),
-                &TextStyle::serif(10.0, theme::accent()),
+                (rect.x + MARKER_X, y + MARKER_TOP),
+                &marker_style(),
                 theme::LEFT,
             );
             // The note editor draws into the note's own placed rectangle,

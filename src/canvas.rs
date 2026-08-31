@@ -92,6 +92,62 @@ pub fn outline(canvas: &mut dyn Canvas, rect: Rect, color: Color) {
     );
 }
 
+/// Another canvas with the origin moved. Everything drawn through it lands
+/// `by` further along, and nothing drawn through it knows.
+///
+/// What this buys is a painter that only ever works in *its own* top-left
+/// coordinates: a sidenote's body is a small `DocLayout` that starts at
+/// `(0, 0)` like any other, and putting it in the margin is wrapping the
+/// canvas rather than threading an origin through every function that draws
+/// a piece of it. Sizes, radii and alignment are untouched — this moves the
+/// origin, it does not scale or transform.
+pub struct Offset<'a> {
+    canvas: &'a mut dyn Canvas,
+    by: (f32, f32),
+}
+
+impl<'a> Offset<'a> {
+    pub fn new(canvas: &'a mut dyn Canvas, by: (f32, f32)) -> Self {
+        Self { canvas, by }
+    }
+
+    fn at(&self, point: (f32, f32)) -> (f32, f32) {
+        (point.0 + self.by.0, point.1 + self.by.1)
+    }
+}
+
+impl Canvas for Offset<'_> {
+    fn draw_rectangle(
+        &mut self,
+        at: (f32, f32),
+        size: (f32, f32),
+        color: Color,
+        rounding: Rounding,
+    ) {
+        let at = self.at(at);
+        self.canvas.draw_rectangle(at, size, color, rounding);
+    }
+
+    fn draw_circle(&mut self, center: (f32, f32), radius: f32, color: Color) {
+        let center = self.at(center);
+        self.canvas.draw_circle(center, radius, color);
+    }
+
+    fn draw_path(&mut self, d: &str, at: (f32, f32), rotation: f32, paint: &PathPaint) {
+        let at = self.at(at);
+        self.canvas.draw_path(d, at, rotation, paint);
+    }
+
+    fn draw_text(&mut self, text: &str, at: (f32, f32), style: &TextStyle, align: Alignment) {
+        let at = self.at(at);
+        self.canvas.draw_text(text, at, style, align);
+    }
+
+    fn measure(&self, text: &str, style: &TextStyle) -> f32 {
+        self.canvas.measure(text, style)
+    }
+}
+
 /// The screen. Every method forwards to the [`Layer`] call it is named
 /// after, so a shared painter drawing through a `Canvas` queues exactly the
 /// draw commands one holding the `Layer` itself would.

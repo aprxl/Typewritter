@@ -16,6 +16,7 @@
 //! similar ones.
 
 mod geometry;
+mod notes;
 mod paginate;
 mod paint;
 mod pdf;
@@ -29,7 +30,7 @@ use crate::components::editor::MEASURE;
 use crate::document::layout::{self, DocLayout};
 use crate::document::{Block, Document};
 use crate::renderer::Layer;
-use crate::theme::{self, Theme};
+use crate::theme::{self, TextStyle, Theme};
 
 pub use geometry::{PageGeometry, Paper};
 
@@ -97,15 +98,27 @@ pub fn render(document: &Document, layer: &Layer, options: Options) -> Result<Ve
     let restore = theme::current();
     theme::set(options.theme);
 
-    let geometry = PageGeometry::plain(options.paper);
-    let layout = lay_out(document, layer, &geometry);
+    let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+    let layout = lay_out(document, &measure);
+    // Both geometries lay the text column out at `MEASURE`, so the layout
+    // above is the same either way and the choice can wait until after it.
+    // Only the sheet under it changes: a document with notes needs room
+    // beside its column, and pays for it in scale (`PDF.md` §2, decision 2).
+    let geometry = if notes::present(document, &layout) {
+        PageGeometry::noted(options.paper)
+    } else {
+        PageGeometry::plain(options.paper)
+    };
     let pages = paginate::paginate(&layout, &geometry);
+    // After pagination, never before: a note follows its anchor onto
+    // whichever page the prose put it on, and never moves the prose.
+    let placed = notes::place(document, &layout, &pages, geometry.content_height, &measure);
     let numbers = heading_numbers(&layout);
 
     let shaper = text::Shaper::new(layer);
     let mut fonts = pdf::Fonts::default();
     let mut pdf = krilla::Document::new();
-    for page in &pages {
+    for (page, notes) in pages.iter().zip(&placed) {
         let settings = PageSettings::new(
             krilla::geom::Size::from_wh(geometry.paper.width, geometry.paper.height)
                 .expect("a sheet has a positive size"),
@@ -113,6 +126,7 @@ pub fn render(document: &Document, layer: &Layer, options: Options) -> Result<Ve
         let mut sheet = pdf.start_page_with(settings);
         let mut canvas = pdf::PdfCanvas::new(sheet.surface(), &shaper, layer, &mut fonts, geometry);
         paint::page(&mut canvas, &layout, page, &numbers, geometry.content_width);
+        paint::notes(&mut canvas, notes);
     }
 
     let bytes = pdf.finish();
@@ -122,23 +136,23 @@ pub fn render(document: &Document, layer: &Layer, options: Options) -> Result<Ve
 
 /// The document's layout at the page's column width.
 ///
-/// Not the editor's cached one: folds are a reading aid, and a collapsed
-/// section prints in full (`PDF.md` §2, decision 3), so the layout the page
-/// paginates is taken from a copy with every fold opened.
-fn lay_out(document: &Document, layer: &Layer, geometry: &PageGeometry) -> DocLayout {
+/// [`MEASURE`] and not a page-derived width: the editor's column is a fixed
+/// number of pixels, so laying out at exactly that number is what makes the
+/// page's line breaks the editor's, character for character. Every
+/// [`PageGeometry`] agrees — they differ in how large that column prints,
+/// never in how wide it is.
+///
+/// Not the editor's cached layout either: folds are a reading aid, and a
+/// collapsed section prints in full (`PDF.md` §2, decision 3), so this is
+/// taken from a copy with every fold opened.
+fn lay_out(document: &Document, measure: &dyn Fn(&str, &TextStyle) -> f32) -> DocLayout {
     let mut unfolded = document.clone();
     for block in unfolded.body_mut() {
         if let Block::Heading { folded, .. } = block {
             *folded = false;
         }
     }
-    debug_assert_eq!(
-        geometry.content_width, MEASURE,
-        "the page is laid out at the editor's measure or its lines break elsewhere"
-    );
-    layout::layout(&unfolded, geometry.content_width, &|text, style| {
-        theme::width(layer, text, style)
-    })
+    layout::layout(&unfolded, MEASURE, measure)
 }
 
 /// The heading auto-numbers, derived the way the editor derives them —

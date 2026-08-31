@@ -128,17 +128,28 @@ PageGeometry::plain()                 no sidenotes
     top/bottom 72 pt each
     content    697.89 pt  =  1107.8 px  ≈  37 body lines
 
-PageGeometry::noted()                 sidenotes present — NOT YET BUILT
+PageGeometry::noted()                 sidenotes present
     spread     MEASURE + RIGHT_MARGIN + sidenotes::WIDTH
                634 + 24 + 215  =  873 px
     side       40 pt
     pt_per_px  (595.276 − 80) / 873  =  0.590   → body 10.3 pt
+    content    697.89 pt  =  1182.4 px  ≈  39 body lines
+    NOTE_COLUMN  = MEASURE + RIGHT_MARGIN = 658 px, the margin's left edge
 ```
 
+`content_width` is `MEASURE` in both. The spread is wider, the column is
+not: the page's line breaks are the editor's character for character, and
+the margin hangs off the column's right edge rather than eating into it.
+That is also why the geometry can be chosen *after* the layout pass —
+`notes::present` needs the anchors, and the anchors need a layout, and the
+layout is the same either way.
+
 `noted()` prints smaller, which is the honest trade: a page carrying
-sidenotes carries more. If it reads too small in practice the escape hatch
-is the paper, not the scale — landscape A4 or A3 — and that is a
-`Paper` field, not a redesign.
+sidenotes carries more. The scale is derived rather than picked — the
+spread is a fixed number of pixels and the sheet a fixed number of points,
+so exactly one number makes them meet. If it reads too small in practice
+the escape hatch is the paper, not the scale — landscape A4 or A3 — and
+that is a `Paper` field, not a redesign.
 
 **The page is the only place `pt` exists.** Everything upstream —
 pagination, painting, every constant in `paint.rs` — is in the editor's
@@ -174,6 +185,7 @@ Everything lives in `src/export/`. One concern per file, per AGENTS.md.
 | `export/geometry.rs` | `Paper`, `PageGeometry`, px → pt. The only file that says `pt` |
 | `export/text.rs` | `Shaper`: measurement and shaped glyph runs from the app's text stack |
 | `export/paginate.rs` | `Piece`, `Page`, `paginate`. Where a page breaks and what lands on it |
+| `export/notes.rs` | `Placed`, `place`. Which sidenote is on which page, and where down it |
 | `export/paint.rs` | `DocLayout` → `Canvas` calls. **The extension point** |
 | `export/pdf.rs` | `PdfCanvas` — the krilla backend, and the font cache that feeds it |
 
@@ -181,7 +193,7 @@ Two of them are not under `export/`, because they are not the exporter's:
 
 | File | Owns |
 |---|---|
-| `src/canvas.rs` | The `Canvas` trait, `impl` for `&Layer`, and the `rule`/`outline` helpers |
+| `src/canvas.rs` | The `Canvas` trait, `impl` for `&Layer`, `Offset`, and the `rule`/`outline` helpers |
 | `src/document/math_paint.rs` | Drawing a `MathBox`. Called by the editor *and* the page |
 
 Plus, in the vendored platform:
@@ -212,6 +224,12 @@ this file.
 draws the glyphs is the only thing that can say how wide they are — and
 because it lets a painter be tested against a recording canvas with no GPU
 behind it, which is how every test in `paint.rs` runs.
+
+`Offset` is a `Canvas` wrapping another with the origin moved. It exists so
+a sub-document — a sidenote's body — can be drawn by the same painter
+without threading an origin through every function that draws a piece of
+it. Nothing below an `Offset` knows it is not at `(0, 0)`, which is what
+lets a note hold anything the page can.
 
 ---
 
@@ -309,7 +327,8 @@ Rules, in order:
    break — a page never opens with leading whitespace.
 
 Rules 1–3 and 5 exist today; 4 arrives next, and the code half of 3 with
-the code row of §6.
+the code row of §6. Sidenotes add a sixth that is not about height at all
+— see below.
 
 Rule 3 yields to the loop's own hang guard: a block too tall for any page
 takes the page it is on and overflows, atomic or not, because the
@@ -321,6 +340,37 @@ Folded blocks are expanded before pagination (decision 3), so
 means export cannot use the editor's `DocLayout`** — the shell's cached
 one has folds applied. Export lays out its own from a fold-cleared copy of
 the document.
+
+### Sidenotes repaginate
+
+`SPEC` §10: *a sidenote near a break travels with its anchor*. That is the
+whole rule, and it makes `export/notes.rs` a consequence of pagination
+rather than an input to it — the break is decided by the prose alone, and
+a note follows whichever side of it its anchor's line ended up on.
+**Nothing in `notes.rs` can move a line of text.** It runs after
+`paginate`, never before.
+
+An anchor belongs to a `Piece` when its line index is inside
+`piece.lines` — not merely when its block is the piece's, since a
+paragraph split across a break has anchors on both sides.
+`Anchor::line` carries that index, filled in by `layout` from the same
+lookup that fills in `Anchor::y`, so the two cannot name different lines.
+
+Within a page, `notes::settle` stacks them:
+
+- **Forward** is `sidenotes::stack`, the margin's own — each note at its
+  anchor, pushed down past the one above, never up. Shared rather than
+  reimplemented, so two crowded notes crowd the same way on paper as on
+  screen.
+- **Backward** is the page's addition, and only runs when the stack
+  overruns the bottom. A screen scrolls, so a note pushed past the fold is
+  still readable; a sheet ends, so the same note is gone. Pulling the
+  stack back up can leave a note slightly *above* its anchor — the one
+  place the margin's rule is broken, and the only alternative to losing
+  it.
+- **Overfull** — more notes than the page can hold — starts flush at the
+  top and overflows the bottom visibly, the way `paginate` lets an
+  unfittable line overflow rather than hang.
 
 ---
 
@@ -364,12 +414,12 @@ thing would be indirection with no reader.
 | bold / italic / plain runs | ✅ shared | ✅ | — |
 | Divider | ✅ shared | ✅ | ✅ |
 | Math, inline and display | ✅ shared | ✅ shared | ✅ |
-| Equation numbers | ✅ shared | ✅ | — |
+| Equation numbers, `@eq:` references | ✅ shared | ✅ | — |
 | Inline code, code blocks | ✅ shared | ⬜ | keep-together ⬜ |
 | Lists: bullet, number, task | ✅ shared | ⬜ | ✅ |
 | Badges | ✅ shared | ⬜ | — |
 | Highlights | ✅ shared | ⬜ | — |
-| Sidenotes | ✅ shared | ⬜ | repaginate ⬜ |
+| Sidenotes (anchor, marker, body) | ✅ shared | ✅ | ✅ travels with its anchor |
 | Images | — | ⬜ | ⬜ |
 
 Every ⬜ in the Paint column prints its **text** correctly today and only
@@ -400,6 +450,11 @@ product works at every step, and each row above is one commit.
 - **`equation_numbers` and `anchors` are derived by `layout`, and heading
   numbers by `outline::outline`.** Export derives all three the same way
   the editor does. Never store them.
+- **A single-glyph run gets no `ActualText` span.** krilla emits one only
+  for runs it has something to say about, so an anchor's `1` and a note's
+  marker appear in the content stream as a bare `Tf … Tm(…)Tj` with no
+  `/Span` around them. Grepping the stream for `ActualText` will report
+  them missing when they are there; count `BT` blocks instead.
 - **`cargo check` proves nothing about output.** Nor does the suite: the
   painter's tests run against a recording canvas with no font behind it, so
   they check *what is drawn where* and can say nothing about what came out.
