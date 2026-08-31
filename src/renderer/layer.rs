@@ -35,6 +35,7 @@ use super::path_paint::{FillRule, LineCap, LineJoin, PathPaint, Stroke};
 use super::pixels::Pixels;
 use super::rounding::Rounding;
 use super::shader::ShaderEffect;
+use super::shaped_text::{FaceId, ShapedText};
 use super::text_stack::TextStack;
 use super::{Alignment, Font, FontParameters, TextSpan, Vertex};
 
@@ -3263,6 +3264,44 @@ impl Layer {
             .borrow_mut()
             .measure(text, font, &scaled);
         (width / s, height / s)
+    }
+
+    /// The glyphs behind [`Layer::get_text_size`], for a caller that has
+    /// to place them somewhere this layer won't draw — an exporter, not a
+    /// widget. See `shaped_text.rs` for what is and isn't baked into the
+    /// positions.
+    ///
+    /// Scaled into physical pixels for shaping and divided back out, the
+    /// same as `get_text_size`, so a glyph's `x` and the width a caller
+    /// wrapped on come from one number.
+    pub fn shape_text(
+        &self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> ShapedText {
+        let s = self.scale_factor();
+        let scaled = font_parameters.scaled(s);
+        let mut shaped = self
+            .0
+            .borrow()
+            .text_stack
+            .borrow_mut()
+            .shape_run(text, font, &scaled);
+        for glyph in &mut shaped.glyphs {
+            glyph.x /= s;
+            glyph.advance /= s;
+        }
+        shaped.baseline /= s;
+        shaped.size = (shaped.size.0 / s, shaped.size.1 / s);
+        shaped
+    }
+
+    /// The font file backing one of [`ShapedText`]'s faces, and its index
+    /// within that file. For embedding the face that was actually drawn
+    /// with — including whichever one shaping fell back to.
+    pub fn face_data(&self, face: FaceId) -> Option<(Vec<u8>, u32)> {
+        self.0.borrow().text_stack.borrow().face_data(face)
     }
 
     /// Draw multiple independently-styled runs of text as one logical

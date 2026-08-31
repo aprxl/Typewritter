@@ -35,6 +35,7 @@ mod path_paint;
 mod pixels;
 mod rounding;
 mod shader;
+mod shaped_text;
 mod text_span;
 mod text_stack;
 
@@ -48,6 +49,7 @@ pub use color::Rgba;
 pub use color::{Color, GradientDirection, to_linear};
 pub use font::Font;
 pub use font_parameters::FontParameters;
+pub use glyph_effects::effect_advance_delta;
 pub use layer::{Layer, LayerInvalidation};
 // Same story as `PathFileError` below: only bins that actually clip by
 // shape touch it.
@@ -61,6 +63,7 @@ pub use path_paint::{FillRule, LineCap, LineJoin, PathPaint, Stroke};
 pub use pixels::Pixels;
 pub use rounding::Rounding;
 pub use shader::{ColorMatrix, ShaderEffect};
+pub use shaped_text::{FaceId, ShapedGlyph, ShapedText};
 pub use text_span::TextSpan;
 
 /// MSAA sample count for every layer's own render pass (the solid, image,

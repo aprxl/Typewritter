@@ -133,6 +133,15 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.open_finder(),
     },
     Command {
+        id: "file.export_pdf",
+        title: "Export as PDF",
+        group: "File",
+        // No chord: it opens a file dialog and can take a moment on a long
+        // note, which is not something a hand should be able to trip into.
+        chord: None,
+        run: |shell| shell.export_pdf(),
+    },
+    Command {
         id: "file.close",
         title: "Close note",
         group: "File",
