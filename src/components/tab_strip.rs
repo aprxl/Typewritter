@@ -124,7 +124,12 @@ impl Component for TabStrip {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(rect.position(), rect.size(), theme::chrome(), Rounding::NONE);
+        layer.draw_rectangle(
+            rect.position(),
+            rect.size(),
+            theme::chrome(),
+            Rounding::NONE,
+        );
         theme::rule(
             layer,
             (rect.x, rect.bottom() - 1.0),

@@ -10,10 +10,12 @@ pub mod input;
 pub mod renderer;
 
 // Typewritter's own.
+pub mod canvas;
 pub mod clipboard;
 pub mod components;
 pub mod config;
 pub mod document;
+pub mod export;
 pub mod layout;
 pub mod prose;
 pub mod search;

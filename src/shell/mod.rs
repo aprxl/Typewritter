@@ -50,6 +50,7 @@ use crate::document::layout::{ContextHit, DocLayout, RangeKind, layout_blocks};
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_conversion;
 use crate::document::outline;
+use crate::export;
 use crate::frame::FrameScheduler;
 use crate::input::Input;
 use crate::layout::{Layout, NodeId, Rect, Size, Style};
@@ -988,6 +989,35 @@ impl Shell {
             return None;
         }
         Some(self.autosave_last_attempt + AUTOSAVE_IDLE)
+    }
+
+    /// Renders the active note to a PDF the reader picks a place for.
+    ///
+    /// Measuring and shaping go through the text region's own layer, which
+    /// is what makes the page break its lines exactly where the editor does
+    /// — see `PDF.md` §4. That makes this synchronous and main-thread, which
+    /// is fine: it is an export, not a keystroke.
+    fn export_pdf(&mut self) {
+        let (document, name) = {
+            let docs = self.docs.borrow();
+            let Some(tab) = docs.active() else {
+                return;
+            };
+            (tab.document.clone(), tab.name().to_string())
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export as PDF")
+            .set_file_name(format!("{name}.pdf"))
+            .add_filter("PDF", &["pdf"])
+            .save_file()
+        else {
+            return;
+        };
+        let layer = self.regions[self.text_region].layer();
+        if let Err(error) = export::export_pdf(&document, layer, &path, export::Options::default())
+        {
+            eprintln!("PDF export failed for {}: {error}", path.display());
+        }
     }
 
     /// Writes every dirty tab now, for the window-close path. Failures are

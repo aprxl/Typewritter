@@ -65,7 +65,12 @@ impl Component for Breadcrumb {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(rect.position(), rect.size(), theme::chrome(), Rounding::NONE);
+        layer.draw_rectangle(
+            rect.position(),
+            rect.size(),
+            theme::chrome(),
+            Rounding::NONE,
+        );
         theme::hover_fill(layer, rect, self.hover.value());
         theme::rule(
             layer,

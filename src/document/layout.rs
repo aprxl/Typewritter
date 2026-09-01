@@ -169,6 +169,12 @@ pub struct Anchor {
     pub label: String,
     /// The raised number shown, "1".."n" in document order.
     pub number: String,
+    /// Which of the block's visual lines the anchor sits on, and `None` when
+    /// the block is folded away and has no lines to sit on. The export reads
+    /// this to decide which page a note travels to, because a page break
+    /// falls between lines and the y alone cannot say which side of one an
+    /// anchor is on.
+    pub line: Option<usize>,
     /// The y of the anchor's visual line, in document coordinates.
     pub y: f32,
 }
@@ -511,6 +517,7 @@ pub fn layout_blocks(
                     inline,
                     label: label.clone(),
                     number: ordinal,
+                    line: None,
                     y: 0.0,
                 });
             }
@@ -729,10 +736,14 @@ pub fn layout_blocks(
         }
     }
 
-    // A note sits beside the line its anchor is on, and that line's y is only
-    // known after the block is laid out — fill it in now that the lines exist.
+    // A note sits beside the line its anchor is on, and that line is only
+    // known after the block is laid out — fill it in now that the lines
+    // exist. The index and the y come from the same lookup, so they cannot
+    // name two different lines.
     for anchor in &mut anchors {
-        anchor.y = anchor_y(&laid[anchor.block], anchor.inline);
+        let block = &laid[anchor.block];
+        anchor.line = anchor_line(block, anchor.inline);
+        anchor.y = anchor.line.map_or(block.y, |index| block.lines[index].y);
     }
 
     DocLayout {
@@ -745,16 +756,17 @@ pub fn layout_blocks(
     }
 }
 
-/// The y of the visual line the anchor `inline` sits on, in document
-/// coordinates — the same space the editor scrolls in. A note in the margin
-/// starts at this y, so it sits beside the sentence that anchored it.
-fn anchor_y(block: &BlockLayout, inline: usize) -> f32 {
-    for line in &block.lines {
-        if line.segments.iter().any(|segment| segment.inline == inline) {
-            return line.y;
-        }
-    }
-    block.y
+/// Which visual line the anchor `inline` sits on. A note in the margin starts
+/// at that line's y, so it sits beside the sentence that anchored it.
+///
+/// `None` when no line carries the run, which today means the block is folded
+/// away and has none. The margin does not draw a note for a hidden anchor and
+/// the export expands every fold before it lays out, so neither ever asks.
+fn anchor_line(block: &BlockLayout, inline: usize) -> Option<usize> {
+    block
+        .lines
+        .iter()
+        .position(|line| line.segments.iter().any(|segment| segment.inline == inline))
 }
 
 /// A heading block's level; every caller has already matched the variant.

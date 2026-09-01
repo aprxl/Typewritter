@@ -45,6 +45,7 @@ use super::draw_command::DrawCommand;
 use super::font::Font;
 use super::font_parameters::FontParameters;
 use super::glyph_effects::{EffectGlyphs, GlyphEffect, effect_advance_delta};
+use super::shaped_text::{FaceId, ShapedGlyph, ShapedText};
 use super::text_span::TextSpan;
 use super::{Alignment, HorizontalAlign, VerticalAlign};
 
@@ -262,6 +263,61 @@ impl TextStack {
         let key = self.ensure_shaped(text, font, font_parameters);
         let effect = GlyphEffect::from(font_parameters);
         measure_shaped_buffer_with(&self.shape_cache[&key].buffer, |_| effect)
+    }
+
+    /// The glyphs behind [`TextStack::measure`], for a caller that has to
+    /// place them itself — see `shaped_text.rs`. Shares the shape cache
+    /// with measuring and drawing, so asking for a string's glyphs after
+    /// measuring it costs a lookup, not a second shaping.
+    ///
+    /// Only the first layout run is returned: this mirrors `draw_text`,
+    /// whose buffers are built unbounded (`set_size(None, None)`) and so
+    /// wrap only where the string itself has a newline. A caller drawing
+    /// multi-line text draws it a line at a time, the way the editor does.
+    pub(super) fn shape_run(
+        &mut self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> ShapedText {
+        let key = self.ensure_shaped(text, font, font_parameters);
+        let effect = GlyphEffect::from(font_parameters);
+        let buffer = &self.shape_cache[&key].buffer;
+        let size = measure_shaped_buffer_with(buffer, |_| effect);
+        let Some(run) = buffer.layout_runs().next() else {
+            return ShapedText {
+                glyphs: Vec::new(),
+                baseline: 0.0,
+                size,
+            };
+        };
+        let glyphs = run
+            .glyphs
+            .iter()
+            .map(|glyph| ShapedGlyph {
+                face: FaceId(glyph.font_id),
+                glyph: glyph.glyph_id,
+                x: glyph.x,
+                advance: glyph.w,
+                cluster: glyph.start,
+            })
+            .collect();
+        ShapedText {
+            glyphs,
+            baseline: run.line_y,
+            size,
+        }
+    }
+
+    /// The font file backing `face`, and its index within that file — what
+    /// an exporter needs to embed the face it was actually drawn with.
+    /// Copies, since `fontdb` only lends the data for the callback's
+    /// lifetime; callers are expected to do this once per face, not per
+    /// run.
+    pub(super) fn face_data(&self, face: FaceId) -> Option<(Vec<u8>, u32)> {
+        self.font_system
+            .db()
+            .with_face_data(face.0, |data, index| (data.to_vec(), index))
     }
 
     /// Look up (or shape and insert) the cached buffer for one
