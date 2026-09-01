@@ -80,6 +80,13 @@ pub struct Command {
 const CTRL: ModifiersState = ModifiersState::CONTROL;
 const CTRL_SHIFT: ModifiersState = ModifiersState::CONTROL.union(ModifiersState::SHIFT);
 
+fn capture_mode_target<I>(mut panels: I) -> bool
+where
+    I: Iterator<Item = bool>,
+{
+    !panels.all(|open| open)
+}
+
 pub const COMMANDS: &[Command] = &[
     Command {
         id: "file.new",
@@ -120,10 +127,9 @@ pub const COMMANDS: &[Command] = &[
             key: KeyCode::KeyS,
         }),
         // Saving clears the dirty flags; the revision bump that follows is
-        // what the views rebuild from.
-        run: |shell| {
-            let _ = shell.docs.borrow_mut().save_active();
-        },
+        // what the views rebuild from. Failures remain visible in the status
+        // line while the tab stays open for retry.
+        run: |shell| shell.save_active(),
     },
     Command {
         id: "file.open",
@@ -149,7 +155,16 @@ pub const COMMANDS: &[Command] = &[
             mods: CTRL,
             key: KeyCode::KeyW,
         }),
-        run: |shell| shell.docs.borrow_mut().close_active(),
+        run: |shell| shell.close_active(),
+    },
+    Command {
+        id: "file.discard",
+        title: "Discard changes and close note",
+        group: "File",
+        // Deliberately palette-only: discarding is destructive and should
+        // never be a one-chord accident.
+        chord: None,
+        run: |shell| shell.discard_active(),
     },
     Command {
         id: "file.delete",
@@ -215,9 +230,9 @@ pub const COMMANDS: &[Command] = &[
         // Spec §3.2: one key to bare text and back — open if any panel is
         // closed, close all of them if every panel is already open.
         run: |shell| {
-            let any_open = shell.panels().iter().any(|p| p.open);
+            let open = capture_mode_target(shell.panels().iter().map(|p| p.open));
             for panel in shell.panels_mut() {
-                panel.set_open(!any_open);
+                panel.set_open(open);
             }
         },
     },
@@ -846,6 +861,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn capture_mode_opens_mixed_or_closed_panels_and_closes_open_ones() {
+        assert!(capture_mode_target([false, false, false].into_iter()));
+        assert!(capture_mode_target([true, false, true].into_iter()));
+        assert!(!capture_mode_target([true, true, true].into_iter()));
     }
 
     #[test]

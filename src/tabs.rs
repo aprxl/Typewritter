@@ -18,18 +18,33 @@ pub struct Tab {
     undo: Vec<Document>,
     redo: Vec<Document>,
     yank: String,
+    saved_content: String,
 }
 
 impl Tab {
     /// Loads a file into a tab, or `None` when it cannot be read.
     fn load(path: &Path, preview: bool) -> Option<Tab> {
-        Document::load(path).map(|document| Tab {
-            document,
-            preview,
-            undo: Vec::new(),
-            redo: Vec::new(),
-            yank: String::new(),
+        Document::load(path).map(|document| {
+            let saved_content = crate::document::markdown::serialize(&document);
+            Tab {
+                document,
+                preview,
+                undo: Vec::new(),
+                redo: Vec::new(),
+                yank: String::new(),
+                saved_content,
+            }
         })
+    }
+
+    fn mark_saved(&mut self) {
+        self.saved_content = crate::document::markdown::serialize(&self.document);
+        self.document.set_dirty(false);
+    }
+
+    fn refresh_dirty(&mut self) {
+        let current = crate::document::markdown::serialize(&self.document);
+        self.document.set_dirty(current != self.saved_content);
     }
 }
 
@@ -40,10 +55,14 @@ pub struct Tabs {
     pub tree_selected: Option<PathBuf>,
     /// The editor pane's scroll for the active tab, in logical pixels.
     pub editor_scroll: f32,
-    /// Bumped on every structural or content change; the shell rebuilds its
-    /// views when it moves.
+    /// Bumped on every view-visible change; the shell rebuilds snapshots when
+    /// it moves. Content has its own revision so layout caches do not expire
+    /// for caret or scroll changes.
     revision: u64,
+    content_revision: u64,
+    layout_revision: u64,
     transaction: Option<Document>,
+    pending_error: Option<String>,
 }
 
 impl Default for Tabs {
@@ -60,7 +79,10 @@ impl Tabs {
             tree_selected: None,
             editor_scroll: 0.0,
             revision: 0,
+            content_revision: 0,
+            layout_revision: 0,
             transaction: None,
+            pending_error: None,
         }
     }
 
@@ -68,8 +90,27 @@ impl Tabs {
         self.revision
     }
 
-    fn bump(&mut self) {
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
+    pub fn layout_revision(&self) -> u64 {
+        self.layout_revision
+    }
+
+    fn bump_view(&mut self) {
         self.revision += 1;
+    }
+
+    fn bump_content(&mut self) {
+        self.content_revision += 1;
+        self.layout_revision += 1;
+        self.bump_view();
+    }
+
+    fn bump_layout(&mut self) {
+        self.layout_revision += 1;
+        self.bump_view();
     }
 
     pub fn active(&self) -> Option<&Tab> {
@@ -88,7 +129,7 @@ impl Tabs {
     pub fn activate(&mut self, index: usize) {
         if index < self.tabs.len() && self.active != Some(index) {
             self.active = Some(index);
-            self.bump();
+            self.bump_view();
         }
     }
 
@@ -97,15 +138,52 @@ impl Tabs {
     pub fn set_editor_scroll(&mut self, scroll: f32) {
         if (self.editor_scroll - scroll).abs() > 0.5 {
             self.editor_scroll = scroll;
-            self.bump();
+            self.bump_view();
         }
     }
 
-    /// Ctrl+W / the tab's close button.
-    pub fn close_active(&mut self) {
-        if let Some(i) = self.active {
-            self.close(i);
+    /// Ctrl+W / the tab's close button. A failed save leaves the tab open.
+    pub fn try_close_active(&mut self) -> std::io::Result<bool> {
+        let Some(index) = self.active else {
+            return Ok(false);
+        };
+        self.try_close(index)
+    }
+
+    /// Saves a dirty tab before removing it. This keeps an edit recoverable
+    /// when the user closes a tab before autosave gets a chance to run.
+    pub fn try_close(&mut self, index: usize) -> std::io::Result<bool> {
+        if index >= self.tabs.len() {
+            return Ok(false);
         }
+
+        let was_dirty = self.tabs[index].document.is_dirty();
+        let save_error = {
+            let tab = &mut self.tabs[index];
+            if was_dirty {
+                tab.document.save().err()
+            } else {
+                None
+            }
+        };
+        if let Some(error) = save_error {
+            self.pending_error = Some(format!(
+                "close failed: {error} (Ctrl+S to retry; Discard changes to close)"
+            ));
+            return Err(error);
+        }
+        self.pending_error = None;
+        if was_dirty {
+            self.tabs[index].mark_saved();
+        }
+        self.close(index);
+        Ok(true)
+    }
+
+    /// Takes a persistence error raised by a component event, such as a tab
+    /// strip close click, so the shell can show it in the status line.
+    pub fn take_error(&mut self) -> Option<String> {
+        self.pending_error.take()
     }
 
     /// Saves the active tab, promoting the preview it is. `Ok` even when
@@ -114,11 +192,10 @@ impl Tabs {
         let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) else {
             return Ok(());
         };
-        if tab.preview {
-            tab.preview = false;
-        }
         tab.document.save()?;
-        self.bump();
+        tab.mark_saved();
+        tab.preview = false;
+        self.bump_view();
         Ok(())
     }
 
@@ -141,9 +218,11 @@ impl Tabs {
             }
             if let Err(error) = tab.document.save() {
                 failed.push((tab.document.path.clone(), error));
+            } else {
+                tab.mark_saved();
             }
         }
-        self.bump();
+        self.bump_view();
         failed
     }
 
@@ -175,7 +254,7 @@ impl Tabs {
         if let Some(i) = self.tabs.iter().position(|t| t.preview) {
             self.tabs[i] = tab;
             self.active = Some(i);
-            self.bump();
+            self.bump_view();
             return;
         }
         match self.active {
@@ -189,7 +268,7 @@ impl Tabs {
                 self.active = Some(0);
             }
         }
-        self.bump();
+        self.bump_view();
     }
 
     /// Double click: `path` becomes a full tab. A preview of it is promoted.
@@ -197,7 +276,7 @@ impl Tabs {
         if let Some(i) = self.tabs.iter().position(|t| t.path() == path) {
             if self.tabs[i].preview {
                 self.tabs[i].preview = false;
-                self.bump();
+                self.bump_view();
             }
             self.activate(i);
             return;
@@ -208,7 +287,7 @@ impl Tabs {
         let index = self.tabs.len();
         self.tabs.push(tab);
         self.active = Some(index);
-        self.bump();
+        self.bump_view();
     }
 
     /// Editing a preview makes it permanent (spec §7.1).
@@ -217,7 +296,6 @@ impl Tabs {
             && tab.preview
         {
             tab.preview = false;
-            self.bump();
         }
     }
 
@@ -237,7 +315,7 @@ impl Tabs {
             Some(a) if a > index => Some(a - 1),
             other => other,
         };
-        self.bump();
+        self.bump_view();
     }
 
     /// Removes every tab pointing at `path` (used when a file is deleted).
@@ -252,7 +330,7 @@ impl Tabs {
         }
         if self.tree_selected.as_deref() == Some(path) {
             self.tree_selected = None;
-            self.bump();
+            self.bump_view();
         }
     }
 
@@ -263,21 +341,27 @@ impl Tabs {
             return;
         }
         let index = self.active.unwrap();
-        let before = self.tabs[index].document.clone();
+        let before = (self.transaction.is_none()).then(|| self.tabs[index].document.clone());
         let was_preview = self.tabs[index].preview;
+        let was_dirty = self.tabs[index].document.is_dirty();
+        self.tabs[index].document.set_dirty(false);
         if let Some(tab) = self.active_mut() {
             f(&mut tab.document);
         }
-        let changed = self.tabs[index].document.body() != before.body()
-            || self.tabs[index].document.notes != before.notes;
-        if changed && self.transaction.is_none() {
+        let changed = self.tabs[index].document.is_dirty();
+        if !changed {
+            self.tabs[index].document.set_dirty(was_dirty);
+        }
+        if changed && let Some(before) = before {
             self.tabs[index].undo.push(before);
             self.tabs[index].redo.clear();
         }
         if changed && was_preview {
             self.promote_active();
         }
-        self.bump();
+        if changed {
+            self.bump_content();
+        }
     }
 
     /// Group edits spanning multiple input frames into one snapshot.
@@ -294,11 +378,14 @@ impl Tabs {
         let Some(index) = self.active else {
             return;
         };
-        if self.tabs[index].document.body() != before.body()
-            || self.tabs[index].document.notes != before.notes
-        {
+        let changed = self.tabs[index].document.body() != before.body()
+            || self.tabs[index].document.notes != before.notes;
+        if changed {
+            self.tabs[index].document.set_dirty(true);
             self.tabs[index].undo.push(before);
             self.tabs[index].redo.clear();
+        } else {
+            self.tabs[index].document.set_dirty(before.is_dirty());
         }
     }
 
@@ -313,14 +400,40 @@ impl Tabs {
         }
     }
 
-    /// Caret-only movement: bumps the revision (the views still need to
-    /// redraw) but never promotes a preview tab — only an actual content
-    /// change does that (spec §7.1). Arrow keys and click-to-place go
-    /// through this, and so do vim motions applied from the shell.
+    /// Applies a small document operation without taking an undo snapshot.
+    /// Caret-only movement bumps the view revision, while content changes
+    /// also invalidate layout. This path never promotes a preview tab — the
+    /// paste helper handles that explicitly (spec §7.1).
     pub fn touch(&mut self, f: impl FnOnce(&mut Document)) {
-        if let Some(tab) = self.active_mut() {
+        let Some(index) = self.active else {
+            return;
+        };
+        let (content_changed, view_changed) = {
+            let tab = &mut self.tabs[index];
+            let before = (
+                tab.document.caret,
+                tab.document.math.clone(),
+                tab.document.focus,
+            );
+            let was_dirty = tab.document.is_dirty();
+            tab.document.set_dirty(false);
             f(&mut tab.document);
-            self.bump();
+            let content_changed = tab.document.is_dirty();
+            if !content_changed {
+                tab.document.set_dirty(was_dirty);
+            }
+            let view_changed = before
+                != (
+                    tab.document.caret,
+                    tab.document.math.clone(),
+                    tab.document.focus,
+                );
+            (content_changed, view_changed)
+        };
+        if content_changed {
+            self.bump_content();
+        } else if view_changed {
+            self.bump_view();
         }
     }
 
@@ -431,7 +544,8 @@ impl Tabs {
         };
         let current = std::mem::replace(&mut self.tabs[index].document, previous);
         self.tabs[index].redo.push(current);
-        self.bump();
+        self.tabs[index].refresh_dirty();
+        self.bump_content();
     }
 
     pub fn redo(&mut self) {
@@ -441,7 +555,8 @@ impl Tabs {
         };
         let current = std::mem::replace(&mut self.tabs[index].document, next);
         self.tabs[index].undo.push(current);
-        self.bump();
+        self.tabs[index].refresh_dirty();
+        self.bump_content();
     }
 
     pub fn open_below(&mut self) {
@@ -792,33 +907,53 @@ impl Tabs {
     /// Toggles one heading's fold. If the caret was inside the folded body
     /// it moves up to the heading — folded ground holds no caret.
     pub fn toggle_fold_at(&mut self, block: usize) {
+        let mut changed = false;
         self.touch(|doc| {
             if let Some(Block::Heading { folded, .. }) = doc.body_mut().get_mut(block) {
                 *folded = !*folded;
+                changed = true;
             }
             snap_caret_out_of_folded_ground(doc);
         });
+        if changed {
+            self.bump_layout();
+        }
     }
 
     pub fn open_all_folds(&mut self) {
-        self.touch(|doc| set_all_folds(doc, false));
+        let mut changed = false;
+        self.touch(|doc| changed = set_all_folds(doc, false));
+        if changed {
+            self.bump_layout();
+        }
     }
 
     pub fn close_all_folds(&mut self) {
-        self.touch(|doc| set_all_folds(doc, true));
+        let mut changed = false;
+        self.touch(|doc| changed = set_all_folds(doc, true));
+        if changed {
+            self.bump_layout();
+        }
     }
 
     /// Unfolds every fold hiding `block` — the rule every caret jump obeys:
     /// search, the finder, and the topics panel land on visible ground.
     pub fn reveal_block(&mut self, block: usize) {
+        let mut changed = false;
         self.touch(|doc| {
             while let Some(owner) = fold_owner_of(doc.body(), block) {
                 match doc.body_mut().get_mut(owner) {
-                    Some(Block::Heading { folded, .. }) if *folded => *folded = false,
+                    Some(Block::Heading { folded, .. }) if *folded => {
+                        *folded = false;
+                        changed = true;
+                    }
                     _ => break,
                 }
             }
         });
+        if changed {
+            self.bump_layout();
+        }
     }
 
     /// Jumps the caret to a block's start, unfolding over it on the way.
@@ -841,13 +976,16 @@ impl Tabs {
 }
 
 /// Folds or unfolds every heading in the document.
-fn set_all_folds(doc: &mut Document, folded: bool) {
+fn set_all_folds(doc: &mut Document, folded: bool) -> bool {
+    let mut changed = false;
     for block in doc.body_mut() {
         if let Block::Heading { folded: state, .. } = block {
+            changed |= *state != folded;
             *state = folded;
         }
     }
     snap_caret_out_of_folded_ground(doc);
+    changed
 }
 
 /// A caret on folded ground is a caret pointing at nothing; it moves to the
@@ -1228,6 +1366,7 @@ mod tests {
             undo: Vec::new(),
             redo: Vec::new(),
             yank: String::new(),
+            saved_content: String::new(),
         });
         tabs.activate(0);
         tabs.type_text(" edited");
@@ -1257,6 +1396,7 @@ mod tests {
             undo: Vec::new(),
             redo: Vec::new(),
             yank: String::new(),
+            saved_content: String::new(),
         });
         tabs.active = Some(0);
         tabs.type_text("untitled");
@@ -1283,6 +1423,65 @@ mod tests {
             tabs.active().unwrap().document.word_count()
         );
         assert!(on_disk.contains("**bold**"));
+    }
+
+    #[test]
+    fn undo_after_save_restores_dirty_state_against_disk() {
+        let path = temp_file("undo-after-save", "original");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        tabs.type_text(" changed");
+        tabs.save_active().unwrap();
+
+        tabs.undo();
+
+        assert!(tabs.active().unwrap().document.is_dirty());
+        assert_eq!(
+            Document::load(&path).unwrap().block_text(0),
+            " changedoriginal"
+        );
+        assert_eq!(tabs.active().unwrap().document.block_text(0), "original");
+
+        tabs.redo();
+
+        assert!(!tabs.active().unwrap().document.is_dirty());
+        assert_eq!(
+            tabs.active().unwrap().document.block_text(0),
+            " changedoriginal"
+        );
+    }
+
+    #[test]
+    fn try_close_keeps_a_dirty_tab_when_save_fails() {
+        let blocker = temp_file("close-blocker", "blocker");
+        let path = blocker.join("child").join("note.md");
+        let mut tabs = Tabs::new();
+        tabs.tabs.push(Tab {
+            document: Document::new(&path),
+            preview: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            yank: String::new(),
+            saved_content: String::new(),
+        });
+        tabs.active = Some(0);
+        tabs.type_text("unsaved");
+
+        assert!(tabs.try_close_active().is_err());
+        assert_eq!(tabs.tabs.len(), 1);
+        assert!(tabs.active().unwrap().document.is_dirty());
+    }
+
+    #[test]
+    fn no_op_edit_does_not_advance_the_view_revision() {
+        let path = temp_file("no-op-edit", "");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        let before = tabs.revision();
+
+        tabs.backspace();
+
+        assert_eq!(tabs.revision(), before);
     }
 
     #[test]

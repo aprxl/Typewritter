@@ -1574,14 +1574,53 @@ impl Shell {
 
     // ---- file finder --------------------------------------------------
 
+    /// Closes the active tab only after a dirty document has been persisted.
+    /// A failed save leaves the tab and its undo history in place.
+    pub(super) fn close_active(&mut self) {
+        match self.docs.borrow_mut().try_close_active() {
+            Ok(_) => self.save_error = None,
+            Err(error) => {
+                self.save_error = Some(format!(
+                    "close failed: {error} (Ctrl+S to retry; Discard changes to close)"
+                ));
+                eprintln!("close failed: {error}");
+            }
+        }
+        self.rebuild_views();
+    }
+
+    pub(super) fn save_active(&mut self) {
+        match self.docs.borrow_mut().save_active() {
+            Ok(()) => self.save_error = None,
+            Err(error) => {
+                self.save_error = Some(format!("save failed: {error}"));
+                eprintln!("save failed: {error}");
+            }
+        }
+        self.rebuild_views();
+    }
+
+    /// Explicitly drops the active tab without attempting persistence. This
+    /// is the recovery route when a close/save error cannot be repaired.
+    pub(super) fn discard_active(&mut self) {
+        let index = self.docs.borrow().active_index();
+        if let Some(index) = index {
+            self.docs.borrow_mut().close(index);
+            self.save_error = None;
+            self.rebuild_views();
+        }
+    }
+
     pub(super) fn open_finder(&mut self) {
         let Some(vault) = &self.vault else {
             return;
         };
         self.popup_reveal.restart();
         let files = vault.borrow().files();
+        let index = crate::search::SearchIndex::build(&files);
         self.finder = Some(super::FinderState {
-            rows: crate::search::search(&files, ""),
+            rows: index.search(""),
+            index,
             query: String::new(),
             selected: 0,
         });
@@ -1594,18 +1633,13 @@ impl Shell {
     }
 
     /// Re-ranks the rows against the current query. The shell owns the
-    /// ranked list (the component only draws a snapshot), so every query
-    /// change re-runs `search::search` here — the vault is a few hundred
-    /// kilobytes, well inside the §11 search budget.
+    /// ranked list (the component only draws a snapshot); the index was built
+    /// when the finder opened, so this path is memory-only.
     fn rerank_finder(&mut self) {
         let Some(state) = self.finder.as_mut() else {
             return;
         };
-        let files = self.vault.as_ref().map(|v| v.borrow().files());
-        let Some(files) = files else {
-            return;
-        };
-        state.rows = crate::search::search(&files, &state.query);
+        state.rows = state.index.search(&state.query);
         state.selected = state.selected.min(state.rows.len().saturating_sub(1));
     }
 
@@ -4362,7 +4396,9 @@ mod tests {
     fn our_own_clipboard_text_pastes_as_notation() {
         let mut tabs = insert_tabs("own", "");
         tabs.set_yank("costs $a/b$ today".to_string());
+        let before = tabs.layout_revision();
         paste(&mut tabs, false, 1, "costs $a/b$ today");
+        assert!(tabs.layout_revision() > before);
         let runs = tabs.active().unwrap().document.body()[0].inlines();
         assert!(matches!(runs[0], Inline::Text(ref t) if t.text == "costs "));
         assert!(matches!(runs[1], Inline::Math(_)));

@@ -117,10 +117,12 @@ impl ApplicationHandler for App {
                 // reader's, this is a local vault with git sync planned, and a
                 // dialog between a student and their closing laptop is a way
                 // to lose work, not a way to protect it.
-                if let Some(shell) = &mut self.shell {
-                    shell.save_all();
+                let saved = self.shell.as_mut().is_none_or(|shell| shell.save_all());
+                if saved {
+                    event_loop.exit();
+                } else {
+                    self.scheduler.request_redraw();
                 }
-                event_loop.exit();
             }
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {

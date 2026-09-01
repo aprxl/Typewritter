@@ -740,6 +740,13 @@ impl Document {
         self.dirty
     }
 
+    /// Updates the persistence marker without touching document content.
+    /// Tabs use this when restoring an undo snapshot and comparing it with
+    /// the last successfully serialized content.
+    pub(crate) fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
+    }
+
     /// The blocks the caret is in — the body, or the focused note's body.
     /// Anything that edits at the caret, moves the caret, or answers a
     /// question about where the caret is, goes through here.
@@ -2323,6 +2330,9 @@ impl Document {
     pub fn set_code(&mut self, on: bool) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_code() == on {
+            return;
+        }
         let flat_text: String = self.scope()[b].inlines().iter().map(Inline::text).collect();
         let style = if on {
             Style {
@@ -2393,6 +2403,14 @@ impl Document {
             if !(1..=4).contains(&level) {
                 return;
             }
+            if matches!(
+                self.scope()[b],
+                Block::Heading {
+                    level: current, ..
+                } if current == level
+            ) {
+                return;
+            }
             let mut inlines = std::mem::take(self.scope_mut()[b].inlines_mut());
             if self.scope()[b].is_code() {
                 for run in &mut inlines {
@@ -2408,6 +2426,9 @@ impl Document {
                 content: inlines,
             };
         } else {
+            if matches!(self.scope()[b], Block::Paragraph(_)) {
+                return;
+            }
             let mut inlines = std::mem::take(self.scope_mut()[b].inlines_mut());
             if self.scope()[b].is_code() {
                 for run in &mut inlines {
@@ -2470,6 +2491,9 @@ impl Document {
         self.clamp_caret();
         let b = self.caret.block;
         if self.scope()[b].is_code() {
+            return;
+        }
+        if marker.is_none() && matches!(self.scope()[b], Block::Paragraph(_)) {
             return;
         }
         let same_kind = matches!(

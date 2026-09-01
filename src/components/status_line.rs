@@ -107,10 +107,13 @@ impl Component for StatusLine {
     }
 
     fn sync(&mut self, context: &Context) {
-        self.dirty.write(&mut self.frametime, context.frametime);
-        self.dirty.write(&mut self.layouts, context.layouts);
-        self.dirty.write(&mut self.redraws, context.redraws);
+        let show_stats_changed = self.show_stats != context.show_stats;
         self.dirty.write(&mut self.show_stats, context.show_stats);
+        if self.show_stats || show_stats_changed {
+            self.dirty.write(&mut self.frametime, context.frametime);
+            self.dirty.write(&mut self.layouts, context.layouts);
+            self.dirty.write(&mut self.redraws, context.redraws);
+        }
     }
 
     fn is_dirty(&self) -> bool {

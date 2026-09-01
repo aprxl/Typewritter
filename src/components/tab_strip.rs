@@ -104,7 +104,7 @@ impl Component for TabStrip {
                 .position(|rect| rect.contains(position))
         {
             if close_rect(self.tab_rects[index]).contains(position) {
-                self.docs.borrow_mut().close(index);
+                let _ = self.docs.borrow_mut().try_close(index);
             } else {
                 self.docs.borrow_mut().activate(index);
             }
