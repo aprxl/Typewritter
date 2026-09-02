@@ -598,13 +598,21 @@ impl Shell {
         // when they open, so this layer sits below every popup that will
         // ever attach and above every panel that exists.
         //
-        // Blur set once at creation, never changed. A wider radius than the
-        // highlight's — a popup floats further above the page than a bar of
-        // ink sits under it, so its shadow spreads softer before it lands.
+        // The blur is DISABLED. `render_layers` runs `apply_effect` for
+        // every live layer on every frame with no dirty check, and this
+        // layer is full-surface and never detaches, so the blur cost two
+        // fullscreen passes on every frame of the session — popup on
+        // screen or not. Measured on this machine, debug: 70 fps / 7.3 ms
+        // render with it, 97 fps / 3.2 ms without. Gating it on ownership
+        // fixes the idle cost but not the cost while a popup is open,
+        // which is still enough to stall the window.
+        //
+        // ponytail: restore the shadow once the blur is affordable —
+        // guard `apply_effect`/`render_to_texture` on the rebuild flag
+        // `render_layers` currently discards, or blur a popup-sized
+        // region instead of the whole surface. The same note on `glow`
+        // above is the same bug on a smaller radius.
         let popup_shadow = renderer.new_layer_top(LayerInvalidation::Manual);
-        popup_shadow.set_effect(Some(ShaderEffect::Blur {
-            radius: crate::components::popup::SHADOW_BLUR_RADIUS,
-        }));
 
         Self {
             layout,
