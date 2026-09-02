@@ -2,14 +2,19 @@
 //! visible. The shell lays out the open document and hands it over as an
 //! [`Rc`]; this component only reads it.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::document::layout::{self, ContextHit, DocLayout, RangeKind};
-use crate::document::math::{MathCursor, NodeAddress, SymbolRole};
-use crate::document::math_layout::{self, BoxKind, MathBox, MathPrimitive};
-use crate::document::{ATOM, BadgeColor, Block, Caret, FlatRange, Inline, Style};
+use crate::document::layout::{
+    self, CHEVRON_WIDTH, ContextHit, DocLayout, FOLD_INDICATOR_HEIGHT, NUMBER_GUTTER, NUMBER_SIZE,
+    RangeKind,
+};
+use crate::document::math::{MathCursor, NodeAddress};
+use crate::document::math_layout::{self, MathBox};
+use crate::document::math_paint;
+use crate::document::{ATOM, BadgeColor, Block, Caret, FlatRange, Inline, ListMarker, Style};
 use crate::layout::Rect;
-use crate::renderer::{Layer, LineCap, LineJoin, PathPaint, Rounding, Stroke};
+use crate::renderer::{Layer, PathPaint, Rounding};
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
 
@@ -17,13 +22,24 @@ use crate::ui::{Component, Context, Dirty};
 /// document's own H1 is the title).
 pub const TOP: f32 = 28.0;
 pub const INSET: f32 = 56.0;
-/// The gutter between a heading's auto-number and the text it belongs to.
-/// The number is drawn right-aligned against this, so numbers of different
-/// depths line up on their right edge instead of ragging.
-const NUMBER_GUTTER: f32 = 12.0;
-/// The auto-number's size. Constant rather than scaled per heading level:
-/// it is a margin annotation, not part of the heading's own typography.
-const NUMBER_SIZE: f32 = 11.0;
+/// The equation number's size — the same margin-annotation register as the
+/// heading auto-number, never part of the math's own typography.
+pub const EQ_NUMBER_SIZE: f32 = 11.0;
+/// Room kept between the equation number and the band's right edge, so the
+/// widest reading of the band never crowds it.
+pub const EQ_NUMBER_INSET: f32 = 18.0;
+/// A bullet's dot: inset from the content column and sized to read as a
+/// mark, not as a glyph. `BULLET_INSET` is from the column's left edge to
+/// the dot's centre.
+const BULLET_INSET: f32 = 11.0;
+const BULLET_RADIUS: f32 = 2.5;
+/// A task checkbox's corner radius — between the row radius and a code
+/// span's, so it reads as a control, not as a box of text.
+const CHECK_RADIUS: f32 = 4.5;
+const CHECK_ROUNDING: Rounding = Rounding::uniform(CHECK_RADIUS);
+/// A done task's strike: centred on the line's own centre — the text is
+/// drawn v-centred on the same point, so the rule crosses the x-height.
+const STRIKE_THICKNESS: f32 = 1.4;
 /// The design's measure: the content column is never wider than this.
 pub const MEASURE: f32 = 634.0;
 /// Space kept past the right edge before a line may wrap.
@@ -33,9 +49,9 @@ pub const BRUSH_RADIUS: f32 = 9.0;
 /// Padding of the tint behind code: a fenced block gets the generous one,
 /// an inline span the tight one, so a `` `run` `` mid-sentence doesn't push
 /// the line apart.
-const BLOCK_PAD: (f32, f32) = (10.0, 6.0);
+pub const BLOCK_PAD: (f32, f32) = (10.0, 6.0);
 const INLINE_PAD: (f32, f32) = (8.0, 4.0);
-const CODE_ROUNDING: Rounding = Rounding::uniform(6.0);
+pub const CODE_ROUNDING: Rounding = Rounding::uniform(6.0);
 const MATH_SELECTION_ROUNDING: Rounding = Rounding::uniform(4.0);
 /// The highlight bar: an underline, not a wash, so the glyphs keep the
 /// page's own contrast. `DROP` is measured down from the line's centre.
@@ -64,6 +80,11 @@ pub const OVERSCROLL: f32 = 0.5;
 /// The numbers an editor draws with. The page has one value for each; a
 /// note embedded in the margin has its own. Both are named, so the two
 /// sites never drift into a shared "the" size that only one of them wants.
+/// The fold chevron's path: a filled triangle pointing down (the section
+/// is open), centred on the origin so [`Layer::draw_path_rotated`] turns it
+/// about its own centre — a quarter turn and it points right (folded).
+const CHEVRON: &str = "M0 3 L-3.5 -3 L3.5 -3 Z";
+
 pub struct Metrics {
     /// Left padding of the content area.
     pub inset: f32,
@@ -101,29 +122,9 @@ impl Metrics {
 /// One measured piece of a visual line: `(text, style, x, width)`.
 type Painted = (String, Style, f32, f32);
 
-/// Draws a laid-out expression. `origin` is the box's baseline-left point
-/// on screen; child offsets are baseline-relative with y positive upward,
-/// so descending into a child subtracts its y.
-///
-/// `slots` draws the empty-slot placeholders. They are typing affordances —
-/// they say where the next character lands — so they appear only while the
-/// caret is actually inside this expression in Insert mode; read back later,
-/// an expression shows its notation and nothing else. Their geometry is
-/// reserved either way, so an expression never resizes as the caret enters
-/// or leaves it.
-fn draw_math(layer: &Layer, box_: &MathBox, origin: (f32, f32), slots: bool) {
-    draw_math_inner(layer, box_, origin, false, slots);
-}
-
-fn math_rect(box_: &MathBox, origin: (f32, f32)) -> Rect {
-    Rect {
-        x: origin.0,
-        y: origin.1 - box_.ascent,
-        width: box_.width,
-        height: box_.ascent + box_.descent,
-    }
-}
-
+/// The wash behind a selected expression, or behind one addressed node of
+/// it. Editor-only: a page has no selection, which is why this stayed here
+/// while the notation itself moved to [`math_paint`].
 fn draw_math_selection(
     layer: &Layer,
     list: &crate::document::math::MathList,
@@ -145,7 +146,7 @@ fn draw_math_selection(
             height: bounds.top - bounds.bottom + PAD * 2.0,
         }
     } else {
-        let rect = math_rect(box_, origin);
+        let rect = math_paint::rect(box_, origin);
         Rect {
             x: rect.x - PAD,
             y: rect.y - PAD,
@@ -165,83 +166,74 @@ fn draw_brush(layer: &Layer, center: (f32, f32)) {
     layer.draw_circle(center, BRUSH_RADIUS, theme::fade(theme::accent(), 0.14));
 }
 
-fn draw_math_inner(layer: &Layer, box_: &MathBox, origin: (f32, f32), covered: bool, slots: bool) {
-    if let Some(role) = box_.highlight.filter(|_| !covered) {
-        let height = box_.ascent + box_.descent;
-        let color = match role {
-            SymbolRole::Variable => theme::variable(),
-            SymbolRole::Constant => theme::constant(),
-            SymbolRole::Function => theme::function(),
-        };
-        layer.draw_rectangle(
-            (origin.0, origin.1 - box_.ascent),
-            (box_.width, height),
-            color,
-            Rounding::uniform(box_.width.min(height) * 0.45),
-        );
-    }
-    let covered = covered || box_.highlight.is_some();
-    match &box_.kind {
-        BoxKind::Glyph {
-            text,
-            size,
-            offset_x,
-            offset_y,
-            condense,
-        } => {
-            // Math boxes use glyph centers as their baseline for now; LEFT's
-            // vertical centering therefore matches the prose baseline draw.
+/// A list item's marker, hung in the gutter left of the content column.
+/// Virtual like a heading's auto-number: drawn, never laid out, so the
+/// caret cannot reach it and it never shifts the text it labels. Bullets
+/// are drawn glyphs, numbers are right-aligned mono in a fixed column, and
+/// a task's box is a control — filled and ticked when done. `content_x` is
+/// the content column the item's text hangs from; `baseline` the line's
+/// vertical centre.
+fn draw_list_marker(layer: &Layer, marker: &ListMarker, content_x: f32, baseline: f32, scale: f32) {
+    match marker {
+        ListMarker::Bullet => {
+            // Optically centred: a dot a hair above the true centre reads
+            // as aligned with lowercase text.
+            layer.draw_circle(
+                (content_x - BULLET_INSET * scale, baseline - 1.0),
+                BULLET_RADIUS * scale,
+                theme::accent(),
+            );
+        }
+        ListMarker::Number(n) => {
             theme::draw(
                 layer,
-                text,
-                (origin.0 + offset_x, origin.1 - offset_y),
-                &TextStyle::math(*size, theme::ink()).condensed(*condense),
-                theme::LEFT,
+                &n.to_string(),
+                (content_x - NUMBER_GUTTER, baseline),
+                &TextStyle::mono(NUMBER_SIZE, theme::non_text()),
+                theme::RIGHT,
             );
         }
-        BoxKind::Bar { thickness } => {
-            // A fractional one-pixel rule smears across adjacent rows.
-            theme::rule(
-                layer,
-                (origin.0, (origin.1 - thickness * 0.5).round()),
-                box_.width,
-                *thickness,
-                theme::ink(),
-            );
-        }
-        BoxKind::Slot { visible, .. } => {
-            // `visible` is structural — an integral's unasked-for limits are
-            // never drawn. `slots` is the mode gate on top of it.
-            if !visible || !slots {
-                return;
-            }
+        ListMarker::Task { done } => {
+            let size = crate::document::layout::CHECK_SIZE * scale;
+            let gap = crate::document::layout::CHECK_GAP * scale;
             let rect = Rect {
-                x: origin.0,
-                y: origin.1 - box_.ascent,
-                width: box_.width,
-                height: box_.ascent + box_.descent,
+                x: content_x - gap - size,
+                y: baseline - size * 0.5,
+                width: size,
+                height: size,
             };
-            layer.draw_rectangle(rect.position(), rect.size(), theme::alt(), Rounding::NONE);
-            theme::outline(layer, rect, theme::non_text());
-        }
-        BoxKind::Primitive(primitive) => match primitive {
-            MathPrimitive::Stroke { path, thickness } => {
-                let mut stroke = Stroke::new(theme::ink(), *thickness);
-                stroke.cap = LineCap::Round;
-                stroke.join = LineJoin::Round;
-                layer
-                    .draw_path(path, origin, PathPaint::Stroke(stroke))
-                    .expect("math paths are generated by layout");
-            }
-            MathPrimitive::Dots { centers, radius } => {
-                for &(x, y) in centers {
-                    layer.draw_circle((origin.0 + x, origin.1 + y), *radius, theme::ink());
-                }
-            }
-        },
-        BoxKind::Row { children } => {
-            for (x, y, child) in children {
-                draw_math_inner(layer, child, (origin.0 + x, origin.1 - y), covered, slots);
+            if *done {
+                layer.draw_rectangle(
+                    rect.position(),
+                    rect.size(),
+                    theme::fade(theme::accent(), 0.18),
+                    CHECK_ROUNDING,
+                );
+                theme::rounded_outline(
+                    layer,
+                    rect.inset(0.5),
+                    CHECK_RADIUS - 0.5,
+                    1.0,
+                    theme::accent(),
+                );
+                theme::polyline(
+                    layer,
+                    &[
+                        (rect.x + size * 0.24, rect.y + size * 0.52),
+                        (rect.x + size * 0.42, rect.y + size * 0.70),
+                        (rect.x + size * 0.76, rect.y + size * 0.30),
+                    ],
+                    theme::accent(),
+                    1.6,
+                );
+            } else {
+                theme::rounded_outline(
+                    layer,
+                    rect.inset(0.5),
+                    CHECK_RADIUS - 0.5,
+                    1.0,
+                    theme::non_text(),
+                );
             }
         }
     }
@@ -403,6 +395,7 @@ impl Editor {
                 scale: 1.0,
                 source: Vec::new(),
                 anchors: Vec::new(),
+                equation_numbers: HashMap::new(),
             }),
             metrics: Metrics::PAGE,
             caret: None,
@@ -581,6 +574,23 @@ impl Component for Editor {
                             theme::math_surface(),
                             CODE_ROUNDING,
                         );
+                        // The equation's number: virtual, hung flush right
+                        // in the band with room to spare, so it annotates
+                        // without ever crowding the expression. Only tagged
+                        // blocks have one; the caret cannot reach it and it
+                        // never reflows the math it labels.
+                        if let Some(number) = self.layout.equation_numbers.get(&bi) {
+                            theme::draw(
+                                layer,
+                                number,
+                                (
+                                    x + self.metrics.content_width(rect) - EQ_NUMBER_INSET,
+                                    content + first_line.y + first_line.height * 0.5 - self.scroll,
+                                ),
+                                &TextStyle::mono(EQ_NUMBER_SIZE, theme::non_text()),
+                                theme::RIGHT,
+                            );
+                        }
                     }
                 }
                 bi += 1;
@@ -636,6 +646,12 @@ impl Component for Editor {
         let mut pieces: Vec<Painted> = Vec::new();
         for (bi, block) in self.layout.blocks.iter().enumerate() {
             let kind = &self.layout.source[bi];
+            // Folded ground draws nothing at all — not the runs, not the
+            // slabs, not a hint of what is hidden. The folded heading's own
+            // indicator is the only trace.
+            if block.hidden.is_some() {
+                continue;
+            }
             // A rule has no runs to paint, so it is drawn here rather than
             // in the text pass below: a hairline centred in its own short
             // band, spanning the text column and nothing more.
@@ -656,18 +672,37 @@ impl Component for Editor {
                 }
                 continue;
             }
+            // A done task is quiet twice over: dim ink (via `text_style`)
+            // and a real drawn rule through the run.
+            let done_task = matches!(
+                kind,
+                Block::ListItem {
+                    marker: ListMarker::Task { done: true },
+                    ..
+                }
+            );
             for (line_index, line) in block.lines.iter().enumerate() {
                 let top = content + line.y - self.scroll;
                 if top + line.height < rect.y || top > rect.bottom() {
                     continue;
                 }
                 let baseline = top + line.height * 0.5;
-                let mut cursor = x;
+                // The marker hangs in the gutter of the item's first line
+                // only; every wrapped line below keeps the indent.
+                if line_index == 0
+                    && let Block::ListItem { marker, .. } = kind
+                {
+                    draw_list_marker(layer, marker, x + line.x, baseline, self.layout.scale);
+                }
+                // The line's text starts at its own left edge — indented
+                // for a list item's content, the gutter for everything else.
+                let mut cursor = x + line.x;
                 pieces.clear();
                 for segment in &line.segments {
                     let run = &kind.inlines()[segment.inline];
                     let is_math = matches!(run, Inline::Math(_));
                     let is_note = matches!(run, Inline::Note(_));
+                    let is_eq_ref = matches!(run, Inline::EqRef(_));
                     let text: String = match run {
                         Inline::Text(t) => t
                             .text
@@ -678,8 +713,11 @@ impl Component for Editor {
                         Inline::Math(_) => ATOM.to_string(),
                         // An anchor draws its derived number, not the label
                         // the author stored — carried on the segment, so the
-                        // drawing and `advance` read the same value.
+                        // drawing and `advance` read the same value. A
+                        // reference likewise draws its `(n)`, or its raw
+                        // spelling when nothing resolves.
                         Inline::Note(_) => segment.number.clone().unwrap_or_default(),
+                        Inline::EqRef(_) => segment.number.clone().unwrap_or_default(),
                     };
                     let width = layout::advance(
                         run,
@@ -699,6 +737,10 @@ impl Component for Editor {
                             &style,
                             theme::LEFT,
                         );
+                    }
+                    if is_eq_ref {
+                        let style = layout::eq_ref_style(&text, self.layout.scale);
+                        theme::draw(layer, &text, (cursor, baseline), &style, theme::LEFT);
                     }
                     let label_x = cursor
                         + if segment.style.badge {
@@ -768,8 +810,14 @@ impl Component for Editor {
                             (Some(_), Some(caret))
                                 if bi == caret.block && segment.inline == caret.inline
                         );
-                        draw_math(
-                            layer,
+                        // The notation itself is drawn by `math_paint`, the
+                        // one copy an export runs too — so a fraction's bar
+                        // cannot land differently on a page than on screen.
+                        // A layer is a handle, so a `Canvas` over it is a
+                        // rebinding, not a conversion.
+                        let mut canvas = layer;
+                        math_paint::draw(
+                            &mut canvas,
                             &box_,
                             (cursor, baseline),
                             typing_here && !self.block_caret,
@@ -841,10 +889,19 @@ impl Component for Editor {
                         );
                     }
                 }
+                if done_task && let (Some(first), Some(last)) = (pieces.first(), pieces.last()) {
+                    theme::rule(
+                        layer,
+                        (first.2 - 1.0, baseline - STRIKE_THICKNESS * 0.5),
+                        last.2 + last.3 - first.2 + 2.0,
+                        STRIKE_THICKNESS,
+                        theme::dim(),
+                    );
+                }
                 for ((text, style, at, _), segment) in pieces.iter().zip(&line.segments) {
                     if matches!(
                         kind.inlines()[segment.inline],
-                        Inline::Math(_) | Inline::Note(_)
+                        Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_)
                     ) {
                         continue;
                     }
@@ -854,16 +911,90 @@ impl Component for Editor {
                 // The auto-number, hung in the margin: virtual, so it is
                 // drawn rather than laid out — the caret cannot reach it and
                 // it never shifts the heading it labels.
-                if line_index == 0
-                    && kind.is_heading()
-                    && let Some(number) = &self.numbers[bi]
-                {
-                    theme::draw(
+                if line_index == 0 && kind.is_heading() {
+                    if let Some(number) = &self.numbers[bi] {
+                        theme::draw(
+                            layer,
+                            number,
+                            (x - NUMBER_GUTTER, baseline),
+                            &TextStyle::mono(NUMBER_SIZE, theme::non_text()),
+                            theme::RIGHT,
+                        );
+                    }
+                    // The fold chevron, just left of the number: down while
+                    // the section is open, turned to point right when it is
+                    // folded. The turn itself is instant — a component
+                    // recreated on every rebuild cannot hold a clock, and
+                    // §11 forbids the *reflow* from animating anyway; the
+                    // state change is the statement.
+                    let folded = kind.is_folded();
+                    let scale = self.layout.scale;
+                    let number_width = self.numbers[bi].as_deref().map_or(0.0, |number| {
+                        theme::width(layer, number, &TextStyle::mono(NUMBER_SIZE, theme::ink()))
+                    });
+                    let right = layout::chevron_right(number_width, scale);
+                    let centre_x = x + right - CHEVRON_WIDTH * scale / 2.0;
+                    let colour = if folded {
+                        theme::dim()
+                    } else {
+                        theme::non_text()
+                    };
+                    layer
+                        .draw_path_rotated(
+                            CHEVRON,
+                            (centre_x, baseline),
+                            if folded {
+                                -std::f32::consts::FRAC_PI_2
+                            } else {
+                                0.0
+                            },
+                            PathPaint::fill(colour),
+                        )
+                        .expect("chevron path parses");
+                }
+            }
+
+            // The collapsed-body indicator: one quiet italic line standing
+            // in for everything folded away, riding a hairline rule that
+            // runs out to the column's right edge. The three midline dots
+            // are drawn, not typed — Georgia has no U+22EF, and a missing
+            // glyph would break the quiet this line exists to keep. The
+            // whole band is a click target (see `DocLayout::
+            // fold_indicator_at`): touching it unfolds the fold.
+            if let Some(indicator) = &block.indicator {
+                let scale = self.layout.scale;
+                let height = FOLD_INDICATOR_HEIGHT * scale;
+                let mid = content + indicator.y + height * 0.5 - self.scroll;
+                let label = if indicator.lines == 1 {
+                    "1 line hidden".to_string()
+                } else {
+                    format!("{} lines hidden", indicator.lines)
+                };
+                let style = TextStyle::serif(12.5 * scale, theme::comment()).italic();
+                for dot in 0..3 {
+                    layer.draw_circle(
+                        (x + 4.0 * scale + dot as f32 * 4.5 * scale, mid),
+                        1.2 * scale,
+                        theme::faint(),
+                    );
+                }
+                theme::draw(
+                    layer,
+                    &label,
+                    (x + 22.0 * scale, mid + 4.5 * scale),
+                    &style,
+                    theme::LEFT,
+                );
+                let text_width = theme::width(layer, &label, &style);
+                let rule_x = x + 22.0 * scale + text_width + 12.0 * scale;
+                let rule_end = x + self.metrics.content_width(rect);
+                if rule_end > rule_x {
+                    theme::rule(
                         layer,
-                        number,
-                        (x - NUMBER_GUTTER, baseline),
-                        &TextStyle::mono(NUMBER_SIZE, theme::non_text()),
-                        theme::RIGHT,
+                        (rule_x, mid),
+                        rule_end - rule_x,
+                        1.0,
+                        theme::border(),
                     );
                 }
             }
@@ -879,6 +1010,7 @@ impl Component for Editor {
                     Inline::Text(t) => t.text.chars().nth(caret.offset),
                     Inline::Math(_) => Some(ATOM),
                     Inline::Note(_) => Some(ATOM),
+                    Inline::EqRef(_) => Some(ATOM),
                 })
         });
         let screen_x = x + caret_x;
@@ -901,7 +1033,8 @@ impl Component for Editor {
             // legible. Falls back to a space's advance past the end of the
             // line, like the old line editor did.
             let sample = caret_char.map(String::from).unwrap_or_else(|| " ".into());
-            let width = theme::width(layer, &sample, &TextStyle::serif(17.5, theme::ink())).max(1.0);
+            let width =
+                theme::width(layer, &sample, &TextStyle::serif(17.5, theme::ink())).max(1.0);
             layer.draw_rectangle(
                 (screen_x, screen_y - caret_height * 0.5 + 2.0),
                 (width, caret_height - 4.0),
@@ -1011,7 +1144,7 @@ impl Editor {
                                 layer,
                             );
                             layer.draw_rectangle(
-                                (x + left, top),
+                                (x + line.x + left, top),
                                 ((right - left).max(1.0), line.height),
                                 theme::selection(),
                                 Rounding::NONE,
@@ -1045,6 +1178,7 @@ impl Editor {
                     .collect(),
                 Inline::Math(_) => ATOM.to_string(),
                 Inline::Note(_) => ATOM.to_string(),
+                Inline::EqRef(_) => ATOM.to_string(),
             };
             if flat >= cursor + segment.len {
                 x += layout::advance(
@@ -1111,6 +1245,7 @@ pub fn max_scroll(content_height: f32, view_height: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::document::math::MathNode;
+    use crate::document::math_layout::BoxKind;
     use crate::document::{Document, Text};
     use std::path::Path;
 
@@ -1207,10 +1342,12 @@ mod tests {
             Block::Paragraph(vec![text("intro")]),
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![text("First")],
             },
             Block::Heading {
                 level: 2,
+                folded: false,
                 content: vec![text("Nested")],
             },
         ];
@@ -1290,10 +1427,30 @@ mod tests {
         let box_width = match &run {
             Inline::Math(list) => math_layout::layout(list, 0, 1.0, &measure).width,
             Inline::Text(_) => unreachable!(),
-            Inline::Note(_) => unreachable!(),
+            Inline::Note(_) | Inline::EqRef(_) => unreachable!(),
         };
         assert_eq!(width, box_width);
         assert!(width > measure(&atom, &TextStyle::serif(17.5, theme::ink())));
+    }
+
+    /// The fold chevron's path is parsed by the renderer at draw time; the
+    /// exact string the editor draws is pinned here.
+    #[test]
+    fn the_fold_chevron_path_parses() {
+        let mut parser = lyon_extra::parser::PathParser::new();
+        let mut builder = lyon::path::Path::builder();
+        let mut source = lyon_extra::parser::Source::new(CHEVRON.chars());
+        let ok = parser
+            .parse(
+                &lyon_extra::parser::ParserOptions::DEFAULT,
+                &mut source,
+                &mut builder,
+            )
+            .is_ok();
+        assert!(
+            ok,
+            "the chevron path must parse or every heading draw panics"
+        );
     }
 
     /// `math_rect` is what a whole-expression selection is drawn to now that
@@ -1309,7 +1466,7 @@ mod tests {
             kind: BoxKind::Row { children: vec![] },
         };
         assert_eq!(
-            math_rect(&box_, (7.0, 31.0)),
+            math_paint::rect(&box_, (7.0, 31.0)),
             Rect {
                 x: 7.0,
                 y: 12.0,

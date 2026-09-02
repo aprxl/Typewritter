@@ -54,6 +54,7 @@ pub fn outline(blocks: &[Block]) -> Vec<Node> {
                 // Math is opaque and contributes no heading prose.
                 Inline::Math(_) => "",
                 Inline::Note(_) => "",
+                Inline::EqRef(_) => "",
             })
             .collect();
 
@@ -113,6 +114,7 @@ mod tests {
     fn heading(level: u8, text: &str) -> Block {
         Block::Heading {
             level,
+            folded: false,
             content: vec![Inline::Text(Text {
                 text: text.to_owned(),
                 style: Style::PLAIN,

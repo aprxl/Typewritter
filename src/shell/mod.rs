@@ -38,9 +38,10 @@ use crate::components::sidenotes::Note;
 use crate::components::tab_strip::TabView;
 use crate::components::topics::Entry;
 use crate::components::{
-    Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileFinder, FileTree, MathMenu, Onboarding,
-    Palette, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics, breadcrumb, editor,
-    file_tree, sidenotes, status_line, tab_strip, title_bar, topics,
+    Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileTree, Finder, FormatBar, MathMenu,
+    Onboarding, Palette, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics,
+    breadcrumb, editor, file_tree, format_bar, sidenotes, status_line, tab_strip, title_bar,
+    topics,
 };
 use crate::config::Config;
 use crate::document::Caret;
@@ -49,6 +50,7 @@ use crate::document::layout::{ContextHit, DocLayout, RangeKind, layout_blocks};
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_conversion;
 use crate::document::outline;
+use crate::export;
 use crate::frame::FrameScheduler;
 use crate::input::Input;
 use crate::layout::{Layout, NodeId, Rect, Size, Style};
@@ -70,8 +72,13 @@ struct PaletteState {
     selected: usize,
 }
 
-struct FileFinderState {
-    files: Vec<crate::vault::VaultFile>,
+/// The open finder's ranked rows, query, and selection while it's open —
+/// the shell owns these (it's the one taking keystrokes), the same reason
+/// `PaletteState` lives here instead of in the component. The rows are the
+/// full ranked list (`search::search`), so picking row *n* is a direct
+/// index and `Ctrl+1..5` needs no re-filter.
+struct FinderState {
+    rows: Vec<crate::search::Row>,
     query: String,
     selected: usize,
 }
@@ -100,6 +107,68 @@ struct ContextMenuState {
     selected: usize,
     anchor: (f32, f32),
     target: Option<ContextHit>,
+}
+
+/// The open word-format bar's resolved commands, selection, anchor, and
+/// target — the same shape as the context menu's state, but for the bar
+/// that opens over a word in Normal mode. Lives in the shell for the same
+/// reason the menu's does: the shell owns the keystrokes while it is open.
+struct WordFormatState {
+    items: Vec<&'static commands::Command>,
+    selected: usize,
+    anchor: (f32, f32),
+    target: Option<ContextHit>,
+    /// The cell the pill last sat on — the shell's copy of the bar's
+    /// persistent hover, fed back into every refreshed snapshot. Lives
+    /// here because snapshots are recreated per toggle; this survives.
+    hover_cell: Option<usize>,
+}
+
+/// A word-format bar animating out: the state is closed, but the drawing
+/// needs its last shape until the fade lands. The real items, kinds and
+/// checked states included — placeholders of any kind would flash a row of
+/// substitutes for the bar's actual affordances, which reads as a glitch
+/// even at 140ms.
+/// A popup dismissal in flight: whichever anchored menu just closed, held
+/// so its region can keep drawing one last faded frame while a wall-clock
+/// weight falls 1→0 over `popup::GHOST_DURATION`. The shell's refresh path
+/// turns the variant back into a `dismissing` snapshot of that menu's
+/// component.
+///
+/// Every variant carries clones of the menu's REAL state at close time,
+/// captured before the live state is `take()`n — a placeholder that merely
+/// resembles the content reads as a glitch even for 140ms, so placeholders
+/// are banned here by construction. Large modals have no variant: they
+/// close instantly.
+enum MenuDismiss {
+    /// The word-format bar: its cells with live checked states, where it
+    /// opened, and which cell the pill had parked on.
+    Format {
+        items: Vec<format_bar::Item>,
+        anchor: (f32, f32),
+        pointer_cell: Option<usize>,
+    },
+    /// The slash menu: query, selection, scroll window, anchor — everything
+    /// the component needs to redraw itself exactly as it stood.
+    Slash {
+        state: crate::components::slash_menu::Snapshot,
+        /// Where the menu opened; re-fed to the ghost's geometry.
+        anchor: (f32, f32),
+        /// Which row the pill had parked on.
+        pointer_row: Option<usize>,
+    },
+    /// The right-click context menu: rows and live checkmarks as they stood.
+    Context {
+        state: crate::components::context_menu::Snapshot,
+        anchor: (f32, f32),
+        pill_row: usize,
+    },
+    /// The in-math completion card: rows, grid split, selection.
+    Math {
+        state: crate::components::math_menu::Snapshot,
+        anchor: (f32, f32),
+        pill_row: usize,
+    },
 }
 
 /// The in-math completion card while it is showing: the precise tree query,
@@ -221,12 +290,14 @@ pub struct Shell {
     vim: Vim,
     /// The open palette's query and selection, if it's open.
     palette: Option<PaletteState>,
-    /// The open file finder's files, query, and selection, if it's open.
-    finder: Option<FileFinderState>,
+    /// The open finder's rows, query, and selection, if it's open.
+    finder: Option<FinderState>,
     /// The open slash menu's query, selection, and anchor point, if it's open.
     slash_menu: Option<SlashMenuState>,
     /// The open context menu's rows, selection, and anchor point, if open.
     context_menu: Option<ContextMenuState>,
+    /// The open word-format bar, if any — see [`WordFormatState`].
+    format_bar: Option<WordFormatState>,
     /// Persistent Ctrl-brush selection, plus the targets currently under the
     /// brush so a held stroke toggles each target only on entry.
     brush_selected: Vec<ContextHit>,
@@ -256,11 +327,29 @@ pub struct Shell {
     #[allow(dead_code)] // wired up in a later task
     slash_region: usize,
     menu_region: usize,
+    format_region: usize,
     math_menu_region: usize,
     /// Blinks the caret in the editor and the name prompt.
     caret: Stepped,
     /// Fades the writing indicator.
     pulse: Stepped,
+    /// The entrance-reveal clock for whichever popup is opening — a menu
+    /// grows out of its anchor as this weight climbs, a modal fades up with
+    /// it (the curves live in the drawing: `popup::MENU_SLIDE_EASING`,
+    /// `popup::MODAL_FADE_DURATION`). Owned by the shell so a refreshed
+    /// snapshot never re-triggers the pop; see `Context::reveal`.
+    ///
+    /// A closing menu does not touch this clock: its ghost runs on
+    /// `menu_dismiss_clock` instead — see that field.
+    popup_reveal: Animation,
+    /// A dismissal in flight: the closing snapshot's geometry, held so the
+    /// region can keep drawing (and fading) a bar whose state is gone.
+    menu_dismiss: Option<MenuDismiss>,
+    /// The dismissal clock, falling 1→0 over `popup::GHOST_DURATION`
+    /// while `menu_dismiss` is `Some`. `Context::reveal` reports it in
+    /// place of the reveal weight, so the ghost draws with the entrance's
+    /// own curve — the weight simply falls instead of climbing.
+    menu_dismiss_clock: f32,
     /// When the next animation step is due, for the frames the shell does
     /// *not* ask for. A stepped animation reports nothing through the flat
     /// middle of a step, so without this the loop would sleep past the
@@ -329,6 +418,19 @@ pub struct Shell {
     /// here because `rebuild_views` swaps the editor component out and the
     /// layer has to outlive that.
     glow: Layer,
+    /// The blurred layer under every overlay, carrying floating surfaces'
+    /// drop shadows — today only the word-format bar paints one (its
+    /// snapshot paints into this in its own `sync`; see
+    /// `FormatBar::paint_shadow`). Held from creation so it composites
+    /// above the page but below every overlay that opens after it, because
+    /// a shadow must fall on the page, never on a popup.
+    popup_shadow: Layer,
+    /// The region that owned `popup_shadow` on the previous frame. When
+    /// ownership changes — a modal closed instantly, ownership dropping to
+    /// `None` with nobody left to clear — the loser is granted one more
+    /// frame as owner specifically to clear the layer. Without this, a
+    /// modal's halo would freeze on screen forever.
+    last_shadow_owner: Option<usize>,
     /// The palette swap in flight, if there is one — see [`ThemeSwap`].
     /// `Some` is also what locks the switch: a swap cannot be spammed,
     /// because a second one would capture a frame mid-wipe and hold *that*
@@ -470,10 +572,7 @@ impl Shell {
             Box::new(SlashMenu::closed()),
         ));
         let slash_region = regions.len() - 1;
-        regions.push(Region::detached(
-            Layout::ROOT,
-            Box::new(FileFinder::closed()),
-        ));
+        regions.push(Region::detached(Layout::ROOT, Box::new(Finder::closed())));
         let finder_region = regions.len() - 1;
         regions.push(Region::detached(
             Layout::ROOT,
@@ -482,6 +581,30 @@ impl Shell {
         let menu_region = regions.len() - 1;
         regions.push(Region::detached(Layout::ROOT, Box::new(MathMenu::closed())));
         let math_menu_region = regions.len() - 1;
+        regions.push(Region::detached(
+            Layout::ROOT,
+            Box::new(FormatBar::closed()),
+        ));
+        let format_region = regions.len() - 1;
+
+        // The blur layer carrying popups' drop shadows. Created *here* —
+        // after every regular region, before any overlay opens — because
+        // layers composite in creation order and a shadow must fall on
+        // everything on the page, sidenotes and panels included. Beside the
+        // glow it was made before the panels, and the sidenote margin
+        // composited right over the halo, clipping it whenever a word near
+        // the editor's edge opened a bar. Overlays don't have this problem:
+        // they detach when closed and `new_layer_top` back above everything
+        // when they open, so this layer sits below every popup that will
+        // ever attach and above every panel that exists.
+        //
+        // Blur set once at creation, never changed. A wider radius than the
+        // highlight's — a popup floats further above the page than a bar of
+        // ink sits under it, so its shadow spreads softer before it lands.
+        let popup_shadow = renderer.new_layer_top(LayerInvalidation::Manual);
+        popup_shadow.set_effect(Some(ShaderEffect::Blur {
+            radius: crate::components::popup::SHADOW_BLUR_RADIUS,
+        }));
 
         Self {
             layout,
@@ -501,6 +624,9 @@ impl Shell {
             finder: None,
             slash_menu: None,
             context_menu: None,
+            format_bar: None,
+            menu_dismiss: None,
+            menu_dismiss_clock: 0.0,
             brush_selected: Vec::new(),
             brush_inside: Vec::new(),
             brush_point: None,
@@ -523,6 +649,7 @@ impl Shell {
             finder_region,
             slash_region,
             menu_region,
+            format_region,
             math_menu_region,
             // Two steps, because a caret is on or off: every frame between
             // two flips repaints the same pixels. The writing indicator is
@@ -530,6 +657,10 @@ impl Shell {
             // sixteen steps is every value that reaches the screen.
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
             pulse: Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16).ping_pong(),
+            popup_reveal: Animation::new(
+                crate::components::popup::MENU_SLIDE_DURATION,
+                crate::components::popup::MENU_SLIDE_EASING,
+            ),
             wake_at: None,
             autosave_last_attempt: Instant::now(),
             autosave_revision: 0,
@@ -567,6 +698,8 @@ impl Shell {
             insert_prefix: None,
             last_width: 0.0,
             glow,
+            popup_shadow,
+            last_shadow_owner: None,
             theme_swap: None,
         }
     }
@@ -606,6 +739,28 @@ impl Shell {
         // cannot drive something that sleeps longer than the clamp.
         animating |= self.caret.advance();
         animating |= self.pulse.advance();
+        if self.any_overlay_open() || self.popup_reveal.is_playing() {
+            animating |= self.popup_reveal.advance(dt);
+        }
+        if self.menu_dismiss.is_some() {
+            // The fall is wall-clock proportional, not the reveal animation
+            // run backwards: independent pacing, no shared state to reset.
+            self.menu_dismiss_clock -=
+                dt.as_secs_f32() / crate::components::popup::GHOST_DURATION.as_secs_f32();
+            if self.menu_dismiss_clock <= 0.0 {
+                // Land on the closed snapshot of whichever menu fell away —
+                // each refresh_*_menu arm rebuilds its own region.
+                let ended = self.menu_dismiss.take().expect("checked above");
+                self.menu_dismiss_clock = 0.0;
+                match ended {
+                    MenuDismiss::Format { .. } => self.refresh_format_bar(),
+                    MenuDismiss::Slash { .. } => self.refresh_slash_menu(),
+                    MenuDismiss::Context { .. } => self.refresh_context_menu(),
+                    MenuDismiss::Math { .. } => self.refresh_math_menu(),
+                }
+            }
+            animating = true;
+        }
         let animation_wake = Instant::now() + self.caret.wake_in().min(self.pulse.wake_in());
         // A pending autosave is a deadline too: it must wake the loop from
         // its sleep even though no animation is asking for a frame. Without
@@ -631,7 +786,25 @@ impl Shell {
             });
         }
 
+        // The popup shadow layer has ONE writer per frame: whichever region
+        // currently hosts the visible popup (or its falling ghost). Every
+        // other region's context denies ownership — a closed snapshot that
+        // cleared anyway would race and wipe a live halo (that bug shipped:
+        // popups lost their shadows after one format-bar use, because the
+        // bar region's sync ran after the other regions' draws).
+        let mut shadow_owner = self.shadow_owner_region();
+        if shadow_owner.is_none() {
+            // Instant modal close: ownership dropped with no ghost to catch
+            // the halo. The region that had it gets exactly one more frame
+            // as owner — its snapshot is closed by now, so the grant makes
+            // it clear and then release.
+            shadow_owner = self.last_shadow_owner;
+            self.last_shadow_owner = None;
+        } else {
+            self.last_shadow_owner = shadow_owner;
+        }
         let context = Context {
+            owns_shadow: false,
             frametime,
             animation_dt: dt,
             layouts: self.layouts,
@@ -651,20 +824,23 @@ impl Shell {
             self_rect: Rect::default(),
             divider_hover: self.divider_hover.value(),
             debug_rows: self.debug_rows,
-            overlay_open: self.dialog.is_some()
-                || self.onboarding
-                || self.palette.is_some()
-                || self.slash_menu.is_some()
-                || self.context_menu.is_some()
-                || self.math_menu.is_some()
-                || self.finder.is_some(),
+            // During a dismissal the ghost needs a *falling* weight: hand
+            // it the dismiss clock so `FormatBar::draw`'s entrance math
+            // doubles as the exit — at 0 the ghost is gone.
+            reveal: if self.menu_dismiss.is_some() {
+                self.menu_dismiss_clock
+            } else {
+                self.popup_reveal.weight()
+            },
+            overlay_open: self.any_overlay_open(),
             theme_locked: self.theme_swap.is_some(),
         };
-        for region in &mut self.regions {
+        for (index, region) in self.regions.iter_mut().enumerate() {
             let mut context = context;
             // A component hit-tests against its own rect; the shell is the
             // only one that knows where that rect is, so it hands it over.
             context.self_rect = self.layout.rect(region.node());
+            context.owns_shadow = Some(index) == shadow_owner;
             region.sync(&context);
             animating |= region.is_animating();
             region.measure_into(&mut self.layout);
@@ -717,6 +893,56 @@ impl Shell {
         animating
     }
 
+    /// Which region draws this frame's halo onto `popup_shadow` — the one
+    /// hosting the live popup, else the one hosting its falling ghost, else
+    /// none. One writer; see `owns_shadow` on `Context`.
+    fn shadow_owner_region(&self) -> Option<usize> {
+        if self.dialog.is_some() {
+            return Some(self.dialog_region);
+        }
+        if self.onboarding {
+            return Some(self.onboard_region);
+        }
+        if self.palette.is_some() {
+            return Some(self.palette_region);
+        }
+        if self.slash_menu.is_some() {
+            return Some(self.slash_region);
+        }
+        if self.finder.is_some() {
+            return Some(self.finder_region);
+        }
+        if self.context_menu.is_some() {
+            return Some(self.menu_region);
+        }
+        if self.math_menu.is_some() {
+            return Some(self.math_menu_region);
+        }
+        if self.format_bar.is_some() {
+            return Some(self.format_region);
+        }
+        match &self.menu_dismiss {
+            Some(MenuDismiss::Format { .. }) => Some(self.format_region),
+            Some(MenuDismiss::Slash { .. }) => Some(self.slash_region),
+            Some(MenuDismiss::Context { .. }) => Some(self.menu_region),
+            Some(MenuDismiss::Math { .. }) => Some(self.math_menu_region),
+            None => None,
+        }
+    }
+
+    /// Is any popup showing? One disjunction, so the frame loop's "something
+    /// is open" decisions and `Context::overlay_open` can never disagree.
+    fn any_overlay_open(&self) -> bool {
+        self.dialog.is_some()
+            || self.onboarding
+            || self.palette.is_some()
+            || self.slash_menu.is_some()
+            || self.context_menu.is_some()
+            || self.format_bar.is_some()
+            || self.math_menu.is_some()
+            || self.finder.is_some()
+    }
+
     /// The smallest the window may be before regions start overlapping.
     pub fn min_window_size(&self) -> (f32, f32) {
         self.layout.min_size(Layout::ROOT)
@@ -765,6 +991,35 @@ impl Shell {
         Some(self.autosave_last_attempt + AUTOSAVE_IDLE)
     }
 
+    /// Renders the active note to a PDF the reader picks a place for.
+    ///
+    /// Measuring and shaping go through the text region's own layer, which
+    /// is what makes the page break its lines exactly where the editor does
+    /// — see `PDF.md` §4. That makes this synchronous and main-thread, which
+    /// is fine: it is an export, not a keystroke.
+    fn export_pdf(&mut self) {
+        let (document, name) = {
+            let docs = self.docs.borrow();
+            let Some(tab) = docs.active() else {
+                return;
+            };
+            (tab.document.clone(), tab.name().to_string())
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export as PDF")
+            .set_file_name(format!("{name}.pdf"))
+            .add_filter("PDF", &["pdf"])
+            .save_file()
+        else {
+            return;
+        };
+        let layer = self.regions[self.text_region].layer();
+        if let Err(error) = export::export_pdf(&document, layer, &path, export::Options::default())
+        {
+            eprintln!("PDF export failed for {}: {error}", path.display());
+        }
+    }
+
     /// Writes every dirty tab now, for the window-close path. Failures are
     /// logged to stderr and swallowed — the window must always close, and
     /// there is nothing left to retry once the loop has exited.
@@ -791,10 +1046,26 @@ impl Shell {
             (self.onboard_region, self.onboarding),
             (self.dialog_region, self.dialog.is_some()),
             (self.palette_region, self.palette.is_some()),
-            (self.slash_region, self.slash_menu.is_some()),
+            (
+                self.slash_region,
+                self.slash_menu.is_some()
+                    || matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })),
+            ),
             (self.finder_region, self.finder.is_some()),
-            (self.menu_region, self.context_menu.is_some()),
-            (self.math_menu_region, self.math_menu.is_some()),
+            (
+                self.menu_region,
+                self.context_menu.is_some()
+                    || matches!(self.menu_dismiss, Some(MenuDismiss::Context { .. })),
+            ),
+            (
+                self.format_region,
+                self.format_bar.is_some() || self.menu_dismiss.is_some(),
+            ),
+            (
+                self.math_menu_region,
+                self.math_menu.is_some()
+                    || matches!(self.menu_dismiss, Some(MenuDismiss::Math { .. })),
+            ),
         ];
         for (index, open) in overlays {
             match (open, self.regions[index].is_attached()) {
@@ -988,6 +1259,7 @@ impl Shell {
                     scale: 1.0,
                     source: Vec::new(),
                     anchors: Vec::new(),
+                    equation_numbers: std::collections::HashMap::new(),
                 },
             }
         };
@@ -1140,6 +1412,7 @@ impl Shell {
                                 crate::document::Inline::Text(text) => text.text.chars().count(),
                                 crate::document::Inline::Math(_) => 1,
                                 crate::document::Inline::Note(_) => 1,
+                                crate::document::Inline::EqRef(_) => 1,
                             })
                             .sum();
                         crate::document::FlatRange::new(

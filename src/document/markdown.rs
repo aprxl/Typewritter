@@ -22,7 +22,7 @@ use std::io;
 use std::path::Path;
 
 use super::math_notation;
-use super::{BadgeColor, Block, Caret, Document, Focus, Inline, Sidenote, Style, Text};
+use super::{BadgeColor, Block, Caret, Document, Focus, Inline, ListMarker, Sidenote, Style, Text};
 
 /// Scan for the next unescaped occurrence of `marker` at or after `start`.
 /// The char immediately before a match must be non-whitespace. Escaped
@@ -72,6 +72,50 @@ fn unescape(s: &[char]) -> String {
         }
     }
     out
+}
+
+/// Whether `name` is a legal equation-label name: `[A-Za-z0-9_-]+`.
+fn is_eq_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The length of an equation reference at the start of `chars`: `@eq:` plus
+/// a legal label name, or `None` when this `@` is ordinary text.
+fn eq_ref_at(chars: &[char]) -> Option<usize> {
+    if chars.len() < 5 || chars[1] != 'e' || chars[2] != 'q' || chars[3] != ':' {
+        return None;
+    }
+    let mut n = 4;
+    while n < chars.len()
+        && (chars[n].is_ascii_alphanumeric() || chars[n] == '_' || chars[n] == '-')
+    {
+        n += 1;
+    }
+    if n > 4 { Some(n) } else { None }
+}
+
+/// Parse a fence info string: `tw-math v1`, optionally followed by one
+/// equation tag `#eq:<name>`. Returns whether the fence is a math block and
+/// its label (`eq:<name>`, without the `#`). Any other spelling stays a
+/// code fence, so unknown versions and foreign files always open.
+fn parse_math_info(info: &str) -> (bool, Option<String>) {
+    let mut tokens = info.split_whitespace();
+    if tokens.next() != Some("tw-math") || tokens.next() != Some("v1") {
+        return (false, None);
+    }
+    let mut tag = None;
+    for token in tokens {
+        if let Some(name) = token.strip_prefix("#eq:")
+            && is_eq_name(name)
+            && tag.is_none()
+        {
+            tag = Some(format!("eq:{name}"));
+        }
+    }
+    (true, tag)
 }
 
 /// Parse the inline grammar into a `Vec<Inline>`. Runs are flat — markers
@@ -208,6 +252,7 @@ fn parse_inline(s: &str) -> Vec<Inline> {
                                 }
                                 Inline::Math(list) => runs.push(Inline::Math(list)),
                                 Inline::Note(label) => runs.push(Inline::Note(label)),
+                                Inline::EqRef(label) => runs.push(Inline::EqRef(label)),
                             }
                         }
                         i = cl + 2;
@@ -284,6 +329,22 @@ fn parse_inline(s: &str) -> Vec<Inline> {
                     }
                 }
             }
+            '@' => {
+                // An equation reference: `@eq:<name>`. Anything else after
+                // the `@` is literal text — no error path, like every other
+                // marker here.
+                if let Some(len) = eq_ref_at(&chars[i..]) {
+                    push_plain(&mut runs, &mut text_buf);
+                    // The label is everything after the `@`: `eq:<name>`, the
+                    // tag without its `#`.
+                    let label: String = chars[i + 1..i + len].iter().collect();
+                    runs.push(Inline::EqRef(label));
+                    i += len;
+                } else {
+                    text_buf.push('@');
+                    i += 1;
+                }
+            }
             c => {
                 text_buf.push(c);
                 i += 1;
@@ -310,6 +371,24 @@ fn is_divider_line(line: &str) -> bool {
     line.len() >= 3 && line.chars().all(|c| c == '-')
 }
 
+/// Whether a serialized line would re-read as a list item's marker —
+/// `- `, `* `, `+ `, or `N.`/`N) ` — and so needs a leading escape. Only a
+/// line's *start* can claim it: mid-prose `-` and `1.` are ordinary text.
+fn reads_as_list_item(line: &str) -> bool {
+    if line.starts_with("- ") || line.starts_with("* ") || line.starts_with("+ ") {
+        return true;
+    }
+    let bytes = line.as_bytes();
+    let mut digits = 0;
+    while digits < bytes.len() && bytes[digits].is_ascii_digit() {
+        digits += 1;
+    }
+    digits > 0
+        && digits < bytes.len()
+        && (bytes[digits] == b'.' || bytes[digits] == b')')
+        && bytes.get(digits + 1) == Some(&b' ')
+}
+
 /// Parse a line as a heading `#{1,4}\s+...`. Returns `(level, content)`.
 fn parse_heading(line: &str) -> Option<(u8, &str)> {
     let bytes = line.as_bytes();
@@ -324,6 +403,46 @@ fn parse_heading(line: &str) -> Option<(u8, &str)> {
     }
     let rest = line[i + 1..].trim_start();
     Some((count as u8, rest))
+}
+
+/// The kinds of list marker a line can carry. The ordinal an ordered item
+/// was typed with is tolerated (`N.`/`N)`) but never stored — the item's
+/// place in its run is the only number there is, and serialization
+/// renumbers the run anyway.
+enum ListKind {
+    Bullet,
+    Ordered,
+    Task { done: bool },
+}
+
+/// Parse a line as a list item — one line, never an indented continuation:
+/// `- `/`* `/`+ ` bullets, `- [ ]` / `- [x]` tasks (also `* [ ]`, and either
+/// case of the check), or `N.`/`N)` ordered. Returns the marker kind and
+/// the content after it.
+fn parse_list_item(line: &str) -> Option<(ListKind, &str)> {
+    let (marker, rest) = line.split_once(' ')?;
+    if matches!(marker, "-" | "*" | "+") {
+        let rest = rest.trim_start();
+        if let Some(content) = rest.strip_prefix("[ ]") {
+            return Some((ListKind::Task { done: false }, content.trim_start()));
+        }
+        for (prefix, done) in [("[x]", true), ("[X]", true)] {
+            if let Some(content) = rest.strip_prefix(prefix) {
+                return Some((ListKind::Task { done }, content.trim_start()));
+            }
+        }
+        return Some((ListKind::Bullet, rest));
+    }
+    let last = marker.chars().last()?;
+    if marker.len() > 1
+        && (last == '.' || last == ')')
+        && marker[..marker.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_digit())
+    {
+        return Some((ListKind::Ordered, rest));
+    }
+    None
 }
 
 /// A footnote definition line `[^label]: body`. Returns `(label, body)` where
@@ -360,8 +479,13 @@ pub fn parse(path: &Path, text: &str) -> Document {
     let mut fence_had_lines = false;
     let mut fence_lang: Option<String> = None;
     let mut fence_math = false;
+    let mut fence_tag: Option<String> = None;
     let mut math_body = String::new();
     let mut definitions: Vec<(String, Block)> = Vec::new();
+    // The running ordinal of the ordered run being read. Reset by every
+    // non-ordered-item block, so a run numbers 1,2,3… the way serialization
+    // writes it.
+    let mut ordinal = 0u32;
 
     let flush_para = |blocks: &mut Vec<Block>, para: &mut Vec<String>| {
         if !para.is_empty() {
@@ -376,9 +500,10 @@ pub fn parse(path: &Path, text: &str) -> Document {
         if in_fence {
             if line.trim() == "```" {
                 if fence_math {
-                    blocks.push(Block::Math(vec![Inline::Math(math_notation::parse(
-                        &math_body,
-                    ))]));
+                    blocks.push(Block::Math {
+                        list: vec![Inline::Math(math_notation::parse(&math_body))],
+                        tag: fence_tag.take(),
+                    });
                     math_body.clear();
                 } else if !fence_had_lines {
                     let empty = Inline::Text(Text {
@@ -398,6 +523,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
                 fence_had_lines = false;
                 fence_lang = None;
                 fence_math = false;
+                fence_tag = None;
             } else {
                 if fence_math {
                     math_body.push_str(line);
@@ -425,7 +551,9 @@ pub fn parse(path: &Path, text: &str) -> Document {
             flush_para(&mut blocks, &mut para);
             let info = line.trim()[3..].trim();
             // Unknown tw-math versions remain code so newer files always open.
-            fence_math = info == "tw-math v1";
+            let (math, tag) = parse_math_info(info);
+            fence_math = math;
+            fence_tag = tag;
             math_body.clear();
             fence_lang = if info.is_empty() {
                 None
@@ -465,7 +593,40 @@ pub fn parse(path: &Path, text: &str) -> Document {
             }
             blocks.push(Block::Heading {
                 level,
+                folded: false,
                 content: inlines,
+            });
+        } else if let Some((kind, content)) = parse_list_item(line) {
+            flush_para(&mut blocks, &mut para);
+            // An ordered run continues only through consecutive ordered
+            // items; a bullet or task item between them restarts it, as
+            // does any non-list block.
+            if !matches!(
+                blocks.last(),
+                Some(Block::ListItem {
+                    marker: ListMarker::Number(_),
+                    ..
+                })
+            ) {
+                ordinal = 0;
+            }
+            ordinal += 1;
+            let marker = match kind {
+                ListKind::Bullet => ListMarker::Bullet,
+                ListKind::Task { done } => ListMarker::Task { done },
+                ListKind::Ordered => ListMarker::Number(ordinal),
+            };
+            let mut runs = parse_inline(content);
+            if runs.is_empty() {
+                // Every block keeps at least one run, even if empty.
+                runs.push(Inline::Text(Text {
+                    text: String::new(),
+                    style: Style::PLAIN,
+                }));
+            }
+            blocks.push(Block::ListItem {
+                marker,
+                content: runs,
             });
         } else if line.trim().is_empty() {
             flush_para(&mut blocks, &mut para);
@@ -478,9 +639,10 @@ pub fn parse(path: &Path, text: &str) -> Document {
     if in_fence {
         // Unterminated fences still produce their content; the file must open.
         if fence_math {
-            blocks.push(Block::Math(vec![Inline::Math(math_notation::parse(
-                &math_body,
-            ))]));
+            blocks.push(Block::Math {
+                list: vec![Inline::Math(math_notation::parse(&math_body))],
+                tag: fence_tag,
+            });
         }
     }
 
@@ -601,6 +763,7 @@ fn serialize_runs(runs: &[Inline]) -> String {
         }
         Inline::Math(list) => format!("${}$", math_notation::print(list)),
         Inline::Note(label) => format!("[^{label}]"),
+        Inline::EqRef(label) => format!("@{label}"),
     };
     let mut out = String::new();
     let mut i = 0;
@@ -646,11 +809,24 @@ pub fn serialize(doc: &Document) -> String {
     let mut out = String::new();
     let mut i = 0;
     let mut first = true;
+    // The running ordinal of the ordered run being written, reset by every
+    // non-ordered-item block. The stored `Number` is never printed; the
+    // run's sequence is the number.
+    let mut ordinal = 0u32;
     while i < doc.body().len() {
         if !first {
             out.push_str("\n\n");
         }
         first = false;
+        if !matches!(
+            &doc.body()[i],
+            Block::ListItem {
+                marker: ListMarker::Number(_),
+                ..
+            }
+        ) {
+            ordinal = 0;
+        }
         match &doc.body()[i] {
             Block::CodeLine { lang, .. } => {
                 let opener = match lang {
@@ -672,7 +848,11 @@ pub fn serialize(doc: &Document) -> String {
                 out.push_str("```");
                 i = j;
             }
-            Block::Heading { level, content } => {
+            Block::Heading {
+                level,
+                folded: _,
+                content,
+            } => {
                 out.push_str(&"#".repeat(*level as usize));
                 out.push(' ');
                 out.push_str(&serialize_runs(content));
@@ -682,14 +862,44 @@ pub fn serialize(doc: &Document) -> String {
                 out.push_str("---");
                 i += 1;
             }
-            Block::Math(runs) => {
+            Block::Math { list: runs, tag } => {
                 let list = match runs.as_slice() {
                     [Inline::Math(list)] => list,
                     _ => unreachable!("enforced math block invariant"),
                 };
-                out.push_str("```tw-math v1\n");
+                out.push_str("```tw-math v1");
+                if let Some(tag) = tag {
+                    out.push_str(" #");
+                    out.push_str(tag);
+                }
+                out.push('\n');
                 out.push_str(&math_notation::print(list));
                 out.push_str("\n```");
+                i += 1;
+            }
+            Block::ListItem { marker, content } => {
+                let mut line = serialize_runs(content);
+                // A bullet whose content would read as a task box (or an
+                // empty one) is escaped so it re-reads as the bullet it is.
+                if matches!(marker, ListMarker::Bullet)
+                    && (line.starts_with("[ ]")
+                        || line.starts_with("[x]")
+                        || line.starts_with("[X]"))
+                {
+                    line.insert(0, '\\');
+                }
+                match marker {
+                    ListMarker::Bullet => out.push_str("- "),
+                    ListMarker::Task { done } => {
+                        out.push_str(if *done { "- [x] " } else { "- [ ] " });
+                    }
+                    ListMarker::Number(_) => {
+                        ordinal += 1;
+                        out.push_str(&ordinal.to_string());
+                        out.push_str(". ");
+                    }
+                }
+                out.push_str(&line);
                 i += 1;
             }
             Block::Paragraph(runs) => {
@@ -702,6 +912,10 @@ pub fn serialize(doc: &Document) -> String {
                 // Guard a paragraph that would otherwise re-read as a
                 // divider (e.g. text `---`).
                 if is_divider_line(&line) {
+                    line.insert(0, '\\');
+                }
+                // …or as a list item (e.g. text `- tea` or `1) note`).
+                if reads_as_list_item(&line) {
                     line.insert(0, '\\');
                 }
                 out.push_str(&line);
@@ -863,8 +1077,28 @@ mod tests {
     fn head(level: u8, runs: Vec<Inline>) -> Block {
         Block::Heading {
             level,
+            folded: false,
             content: runs,
         }
+    }
+
+    #[test]
+    fn folded_state_never_reaches_disk() {
+        let text = "# Top\n\nbody\n";
+        let plain = parse(Path::new("x"), text);
+        let printed_plain = serialize(&plain);
+
+        let mut folded = parse(Path::new("x"), text);
+        if let Block::Heading { folded: state, .. } = &mut folded.body_mut()[0] {
+            *state = true;
+        }
+        assert_eq!(
+            serialize(&folded),
+            printed_plain,
+            "the flag is editor state only"
+        );
+        // And re-parsing the file opens unfolded, whatever was on disk.
+        assert!(!parse(Path::new("x"), &printed_plain).body()[0].is_folded());
     }
 
     #[test]
@@ -928,7 +1162,10 @@ mod tests {
 
     #[test]
     fn a_math_block_round_trips_through_its_fence() {
-        let d = doc_with(vec![Block::Math(vec![math("1/2")])]);
+        let d = doc_with(vec![Block::Math {
+            list: vec![math("1/2")],
+            tag: None,
+        }]);
         assert_eq!(serialize(&d), "```tw-math v1\n1/2\n```\n");
         assert_eq!(parse(Path::new("x"), &serialize(&d)).body(), d.body());
     }
@@ -980,6 +1217,7 @@ mod tests {
             parse(Path::new("x"), "#### x\n").body(),
             vec![Block::Heading {
                 level: 4,
+                folded: false,
                 content: vec![plain("x")]
             }]
         );
@@ -997,11 +1235,12 @@ mod tests {
             parse(Path::new("x"), "**no close\n").body(),
             vec![np("**no close")]
         );
-        // Opening marker must be followed by non-space: `* space*` is plain
-        // (a single literal `*`), and the trailing lone `*` is literal too.
+        // Opening marker must be followed by non-space — but a line-leading
+        // `* ` is now a bullet, so `* space*` reads as one item whose lone
+        // trailing `*` is literal text.
         assert_eq!(
             parse(Path::new("x"), "* space*\n").body(),
-            vec![np("* space*")]
+            vec![item(ListMarker::Bullet, "space*")]
         );
         // Escaped literal star.
         assert_eq!(
@@ -1538,6 +1777,264 @@ mod tests {
             ])]
         );
         assert_eq!(serialize(&d), text);
+    }
+
+    // ---- equation tags and references ------------------------------------
+
+    #[test]
+    fn a_tagged_math_block_round_trips_through_its_fence() {
+        let text = "```tw-math v1 #eq:gain\n1/2\n```\n";
+        let d = parse(Path::new("x"), text);
+        assert!(matches!(
+            d.body()[0],
+            Block::Math {
+                tag: Some(ref tag),
+                ..
+            } if tag == "eq:gain"
+        ));
+        assert_eq!(serialize(&d), text);
+        assert_eq!(parse(Path::new("x"), &serialize(&d)).body(), d.body());
+    }
+
+    #[test]
+    fn a_tag_stays_put_through_the_editor_round_trip() {
+        let d = doc_with(vec![
+            Block::Math {
+                list: vec![math("1/2")],
+                tag: Some("eq:gain".into()),
+            },
+            para(vec![
+                plain("see "),
+                Inline::EqRef("eq:gain".into()),
+                plain(" here"),
+            ]),
+        ]);
+        let text = serialize(&d);
+        assert!(text.starts_with("```tw-math v1 #eq:gain\n"), "got {text:?}");
+        assert!(text.contains("@eq:gain"), "got {text:?}");
+        assert_eq!(parse(Path::new("x"), &text).body(), d.body());
+    }
+
+    #[test]
+    fn an_equation_reference_round_trips_through_its_at_spelling() {
+        let text = "by @eq:gain above\n";
+        let d = parse(Path::new("x"), text);
+        assert_eq!(
+            d.body(),
+            vec![para(vec![
+                plain("by "),
+                Inline::EqRef("eq:gain".into()),
+                plain(" above")
+            ])]
+        );
+        assert_eq!(serialize(&d), text);
+        assert_eq!(parse(Path::new("x"), &serialize(&d)).body(), d.body());
+    }
+
+    #[test]
+    fn an_at_sign_that_is_not_a_reference_is_literal() {
+        for text in [
+            "@eq: no space name\n", // `@eq:` alone then space
+            "@user mentioned\n",    // wrong keyword
+            "@ eq:gain spaced\n",   // space after @
+            "a lone @\n",           // bare @
+            "@eq:\n",               // no name at all
+        ] {
+            let d = parse(Path::new("x"), text);
+            assert!(
+                d.body()[0]
+                    .inlines()
+                    .iter()
+                    .all(|r| !matches!(r, Inline::EqRef(_))),
+                "{text:?} should not have produced a reference"
+            );
+            let out = serialize(&d);
+            assert_eq!(parse(Path::new("x"), &out).body(), d.body(), "{text:?}");
+        }
+        // A reference may carry digits, underscores, and dashes.
+        let d = parse(Path::new("x"), "@eq:Gain_2-x\n");
+        assert!(matches!(
+            d.body()[0].inlines()[0],
+            Inline::EqRef(ref l) if l == "eq:Gain_2-x"
+        ));
+    }
+
+    #[test]
+    fn a_fence_with_an_unknown_version_never_becomes_math() {
+        // A tag on an unknown version does not rescue it into math.
+        let d = parse(Path::new("x"), "```tw-math v2 #eq:gain\nx\n```\n");
+        assert!(d.body()[0].is_code());
+        assert_eq!(serialize(&d), "```tw-math v2 #eq:gain\nx\n```\n");
+    }
+
+    #[test]
+    fn a_tag_with_an_illegal_name_is_dropped_not_error() {
+        let d = parse(Path::new("x"), "```tw-math v1 #eq:bad!name\nx\n```\n");
+        assert!(matches!(d.body()[0], Block::Math { tag: None, .. }));
+        // Serializing writes the canonical spelling: no tag.
+        assert_eq!(serialize(&d), "```tw-math v1\nx\n```\n");
+    }
+
+    // ---- list item tests -------------------------------------------------
+
+    fn item(marker: ListMarker, t: &str) -> Block {
+        Block::ListItem {
+            marker,
+            content: vec![plain(t)],
+        }
+    }
+
+    /// Round trip is mandatory for every new spelling: parse then serialize
+    /// returns the same blocks, serialize is byte-stable, and the tolerant
+    /// variants all land on the one canonical spelling.
+    #[test]
+    fn list_spellings_parse_and_round_trip() {
+        let cases = [
+            // (source, expected marker of block 0, expected content)
+            ("- tea\n", ListMarker::Bullet, "tea"),
+            ("* tea\n", ListMarker::Bullet, "tea"),
+            ("+ tea\n", ListMarker::Bullet, "tea"),
+            (
+                "- [ ] buy milk\n",
+                ListMarker::Task { done: false },
+                "buy milk",
+            ),
+            (
+                "* [ ] buy milk\n",
+                ListMarker::Task { done: false },
+                "buy milk",
+            ),
+            (
+                "- [x] buy milk\n",
+                ListMarker::Task { done: true },
+                "buy milk",
+            ),
+            (
+                "- [X] buy milk\n",
+                ListMarker::Task { done: true },
+                "buy milk",
+            ),
+            ("1. tea\n", ListMarker::Number(1), "tea"),
+            ("12) tea\n", ListMarker::Number(1), "tea"),
+            ("- [ ]\n", ListMarker::Task { done: false }, ""),
+            ("1. \n", ListMarker::Number(1), ""),
+        ];
+        for (source, marker, content) in cases {
+            let d = parse(Path::new("x"), source);
+            assert_eq!(
+                d.body(),
+                vec![item(marker, content)],
+                "parse failed for {source:?}"
+            );
+            let text = serialize(&d);
+            assert_eq!(
+                parse(Path::new("x"), &text).body(),
+                d.body(),
+                "round-trip failed for {source:?}"
+            );
+            assert_eq!(
+                serialize(&parse(Path::new("x"), &text)),
+                text,
+                "canonical stability failed for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_markers_serialize_to_one_spelling() {
+        for source in ["* tea\n", "+ tea\n"] {
+            assert_eq!(serialize(&parse(Path::new("x"), source)), "- tea\n");
+        }
+        assert_eq!(
+            serialize(&parse(Path::new("x"), "- [X] done\n")),
+            "- [x] done\n"
+        );
+        // The typed ordinal is never stored: the run is renumbered.
+        let d = parse(Path::new("x"), "5. a\n6. b\n");
+        assert_eq!(
+            d.body(),
+            vec![
+                item(ListMarker::Number(1), "a"),
+                item(ListMarker::Number(2), "b"),
+            ]
+        );
+        assert_eq!(serialize(&d), "1. a\n\n2. b\n");
+    }
+
+    #[test]
+    fn an_ordered_run_restarts_after_a_non_list_block() {
+        let d = parse(Path::new("x"), "1. a\n\npara\n\n2. b\n");
+        assert_eq!(
+            d.body(),
+            vec![
+                item(ListMarker::Number(1), "a"),
+                para(vec![plain("para")]),
+                item(ListMarker::Number(1), "b"),
+            ]
+        );
+        assert_eq!(serialize(&d), "1. a\n\npara\n\n1. b\n");
+    }
+
+    #[test]
+    fn a_bullet_or_task_item_ends_an_ordered_run() {
+        let d = parse(Path::new("x"), "1. a\n- b\n2. c\n");
+        assert_eq!(
+            d.body(),
+            vec![
+                item(ListMarker::Number(1), "a"),
+                item(ListMarker::Bullet, "b"),
+                item(ListMarker::Number(1), "c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_content_keeps_its_inline_grammar() {
+        let d = parse(Path::new("x"), "- **bold** step and $a/b$\n");
+        assert_eq!(
+            d.body(),
+            vec![Block::ListItem {
+                marker: ListMarker::Bullet,
+                content: vec![bold("bold"), plain(" step and "), math("a/b")],
+            }]
+        );
+        assert_eq!(serialize(&d), "- **bold** step and $a/b$\n");
+    }
+
+    #[test]
+    fn list_like_paragraphs_are_escaped_on_the_way_out() {
+        // A paragraph whose text reads as a list item gets a leading
+        // escape, exactly like the `#` and `---` guards.
+        let d = doc_with(vec![para(vec![plain("- tea")])]);
+        let out = serialize(&d);
+        assert_eq!(out, "\\- tea\n");
+        assert_eq!(parse(Path::new("x"), &out).body(), d.body());
+
+        let d = doc_with(vec![para(vec![plain("1) note")])]);
+        let out = serialize(&d);
+        assert_eq!(out, "\\1) note\n");
+        assert_eq!(parse(Path::new("x"), &out).body(), d.body());
+    }
+
+    #[test]
+    fn a_bullet_whose_content_reads_as_a_task_box_is_escaped() {
+        let d = doc_with(vec![item(ListMarker::Bullet, "[ ] not a task")]);
+        let out = serialize(&d);
+        assert_eq!(out, "- \\[ ] not a task\n");
+        assert_eq!(parse(Path::new("x"), &out).body(), d.body());
+    }
+
+    #[test]
+    fn a_list_line_does_not_join_a_paragraph() {
+        let d = parse(Path::new("x"), "intro\n- tea\n\noutro\n");
+        assert_eq!(
+            d.body(),
+            vec![
+                para(vec![plain("intro")]),
+                item(ListMarker::Bullet, "tea"),
+                para(vec![plain("outro")]),
+            ]
+        );
     }
 
     #[test]

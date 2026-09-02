@@ -14,8 +14,8 @@ use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 use crate::document::BadgeColor;
 use crate::layout::Rect;
 use crate::renderer::{
-    Alignment, Color, Font, FontParameters, HorizontalAlign, Layer, LineCap, LineJoin, PathPaint,
-    Rounding, Stroke, VerticalAlign,
+    Alignment, Color, Font, FontParameters, GradientDirection, HorizontalAlign, Layer, LineCap,
+    LineJoin, PathPaint, Rounding, Stroke, VerticalAlign,
 };
 
 /// Whether a palette is a light one or a dark one.
@@ -607,6 +607,23 @@ pub fn fade(color: Color, alpha: f32) -> Color {
     }
 }
 
+/// Scales a color's OWN alpha by `weight`, keeping its hue. Where [`fade`]
+/// replaces the alpha outright — the right tool when the caller knows the
+/// final opacity — this preserves how translucent the color already is,
+/// for weights applied ON TOP of an authored value: a shadow ink authored
+/// at 6% must still be 6% at rest, not 100% because its reveal weight is.
+pub fn scale_alpha(color: Color, weight: f32) -> Color {
+    match color {
+        Color::Solid([r, g, b, a]) => Color::rgba(
+            r,
+            g,
+            b,
+            ((a as f32 / 255.0) * weight.clamp(0.0, 1.0) * 255.0) as u8,
+        ),
+        other => other,
+    }
+}
+
 /// Linear blend between two solid colors, `t` in 0..=1. Non-solid inputs
 /// are returned as `from` — there is no single channel blend for a gradient.
 pub fn mix(from: Color, to: Color, t: f32) -> Color {
@@ -628,6 +645,22 @@ pub fn vertical_rule(layer: &Layer, at: (f32, f32), length: f32, thickness: f32,
     layer.draw_rectangle(at, (thickness, length), color, Rounding::NONE);
 }
 
+/// Draws a filled glyph from the Material Symbols set — these are filled
+/// shapes authored in a `0 -960 960 960` viewbox, not the stroked feather
+/// glyphs [`icon`] draws, so they need their own helper rather than a pen.
+/// `at` is the top-left corner of the `size`-square the glyph fills.
+pub fn material(layer: &Layer, d: &str, at: (f32, f32), size: f32, color: Color) {
+    layer
+        .draw_svg_icon(
+            d,
+            (0.0, -960.0, 960.0, 960.0),
+            (size, size),
+            at,
+            crate::renderer::PathPaint::fill(color),
+        )
+        .expect("material icon paths are constants — a parse failure is a typo, not input");
+}
+
 /// A 1px outline, drawn as four rules.
 pub fn outline(layer: &Layer, rect: Rect, color: Color) {
     rule(layer, rect.position(), rect.width, 1.0, color.clone());
@@ -640,6 +673,80 @@ pub fn outline(layer: &Layer, rect: Rect, color: Color) {
     );
     vertical_rule(layer, rect.position(), rect.height, 1.0, color.clone());
     vertical_rule(layer, (rect.right() - 1.0, rect.y), rect.height, 1.0, color);
+}
+
+/// The ink a floating surface's shadow is drawn in — one value for every
+/// popup, tuned per palette. Deliberately translucent at full weight: the
+/// blur's falloff ring is half-transparent by nature, and an opaque core
+/// makes the page's own text ghost through that ring darkened — a grid of
+/// noise around every popup. A soft shadow reads as depth; a hard one
+/// reads as a smudge.
+pub fn shadow_ink() -> Color {
+    match mode() {
+        // 0x80 (50%) by ear: scale_alpha finally lets this byte through
+        // (see the slab painter), and the halved values from before read as
+        // barely-there now that they are actually applied.
+        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x80),
+        Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x80),
+    }
+}
+
+/// An elevated floating card's surface: [`Theme::popup`]'s hue lifted into
+/// a vertical gradient — a touch lighter above the content, settling back
+/// to the flat colour below it. Reads as one raised object with light on it
+/// rather than a tinted slab. `e` is an entrance weight; the stops' shared
+/// alpha carries it, so a gradient fades without per-pixel work.
+pub fn elevated_popup(e: f32) -> Color {
+    let base = popup();
+    let lift = if mode() == Mode::Light { 6 } else { 9 };
+    let Color::Solid([r, g, b, _]) = base.clone() else {
+        return fade(base, e);
+    };
+    let a = (e.clamp(0.0, 1.0) * 255.0) as u8;
+    // The lift is small enough that no palette channel can overflow —
+    // clippy knows it too, so there is deliberately no `.min(255)` here.
+    assert!(lift <= 15);
+    let up = |c: u8| c + lift;
+    Color::gradient(
+        [up(r), up(g), up(b), a],
+        [r, g, b, a],
+        GradientDirection::Vertical,
+    )
+}
+
+/// Draw `rect` as a rounded-rectangle outline by stroking its border path —
+/// straight edges joined by real quarter arcs, so the stroke's corners
+/// match a fill drawn at the same radius. ([`outline`]'s four axis-aligned
+/// rules cannot do this: they square off any radius they are drawn
+/// around.) One path, one pen; parse failures are impossible because the
+/// geometry is generated here — and pinned by a unit test anyway.
+pub fn rounded_outline(layer: &Layer, rect: Rect, radius: f32, width: f32, color: Color) {
+    let d = rounded_rect_path(rect, radius);
+    let mut pen = Stroke::new(color, width);
+    pen.join = LineJoin::Round;
+    layer
+        .draw_path(&d, (0.0, 0.0), PathPaint::Stroke(pen))
+        .expect("rounded_outline generates its own path data");
+}
+
+/// The SVG path data for `rect`'s rounded border, clockwise from the top
+/// edge — the exact shape [`rounded_outline`] strokes. The radius is
+/// clamped to half the shorter side, so degenerate rects come out as
+/// stadia rather than nonsense arcs.
+fn rounded_rect_path(rect: Rect, radius: f32) -> String {
+    let r = radius.max(0.0).min(rect.width / 2.0).min(rect.height / 2.0);
+    let (x, y) = rect.position();
+    let right = rect.right();
+    let bottom = rect.bottom();
+    // Arc flags: rx ry rotation large-arc sweep — quarter circles, the
+    // short way round, clockwise (sweep 1 in SVG's y-down space).
+    format!(
+        "M{mx} {y} H{tx} A{r} {r} 0 0 1 {right} {ty} V{by} A{r} {r} 0 0 1 {tx} {bottom} H{mx} A{r} {r} 0 0 1 {x} {by} V{ty} A{r} {r} 0 0 1 {mx} {y} Z",
+        mx = x + r,
+        tx = right - r,
+        ty = y + r,
+        by = bottom - r,
+    )
 }
 
 /// The hover surface every interactive row and button shares: one tint, one
@@ -757,6 +864,44 @@ pub mod icons {
 mod tests {
     use super::*;
 
+    /// `rounded_outline` strokes generated path data with `.expect` — a
+    /// typo in the generator would panic at draw time, so the exact shape
+    /// it emits is parsed here through the same `lyon_extra` parser the
+    /// renderer uses.
+    #[test]
+    fn the_rounded_rect_path_parses_as_svg() {
+        fn parses(d: &str) -> bool {
+            let mut parser = lyon_extra::parser::PathParser::new();
+            let mut builder = lyon::path::Path::builder();
+            let mut source = lyon_extra::parser::Source::new(d.chars());
+            parser
+                .parse(
+                    &lyon_extra::parser::ParserOptions::DEFAULT,
+                    &mut source,
+                    &mut builder,
+                )
+                .is_ok()
+        }
+        // A normal card, a hairline-thin one, and the degenerate cases the
+        // clamp exists for.
+        assert!(parses(&rounded_rect_path(
+            Rect::new(10.0, 20.0, 200.0, 34.0),
+            9.0
+        )));
+        assert!(parses(&rounded_rect_path(
+            Rect::new(0.0, 0.0, 40.0, 2.0),
+            9.0
+        )));
+        assert!(parses(&rounded_rect_path(
+            Rect::new(0.0, 0.0, 8.0, 8.0),
+            9.0
+        )));
+        assert!(parses(&rounded_rect_path(
+            Rect::new(0.0, 0.0, 30.0, 24.0),
+            0.0
+        )));
+    }
+
     /// The palette a widget reads has to be the one that was set, or a
     /// theme switch is only half a switch.
     #[test]
@@ -812,5 +957,38 @@ mod tests {
 
         assert!(server.take_change(), "a swap owes a redraw");
         assert!(!server.take_change(), "and only one");
+    }
+
+    /// The two alpha helpers are not interchangeable, and a popup's shadow
+    /// once shipped tuned-then-discarded because the slab painter reached
+    /// for `fade` (replace) where it meant `scale_alpha` (multiply): the
+    /// ink's authored byte never survived the reveal weight overwriting it.
+    #[test]
+    fn fade_replaces_but_scale_alpha_multiplies() {
+        // A fresh value per use: Color is not Copy.
+        let ink = || Color::rgba(0x3C, 0x38, 0x36, 0x20);
+        let weight = 0.5;
+
+        // fade answers "what is this color AT 50% opacity" — the authored
+        // byte is irrelevant.
+        let Color::Solid([r, g, b, _]) = fade(ink(), weight) else {
+            panic!("fade must pass solids through");
+        };
+        assert_eq!((r, g, b), (0x3C, 0x38, 0x36));
+        // (0.5 * 255) as u8 truncates to 127, not 128.
+        assert_eq!(fade(ink(), weight), Color::rgba(r, g, b, 127));
+
+        // scale_alpha answers "what is this color at HALF ITS authored
+        // opacity" — an authored 0x20 lands on 0x10, not 0x80.
+        assert_eq!(
+            scale_alpha(ink(), weight),
+            Color::rgba(0x3C, 0x38, 0x36, 0x10)
+        );
+        // The weight clamps and fully-transparent stays fully transparent.
+        assert_eq!(scale_alpha(ink(), 1.5), scale_alpha(ink(), 1.0));
+        assert_eq!(
+            scale_alpha(Color::rgba(1, 2, 3, 0), weight),
+            Color::rgba(1, 2, 3, 0)
+        );
     }
 }

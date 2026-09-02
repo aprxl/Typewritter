@@ -9,6 +9,8 @@ use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
 
+use super::popup::{CARD_RADIUS, Slide, paint_shadow_slab};
+
 const CARD_W: f32 = 460.0;
 const CARD_H: f32 = 216.0;
 const BUTTON_W: f32 = 96.0;
@@ -82,24 +84,69 @@ pub fn buttons(viewport: Rect) -> (Rect, Rect) {
 pub struct Dialog {
     prompt: Option<Prompt>,
     caret_on: bool,
+    /// The blurred layer this card paints its shadow slab into.
+    shadow: Option<Layer>,
+    reveal: f32,
+    slide: Slide,
+    started: bool,
     dirty: Dirty,
 }
+
+/// Corner radius of the field and buttons — nested smaller things round
+/// less than the card itself.
+const FIELD_RADIUS: f32 = 6.0;
 
 impl Dialog {
     pub fn new(prompt: Option<Prompt>) -> Self {
         Self {
             prompt,
             caret_on: true,
+            shadow: None,
+            reveal: 0.0,
+            slide: Slide::new(),
+            started: false,
             dirty: Dirty::new(),
         }
+    }
+
+    /// Attaches the shell's blurred shadow layer (see `Palette`).
+    pub fn with_shadow(mut self, shadow: Layer) -> Self {
+        self.shadow = Some(shadow);
+        self
+    }
+
+    /// Paints the shadow slab from sync; closed clears unconditionally.
+    fn paint_shadow(&mut self, owns: bool) {
+        if !owns {
+            return;
+        }
+        let Some(shadow) = self.shadow.clone() else {
+            return;
+        };
+        if self.prompt.is_none() || !(0.0..=1.0).contains(&self.reveal) {
+            paint_shadow_slab(&shadow, Rect::default(), -1.0);
+            return;
+        }
+        paint_shadow_slab(&shadow, card(Rect::default()), self.reveal);
     }
 
     /// Draws the name field, showing as much of the name as fits, with the
     /// caret at its character offset.
     fn draw_field(&self, layer: &Layer, card: Rect, input: &[char], caret: usize) {
         let field = field(card);
-        layer.draw_rectangle(field.position(), field.size(), theme::alt(), Rounding::NONE);
-        theme::outline(layer, field, theme::border());
+        layer.draw_rectangle(
+            field.position(),
+            field.size(),
+            theme::alt(),
+            Rounding::uniform(FIELD_RADIUS),
+        );
+        theme::rounded_outline(
+            layer,
+            field.inset(0.5),
+            FIELD_RADIUS - 0.5,
+            1.0,
+            theme::border(),
+        );
 
         let style = TextStyle::serif(16.0, theme::ink());
         let middle = field.y + field.height / 2.0;
@@ -146,8 +193,26 @@ impl Component for Dialog {
     }
 
     fn sync(&mut self, context: &Context) {
+        let reveal_changed = self.reveal != context.reveal;
+        if reveal_changed {
+            self.reveal = context.reveal;
+            self.dirty.set();
+        }
+        self.paint_shadow(context.owns_shadow);
         if self.prompt.is_some() {
             self.dirty.write(&mut self.caret_on, context.caret_on);
+
+            // The pill lands nowhere: a dialog has no row highlight. The
+            // Slide is only along for the shared construction; park it off
+            // screen so it never draws.
+            if !self.started {
+                self.slide.park(Rect::default());
+                self.started = true;
+            }
+        }
+        self.slide.advance(context.animation_dt);
+        if self.slide.advancing() {
+            self.dirty.set();
         }
     }
 
@@ -156,31 +221,54 @@ impl Component for Dialog {
     }
 
     fn clear_dirty(&mut self) {
-        self.dirty.clear();
+        self.dirty.clear()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn is_animating(&self) -> bool {
+        self.prompt.is_some() && (self.reveal > 0.0 && self.reveal < 1.0)
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
         let Some(prompt) = &self.prompt else {
             return;
         };
-        // Dimmed rather than opaque: the note underneath is the context for
-        // what is being asked.
+        let ea = self.reveal.clamp(0.0, 1.0);
+        // Dimmed rather than opaque — the note underneath is the context
+        // for what is being asked — fading up with the card.
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            theme::fade(theme::background(), 0.72),
+            theme::fade(theme::background(), 0.72 * ea),
             Rounding::NONE,
         );
 
-        let card = card(rect);
-        layer.draw_rectangle(card.position(), card.size(), theme::popup(), Rounding::NONE);
-        theme::outline(layer, card, theme::border());
+        let resting = card(rect);
+        let travel = (1.0 - ea) * -4.0;
+        let card = Rect::new(resting.x, resting.y + travel, resting.width, resting.height);
+
+        layer.draw_rectangle(
+            card.position(),
+            card.size(),
+            theme::elevated_popup(ea),
+            Rounding::uniform(CARD_RADIUS),
+        );
+        theme::rounded_outline(
+            layer,
+            card.inset(0.5),
+            CARD_RADIUS - 0.5,
+            1.0,
+            theme::fade(theme::non_text(), ea),
+        );
 
         theme::draw(
             layer,
             prompt.title(),
             (card.x + card.width / 2.0, card.y + 34.0),
-            &TextStyle::serif(19.0, theme::ink()).bold(),
+            &TextStyle::serif(19.0, theme::fade(theme::ink(), ea)).bold(),
             theme::CENTER,
         );
 
@@ -193,14 +281,14 @@ impl Component for Dialog {
                     layer,
                     name,
                     (card.x + card.width / 2.0, card.y + 82.0),
-                    &TextStyle::serif(16.0, theme::ink()),
+                    &TextStyle::serif(16.0, theme::fade(theme::ink(), ea)),
                     theme::CENTER,
                 );
                 theme::draw(
                     layer,
                     "is deleted from disk. This cannot be undone.",
                     (card.x + card.width / 2.0, card.y + 108.0),
-                    &TextStyle::serif(13.5, theme::dim()),
+                    &TextStyle::serif(13.5, theme::fade(theme::dim(), ea)),
                     theme::CENTER,
                 );
             }
@@ -210,7 +298,7 @@ impl Component for Dialog {
             layer,
             prompt.hint(),
             (card.x + 18.0, card.bottom() - 26.0),
-            &TextStyle::mono(10.0, theme::faint()),
+            &TextStyle::mono(10.0, theme::fade(theme::faint(), ea)),
             theme::LEFT,
         );
 
@@ -221,7 +309,12 @@ impl Component for Dialog {
             // one the whole interface uses for "this is where you are".
             Prompt::DeleteNote { .. } => theme::structure(),
         };
-        layer.draw_rectangle(confirm.position(), confirm.size(), accent, Rounding::NONE);
+        layer.draw_rectangle(
+            confirm.position(),
+            confirm.size(),
+            theme::fade(accent, ea),
+            Rounding::uniform(FIELD_RADIUS),
+        );
         theme::draw(
             layer,
             prompt.confirm_label(),
@@ -229,17 +322,23 @@ impl Component for Dialog {
                 confirm.x + confirm.width / 2.0,
                 confirm.y + confirm.height / 2.0,
             ),
-            &TextStyle::serif(13.0, theme::background()),
+            &TextStyle::serif(13.0, theme::fade(theme::background(), ea)),
             theme::CENTER,
         );
 
         layer.draw_rectangle(
             cancel.position(),
             cancel.size(),
-            theme::popup(),
-            Rounding::NONE,
+            theme::elevated_popup(ea),
+            Rounding::uniform(FIELD_RADIUS),
         );
-        theme::outline(layer, cancel, theme::border());
+        theme::rounded_outline(
+            layer,
+            cancel.inset(0.5),
+            FIELD_RADIUS - 0.5,
+            1.0,
+            theme::fade(theme::border(), ea),
+        );
         theme::draw(
             layer,
             "Cancel",
@@ -247,7 +346,7 @@ impl Component for Dialog {
                 cancel.x + cancel.width / 2.0,
                 cancel.y + cancel.height / 2.0,
             ),
-            &TextStyle::serif(13.0, theme::dim()),
+            &TextStyle::serif(13.0, theme::fade(theme::dim(), ea)),
             theme::CENTER,
         );
     }

@@ -3,11 +3,47 @@
 //!
 //! The shell owns the query, selection, and input. This component owns all
 //! menu geometry so drawing and mouse hit-testing use the same rectangles.
+//! The card speaks the shared popup vocabulary — elevated surface springing
+//! from the math caret, blurred shadow on the shell's layer, one sliding
+//! pill for pointer and keyboard — and closes as a ghost of its real rows
+//! on the shared clock.
 
 use crate::layout::Rect;
 use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
+
+use super::popup::{MENU_SLIDE_EASING, Slide, paint_shadow_slab, revealed_card};
+
+/// Corner radius of a row highlight — nested smaller things round less than
+/// the card itself (see `popup::CARD_RADIUS`).
+const ROW_RADIUS: f32 = 6.0;
+
+/// Everything a dismissal ghost needs to redraw the card exactly as it
+/// stood: cloneable real state, no placeholders. The shell captures this at
+/// close time (`MenuDismiss::Math`).
+#[derive(Clone)]
+pub struct Snapshot {
+    pub rows: Vec<Row>,
+    pub variant_start: usize,
+    pub selected: usize,
+}
+
+impl MathMenu {
+    /// The ghost-rebuild data for this snapshot.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            rows: self.rows.clone(),
+            variant_start: self.variant_start,
+            selected: self.selected,
+        }
+    }
+
+    /// The row/cell the pill sits on — the shell reads this at close time.
+    pub fn pill_row(&self) -> Option<usize> {
+        (!self.rows.is_empty()).then_some(self.selected)
+    }
+}
 
 const CARD_W: f32 = 320.0;
 const ROW_HEIGHT: f32 = 32.0;
@@ -19,6 +55,7 @@ const GRID_GAP: f32 = 5.0;
 const GRID_COLUMNS: usize = 5;
 
 /// One offered completion as the card shows it.
+#[derive(Clone)]
 pub struct Row {
     pub name: String,
     pub group: String,
@@ -117,6 +154,14 @@ pub struct MathMenu {
     selected: usize,
     anchor: (f32, f32),
     open: bool,
+    /// True while this snapshot is a dismissal ghost: dead input, reveal
+    /// weight falling toward 0 through the entrance curve.
+    dismissing: bool,
+    /// The blurred layer this card paints its shadow slab into.
+    shadow: Option<Layer>,
+    reveal: f32,
+    slide: Slide,
+    started: bool,
     dirty: Dirty,
 }
 
@@ -129,8 +174,41 @@ impl MathMenu {
             selected,
             anchor,
             open: true,
+            dismissing: false,
+            shadow: None,
+            reveal: 0.0,
+            slide: Slide::new(),
+            started: false,
             dirty: Dirty::new(),
         }
+    }
+
+    /// A dismissal ghost rebuilt from the state captured at close time:
+    /// same rows and grid, pill parked on the selection. Input is dead; the
+    /// reveal weight falls from outside.
+    pub fn dismissing(snap: &Snapshot, anchor: (f32, f32), pill_row: usize) -> Self {
+        let mut ghost = Self {
+            rows: snap.rows.clone(),
+            variant_start: snap.variant_start,
+            selected: pill_row.min(snap.rows.len().saturating_sub(1)),
+            anchor,
+            open: true,
+            dismissing: true,
+            shadow: None,
+            reveal: 1.0,
+            slide: Slide::new(),
+            started: true,
+            dirty: Dirty::new(),
+        };
+        if let Some(rect) = item_rect(
+            card_anchored(Rect::default(), anchor, snap.rows.len(), snap.variant_start),
+            snap.rows.len(),
+            snap.variant_start,
+            pill_row.min(snap.rows.len().saturating_sub(1)),
+        ) {
+            ghost.slide.park(inset_for_pill(rect));
+        }
+        ghost
     }
 
     pub fn closed() -> Self {
@@ -140,9 +218,53 @@ impl MathMenu {
             selected: 0,
             anchor: (0.0, 0.0),
             open: false,
+            dismissing: false,
+            shadow: None,
+            reveal: 1.0,
+            slide: Slide::new(),
+            started: false,
             dirty: Dirty::new(),
         }
     }
+
+    /// Attaches the shell's blurred shadow layer — every snapshot the shell
+    /// builds carries it, ghosts included.
+    pub fn with_shadow(mut self, shadow: Layer) -> Self {
+        self.shadow = Some(shadow);
+        self
+    }
+
+    /// Paints the shadow slab from sync — see `SlashMenu::paint_shadow`.
+    fn paint_shadow(&mut self, owns: bool, viewport: Rect) {
+        if !owns {
+            return;
+        }
+        let Some(shadow) = self.shadow.clone() else {
+            return;
+        };
+        if !self.open || self.reveal < 0.0 {
+            paint_shadow_slab(&shadow, Rect::default(), -1.0);
+            return;
+        }
+        let e = MENU_SLIDE_EASING.apply(self.reveal).clamp(0.0, 1.0);
+        let card = revealed_card(
+            card_anchored(viewport, self.anchor, self.rows.len(), self.variant_start),
+            self.anchor,
+            1.0,
+        );
+        paint_shadow_slab(&shadow, card, e);
+    }
+}
+
+/// A row/cell rect shrunk to the pill that rides under it — one rule for
+/// flat rows and grid cells alike.
+fn inset_for_pill(rect: Rect) -> Rect {
+    Rect::new(
+        rect.x + 3.0,
+        rect.y + 2.0,
+        rect.width - 6.0,
+        rect.height - 4.0,
+    )
 }
 
 impl Component for MathMenu {
@@ -150,14 +272,66 @@ impl Component for MathMenu {
         (0.0, 0.0)
     }
 
-    fn sync(&mut self, _: &Context) {}
+    fn sync(&mut self, context: &Context) {
+        // Shadow upkeep precedes everything — a closing ghost must still
+        // reach the blurred layer to take its halo with it.
+        let reveal_changed = self.reveal != context.reveal;
+        if reveal_changed {
+            self.reveal = context.reveal;
+        }
+        self.paint_shadow(context.owns_shadow, context.self_rect);
+        if !self.open || self.rows.is_empty() {
+            return;
+        }
+        if reveal_changed && !(self.dismissing && self.reveal <= 0.0) {
+            self.dirty.set();
+        }
+        if !self.dismissing {
+            // The pill is persistent: seeded by `new` from the keyboard
+            // selection and parked on the first sync.
+            if let Some(rect) = item_rect(
+                card_anchored(
+                    context.self_rect,
+                    self.anchor,
+                    self.rows.len(),
+                    self.variant_start,
+                ),
+                self.rows.len(),
+                self.variant_start,
+                self.selected,
+            ) {
+                let target = inset_for_pill(rect);
+                if !self.started {
+                    self.slide.park(target);
+                    self.started = true;
+                    self.dirty.set();
+                } else if self.slide.slide_to(target) {
+                    self.dirty.set();
+                }
+            }
+        }
+        self.slide.advance(context.animation_dt);
+        if self.slide.advancing() || reveal_changed {
+            self.dirty.set();
+        }
+    }
 
     fn is_dirty(&self) -> bool {
         self.dirty.get()
     }
 
     fn clear_dirty(&mut self) {
-        self.dirty.clear();
+        self.dirty.clear()
+    }
+
+    fn is_animating(&self) -> bool {
+        // Never report a never-advanced Slide on a closed snapshot — that
+        // pins the frame loop open (see popup's module docs).
+        self.open && (self.slide.advancing() || (self.reveal > 0.0 && self.reveal < 1.0))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn draw(&mut self, layer: &Layer, viewport: Rect) {
@@ -165,24 +339,42 @@ impl Component for MathMenu {
             return;
         }
 
-        let card = card_anchored(viewport, self.anchor, self.rows.len(), self.variant_start);
-        layer.draw_rectangle(card.position(), card.size(), theme::popup(), Rounding::NONE);
-        theme::outline(layer, card, theme::border());
+        let e = MENU_SLIDE_EASING.apply(self.reveal);
+        let resting = card_anchored(viewport, self.anchor, self.rows.len(), self.variant_start);
+        let card = revealed_card(resting, self.anchor, e);
+        let ea = e.clamp(0.0, 1.0);
 
-        let name_style = TextStyle::serif(15.0, theme::ink());
-        let group_style = TextStyle::serif(11.5, theme::comment());
-        let preview_style = TextStyle::math(17.0, theme::ink());
+        layer.draw_rectangle(
+            card.position(),
+            card.size(),
+            theme::elevated_popup(ea),
+            Rounding::uniform(super::popup::CARD_RADIUS),
+        );
+        theme::rounded_outline(
+            layer,
+            card.inset(0.5),
+            super::popup::CARD_RADIUS - 0.5,
+            1.0,
+            theme::fade(theme::non_text(), ea),
+        );
+
+        let name_style = TextStyle::serif(15.0, theme::fade(theme::ink(), ea));
+        let group_style = TextStyle::serif(11.5, theme::fade(theme::comment(), ea));
+        let preview_style = TextStyle::math(17.0, theme::fade(theme::ink(), ea));
+
+        // The slide pill rides under the selected row/cell, replacing the
+        // flat selection fills below (the grid cell keeps its alt fill).
+        if let Some(rect) = item_rect(card, self.rows.len(), self.variant_start, self.selected) {
+            layer.draw_rectangle(
+                inset_for_pill(rect).position(),
+                inset_for_pill(rect).size(),
+                theme::fade(theme::selection(), ea),
+                Rounding::uniform(ROW_RADIUS),
+            );
+        }
         for (index, row) in self.rows[..self.variant_start].iter().enumerate() {
             let rect = item_rect(card, self.rows.len(), self.variant_start, index)
                 .expect("a menu row must have geometry");
-            if index == self.selected {
-                layer.draw_rectangle(
-                    rect.position(),
-                    rect.size(),
-                    theme::selection(),
-                    Rounding::NONE,
-                );
-            }
             let middle = rect.y + rect.height / 2.0;
             theme::draw(
                 layer,
@@ -225,12 +417,12 @@ impl Component for MathMenu {
             let flat_index = self.variant_start + index;
             let rect = item_rect(card, self.rows.len(), self.variant_start, flat_index)
                 .expect("a variant must have geometry");
-            let color = if flat_index == self.selected {
-                theme::selection()
-            } else {
-                theme::alt()
-            };
-            layer.draw_rectangle(rect.position(), rect.size(), color, Rounding::uniform(5.0));
+            layer.draw_rectangle(
+                rect.position(),
+                rect.size(),
+                theme::fade(theme::alt(), ea),
+                Rounding::uniform(5.0),
+            );
             theme::draw(
                 layer,
                 &row.preview,

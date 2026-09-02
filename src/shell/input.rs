@@ -15,9 +15,9 @@ use super::commands;
 use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
-    ContextMenu, Dialog, FileFinder, FileTree, MathMenu, Onboarding, Palette, SlashMenu,
-    context_menu, editor, file_finder, file_tree, math_menu, onboarding, sidenotes, theme_switch,
-    title_bar,
+    ContextMenu, Dialog, FileTree, Finder, FormatBar, MathMenu, Onboarding, Palette, SlashMenu,
+    Topics, context_menu, editor, file_tree, format_bar, math_menu, onboarding, sidenotes,
+    theme_switch, title_bar,
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind};
@@ -39,7 +39,10 @@ use crate::vim::{
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{ContextMenuState, MathMenuState, PaletteState, Shell, SlashMenuState};
+use super::{
+    ContextMenuState, MathMenuState, MenuDismiss, PaletteState, Shell, SlashMenuState,
+    WordFormatState,
+};
 
 impl Shell {
     /// Choosing a vault is a shell job: the picker persists the config and
@@ -88,6 +91,12 @@ impl Shell {
         if self.context_menu.is_some() && self.handle_context_menu_input(input, viewport) {
             return;
         }
+        // The word-format bar swallows input while open, like the context
+        // menu; an outside click closes it and keeps routing so Normal mode
+        // can immediately target what was clicked.
+        if self.format_bar.is_some() && self.handle_format_bar_input(input, viewport) {
+            return;
+        }
         // Onboarding has exactly one live command — opening a vault — and the
         // splash's button and Enter key are the same request. Matching it out
         // of the table rather than against a literal chord keeps `COMMANDS`
@@ -129,6 +138,17 @@ impl Shell {
             .contains(input.mouse_position())
         {
             self.open_finder();
+            return;
+        }
+
+        // The topics panel jumps the caret to its heading — through the
+        // fold-aware jump, so a row that lists a folded heading (folds never
+        // leave the outline) unfolds over it instead of landing nowhere.
+        if input.is_mouse_pressed(MouseButton::Left)
+            && input.is_cursor_in_window()
+            && let Some(block) = self.topics_row_at(input.mouse_position())
+        {
+            self.docs.borrow_mut().jump_to_block(block);
             return;
         }
 
@@ -189,6 +209,54 @@ impl Shell {
         if let Some(index) = index {
             focus_note(&mut self.docs.borrow_mut(), index);
         }
+    }
+
+    /// Whether a click landed on a fold affordance — a gutter chevron or a
+    /// collapsed-body indicator — and toggled/unfolded it. Runs before caret
+    /// placement in either mode: these are controls, not text.
+    fn fold_click(&mut self, rect: Rect, mouse: (f32, f32)) -> bool {
+        {
+            let docs = self.docs.borrow();
+            if docs.active().is_none() {
+                return false;
+            }
+        }
+        let (local_x, local_y) = {
+            // Unclamped x on purpose: the chevron lives in the gutter left
+            // of the text column, where a clamped point would read as the
+            // text's own left edge. y keeps the page's scroll like clicks.
+            let scroll = self.docs.borrow().editor_scroll;
+            (
+                mouse.0 - (rect.x + editor::INSET),
+                mouse.1 - rect.y - editor::TOP + scroll,
+            )
+        };
+        let layout = self.current_layout(editor::Editor::content_width(rect));
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+        if let Some(block) = layout.fold_chevron_at(local_x, local_y, &measure) {
+            self.docs.borrow_mut().toggle_fold_at(block);
+            return true;
+        }
+        if local_x >= 0.0
+            && let Some(block) = layout.fold_indicator_at(local_y)
+        {
+            self.docs.borrow_mut().reveal_block(block);
+            return true;
+        }
+        false
+    }
+
+    /// The outline heading a click on the topics panel landed on, if any —
+    /// the same rects the hover reads, so click and highlight cannot drift.
+    fn topics_row_at(&self, point: (f32, f32)) -> Option<usize> {
+        if !self.topics.open || !self.layout.rect(self.topics.node).contains(point) {
+            return None;
+        }
+        let index = self.regions[self.topics_region]
+            .component_as::<Topics>()
+            .and_then(|panel| panel.entry_at(point))?;
+        self.outline().get(index).map(|node| node.block)
     }
 
     /// A Normal-mode click on an anchor opens that note. Resolves the click
@@ -283,6 +351,9 @@ impl Shell {
         if self.context_menu.is_some() {
             self.close_context_menu();
         }
+        if self.format_bar.is_some() {
+            self.close_format_bar();
+        }
         let Some((x, y)) = self.editor_point(rect, point) else {
             return true;
         };
@@ -354,12 +425,39 @@ impl Shell {
         }
 
         if has_tab && input.is_mouse_pressed(MouseButton::Left) && over_editor {
-            if self.vim.current_mode() == VimMode::Normal {
+            // Fold affordances claim their clicks first: the gutter chevron
+            // and the collapsed-body indicator are controls, not text, in
+            // either mode.
+            if self.fold_click(rect, mouse) {
+                return;
+            }
+            // A click on a task's checkbox toggles it, whatever the mode:
+            // it is a control, not a caret placement.
+            if let Some((local_x, local_y)) = self.editor_point(rect, mouse)
+                && let Some(block) = self
+                    .current_layout(editor::Editor::content_width(rect))
+                    .task_at(local_x, local_y)
+            {
+                self.goal_x = None;
+                self.docs.borrow_mut().toggle_task_at(block);
+            } else if self.vim.current_mode() == VimMode::Normal {
                 if self.click_anchor(rect, mouse) {
                     // The click focused a note; nothing else to do with it.
                 } else if let Some(target) = self.context_at(rect, mouse) {
-                    let ids = self.context_ids(&target);
-                    self.open_context_target(&ids, mouse, Some(target));
+                    if matches!(
+                        target,
+                        ContextHit::Range {
+                            kind: RangeKind::Word,
+                            ..
+                        }
+                    ) {
+                        // A word opens the format bar; any other target
+                        // keeps the classic list menu.
+                        self.open_format_bar(&target, mouse);
+                    } else {
+                        let ids = self.context_ids(&target);
+                        self.open_context_target(&ids, mouse, Some(target));
+                    }
                 }
             } else if let Some((block, inline, cursor)) = self.math_at(rect, mouse) {
                 self.goal_x = None;
@@ -511,11 +609,17 @@ impl Shell {
         let text = input.text();
         if text == "/" {
             let anchor = self.compute_slash_anchor();
+            // An in-flight fade-out of THIS menu is superseded: it is back.
+            if matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })) {
+                self.menu_dismiss = None;
+                self.menu_dismiss_clock = 0.0;
+            }
             self.slash_menu = Some(SlashMenuState {
                 query: String::new(),
                 selected: 0,
                 anchor,
             });
+            self.popup_reveal.restart();
             self.refresh_slash_menu();
             return;
         }
@@ -695,11 +799,16 @@ impl Shell {
         for c in input.text().chars() {
             if !self.vim.command_active() && c == '/' && self.vim.visual_mode().is_some() {
                 let anchor = self.compute_slash_anchor();
+                if matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })) {
+                    self.menu_dismiss = None;
+                    self.menu_dismiss_clock = 0.0;
+                }
                 self.slash_menu = Some(SlashMenuState {
                     query: String::new(),
                     selected: 0,
                     anchor,
                 });
+                self.popup_reveal.restart();
                 self.refresh_slash_menu();
                 return;
             }
@@ -881,6 +990,7 @@ impl Shell {
                             crate::document::Inline::Text(text) => text.text.as_str(),
                             crate::document::Inline::Math(_) => "\u{FFFC}",
                             crate::document::Inline::Note(_) => "\u{FFFC}",
+                            crate::document::Inline::EqRef(_) => "\u{FFFC}",
                         })
                         .collect::<String>()
                         .chars()
@@ -921,7 +1031,9 @@ impl Shell {
             None => (matches.len() - 1).wrapping_sub(count.max(1) - 1) % matches.len(),
         };
         let position = matches[index];
-        set_body_coordinate_caret(&mut self.docs.borrow_mut(), BodyCoordinate::Flat(position));
+        self.docs
+            .borrow_mut()
+            .jump_to_flat(position.block, position.offset);
     }
 
     fn start_insert(&mut self) {
@@ -1408,6 +1520,7 @@ impl Shell {
             query: String::new(),
             selected: 0,
         });
+        self.popup_reveal.restart();
         self.refresh_palette();
     }
 
@@ -1418,11 +1531,14 @@ impl Shell {
 
     /// Rebuilds the palette region from the live query/selection, the way
     /// `refresh_dialog` does for the dialog.
+    /// Shadow layer rides every arm; a closed snapshot clears the layer so
+    /// the halo leaves with the modal (see `refresh_slash_menu`).
     fn refresh_palette(&mut self) {
         let palette = match &self.palette {
             Some(state) => Palette::new(commands::entries(), state.query.clone(), state.selected),
             None => Palette::closed(),
-        };
+        }
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.palette_region].set_component(Box::new(palette));
     }
 
@@ -1462,8 +1578,10 @@ impl Shell {
         let Some(vault) = &self.vault else {
             return;
         };
-        self.finder = Some(super::FileFinderState {
-            files: vault.borrow().files(),
+        self.popup_reveal.restart();
+        let files = vault.borrow().files();
+        self.finder = Some(super::FinderState {
+            rows: crate::search::search(&files, ""),
             query: String::new(),
             selected: 0,
         });
@@ -1475,6 +1593,22 @@ impl Shell {
         self.refresh_finder();
     }
 
+    /// Re-ranks the rows against the current query. The shell owns the
+    /// ranked list (the component only draws a snapshot), so every query
+    /// change re-runs `search::search` here — the vault is a few hundred
+    /// kilobytes, well inside the §11 search budget.
+    fn rerank_finder(&mut self) {
+        let Some(state) = self.finder.as_mut() else {
+            return;
+        };
+        let files = self.vault.as_ref().map(|v| v.borrow().files());
+        let Some(files) = files else {
+            return;
+        };
+        state.rows = crate::search::search(&files, &state.query);
+        state.selected = state.selected.min(state.rows.len().saturating_sub(1));
+    }
+
     fn refresh_finder(&mut self) {
         let query = self.finder.as_ref().map(|state| state.query.clone());
         self.regions[self.title_region].set_component(Box::new(title_bar::TitleBar::new(
@@ -1483,17 +1617,43 @@ impl Shell {
             query,
         )));
         let finder = match &self.finder {
-            Some(state) => {
-                FileFinder::new(state.files.clone(), state.query.clone(), state.selected)
-            }
-            None => FileFinder::closed(),
-        };
+            Some(state) => Finder::new(state.rows.clone(), state.query.clone(), state.selected),
+            None => Finder::closed(),
+        }
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.finder_region].set_component(Box::new(finder));
+    }
+
+    /// Picks one of the first five rows outright (Ctrl+1..5). The finder
+    /// is the only consumer of these chords: the view toggles that used to
+    /// hold them are gone.
+    fn finder_row_picked(&mut self, input: &Input) -> bool {
+        if !input.ctrl() {
+            return false;
+        }
+        const PICK_KEYS: [KeyCode; 5] = [
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+        ];
+        let Some(row) = PICK_KEYS.iter().position(|key| input.is_key_typed(*key)) else {
+            return false;
+        };
+        if let Some(state) = &mut self.finder {
+            state.selected = row.min(state.rows.len().saturating_sub(1));
+            self.open_selected_finder_file();
+        }
+        true
     }
 
     fn handle_finder_input(&mut self, input: &Input) {
         if input.is_key_pressed(KeyCode::Escape) {
             self.close_finder();
+            return;
+        }
+        if self.finder_row_picked(input) {
             return;
         }
         if input.is_key_typed(KeyCode::Enter) {
@@ -1505,19 +1665,26 @@ impl Shell {
             None => false,
         };
         if changed {
+            self.rerank_finder();
             self.refresh_finder();
         }
     }
 
     fn open_selected_finder_file(&mut self) {
-        let path = self
+        let picked = self
             .finder
             .as_ref()
-            .and_then(|state| file_finder::path_at(&state.files, &state.query, state.selected));
-        let Some(path) = path else {
+            .and_then(|state| state.rows.get(state.selected).cloned());
+        let Some(row) = picked else {
             return;
         };
-        self.docs.borrow_mut().open_preview(&path);
+        {
+            let mut docs = self.docs.borrow_mut();
+            docs.open_preview(row.path());
+            if let Some((block, offset)) = row.position() {
+                docs.jump_to_flat(block, offset);
+            }
+        }
         self.close_finder();
     }
 
@@ -1546,7 +1713,10 @@ impl Shell {
         (screen_x, screen_y)
     }
 
-    fn refresh_slash_menu(&mut self) {
+    /// Every arm carries the blurred shadow layer — closed ghosts included:
+    /// `paint_shadow` clears it before anything else, so the snapshot that
+    /// closes the menu is also the one that takes the halo off the screen.
+    pub(super) fn refresh_slash_menu(&mut self) {
         let menu = match &self.slash_menu {
             Some(state) => SlashMenu::new(
                 commands::editor_entries(),
@@ -1554,8 +1724,16 @@ impl Shell {
                 state.selected,
                 state.anchor,
             ),
-            None => SlashMenu::closed(),
-        };
+            None => match &self.menu_dismiss {
+                Some(MenuDismiss::Slash {
+                    state,
+                    anchor,
+                    pointer_row,
+                }) => SlashMenu::dismissing(state, *anchor, *pointer_row),
+                _ => SlashMenu::closed(),
+            },
+        }
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.slash_region].set_component(Box::new(menu));
     }
 
@@ -1583,6 +1761,7 @@ impl Shell {
                         Inline::Math(list) => math::node_at(list, address),
                         Inline::Text(_) => None,
                         Inline::Note(_) => None,
+                        Inline::EqRef(_) => None,
                     });
                 match node {
                     Some(MathNode::Sym(ch)) if ch.is_alphabetic() => symbol_context_ids(*ch),
@@ -1601,29 +1780,44 @@ impl Shell {
         }
     }
 
+    /// Which document target the open formatting surface — the classic
+    /// context menu or the word-format bar — is operating on. Both keep
+    /// their target in the shell, so the two surfaces cannot disagree about
+    /// what a toggle applies to.
+    fn context_target(&self) -> Option<ContextHit> {
+        match self
+            .context_menu
+            .as_ref()
+            .and_then(|state| state.target.clone())
+        {
+            Some(target) => Some(target),
+            None => self
+                .format_bar
+                .as_ref()
+                .and_then(|state| state.target.clone()),
+        }
+    }
+
     fn context_range(&self) -> Option<FlatRange> {
-        match self.context_menu.as_ref()?.target.as_ref()? {
-            ContextHit::Range { range, .. } => Some(*range),
-            ContextHit::Math { .. } => None,
+        match self.context_target() {
+            Some(ContextHit::Range { range, .. }) => Some(range),
+            _ => None,
         }
     }
 
     fn context_math_target(&self) -> Option<(usize, usize, NodeAddress)> {
-        match self.context_menu.as_ref()?.target.as_ref()? {
-            ContextHit::Math {
+        match self.context_target() {
+            Some(ContextHit::Math {
                 block,
                 inline,
                 node: Some(address),
-            } => Some((*block, *inline, address.clone())),
+            }) => Some((block, inline, address.clone())),
             _ => None,
         }
     }
 
     fn context_command_checked(&self, id: &str) -> bool {
-        let target = self
-            .context_menu
-            .as_ref()
-            .and_then(|state| state.target.clone());
+        let target = self.context_target();
         let Some(target) = target else {
             return false;
         };
@@ -1689,7 +1883,7 @@ impl Shell {
                     .and_then(|block| block.inlines().get(inline))
                     .and_then(|run| match run {
                         Inline::Math(list) => math::node_at(list, &address),
-                        Inline::Text(_) | Inline::Note(_) => None,
+                        Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
                     });
                 match (id, node) {
                     ("context.symbol.variable", Some(MathNode::Resolved { role, .. })) => {
@@ -1904,6 +2098,12 @@ impl Shell {
         anchor: (f32, f32),
         target: Option<crate::document::layout::ContextHit>,
     ) {
+        self.format_bar = None;
+        // An in-flight fade-out of THIS menu is superseded: it is back.
+        if matches!(self.menu_dismiss, Some(MenuDismiss::Context { .. })) {
+            self.menu_dismiss = None;
+            self.menu_dismiss_clock = 0.0;
+        }
         let items = commands::menu(ids);
         if items.is_empty() {
             return;
@@ -1914,11 +2114,14 @@ impl Shell {
             anchor,
             target,
         });
+        self.popup_reveal.restart();
         self.refresh_context_menu();
         self.rebuild_views();
     }
 
-    fn refresh_context_menu(&mut self) {
+    /// Shadow layer rides every arm — ghosts included — so a closing menu
+    /// always takes its halo away (see `refresh_slash_menu`).
+    pub(super) fn refresh_context_menu(&mut self) {
         let menu = match &self.context_menu {
             Some(state) => {
                 let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
@@ -1934,15 +2137,300 @@ impl Shell {
                     state.anchor,
                 )
             }
-            None => ContextMenu::closed(),
-        };
+            None => match &self.menu_dismiss {
+                Some(MenuDismiss::Context {
+                    state,
+                    anchor,
+                    pill_row,
+                }) => ContextMenu::dismissing(state, *anchor, *pill_row),
+                _ => ContextMenu::closed(),
+            },
+        }
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.menu_region].set_component(Box::new(menu));
     }
 
     fn close_context_menu(&mut self) {
-        self.context_menu = None;
+        // Ghost fodder comes from the LIVE menu (rows with current checks +
+        // the pill's row) — read before `take` empties it.
+        let ghost = self.context_menu.take().map(|state| {
+            let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
+            let checked: Vec<bool> = state
+                .items
+                .iter()
+                .map(|command| self.context_command_checked(command.id))
+                .collect();
+            let entries = commands::menu_entries(&ids);
+            let snap = crate::components::context_menu::Snapshot { entries, checked };
+            let pill_row = self.regions[self.menu_region]
+                .component_as::<ContextMenu>()
+                .and_then(|m| m.pill_row())
+                .unwrap_or(state.selected.min(snap.entries.len().saturating_sub(1)));
+            MenuDismiss::Context {
+                state: snap,
+                anchor: state.anchor,
+                pill_row,
+            }
+        });
+        // Zero-row menus have no ghost to show.
+        let spawn = matches!(
+            &ghost,
+            Some(MenuDismiss::Context { state, .. }) if !state.entries.is_empty()
+        );
+        if spawn {
+            self.menu_dismiss = ghost;
+            self.menu_dismiss_clock = 1.0;
+        } else {
+            self.menu_dismiss = None;
+            self.menu_dismiss_clock = 0.0;
+        }
         self.refresh_context_menu();
         self.rebuild_views();
+    }
+
+    // ---- word-format bar ---------------------------------------------------
+
+    /// Opens the format bar over `target` (a word range) at `anchor`. The
+    /// bar keeps its target so toggles keep applying to the same word while
+    /// it stays open — the whole point of a toolbar over a one-shot menu.
+    fn open_format_bar(&mut self, target: &ContextHit, anchor: (f32, f32)) {
+        let ids = self.context_ids(target);
+        let items = commands::menu(&ids);
+        if items.is_empty() {
+            return;
+        }
+        // The two surfaces are mutually exclusive; the click that opened
+        // this bar could not have left the menu claimed, so clear the field
+        // directly rather than through the menu's rebuild path.
+        self.context_menu = None;
+        // An in-flight fade-out is superseded: the bar is back.
+        if matches!(self.menu_dismiss, Some(MenuDismiss::Format { .. })) {
+            self.menu_dismiss = None;
+            self.menu_dismiss_clock = 0.0;
+        }
+        self.format_bar = Some(WordFormatState {
+            items,
+            selected: 0,
+            anchor,
+            target: Some(target.clone()),
+            hover_cell: None,
+        });
+        // A fresh pop every time the bar opens, driven from the shell so
+        // the per-toggle refresh below never replays it.
+        self.popup_reveal.restart();
+        self.refresh_format_bar();
+        self.rebuild_views();
+    }
+
+    /// Rebuilds the drawn snapshot from the live shell state — the checked
+    /// flags come from the document, so a toggle lands on the next frame.
+    pub(super) fn refresh_format_bar(&mut self) {
+        // Every arm carries the blurred shadow layer, the closed ones
+        // included: `paint_shadow` clears it before anything else, so the
+        // snapshot that closes the bar is also the one that takes the
+        // halo off the screen. A closed bar without the layer would leave
+        // the last slab frozen in the Manual-mode blur forever.
+        //
+        // While a dismissal is in flight the region shows the ghost: dead
+        // placeholder cells at the bar's last geometry, whose reveal weight
+        // the shell is dropping back toward 0 — the fade-out.
+        let view = match &self.format_bar {
+            Some(state) => {
+                let items = self.format_bar_geometry();
+                if items.is_empty() {
+                    FormatBar::closed()
+                } else {
+                    let mut bar = FormatBar::open(items, state.selected, state.anchor);
+                    bar.set_pointer_cell(state.hover_cell);
+                    bar
+                }
+            }
+            None => match &self.menu_dismiss {
+                Some(MenuDismiss::Format {
+                    items,
+                    anchor,
+                    pointer_cell,
+                }) => FormatBar::dismissing(items.clone(), *anchor, *pointer_cell),
+                _ => FormatBar::closed(),
+            },
+        }
+        .with_shadow(self.popup_shadow.clone());
+        self.regions[self.format_region].set_component(Box::new(view));
+        // The shell owns the pill memory across refreshes: ask the fresh
+        // snapshot where its pill is (it may have been seeded, and its
+        // first sync may already have moved it) and keep that.
+        if let Some(state) = &mut self.format_bar {
+            state.hover_cell = self.regions[self.format_region]
+                .component_as::<FormatBar>()
+                .and_then(|bar| bar.pointer_cell());
+        }
+    }
+
+    fn close_format_bar(&mut self) {
+        // The ghost's shape comes from the live state, so read the geometry
+        // before `take` empties it — afterwards `format_bar_geometry` sees
+        // `None` and would report an empty bar, killing every fade-out.
+        let ghost_items = self.format_bar_geometry();
+        let Some(state) = self.format_bar.take() else {
+            return;
+        };
+        // Keep a ghost alive for the fade-out: the same item count and
+        // anchor, drawn from a falling clock. Nothing accepts input while
+        // it fades — `format_bar` is already `None`, so input routing sees
+        // a closed bar from this frame on.
+        if !ghost_items.is_empty() {
+            // The ghost's pill parks on the keyboard selection — the same
+            // place a fresh open starts — and freezes there for the fade.
+            let last = ghost_items.len() - 1;
+            self.menu_dismiss = Some(MenuDismiss::Format {
+                items: ghost_items,
+                anchor: state.anchor,
+                pointer_cell: Some(state.selected.min(last)),
+            });
+            self.menu_dismiss_clock = 1.0;
+        } else {
+            self.menu_dismiss = None;
+            self.menu_dismiss_clock = 0.0;
+        }
+        self.refresh_format_bar();
+        self.rebuild_views();
+    }
+
+    /// The bar's affordances as the drawing and hit-testing see them, with
+    /// each one's live checked state read off the document. A `Dismiss`
+    /// cell is appended last — it is the bar's own close affordance, not a
+    /// format command, so it maps to no `format_bar::from_id`.
+    fn format_bar_geometry(&self) -> Vec<format_bar::Item> {
+        let mut items = Vec::new();
+        if let Some(state) = &self.format_bar {
+            for command in &state.items {
+                if let Some(kind) = format_bar::from_id(command.id) {
+                    items.push(format_bar::Item {
+                        kind,
+                        checked: self.context_command_checked(command.id),
+                    });
+                }
+            }
+            items.push(format_bar::Item {
+                kind: format_bar::Kind::Dismiss,
+                checked: false,
+            });
+        }
+        items
+    }
+
+    /// Runs the bar cell's command, keeping the bar open so a word can take
+    /// several formats in one pass; the refreshed snapshot shows the new
+    /// checked state.
+    fn toggle_format(&mut self, cell: usize) {
+        // The last cell is the close affordance; pressing or clicking it
+        // dismisses the bar rather than toggling a format.
+        if let Some(state) = &self.format_bar
+            && cell == state.items.len()
+        {
+            self.close_format_bar();
+            return;
+        }
+        let command = self
+            .format_bar
+            .as_ref()
+            .and_then(|state| state.items.get(cell))
+            .copied();
+        let Some(command) = command else {
+            return;
+        };
+        if let Some(state) = &mut self.format_bar {
+            state.selected = cell;
+        }
+        (command.run)(self);
+        self.refresh_format_bar();
+    }
+
+    /// `false` means an outside click closed the bar and should keep
+    /// routing so Normal mode can immediately target what was clicked.
+    fn handle_format_bar_input(&mut self, input: &Input, viewport: Rect) -> bool {
+        if input.is_key_pressed(KeyCode::Escape) {
+            self.close_format_bar();
+            return true;
+        }
+        if input.is_key_typed(KeyCode::ArrowRight) {
+            let changed = if let Some(state) = &mut self.format_bar {
+                let next = (state.selected + 1).min(state.items.len() - 1);
+                let changed = next != state.selected;
+                state.selected = next;
+                changed
+            } else {
+                false
+            };
+            if changed {
+                self.refresh_format_bar();
+                self.rebuild_views();
+            }
+            return true;
+        }
+        if input.is_key_typed(KeyCode::ArrowLeft) {
+            let changed = if let Some(state) = &mut self.format_bar {
+                let next = state.selected.saturating_sub(1);
+                let changed = next != state.selected;
+                state.selected = next;
+                changed
+            } else {
+                false
+            };
+            if changed {
+                self.refresh_format_bar();
+                self.rebuild_views();
+            }
+            return true;
+        }
+        if input.is_key_pressed(KeyCode::Enter) {
+            if let Some(state) = &self.format_bar {
+                self.toggle_format(state.selected);
+            }
+            return true;
+        }
+
+        let Some(state) = &self.format_bar else {
+            return true;
+        };
+        let geometry = self.format_bar_geometry();
+        if geometry.is_empty() {
+            return true;
+        }
+        let card = format_bar::card_anchored(viewport, state.anchor, &geometry);
+        let point = input.mouse_position();
+        // Persistent hover lives in the shell: a touch of a cell moves the
+        // memory, and the move is applied to the state (and mirrored into a
+        // fresh snapshot) before anything else uses it.
+        let touched = input
+            .is_cursor_in_window()
+            .then(|| format_bar::cell_at(card, &geometry, point))
+            .flatten();
+        let click = input.is_mouse_pressed(MouseButton::Left);
+        let out_click = click && input.is_cursor_in_window() && !card.contains(point);
+        // `state`'s borrow ends here; everything below re-borrows `self`.
+
+        if let Some(cell) = touched {
+            let moved = self
+                .format_bar
+                .as_ref()
+                .is_some_and(|s| s.hover_cell != Some(cell));
+            if let Some(state) = &mut self.format_bar {
+                state.hover_cell = Some(cell);
+            }
+            if moved {
+                self.refresh_format_bar();
+            }
+            if click {
+                self.toggle_format(cell);
+            }
+            return true;
+        }
+        if out_click {
+            self.close_format_bar();
+            return false;
+        }
+        true
     }
 
     /// `false` means an outside left click closed the popup and should keep
@@ -2053,8 +2541,53 @@ impl Shell {
     }
 
     fn close_slash_menu(&mut self) {
+        // The ghost's shape comes from the live state, so read the snapshot
+        // before `take` empties it.
+        let snap = self
+            .slash_menu
+            .as_ref()
+            .map(|state| crate::components::slash_menu::Snapshot {
+                entries: commands::editor_entries(),
+                visible: palette::filter(&commands::editor_entries(), &state.query),
+                query: state.query.clone(),
+                selected: state.selected,
+                // Scroll window rule from `SlashMenu::new`: keep the
+                // selection visible at the bottom of the window.
+                first_visible: state
+                    .selected
+                    .saturating_sub(crate::components::slash_menu::MAX_ROWS.saturating_sub(1)),
+            });
+        let anchor = self.slash_menu.as_ref().map(|state| state.anchor);
+        // The pill parks where the keyboard selection is — the same place a
+        // fresh open starts (see `Format`'s equivalent).
+        let pointer_row = self
+            .slash_menu
+            .as_ref()
+            .and_then(|state| self.pill_row_of_slash(state));
         self.slash_menu = None;
+        if let (Some(snap), Some(anchor)) = (snap, anchor) {
+            if !snap.visible.is_empty() {
+                self.menu_dismiss = Some(MenuDismiss::Slash {
+                    state: snap,
+                    anchor,
+                    pointer_row,
+                });
+                self.menu_dismiss_clock = 1.0;
+            } else {
+                self.menu_dismiss = None;
+                self.menu_dismiss_clock = 0.0;
+            }
+        }
         self.refresh_slash_menu();
+    }
+
+    /// Which row the slash menu's pill sits on. The component holds the live
+    /// one after hover; fall back to the keyboard selection.
+    fn pill_row_of_slash(&self, _state: &SlashMenuState) -> Option<usize> {
+        self.regions[self.slash_region]
+            .component_as::<crate::components::slash_menu::SlashMenu>()
+            .and_then(crate::components::slash_menu::SlashMenu::pill_row)
+            .or(Some(_state.selected))
     }
 
     fn run_selected_slash_command(&mut self) {
@@ -2260,6 +2793,11 @@ impl Shell {
             || math_conversion::offers(&query).offers.is_empty()
         {
             if self.math_menu.take().is_some() {
+                // The card just closed with content on screen: leave a
+                // ghost falling away instead of popping to nothing. (An
+                // empty-offers close has no rows; the spawn check below
+                // covers it.)
+                self.spawn_math_ghost_from_live();
                 self.refresh_math_menu();
             }
             return;
@@ -2314,7 +2852,42 @@ impl Shell {
         (screen_x, screen_y)
     }
 
-    fn refresh_math_menu(&mut self) {
+    /// Captures the live math card's REAL state into `MenuDismiss::Math`
+    /// and arms the clock — call while `self.math_menu` still holds the
+    /// pre-close state and BEFORE refreshing the region.
+    fn spawn_math_ghost_from_live(&mut self) {
+        let snap = self.math_menu.as_ref().map(|state| {
+            let offers = math_conversion::offers(&state.query).offers;
+            crate::components::math_menu::Snapshot {
+                rows: math_menu_rows(&offers),
+                variant_start: math_menu_variant_start(&offers),
+                selected: state.selected,
+            }
+        });
+        let anchor = self.math_menu.as_ref().map(|state| state.anchor);
+        let pill_row = self.regions[self.math_menu_region]
+            .component_as::<MathMenu>()
+            .and_then(MathMenu::pill_row);
+        if let (Some(snap), Some(anchor)) = (snap, anchor)
+            && !snap.rows.is_empty()
+        {
+            // The live component clamps its selection; mirror it.
+            let pill_row = pill_row.unwrap_or(snap.selected.min(snap.rows.len() - 1));
+            self.menu_dismiss = Some(MenuDismiss::Math {
+                state: snap,
+                anchor,
+                pill_row,
+            });
+            self.menu_dismiss_clock = 1.0;
+            return;
+        }
+        self.menu_dismiss = None;
+        self.menu_dismiss_clock = 0.0;
+    }
+
+    /// Shadow layer rides every arm — ghosts included — so a closing card
+    /// always takes its halo away (see `refresh_slash_menu`).
+    pub(super) fn refresh_math_menu(&mut self) {
         let menu = match &self.math_menu {
             Some(state) => {
                 let offers = math_conversion::offers(&state.query).offers;
@@ -2325,8 +2898,16 @@ impl Shell {
                     state.anchor,
                 )
             }
-            None => MathMenu::closed(),
-        };
+            None => match &self.menu_dismiss {
+                Some(MenuDismiss::Math {
+                    state,
+                    anchor,
+                    pill_row,
+                }) => MathMenu::dismissing(state, *anchor, *pill_row),
+                _ => MathMenu::closed(),
+            },
+        }
+        .with_shadow(self.popup_shadow.clone());
         self.regions[self.math_menu_region].set_component(Box::new(menu));
     }
 
@@ -2376,9 +2957,12 @@ impl Shell {
     }
 
     /// Rebuilds the dialog region from the current prompt.
+    /// Shadow layer rides every arm; a closed snapshot clears the layer so
+    /// the halo leaves with the dialog (see `refresh_slash_menu`).
     fn refresh_dialog(&mut self) {
         let prompt = self.dialog.clone();
-        self.regions[self.dialog_region].set_component(Box::new(Dialog::new(prompt)));
+        let dialog = Dialog::new(prompt).with_shadow(self.popup_shadow.clone());
+        self.regions[self.dialog_region].set_component(Box::new(dialog));
     }
 
     fn handle_dialog_input(&mut self, input: &Input, viewport: Rect) {
@@ -2703,13 +3287,14 @@ fn enter_insert(docs: &mut Tabs, vim: &mut Vim) {
     vim.set_mode(Mode::Insert);
 }
 
-/// A coordinate resolved against the page's body layout. Both exact hit-test
-/// carets and flat search positions must reset focus before they touch the
-/// document, so a body coordinate can never be applied to a note by accident.
+/// A caret resolved against the page's body layout. Exact hit-test carets
+/// must reset focus before they touch the document, so a body coordinate can
+/// never be applied to a note by accident. Flat positions — search and finder
+/// landings — go through [`Tabs::jump_to_flat`], which owns the same rule
+/// plus the unfold-over-the-landing one.
 #[derive(Clone, Copy)]
 enum BodyCoordinate {
     Caret(Caret),
-    Flat(FlatPos),
 }
 
 /// Applies a body coordinate as one operation: focus body, then place caret.
@@ -2720,7 +3305,6 @@ fn set_body_coordinate_caret(docs: &mut Tabs, coordinate: BodyCoordinate) {
         doc.focus = Focus::Body;
         match coordinate {
             BodyCoordinate::Caret(caret) => doc.set_caret(caret.block, caret.inline, caret.offset),
-            BodyCoordinate::Flat(position) => doc.set_flat_position(position),
         }
     });
 }
@@ -3045,7 +3629,7 @@ fn reset_brush_selection(
     changed
 }
 
-fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
+fn finder_input(state: &mut super::FinderState, input: &Input) -> bool {
     let mut changed = false;
     if !input.text().is_empty() {
         state.query.push_str(input.text());
@@ -3056,7 +3640,7 @@ fn finder_input(state: &mut super::FileFinderState, input: &Input) -> bool {
         state.selected = 0;
         changed = true;
     }
-    let visible = file_finder::filter(&state.files, &state.query).len();
+    let visible = state.rows.len();
     if input.is_key_typed(KeyCode::ArrowDown) && visible > 0 {
         state.selected = (state.selected + 1).min(visible - 1);
         changed = true;
@@ -3372,7 +3956,7 @@ mod tests {
             .iter()
             .map(|run| match run {
                 Inline::Text(text) => text.text.as_str(),
-                Inline::Math(_) | Inline::Note(_) => "\u{FFFC}",
+                Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => "\u{FFFC}",
             })
             .collect()
     }
@@ -3545,13 +4129,7 @@ mod tests {
     fn a_search_jump_while_a_note_is_focused_returns_focus_to_the_body_at_the_match() {
         let mut tabs = note_tabs("search-note");
         focus_note(&mut tabs, 0);
-        set_body_coordinate_caret(
-            &mut tabs,
-            BodyCoordinate::Flat(FlatPos {
-                block: 0,
-                offset: 5,
-            }),
-        );
+        tabs.jump_to_flat(0, 5);
 
         let doc = &tabs.active().unwrap().document;
         assert_eq!(doc.focus, Focus::Body);

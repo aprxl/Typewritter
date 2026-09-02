@@ -79,6 +79,13 @@ pub struct Context {
     pub show_stats: bool,
     /// Mouse state, for components that handle clicks and hovers.
     pub mouse: Mouse,
+    /// Whether THIS region owns the shared popup shadow layer this frame —
+    /// exactly the region whose popup is on screen (or falling as a ghost).
+    /// Owners paint/clear it; everyone else must never touch it, or a
+    /// closed snapshot's unconditional clear would race a live halo (this
+    /// wiped popups' shadows once the format bar had been used: its closed
+    /// snapshot synced after other regions' paints and cleared their slabs).
+    pub owns_shadow: bool,
     /// Lines scrolled this frame (positive is up), for scrollable regions.
     pub scroll_y: f32,
     /// The region's own solved rect. The shell sets this per region each
@@ -90,6 +97,13 @@ pub struct Context {
     /// Debug aid: draw each row's hit band so hit-testing can be checked
     /// against what is on screen.
     pub debug_rows: bool,
+    /// The entrance reveal of an overlay that opened, 0..1 — 1.0 when none
+    /// is in flight. The shell owns the animation so a refreshed overlay
+    /// snapshot (a new `Component`) never re-triggers the pop: the value is
+    /// a matter of elapsed time, not of which component instance reads it.
+    /// The first consumer is the format bar, which fades and lifts as this
+    /// climbs from 0.
+    pub reveal: f32,
     /// Something is drawn over the whole window — the onboarding splash or
     /// a dialog. Everything underneath is a picture until it closes.
     pub overlay_open: bool,
@@ -251,6 +265,14 @@ pub trait Component {
     fn is_animating(&self) -> bool {
         false
     }
+
+    /// Type-erased access for the shell, which owns regions but not the
+    /// concrete components inside them. The one use today is reading the
+    /// format bar's pill position back after a refresh; implementors that
+    /// never need it get the default for free.
+    fn as_any(&self) -> &dyn std::any::Any {
+        &()
+    }
 }
 
 /// A component bound to a layout node and, usually, its own layer.
@@ -345,6 +367,12 @@ impl Region {
 
     pub fn sync(&mut self, context: &Context) {
         self.component.sync(context);
+    }
+
+    /// The region's component, downcast to `T` — the shell's read-only
+    /// window into a snapshot's state (see [`Component::as_any`]).
+    pub fn component_as<T: 'static>(&self) -> Option<&T> {
+        self.component.as_any().downcast_ref()
     }
 
     pub fn is_animating(&self) -> bool {

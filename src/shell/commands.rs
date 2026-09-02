@@ -15,8 +15,8 @@ use winit::keyboard::{KeyCode, ModifiersState};
 use super::Shell;
 use crate::components::dialog::Prompt;
 use crate::components::palette;
-use crate::document::BadgeColor;
 use crate::document::math::{AccentKind, BigOp, SymbolRole};
+use crate::document::{BadgeColor, ListMarker};
 use crate::input::Input;
 
 #[derive(Clone, Copy)]
@@ -133,6 +133,15 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.open_finder(),
     },
     Command {
+        id: "file.export_pdf",
+        title: "Export as PDF",
+        group: "File",
+        // No chord: it opens a file dialog and can take a moment on a long
+        // note, which is not something a hand should be able to trip into.
+        chord: None,
+        run: |shell| shell.export_pdf(),
+    },
+    Command {
         id: "file.close",
         title: "Close note",
         group: "File",
@@ -192,46 +201,9 @@ pub const COMMANDS: &[Command] = &[
         }),
         run: |shell| shell.open_picker(),
     },
-    Command {
-        id: "view.tree",
-        title: "Toggle file tree",
-        group: "View",
-        chord: Some(Chord {
-            mods: CTRL,
-            key: KeyCode::Digit1,
-        }),
-        run: |shell| shell.panels_mut()[0].toggle(),
-    },
-    Command {
-        id: "view.sidenotes",
-        title: "Toggle sidenotes",
-        group: "View",
-        chord: Some(Chord {
-            mods: CTRL,
-            key: KeyCode::Digit2,
-        }),
-        run: |shell| shell.panels_mut()[1].toggle(),
-    },
-    Command {
-        id: "view.topics",
-        title: "Toggle topics",
-        group: "View",
-        chord: Some(Chord {
-            mods: CTRL,
-            key: KeyCode::Digit3,
-        }),
-        run: |shell| shell.panels_mut()[2].toggle(),
-    },
-    Command {
-        id: "view.status",
-        title: "Toggle status line",
-        group: "View",
-        chord: Some(Chord {
-            mods: CTRL,
-            key: KeyCode::Digit4,
-        }),
-        run: |shell| shell.panels_mut()[3].toggle(),
-    },
+    // Ctrl+1..4 used to toggle the four regions. Those chords now pick a
+    // row in the finder (Ctrl+1..5), the only thing those keys do; the
+    // toggles themselves were reachable only from here and went with them.
     Command {
         id: "view.capture",
         title: "Capture mode",
@@ -262,6 +234,27 @@ pub const COMMANDS: &[Command] = &[
         group: "View",
         chord: None,
         run: |shell| shell.debug_rows = !shell.debug_rows,
+    },
+    Command {
+        id: "fold.toggle",
+        title: "Toggle fold at heading",
+        group: "Fold",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().toggle_fold(),
+    },
+    Command {
+        id: "fold.open_all",
+        title: "Open all folds",
+        group: "Fold",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().open_all_folds(),
+    },
+    Command {
+        id: "fold.close_all",
+        title: "Close all folds",
+        group: "Fold",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().close_all_folds(),
     },
     Command {
         id: "format.body",
@@ -327,6 +320,45 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.docs.borrow_mut().insert_divider(),
     },
     Command {
+        id: "format.bullet_list",
+        title: "Bulleted list",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().set_list(Some(ListMarker::Bullet)),
+    },
+    Command {
+        id: "format.numbered_list",
+        title: "Numbered list",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell
+                .docs
+                .borrow_mut()
+                .set_list(Some(ListMarker::Number(1)))
+        },
+    },
+    Command {
+        id: "format.task_list",
+        title: "Task list",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell
+                .docs
+                .borrow_mut()
+                .set_list(Some(ListMarker::Task { done: false }))
+        },
+    },
+    Command {
+        // The checkbox is also clickable; this is the keyboard route.
+        id: "format.task_toggle",
+        title: "Toggle task",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().toggle_task(),
+    },
+    Command {
         // Spec §5: a sidenote is a block like the rest, reachable from the
         // same `/` menu. No chord: the obvious ones are taken, and the menu
         // is enough on its own.
@@ -357,6 +389,19 @@ pub const COMMANDS: &[Command] = &[
         group: "Format",
         chord: None,
         run: |shell| shell.docs.borrow_mut().insert_math_block(),
+    },
+    Command {
+        // One command for both directions: a tagged equation loses its tag,
+        // an untagged one gains the next free `#eq:N`. The numbers on the
+        // page are derived at layout time in document order, so nothing
+        // stored here can drift from what the reader sees.
+        id: "format.math_tag",
+        title: "Equation tag",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell.docs.borrow_mut().toggle_math_tag();
+        },
     },
     Command {
         id: "format.inline_code",
@@ -861,6 +906,16 @@ mod tests {
             editor
                 .iter()
                 .any(|command| command.id == "format.math_block")
+        );
+    }
+
+    #[test]
+    fn equation_tag_appears_in_the_editors_slash_menu() {
+        assert!(
+            editor_commands()
+                .iter()
+                .any(|command| command.id == "format.math_tag"),
+            "tagging an equation is one keystroke away in Insert mode"
         );
     }
 

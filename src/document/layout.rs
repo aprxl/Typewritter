@@ -14,7 +14,10 @@
 use std::collections::HashMap;
 
 use crate::document::math::{MathCursor, NodeAddress};
-use crate::document::{Block, Caret, Document, FlatPos, FlatRange, Inline, Style, math_layout};
+use crate::document::{
+    Block, Caret, Document, FlatPos, FlatRange, Inline, ListMarker, Style, fold_region_end,
+    math_layout, outline,
+};
 use crate::theme::{self, TextStyle};
 
 /// Visual line heights, in logical pixels.
@@ -49,6 +52,51 @@ pub const GAP_HEADING: f32 = 26.0;
 pub const GAP_AFTER_HEADING: f32 = 8.0;
 /// Space below a rule — tighter than a paragraph's, for the same reason.
 pub const GAP_DIVIDER: f32 = 8.0;
+/// Space below a list item that has another item right after it — tighter
+/// than a paragraph's, because the items are one thought. The last item of
+/// a run keeps the full paragraph gap below it.
+pub const LIST_GAP: f32 = 6.0;
+/// A list item's content column, hung once for the whole block: the marker
+/// lives in the gutter to its left, and every wrapped line aligns here —
+/// under the content, never under the marker (the hanging indent).
+pub const LIST_INDENT: f32 = 26.0;
+/// A task checkbox's edge, and the gap between its right side and the
+/// item's content column. One geometry for the drawing and the click
+/// hit-test, both reading [`DocLayout::task_box`].
+pub const CHECK_SIZE: f32 = 15.0;
+pub const CHECK_GAP: f32 = 9.0;
+/// The collapsed-body indicator's band height: one quiet line, sized to the
+/// small type it carries rather than to the prose around it.
+pub const FOLD_INDICATOR_HEIGHT: f32 = 22.0;
+/// The gutter the heading auto-number and the fold chevron share, measured
+/// back from the text column's left edge in content coordinates. The number
+/// is drawn right-aligned against it; the chevron hangs to its left. Lives
+/// here (not in the editor) because the chevron's hit-test and its drawing
+/// must read one number.
+pub const NUMBER_GUTTER: f32 = 12.0;
+/// The auto-number's size. Constant rather than scaled per heading level:
+/// it is a margin annotation, not part of the heading's own typography.
+pub const NUMBER_SIZE: f32 = 11.0;
+/// The chevron triangle: this wide and this tall, pointing down when the
+/// section is open and right when it is folded.
+pub const CHEVRON_WIDTH: f32 = 7.0;
+pub const CHEVRON_HEIGHT: f32 = 6.0;
+/// Gap between the chevron's right edge and the auto-number's left edge, so
+/// the two gutter marks read as one aligned column, not one collision.
+pub const CHEVRON_GAP: f32 = 9.0;
+/// Slack around the chevron a click is granted: a 5px triangle is a cruel
+/// click target on its own.
+pub const CHEVRON_HIT_PAD: f32 = 8.0;
+/// Floor for the chevron's right edge: a deeply numbered heading must not
+/// push its chevron out of the page gutter where a click cannot reach it.
+pub const CHEVRON_RIGHT_FLOOR: f32 = -44.0;
+
+/// Content x of a fold chevron's right edge, given the width of the
+/// auto-number it must clear — the one formula the editor's drawing and the
+/// layout's hit-test share, so they cannot drift.
+pub fn chevron_right(number_width: f32, scale: f32) -> f32 {
+    (-(NUMBER_GUTTER + number_width + CHEVRON_GAP) * scale).max(CHEVRON_RIGHT_FLOOR * scale)
+}
 /// The size of an anchor's raised number. Matches the heading's auto-number:
 /// both are margin annotations, not part of the prose they annotate.
 pub const ANCHOR_SIZE: f32 = 11.0;
@@ -78,17 +126,38 @@ pub struct Segment {
 pub struct VisLine {
     /// Top of the line, relative to content top.
     pub y: f32,
+    /// Left edge of the line's text, relative to the content column —
+    /// nonzero only for a list item's content, which is indented once for
+    /// every line of the block. The caret, the click hit-tests, and the
+    /// drawing all add it, so they cannot drift apart.
+    pub x: f32,
     /// Actual line height: the block's floor or its tallest content.
     pub height: f32,
     pub segments: Vec<Segment>,
+}
+
+/// The collapsed-body indicator under a folded heading: where it sits and
+/// how many lines it hides. The count lands after the body blocks are laid
+/// out, so it is patched in once the main pass is done.
+pub struct FoldIndicator {
+    /// Top of the indicator band, relative to content top.
+    pub y: f32,
+    pub lines: usize,
 }
 
 /// One block's laid-out lines plus where it sits.
 pub struct BlockLayout {
     /// Top of the block, relative to content top.
     pub y: f32,
-    pub lines: Vec<VisLine>, // never empty — an empty block has one empty line
+    /// Empty exactly when the block is folded away: a hidden block occupies
+    /// no height and draws nothing, but its lines were counted for the
+    /// folded heading's indicator before being dropped.
+    pub lines: Vec<VisLine>,
     pub height: f32,
+    /// The folded heading that hides this block, if it is hidden.
+    pub hidden: Option<usize>,
+    /// Set on a folded heading whose body is non-empty.
+    pub indicator: Option<FoldIndicator>,
 }
 
 /// One sidenote anchor: where it is, and the number the reader sees.
@@ -100,6 +169,12 @@ pub struct Anchor {
     pub label: String,
     /// The raised number shown, "1".."n" in document order.
     pub number: String,
+    /// Which of the block's visual lines the anchor sits on, and `None` when
+    /// the block is folded away and has no lines to sit on. The export reads
+    /// this to decide which page a note travels to, because a page break
+    /// falls between lines and the y alone cannot say which side of one an
+    /// anchor is on.
+    pub line: Option<usize>,
     /// The y of the anchor's visual line, in document coordinates.
     pub y: f32,
 }
@@ -123,6 +198,11 @@ pub struct DocLayout {
     /// outline, they are derived from position so a number can never
     /// disagree with the anchor beside it.
     pub anchors: Vec<Anchor>,
+    /// Each tagged equation block's `(n)`, indexed like `source`. Derived in
+    /// the same pre-pass as the anchor numbers, so the number hung in a
+    /// band's margin can never disagree with what a `@eq:…` reference
+    /// resolves to.
+    pub equation_numbers: HashMap<usize, String>,
 }
 
 /// The smallest editable document node under a Normal-mode click.
@@ -175,9 +255,17 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
             theme::ink(),
         )
         .bold(),
-        Block::Paragraph(_) | Block::Divider(_) | Block::Math(_) => {
+        Block::Paragraph(_) | Block::Divider(_) | Block::Math { .. } => {
             TextStyle::serif(17.5 * scale, theme::ink())
         }
+        // A done task's text is dimmed: the drawn strike through it says
+        // "done", the muted ink says "past tense". Together they quiet the
+        // item without hiding it.
+        Block::ListItem {
+            marker: ListMarker::Task { done: true },
+            ..
+        } => TextStyle::serif(17.5 * scale, theme::dim()),
+        Block::ListItem { .. } => TextStyle::serif(17.5 * scale, theme::ink()),
         Block::CodeLine { .. } => TextStyle::mono(17.5 * scale, theme::ink()),
     };
     if style.bold {
@@ -194,6 +282,19 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
 /// opens something" rather than as a word in the sentence.
 pub fn anchor_style() -> TextStyle {
     TextStyle::serif(ANCHOR_SIZE, theme::accent())
+}
+
+/// The ink an inline equation reference draws with. Resolved, it takes the
+/// accent — a jump target, the way an anchor reads as "this opens
+/// something". Unresolved, its raw `@eq:label` text stays on the page, set
+/// small and muted: never vanishing, never an error, and never mistaken for
+/// a number.
+pub fn eq_ref_style(display: &str, scale: f32) -> TextStyle {
+    if display.starts_with('(') {
+        TextStyle::serif(17.5 * scale, theme::accent())
+    } else {
+        TextStyle::mono(theme::BADGE_SIZE * scale, theme::comment())
+    }
 }
 
 /// One word or whitespace stretch, with its source coordinates.
@@ -242,6 +343,13 @@ pub fn advance(
         // stamped onto the segment this run flows through; nothing measures
         // it from a guess.
         Inline::Note(_) => measure(number.unwrap_or("0"), &anchor_style()),
+        // A reference's display — `(n)` resolved, `@eq:label` not — is
+        // stamped by the numbering pass and carried on the segment, so the
+        // caret, the hit tests, and the drawing all measure the same text.
+        Inline::EqRef(_) => {
+            let display = number.unwrap_or_default();
+            measure(display, &eq_ref_style(display, scale))
+        }
     };
     let box_pad = if style.badge {
         theme::BADGE_PAD * 2.0 * scale
@@ -409,8 +517,47 @@ pub fn layout_blocks(
                     inline,
                     label: label.clone(),
                     number: ordinal,
+                    line: None,
                     y: 0.0,
                 });
+            }
+        }
+    }
+
+    // Number the tagged equations in document order — one counter, one
+    // source of truth, exactly the anchor scheme above. Untagged math gets
+    // no number; a repeated tag takes the first occurrence's number, since
+    // one label naming two equations must still resolve somewhere.
+    let mut eq_of_label: HashMap<&str, usize> = HashMap::new();
+    let mut equation_numbers: HashMap<usize, String> = HashMap::new();
+    let mut equations = 0usize;
+    for (block, source) in blocks.iter().enumerate() {
+        if let Block::Math {
+            tag: Some(label), ..
+        } = source
+        {
+            eq_of_label.entry(label.as_str()).or_insert_with(|| {
+                equations += 1;
+                equations
+            });
+            if let Some(n) = eq_of_label.get(label.as_str()) {
+                equation_numbers.insert(block, format!("({n})"));
+            }
+        }
+    }
+    // Resolve every reference against that map now and stamp the display it
+    // will draw, the way an anchor's number is stamped onto its pieces: an
+    // unresolved label keeps its raw spelling, dimmed at draw time.
+    for (block, source) in blocks.iter().enumerate() {
+        for (inline, run) in source.inlines().iter().enumerate() {
+            if let Inline::EqRef(label) = run {
+                let display = match eq_of_label.get(label.as_str()) {
+                    Some(n) => format!("({n})"),
+                    // The label already carries its `eq:` prefix; the raw
+                    // spelling just puts the `@` back.
+                    None => format!("@{label}"),
+                };
+                number_of.insert((block, inline), display);
             }
         }
     }
@@ -423,7 +570,46 @@ pub fn layout_blocks(
     // is what keeps its space above equal to its space below.
     let mut gap_below_previous = 0.0f32;
 
+    // The fold walk. A folded heading hides its body — everything up to the
+    // next heading of level <= its own — in one instant pass (§11: reflow is
+    // never animated, only recomputed). Hidden blocks are laid out for their
+    // line count — the folded heading's indicator reports it — and then
+    // dropped: a zero-height stub with no lines. `fold_cover` names the
+    // folded heading whose body we are inside; a heading of level <= its own
+    // closes the region, which makes nested folds fall out for free: a
+    // folded H3 under a folded H2 is a hidden block like any other, and
+    // keeps its own fold for when the H2 is unfolded.
+    let mut fold_cover: Option<(usize, u8)> = None;
+    let mut hidden_lines: HashMap<usize, usize> = HashMap::new();
+
     for (source_index, block) in blocks.iter().enumerate() {
+        let mut hidden = false;
+        if let Some((owner, level)) = fold_cover {
+            match block {
+                Block::Heading { level: next, .. } if *next <= level => fold_cover = None,
+                _ => {
+                    hidden = true;
+                    *hidden_lines.entry(owner).or_insert(0) += wrap(
+                        &tokens(block, source_index, &number_of),
+                        block,
+                        width,
+                        scale,
+                        measure,
+                    )
+                    .len();
+                    laid.push(BlockLayout {
+                        y,
+                        lines: Vec::new(),
+                        height: 0.0,
+                        hidden: Some(owner),
+                        indicator: None,
+                    });
+                }
+            }
+        }
+        if hidden {
+            continue;
+        }
         let gap_above = if first_block {
             0.0
         } else if block.is_math() {
@@ -442,7 +628,7 @@ pub fn layout_blocks(
             Block::Heading { level: 3, .. } => LINE_H3 * scale,
             Block::Heading { level: 4, .. } => LINE_H4 * scale,
             Block::Divider(_) => LINE_DIVIDER * scale,
-            Block::Math(runs) => {
+            Block::Math { list: runs, .. } => {
                 let Inline::Math(list) = &runs[0] else {
                     unreachable!("math block must contain one math atom")
                 };
@@ -452,10 +638,19 @@ pub fn layout_blocks(
             Block::Heading { .. } | Block::Paragraph(_) | Block::CodeLine { .. } => {
                 LINE_BODY * scale
             }
+            Block::ListItem { .. } => LINE_BODY * scale,
         };
 
+        // A list item's content column is indented once for the whole
+        // block — first line and wraps alike — so the marker hangs in the
+        // gutter and wrapped lines align under the content, never under
+        // the marker.
+        let indent = match block {
+            Block::ListItem { .. } => LIST_INDENT * scale,
+            _ => 0.0,
+        };
         let pieces = tokens(block, source_index, &number_of);
-        let grouped = wrap(&pieces, block, width, scale, measure);
+        let grouped = wrap(&pieces, block, width - indent, scale, measure);
         let mut line_y = y;
         let lines = grouped
             .iter()
@@ -468,13 +663,14 @@ pub fn layout_blocks(
                                 let expression = math_layout::layout(list, 0, scale, measure);
                                 Some(expression.ascent + expression.descent + MATH_LEADING * scale)
                             }
-                            Inline::Text(_) | Inline::Note(_) => None,
+                            Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
                         },
                     )
                     .fold(0.0, f32::max);
                 let height = base_line_height.max(content_height);
                 let line = VisLine {
                     y: line_y,
+                    x: indent,
                     height,
                     segments: segments_for(&pieces, line_pieces),
                 };
@@ -485,8 +681,26 @@ pub fn layout_blocks(
 
         // VisLine heights are content-driven, so later lines start after the
         // actual height of every earlier line rather than a copied constant.
-        let height = lines.iter().map(|line| line.height).sum();
-        laid.push(BlockLayout { y, lines, height });
+        let mut height = lines.iter().map(|line| line.height).sum();
+        // A folded heading reserves its indicator's band right here, in the
+        // flow, so everything below it moves in the same pass — the reflow
+        // is one layout, not a settle.
+        let mut indicator = None;
+        if block.is_folded() && fold_region_end(blocks, source_index) > source_index + 1 {
+            indicator = Some(FoldIndicator {
+                y: y + height,
+                lines: 0,
+            });
+            height += FOLD_INDICATOR_HEIGHT * scale;
+            fold_cover = Some((source_index, heading_level(block)));
+        }
+        laid.push(BlockLayout {
+            y,
+            lines,
+            height,
+            hidden: None,
+            indicator,
+        });
         y += height;
 
         let gap_after = if block.is_code()
@@ -501,6 +715,12 @@ pub fn layout_blocks(
             GAP_AFTER_HEADING * scale
         } else if block.is_divider() {
             GAP_DIVIDER * scale
+        } else if matches!(block, Block::ListItem { .. }) {
+            if matches!(blocks.get(source_index + 1), Some(Block::ListItem { .. })) {
+                LIST_GAP * scale
+            } else {
+                GAP_PARAGRAPH * scale
+            }
         } else {
             GAP_PARAGRAPH * scale
         };
@@ -508,10 +728,22 @@ pub fn layout_blocks(
         gap_below_previous = gap_after;
     }
 
-    // A note sits beside the line its anchor is on, and that line's y is only
-    // known after the block is laid out — fill it in now that the lines exist.
+    // The folded headings' indicators can only be counted while their body
+    // blocks are laid out — stamp the tallies in now that the pass is done.
+    for (owner, count) in &hidden_lines {
+        if let Some(indicator) = &mut laid[*owner].indicator {
+            indicator.lines = *count;
+        }
+    }
+
+    // A note sits beside the line its anchor is on, and that line is only
+    // known after the block is laid out — fill it in now that the lines
+    // exist. The index and the y come from the same lookup, so they cannot
+    // name two different lines.
     for anchor in &mut anchors {
-        anchor.y = anchor_y(&laid[anchor.block], anchor.inline);
+        let block = &laid[anchor.block];
+        anchor.line = anchor_line(block, anchor.inline);
+        anchor.y = anchor.line.map_or(block.y, |index| block.lines[index].y);
     }
 
     DocLayout {
@@ -520,19 +752,29 @@ pub fn layout_blocks(
         height: y,
         scale,
         anchors,
+        equation_numbers,
     }
 }
 
-/// The y of the visual line the anchor `inline` sits on, in document
-/// coordinates — the same space the editor scrolls in. A note in the margin
-/// starts at this y, so it sits beside the sentence that anchored it.
-fn anchor_y(block: &BlockLayout, inline: usize) -> f32 {
-    for line in &block.lines {
-        if line.segments.iter().any(|segment| segment.inline == inline) {
-            return line.y;
-        }
+/// Which visual line the anchor `inline` sits on. A note in the margin starts
+/// at that line's y, so it sits beside the sentence that anchored it.
+///
+/// `None` when no line carries the run, which today means the block is folded
+/// away and has none. The margin does not draw a note for a hidden anchor and
+/// the export expands every fold before it lays out, so neither ever asks.
+fn anchor_line(block: &BlockLayout, inline: usize) -> Option<usize> {
+    block
+        .lines
+        .iter()
+        .position(|line| line.segments.iter().any(|segment| segment.inline == inline))
+}
+
+/// A heading block's level; every caller has already matched the variant.
+fn heading_level(block: &Block) -> u8 {
+    match block {
+        Block::Heading { level, .. } => *level,
+        _ => 0,
     }
-    block.y
 }
 
 fn run_text(run: &Inline) -> &str {
@@ -540,6 +782,7 @@ fn run_text(run: &Inline) -> &str {
         Inline::Text(t) => &t.text,
         Inline::Math(_) => "\u{FFFC}",
         Inline::Note(_) => "\u{FFFC}",
+        Inline::EqRef(_) => "\u{FFFC}",
     }
 }
 
@@ -548,6 +791,7 @@ fn run_style(run: &Inline) -> Style {
         Inline::Text(t) => t.style,
         Inline::Math(_) => Style::PLAIN,
         Inline::Note(_) => Style::PLAIN,
+        Inline::EqRef(_) => Style::PLAIN,
     }
 }
 
@@ -652,6 +896,9 @@ fn x_of_flat(
 /// The visual line that flat offset falls in. At the block's very end it is
 /// the last line; at a wrap boundary it is the *next* line's start.
 fn line_of_flat(layout_block: &BlockLayout, flat: usize) -> usize {
+    if layout_block.lines.is_empty() {
+        return 0;
+    }
     for (i, _) in layout_block.lines.iter().enumerate() {
         if flat < line_flat_start(layout_block, i + 1) {
             return i;
@@ -672,6 +919,9 @@ fn block_of_y(layout: &DocLayout, y: f32) -> usize {
 
 /// The visual line the y-band falls in inside a block.
 fn line_of_y(block: &BlockLayout, y: f32) -> usize {
+    if block.lines.is_empty() {
+        return 0;
+    }
     for (i, line) in block.lines.iter().enumerate() {
         if y < line.y + line.height || i + 1 == block.lines.len() {
             return i;
@@ -794,6 +1044,9 @@ fn caret_for_click(
 ) -> Caret {
     let block = &scan_source[block_idx];
     let line = &layout_block.lines[line_idx];
+    // Clicks arrive in content coordinates; a list item's text starts at
+    // its own indent, so the aim is against the line's left edge.
+    let x = x - line.x;
     let start = line_flat_start(layout_block, line_idx);
 
     // The clicked char's offset within the line's flat text, defaulting to
@@ -816,7 +1069,7 @@ fn caret_for_click(
         );
         // The label sits inside its box; skip the left edge so a click
         // lands on the character the user aimed at.
-        if matches!(run, Inline::Math(_) | Inline::Note(_)) {
+        if matches!(run, Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_)) {
             if x <= cum + width / 2.0 {
                 pos = seg_flat;
                 break 'segments;
@@ -876,6 +1129,37 @@ impl DocLayout {
             .collect()
     }
 
+    /// A task item's checkbox, in content coordinates: `(x, y, w, h)` with
+    /// x from the content column's left edge and y in document coordinates.
+    /// `None` for every block that is not a task item. The drawing and the
+    /// click hit-test both read this one geometry, so they cannot drift.
+    pub fn task_box(&self, block_idx: usize) -> Option<(f32, f32, f32, f32)> {
+        if !matches!(
+            self.source.get(block_idx),
+            Some(Block::ListItem {
+                marker: ListMarker::Task { .. },
+                ..
+            })
+        ) {
+            return None;
+        }
+        let line = self.blocks.get(block_idx)?.lines.first()?;
+        let mid = line.y + line.height * 0.5;
+        let size = CHECK_SIZE * self.scale;
+        let gap = CHECK_GAP * self.scale;
+        let indent = LIST_INDENT * self.scale;
+        Some((indent - gap - size, mid - size * 0.5, size, size))
+    }
+
+    /// The task item whose checkbox contains the point, if any. The frame
+    /// is the same one [`Self::hit`] reads: x from the content column's
+    /// left edge, y in document coordinates.
+    pub fn task_at(&self, x: f32, y: f32) -> Option<usize> {
+        let block_idx = block_of_y(self, y);
+        let (bx, by, w, h) = self.task_box(block_idx)?;
+        (x >= bx && x <= bx + w && y >= by && y <= by + h).then_some(block_idx)
+    }
+
     /// (x, baseline-y, line-height) of a model caret, relative to content top.
     pub fn caret_pos(
         &self,
@@ -885,17 +1169,38 @@ impl DocLayout {
         let flat = flat_of_caret(&self.source, caret);
         let block = &self.source[caret.block];
         let layout_block = &self.blocks[caret.block];
+        if layout_block.lines.is_empty() {
+            // A caret inside a folded region (an undo can restore one) has
+            // no line to sit on; park it on the fold instead of panicking.
+            return (
+                0.0,
+                layout_block.y + layout_block.height * 0.5,
+                layout_block.height.max(LINE_BODY),
+            );
+        }
         let line_idx = line_of_flat(layout_block, flat);
         let line = &layout_block.lines[line_idx];
         let line_start = line_flat_start(layout_block, line_idx);
         let x = x_of_flat(block, line, line_start, flat, self.scale, measure);
-        (x, line.y + line.height / 2.0, line.height)
+        (x + line.x, line.y + line.height / 2.0, line.height)
     }
 
     /// Nearest caret position for a click at (x, y) — y relative to content
     /// top. Style context follows the style-before rule.
     pub fn hit(&self, x: f32, y: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) -> Caret {
         let block_idx = block_of_y(self, y);
+        if let Some(owner) = self.blocks[block_idx].hidden {
+            // Folded ground: the nearest legal caret is the end of the
+            // folded heading that owns the hidden block.
+            let block = &self.source[owner];
+            let (inline, offset) = flat_to_pos(block, block_flat_len(block));
+            return Caret {
+                block: owner,
+                inline,
+                offset,
+                style: Style::PLAIN,
+            };
+        }
         let layout_block = &self.blocks[block_idx];
         let line_idx = line_of_y(layout_block, y);
         caret_for_click(
@@ -918,6 +1223,9 @@ impl DocLayout {
         measure: &dyn Fn(&str, &TextStyle) -> f32,
     ) -> Option<ContextHit> {
         let block_idx = block_of_y(self, y);
+        if self.blocks[block_idx].hidden.is_some() {
+            return None;
+        }
         let layout_block = &self.blocks[block_idx];
         let line_idx = line_of_y(layout_block, y);
         if let Some((block, inline, node)) =
@@ -932,6 +1240,7 @@ impl DocLayout {
 
         let line = &layout_block.lines[line_idx];
         let block = &self.source[block_idx];
+        let x = x - line.x;
 
         if block.is_code() {
             let mut first = block_idx;
@@ -1097,6 +1406,7 @@ impl DocLayout {
                 .flat_map(|run| run_text(run).chars())
                 .collect();
             for line in &layout_block.lines {
+                let point = (x - line.x, y);
                 let baseline = line.y + line.height * 0.5;
                 let mut advance_x = 0.0;
                 for segment in &line.segments {
@@ -1326,6 +1636,7 @@ impl DocLayout {
     ) -> Option<(usize, usize, Option<NodeAddress>)> {
         let line = &self.blocks[block_idx].lines[line_idx];
         let block = &self.source[block_idx];
+        let x = x - line.x;
         let mut advance_x = 0.0;
         for segment in &line.segments {
             let run = &block.inlines()[segment.inline];
@@ -1369,6 +1680,9 @@ impl DocLayout {
         measure: &dyn Fn(&str, &TextStyle) -> f32,
     ) -> Option<(usize, usize, MathCursor)> {
         let block_idx = block_of_y(self, y);
+        if self.blocks[block_idx].hidden.is_some() {
+            return None;
+        }
         let layout_block = &self.blocks[block_idx];
         let line_idx = line_of_y(layout_block, y);
         if let Some(hit) = self.hit_math_on_line(block_idx, line_idx, x, y, measure) {
@@ -1401,6 +1715,7 @@ impl DocLayout {
     ) -> Option<(usize, usize, MathCursor)> {
         let line = &self.blocks[block_idx].lines[line_idx];
         let block = &self.source[block_idx];
+        let x = x - line.x;
         let mut advance_x = 0.0;
 
         for segment in &line.segments {
@@ -1464,7 +1779,7 @@ impl DocLayout {
         if block_idx == 0 {
             return None;
         }
-        let prev = block_idx - 1;
+        let prev = self.visible_before(block_idx)?;
         let last_line = self.blocks[prev].lines.len() - 1;
         Some(caret_for_click(
             &self.source,
@@ -1475,6 +1790,19 @@ impl DocLayout {
             self.scale,
             measure,
         ))
+    }
+
+    /// The nearest visible block above `block_idx`, skipping folded ground —
+    /// vertical motion and folded sections agree that hidden blocks are not
+    /// places a caret can rest.
+    fn visible_before(&self, block_idx: usize) -> Option<usize> {
+        (0..block_idx)
+            .rev()
+            .find(|&index| self.blocks[index].hidden.is_none())
+    }
+
+    fn visible_after(&self, block_idx: usize) -> Option<usize> {
+        (block_idx + 1..self.blocks.len()).find(|&index| self.blocks[index].hidden.is_none())
     }
 
     /// One visual line down from `caret`, aiming at `goal_x` pixels.
@@ -1500,13 +1828,11 @@ impl DocLayout {
                 measure,
             ));
         }
-        if block_idx + 1 >= self.blocks.len() {
-            return None;
-        }
+        let next = self.visible_after(block_idx)?;
         Some(caret_for_click(
             &self.source,
-            &self.blocks[block_idx + 1],
-            block_idx + 1,
+            &self.blocks[next],
+            next,
             0,
             goal_x,
             self.scale,
@@ -1518,9 +1844,61 @@ impl DocLayout {
     pub fn caret_band(&self, caret: Caret) -> (f32, f32) {
         let flat = flat_of_caret(&self.source, caret);
         let layout_block = &self.blocks[caret.block];
+        if layout_block.lines.is_empty() {
+            return (layout_block.y, layout_block.y + layout_block.height);
+        }
         let line_idx = line_of_flat(layout_block, flat);
         let line = &layout_block.lines[line_idx];
         (line.y, line.y + line.height)
+    }
+
+    /// The folded heading whose gutter chevron a click at `(x, y)` landed
+    /// on, in content coordinates. The band is the chevron's own hit pad —
+    /// a 5px triangle is a cruel target — but nothing more, so a click on
+    /// the heading's number or text stays a caret placement.
+    pub fn fold_chevron_at(
+        &self,
+        x: f32,
+        y: f32,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> Option<usize> {
+        let block_idx = block_of_y(self, y);
+        if !self.source[block_idx].is_heading() {
+            return None;
+        }
+        let layout_block = &self.blocks[block_idx];
+        let line = layout_block.lines.first()?;
+        if y < line.y || y >= line.y + line.height {
+            return None;
+        }
+        let right = self.chevron_right(block_idx, measure);
+        let width = CHEVRON_WIDTH * self.scale;
+        let left = right - width - CHEVRON_HIT_PAD * self.scale;
+        (x >= left && x <= right + CHEVRON_HIT_PAD * self.scale).then_some(block_idx)
+    }
+
+    /// The folded heading whose collapsed-body indicator a click at `y`
+    /// landed on. The whole column is the target: the indicator is the one
+    /// quiet line standing in for everything hidden, and clicking it
+    /// unfolds the fold.
+    pub fn fold_indicator_at(&self, y: f32) -> Option<usize> {
+        self.blocks.iter().position(|block| {
+            block.indicator.as_ref().is_some_and(|indicator| {
+                y >= indicator.y && y < indicator.y + FOLD_INDICATOR_HEIGHT * self.scale
+            })
+        })
+    }
+
+    /// Content x of the chevron's right edge on `block`'s first line — the
+    /// auto-number's left edge minus [`CHEVRON_GAP`], clamped so a deeply
+    /// numbered heading cannot push the chevron out of the gutter.
+    fn chevron_right(&self, block: usize, measure: &dyn Fn(&str, &TextStyle) -> f32) -> f32 {
+        let width = outline::outline(&self.source)
+            .iter()
+            .find(|node| node.block == block)
+            .map(|node| measure(&node.number, &TextStyle::mono(NUMBER_SIZE, theme::ink())))
+            .unwrap_or(0.0);
+        chevron_right(width, self.scale)
     }
 }
 
@@ -1565,7 +1943,10 @@ mod tests {
     /// paragraph that happens to precede it.
     #[test]
     fn a_display_expression_is_inset_equally_above_and_below() {
-        let math = Block::Math(vec![Inline::Math(vec![MathNode::Sym('x')])]);
+        let math = Block::Math {
+            list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+            tag: None,
+        };
         let text = || {
             Block::Paragraph(vec![Inline::Text(Text {
                 text: "a".into(),
@@ -1600,12 +1981,16 @@ mod tests {
         let blocks = vec![
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![Inline::Text(Text {
                     text: "h".into(),
                     style: Style::PLAIN,
                 })],
             },
-            Block::Math(vec![Inline::Math(vec![MathNode::Sym('x')])]),
+            Block::Math {
+                list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+                tag: None,
+            },
         ];
         let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
         let above = laid.blocks[1].y - (laid.blocks[0].y + laid.blocks[0].height);
@@ -1680,6 +2065,7 @@ mod tests {
             para("word word word word word word"),
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![Inline::Text(Text {
                     text: "Title".into(),
                     style: Style::PLAIN,
@@ -1749,6 +2135,7 @@ mod tests {
         let d = doc_with(vec![
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![Inline::Text(Text {
                     text: "Title".into(),
                     style: Style::PLAIN,
@@ -1807,6 +2194,7 @@ mod tests {
         let mut d = doc_with(vec![
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![Inline::Text(Text {
                     text: "Title".into(),
                     style: Style::PLAIN,
@@ -2049,6 +2437,127 @@ mod tests {
         assert_eq!(hit.style, Style::PLAIN);
     }
 
+    // ---- list item tests -------------------------------------------------
+
+    fn list_item(marker: ListMarker, t: &str) -> Block {
+        Block::ListItem {
+            marker,
+            content: vec![Inline::Text(Text {
+                text: t.into(),
+                style: Style::PLAIN,
+            })],
+        }
+    }
+
+    /// The hanging indent: every line of a list item's content starts at the
+    /// same left edge, so a wrapped line never slides back under the marker.
+    #[test]
+    fn a_list_item_wraps_with_a_true_hanging_indent() {
+        let d = doc_with(vec![list_item(
+            ListMarker::Bullet,
+            "aaaa bbbb cccc dddd eeee ffff gggg hhhh",
+        )]);
+        // Narrow enough to force at least one wrap at 10px/char.
+        let layout = layout(&d, 220.0, &fake_measure);
+        let block = &layout.blocks[0];
+        assert!(
+            block.lines.len() >= 2,
+            "expected a wrap: {}",
+            block.lines.len()
+        );
+        for line in &block.lines {
+            assert_eq!(
+                line.x, LIST_INDENT,
+                "every line hangs at the content column"
+            );
+        }
+        // The first wrapped line continues exactly where the flat text says:
+        // a click at the content column lands on its first char.
+        let second = line_flat_start(block, 1);
+        let caret = layout.hit(LIST_INDENT, block.lines[1].y + 1.0, &fake_measure);
+        assert_eq!(flat_of_caret(&layout.source, caret), second);
+        // The caret there sits at the content column, not at the gutter.
+        let (x, _, _) = layout.caret_pos(caret, &fake_measure);
+        assert_eq!(x, LIST_INDENT);
+    }
+
+    #[test]
+    fn non_list_lines_start_at_the_column_edge() {
+        let d = doc_with(vec![para("prose"), list_item(ListMarker::Bullet, "item")]);
+        let layout = layout(&d, 400.0, &fake_measure);
+        assert_eq!(layout.blocks[0].lines[0].x, 0.0);
+        assert_eq!(layout.blocks[1].lines[0].x, LIST_INDENT);
+    }
+
+    /// The checkbox is a control: one geometry answers both the drawing and
+    /// the click, sitting in the gutter left of the content column.
+    #[test]
+    fn a_task_checkbox_is_clickable_where_it_is_drawn() {
+        let d = doc_with(vec![
+            list_item(ListMarker::Task { done: false }, "buy milk"),
+            list_item(ListMarker::Bullet, "tea"),
+            list_item(ListMarker::Task { done: true }, "done thing"),
+        ]);
+        let layout = layout(&d, 400.0, &fake_measure);
+
+        let (x, y, w, h) = layout.task_box(0).expect("task item has a box");
+        assert_eq!(w, CHECK_SIZE);
+        assert_eq!(
+            x + w,
+            LIST_INDENT - CHECK_GAP,
+            "right edge clears the column"
+        );
+        let mid = layout.blocks[0].lines[0].y + layout.blocks[0].lines[0].height * 0.5;
+        assert_eq!(y + h * 0.5, mid, "centred on the line");
+
+        assert_eq!(
+            layout.task_at(x + w * 0.5, y + h * 0.5),
+            Some(0),
+            "centre of the box toggles item 0"
+        );
+        assert_eq!(layout.task_at(1.0, 1.0), None, "outside the box");
+        // A bullet is not a control, wherever the click lands.
+        let bullet_mid = layout.blocks[1].lines[0].y + layout.blocks[1].lines[0].height * 0.5;
+        assert_eq!(layout.task_at(2.0, bullet_mid), None);
+        assert!(layout.task_box(2).is_some(), "the done item keeps its box");
+    }
+
+    #[test]
+    fn list_items_sit_tighter_than_paragraphs() {
+        let gap = |blocks: Vec<Block>| {
+            let d = doc_with(blocks);
+            let layout = layout(&d, 400.0, &fake_measure);
+            layout.blocks[1].y - (layout.blocks[0].y + layout.blocks[0].height)
+        };
+        let items = gap(vec![
+            list_item(ListMarker::Bullet, "a"),
+            list_item(ListMarker::Bullet, "b"),
+        ]);
+        let paragraphs = gap(vec![para("a"), para("b")]);
+        assert_eq!(items, LIST_GAP);
+        assert_eq!(paragraphs, GAP_PARAGRAPH);
+        assert!(items < paragraphs);
+        // The last item of a run keeps the full paragraph gap below it.
+        let d = doc_with(vec![
+            list_item(ListMarker::Bullet, "a"),
+            list_item(ListMarker::Bullet, "b"),
+            para("after"),
+        ]);
+        let layout = layout(&d, 400.0, &fake_measure);
+        let after_items = layout.blocks[2].y - (layout.blocks[1].y + layout.blocks[1].height);
+        assert_eq!(after_items, GAP_PARAGRAPH);
+    }
+
+    #[test]
+    fn a_done_task_reads_dim_through_text_style() {
+        let done = list_item(ListMarker::Task { done: true }, "x");
+        let open = list_item(ListMarker::Task { done: false }, "x");
+        let dim = text_style(&done, Style::PLAIN, 1.0);
+        let plain = text_style(&open, Style::PLAIN, 1.0);
+        assert_ne!(dim.color, plain.color, "done tasks are dimmed");
+        assert_eq!(dim.size, plain.size, "same size — quiet, not smaller");
+    }
+
     #[test]
     fn a_rule_costs_less_vertical_space_than_a_blank_line() {
         let d = doc_with(vec![
@@ -2072,6 +2581,7 @@ mod tests {
         let d = doc_with(vec![
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![Inline::Text(Text {
                     text: "Title".into(),
                     style: Style::PLAIN,
@@ -2096,6 +2606,7 @@ mod tests {
         // H4 matches body size (17.5) — bold is what distinguishes it.
         let h4 = Block::Heading {
             level: 4,
+            folded: false,
             content: vec![Inline::Text(Text {
                 text: "Sub".into(),
                 style: Style::PLAIN,
@@ -2908,16 +3419,287 @@ mod tests {
 
     #[test]
     fn a_display_math_block_is_as_tall_as_its_expression() {
-        let single = Block::Math(vec![Inline::Math(vec![MathNode::Sym('x')])]);
-        let nested = Block::Math(vec![Inline::Math(vec![MathNode::Frac {
-            num: vec![MathNode::Frac {
-                num: vec![MathNode::Sym('1')],
-                den: vec![MathNode::Sym('2')],
-            }],
-            den: vec![MathNode::Sym('3')],
-        }])]);
+        let single = Block::Math {
+            list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+            tag: None,
+        };
+        let nested = Block::Math {
+            list: vec![Inline::Math(vec![MathNode::Frac {
+                num: vec![MathNode::Frac {
+                    num: vec![MathNode::Sym('1')],
+                    den: vec![MathNode::Sym('2')],
+                }],
+                den: vec![MathNode::Sym('3')],
+            }])],
+            tag: None,
+        };
         let single_height = layout(&doc_with(vec![single]), 300.0, &fake_measure).blocks[0].height;
         let nested_height = layout(&doc_with(vec![nested]), 300.0, &fake_measure).blocks[0].height;
         assert!(nested_height > single_height);
+    }
+
+    fn tagged_eq(tag: Option<&str>) -> Block {
+        Block::Math {
+            list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+            tag: tag.map(str::to_string),
+        }
+    }
+
+    fn plain_run(t: &str) -> Inline {
+        Inline::Text(Text {
+            text: t.into(),
+            style: Style::PLAIN,
+        })
+    }
+
+    #[test]
+    fn tagged_equations_number_in_document_order() {
+        let d = doc_with(vec![
+            tagged_eq(Some("eq:a")),
+            tagged_eq(None),
+            tagged_eq(Some("eq:b")),
+            Block::Paragraph(vec![
+                plain_run("see "),
+                Inline::EqRef("eq:b".into()),
+                plain_run(" and "),
+                Inline::EqRef("eq:missing".into()),
+            ]),
+        ]);
+        let laid = layout(&d, 600.0, &fake_measure);
+        // Untagged math takes no number; the tagged ones count 1, 2.
+        assert_eq!(
+            laid.equation_numbers,
+            HashMap::from([(0, "(1)".to_string()), (2, "(2)".to_string())])
+        );
+        // A resolved reference draws the number it points at; an unresolved
+        // one keeps its raw spelling.
+        let segments = &laid.blocks[3].lines[0].segments;
+        let resolved = segments.iter().find(|s| s.inline == 1).unwrap();
+        assert_eq!(resolved.number.as_deref(), Some("(2)"));
+        let unresolved = segments.iter().find(|s| s.inline == 3).unwrap();
+        assert_eq!(unresolved.number.as_deref(), Some("@eq:missing"));
+    }
+
+    #[test]
+    fn a_repeated_tag_resolves_to_its_first_equation() {
+        let d = doc_with(vec![
+            tagged_eq(Some("eq:a")),
+            tagged_eq(Some("eq:a")),
+            Block::Paragraph(vec![plain_run("see "), Inline::EqRef("eq:a".into())]),
+        ]);
+        let laid = layout(&d, 600.0, &fake_measure);
+        assert_eq!(laid.equation_numbers[&0], "(1)");
+        assert_eq!(laid.equation_numbers[&1], "(1)");
+        let segments = &laid.blocks[2].lines[0].segments;
+        let reference = segments.iter().find(|s| s.inline == 1).unwrap();
+        assert_eq!(reference.number.as_deref(), Some("(1)"));
+    }
+
+    #[test]
+    fn a_reference_measures_as_the_number_it_draws() {
+        let d = doc_with(vec![
+            tagged_eq(Some("eq:a")),
+            Block::Paragraph(vec![plain_run("see "), Inline::EqRef("eq:a".into())]),
+        ]);
+        let plain_width = {
+            let run = plain_run("see ");
+            advance(
+                &run,
+                "see ",
+                &d.body()[1],
+                Style::PLAIN,
+                None,
+                1.0,
+                &fake_measure,
+            )
+        };
+        // "see " is four glyphs; the reference is one flat position whose
+        // width is the `(1)` it draws, not the placeholder atom.
+        let reference_width = {
+            let run = Inline::EqRef("eq:a".into());
+            advance(
+                &run,
+                "\u{FFFC}",
+                &d.body()[1],
+                Style::PLAIN,
+                Some("(1)"),
+                1.0,
+                &fake_measure,
+            )
+        };
+        assert_eq!(plain_width, 40.0);
+        assert_eq!(reference_width, 30.0);
+    }
+
+    fn heading(level: u8, text: &str) -> Block {
+        Block::Heading {
+            level,
+            folded: false,
+            content: vec![Inline::Text(Text {
+                text: text.into(),
+                style: Style::PLAIN,
+            })],
+        }
+    }
+
+    fn folded_heading(level: u8, text: &str) -> Block {
+        let mut block = heading(level, text);
+        if let Block::Heading { folded, .. } = &mut block {
+            *folded = true;
+        }
+        block
+    }
+
+    const INDICATOR: f32 = FOLD_INDICATOR_HEIGHT;
+
+    #[test]
+    fn a_folded_heading_hides_its_body_up_to_the_next_heading_of_its_level() {
+        let blocks = vec![
+            folded_heading(1, "Top"),
+            para("body one"),
+            para("body two"),
+            heading(1, "Next"),
+            para("visible again"),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        let full = layout_blocks(
+            &[
+                heading(1, "Top"),
+                para("body one"),
+                para("body two"),
+                heading(1, "Next"),
+                para("visible again"),
+            ],
+            400.0,
+            1.0,
+            &fake_measure,
+        );
+
+        // Blocks 1 and 2 are hidden: zero height, no lines, owned by block 0.
+        assert_eq!(laid.blocks[1].hidden, Some(0));
+        assert_eq!(laid.blocks[2].hidden, Some(0));
+        assert!(laid.blocks[1].lines.is_empty());
+        assert_eq!(laid.blocks[1].height, 0.0);
+        // Everything from "Next" on is visible and sits exactly one heading's
+        // spacing below the folded heading — the hidden body contributes
+        // nothing, so the reflow is instant and leaves no residue. The folded
+        // heading itself is taller by exactly its indicator band.
+        assert_eq!(laid.blocks[0].height, full.blocks[0].height + INDICATOR);
+        assert_eq!(
+            laid.blocks[3].y - (laid.blocks[0].y + laid.blocks[0].height),
+            GAP_AFTER_HEADING + GAP_HEADING,
+        );
+        assert!(laid.blocks[3].hidden.is_none());
+        assert!(laid.blocks[4].hidden.is_none());
+
+        // The folded heading's indicator carries the hidden line count.
+        let indicator = laid.blocks[0].indicator.as_ref().unwrap();
+        assert_eq!(indicator.lines, 2);
+    }
+
+    #[test]
+    fn a_folded_h3_inside_a_folded_h1_hides_with_it_and_keeps_its_own_fold() {
+        let blocks = vec![
+            folded_heading(1, "Top"),
+            para("inner body"),
+            folded_heading(3, "Sub"),
+            para("sub body"),
+            heading(1, "Next"),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        // Everything between the H1 and the next H1 is hidden by the H1.
+        for index in 1..4 {
+            assert_eq!(laid.blocks[index].hidden, Some(0));
+        }
+        // The hidden H3 emits no indicator of its own.
+        assert!(laid.blocks[2].indicator.is_none());
+        assert_eq!(laid.blocks[0].indicator.as_ref().unwrap().lines, 3);
+    }
+
+    #[test]
+    fn an_unfolded_h1_leaves_its_nested_folded_h3_folded_with_its_own_indicator() {
+        let blocks = vec![
+            heading(1, "Top"),
+            para("inner body"),
+            folded_heading(3, "Sub"),
+            para("sub body"),
+            heading(1, "Next"),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        assert!(laid.blocks[0].indicator.is_none());
+        assert!(laid.blocks[2].indicator.is_some());
+        assert!(laid.blocks[1].hidden.is_none());
+        assert_eq!(laid.blocks[3].hidden, Some(2));
+    }
+
+    #[test]
+    fn a_fold_with_no_body_gets_no_indicator() {
+        let blocks = vec![folded_heading(1, "Empty"), heading(1, "Next")];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        assert!(laid.blocks[0].indicator.is_none());
+    }
+
+    #[test]
+    fn the_indicator_band_and_hidden_ground_answer_clicks() {
+        let blocks = vec![
+            folded_heading(1, "Top"),
+            para("body one"),
+            para("body two"),
+            heading(1, "Next"),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        let indicator = laid.blocks[0].indicator.as_ref().unwrap();
+
+        // A click in the indicator band (any x — the whole column) unfolds.
+        let mid = indicator.y + INDICATOR * 0.5;
+        assert_eq!(laid.fold_indicator_at(mid), Some(0));
+        assert_eq!(laid.fold_indicator_at(indicator.y - 0.5), None);
+
+        // A click on the folded ground below lands on the owning heading.
+        let caret = laid.hit(100.0, indicator.y + 5.0, &fake_measure);
+        assert_eq!(caret.block, 0);
+
+        // The chevron hit band sits in the gutter and nowhere else.
+        let right = chevron_right(0.0, 1.0);
+        let band_mid_y = laid.blocks[0].lines[0].y + laid.blocks[0].lines[0].height * 0.5;
+        assert_eq!(
+            laid.fold_chevron_at(right - CHEVRON_WIDTH / 2.0, band_mid_y, &fake_measure),
+            Some(0)
+        );
+        // …but a click right of the gutter is a caret placement, not a fold.
+        assert_eq!(laid.fold_chevron_at(50.0, band_mid_y, &fake_measure), None);
+    }
+
+    #[test]
+    fn vertical_motion_skips_hidden_blocks() {
+        let blocks = vec![
+            folded_heading(1, "Top"),
+            para("hidden one"),
+            para("hidden two"),
+            heading(1, "Next"),
+        ];
+        let laid = layout_blocks(&blocks, 400.0, 1.0, &fake_measure);
+        let caret = Caret {
+            block: 0,
+            inline: 0,
+            offset: 0,
+            style: Style::PLAIN,
+        };
+        // Down from the folded heading lands past the hidden body.
+        let down = laid.line_down(caret, 0.0, &fake_measure).unwrap();
+        assert_eq!(down.block, 3);
+        // And back up returns to the heading, never to a hidden block.
+        let up = laid.line_up(down, 0.0, &fake_measure).unwrap();
+        assert_eq!(up.block, 0);
+    }
+
+    #[test]
+    fn chevron_right_clears_the_number_and_stays_in_the_gutter() {
+        // Wide auto-numbers push the chevron left, but never out of reach.
+        let wide = chevron_right(40.0, 1.0);
+        let bare = chevron_right(0.0, 1.0);
+        assert_eq!(bare, -(NUMBER_GUTTER + CHEVRON_GAP));
+        assert_eq!(wide, CHEVRON_RIGHT_FLOOR);
+        assert!(wide < bare);
     }
 }

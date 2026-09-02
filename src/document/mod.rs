@@ -12,6 +12,7 @@ pub mod math;
 pub mod math_conversion;
 pub mod math_layout;
 pub mod math_notation;
+pub mod math_paint;
 pub mod math_symbols;
 pub mod outline;
 
@@ -79,17 +80,44 @@ pub enum Block {
     /// (see `prune_runs`). The rule itself is drawn by the editor — this
     /// block has no content of its own.
     Divider(Vec<Inline>),
-    /// A display math block: exactly one opaque math atom until math rendering lands.
-    Math(Vec<Inline>),
+    /// Display math. `tag` is the author's equation label (`eq:gain`, spelled
+    /// `#eq:gain` in the fence info string), used for numbering and for
+    /// `@eq:…` references. `list` holds exactly one math atom.
+    Math {
+        list: Vec<Inline>,
+        tag: Option<String>,
+    },
     Heading {
         level: u8,
         content: Vec<Inline>,
+        /// Editor state, not content: whether the heading's body — every
+        /// block up to the next heading of level <= its own — is folded
+        /// away. `parse` sets it false and `serialize` ignores it; it lives
+        /// on the block so fold state survives edits above it and rides the
+        /// same undo snapshots as everything else.
+        folded: bool,
     }, // level 1..=4
     CodeLine {
         content: Vec<Inline>,
         first: bool,
         lang: Option<String>,
     }, // one line of a fenced code block
+    /// One list item. Items are flat blocks; nested lists are out of scope.
+    ListItem {
+        marker: ListMarker,
+        content: Vec<Inline>,
+    },
+}
+
+/// What kind of list an item belongs to. `Number` carries the item's
+/// 1-based ordinal within its run of ordered items — layout never counts,
+/// and serialization renumbers, so the stored number and the printed one
+/// agree after a round trip. A task's `done` is content, not UI state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ListMarker {
+    Bullet,
+    Number(u32),
+    Task { done: bool },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -101,6 +129,10 @@ pub enum Inline {
     /// coordinates count it as exactly one position, so every motion,
     /// selection and offset in the document keeps working unchanged.
     Note(String),
+    /// A reference to a tagged display equation: `@eq:gain` on disk, the
+    /// referenced equation's number on the page. Opaque like an anchor: one
+    /// flat position, deleted as a whole, never split mid-label.
+    EqRef(String),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -210,8 +242,11 @@ impl Block {
         match self {
             Block::Paragraph(inlines)
             | Block::Divider(inlines)
-            | Block::Math(inlines)
+            | Block::Math { list: inlines, .. }
             | Block::Heading {
+                content: inlines, ..
+            }
+            | Block::ListItem {
                 content: inlines, ..
             } => inlines,
             Block::CodeLine { content, .. } => content,
@@ -222,8 +257,11 @@ impl Block {
         match self {
             Block::Paragraph(inlines)
             | Block::Divider(inlines)
-            | Block::Math(inlines)
+            | Block::Math { list: inlines, .. }
             | Block::Heading {
+                content: inlines, ..
+            }
+            | Block::ListItem {
                 content: inlines, ..
             } => inlines,
             Block::CodeLine { content, .. } => content,
@@ -234,17 +272,54 @@ impl Block {
         matches!(self, Block::Heading { .. })
     }
 
+    pub fn is_folded(&self) -> bool {
+        matches!(self, Block::Heading { folded: true, .. })
+    }
+
     pub fn is_divider(&self) -> bool {
         matches!(self, Block::Divider(_))
     }
 
     pub fn is_math(&self) -> bool {
-        matches!(self, Block::Math(_))
+        matches!(self, Block::Math { .. })
     }
 
     pub fn is_code(&self) -> bool {
         matches!(self, Block::CodeLine { .. })
     }
+}
+
+/// The extent of a folded heading's body: every block up to — but not
+/// including — the next heading of level <= its own, or the end of the
+/// document. The same extent `TextObject::InnerHeading` gives, so folding
+/// and `ih` can never disagree about what a section is.
+pub fn fold_region_end(blocks: &[Block], heading: usize) -> usize {
+    let Some(Block::Heading { level, .. }) = blocks.get(heading) else {
+        return heading + 1;
+    };
+    let level = *level;
+    (heading + 1..blocks.len())
+        .find(|&index| matches!(blocks[index], Block::Heading { level: next, .. } if next <= level))
+        .unwrap_or(blocks.len())
+}
+
+/// The folded heading whose body hides `block`, if any — the innermost
+/// *visible* fold covering it. A heading folded inside an already-hidden
+/// region is not reported: it draws nothing, so nothing can point at it;
+/// unfolding its visible ancestor exposes it with its own fold intact.
+pub fn fold_owner_of(blocks: &[Block], target: usize) -> Option<usize> {
+    let mut owner = None;
+    let mut end = 0;
+    for index in 0..target {
+        if index == end {
+            owner = None;
+        }
+        if blocks[index].is_folded() && index >= end {
+            owner = Some(index);
+            end = fold_region_end(blocks, index);
+        }
+    }
+    if target < end { owner } else { None }
 }
 
 impl Inline {
@@ -254,6 +329,7 @@ impl Inline {
             // U+FFFC gives every flat-text consumer exactly one position.
             Inline::Math(_) => "\u{FFFC}",
             Inline::Note(_) => "\u{FFFC}",
+            Inline::EqRef(_) => "\u{FFFC}",
         }
     }
 
@@ -265,6 +341,8 @@ impl Inline {
             // An anchor's label is fixed by the note it points at; the
             // reader edits the note body, not the anchor.
             Inline::Note(_) => None,
+            // A reference's label is fixed by the equation it points at.
+            Inline::EqRef(_) => None,
         }
     }
 
@@ -273,6 +351,7 @@ impl Inline {
             Inline::Text(t) => t.style,
             Inline::Math(_) => Style::PLAIN,
             Inline::Note(_) => Style::PLAIN,
+            Inline::EqRef(_) => Style::PLAIN,
         }
     }
 
@@ -281,6 +360,7 @@ impl Inline {
             Inline::Text(t) => t.style = style,
             Inline::Math(_) => {}
             Inline::Note(_) => {}
+            Inline::EqRef(_) => {}
         }
     }
 }
@@ -291,6 +371,7 @@ fn run_len(run: &Inline) -> usize {
         // Opaque math always costs one flat position.
         Inline::Math(_) => 1,
         Inline::Note(_) => 1,
+        Inline::EqRef(_) => 1,
     }
 }
 
@@ -300,13 +381,14 @@ fn merge_style(run: &Inline) -> Option<Style> {
         // An atom is never a prose merge target.
         Inline::Math(_) => None,
         Inline::Note(_) => None,
+        Inline::EqRef(_) => None,
     }
 }
 
 /// Whether a run is opaque — costs one flat position and is deleted as a
 /// whole rather than char by char. Math atoms and sidenote anchors both are.
 fn is_opaque(run: &Inline) -> bool {
-    matches!(run, Inline::Math(_) | Inline::Note(_))
+    matches!(run, Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_))
 }
 
 fn style_matches(style: Style, mask: Style) -> bool {
@@ -333,7 +415,34 @@ fn divider_block() -> Block {
 
 /// A display math block starts with one empty opaque atom.
 fn math_block() -> Block {
-    Block::Math(vec![Inline::Math(Vec::new())])
+    Block::Math {
+        list: vec![Inline::Math(Vec::new())],
+        tag: None,
+    }
+}
+
+/// A list item's placeholder: one empty run under its own marker, so an
+/// item you emptied stays an item until Enter (or Backspace) takes it out
+/// of the list.
+fn list_block(marker: ListMarker) -> Block {
+    Block::ListItem {
+        marker,
+        content: vec![Inline::Text(Text {
+            text: String::new(),
+            style: Style::PLAIN,
+        })],
+    }
+}
+
+/// The marker an item created below `marker` carries: bullets and tasks
+/// repeat themselves; an ordered item takes the next ordinal (the
+/// renumbering pass keeps the run canonical).
+fn continued(marker: ListMarker) -> ListMarker {
+    match marker {
+        ListMarker::Number(n) => ListMarker::Number(n + 1),
+        ListMarker::Task { .. } => ListMarker::Task { done: false },
+        other => other,
+    }
 }
 
 /// Repair one block's runs: drop empty runs, merge equal adjacent prose runs,
@@ -375,8 +484,9 @@ fn prune_block(block: &mut Block) {
     }
     if block.inlines().is_empty() {
         *block = match block {
-            Block::Heading { level, .. } => Block::Heading {
+            Block::Heading { level, folded, .. } => Block::Heading {
                 level: *level,
+                folded: *folded,
                 content: vec![Inline::Text(Text {
                     text: String::new(),
                     style: Style::PLAIN,
@@ -394,7 +504,8 @@ fn prune_block(block: &mut Block) {
                 lang: lang.clone(),
             },
             Block::Divider(_) => divider_block(),
-            Block::Math(_) => math_block(),
+            Block::Math { .. } => math_block(),
+            Block::ListItem { marker, .. } => list_block(*marker),
             Block::Paragraph(_) => empty_block(),
         };
     }
@@ -460,6 +571,26 @@ fn split_run(run: Inline, at: usize) -> (Inline, Inline) {
                 )
             }
         }
+        Inline::EqRef(label) => {
+            // A reference cannot split either; the empty side is pruned.
+            if at == 0 {
+                (
+                    Inline::Text(Text {
+                        text: String::new(),
+                        style: Style::PLAIN,
+                    }),
+                    Inline::EqRef(label),
+                )
+            } else {
+                (
+                    Inline::EqRef(label),
+                    Inline::Text(Text {
+                        text: String::new(),
+                        style: Style::PLAIN,
+                    }),
+                )
+            }
+        }
         Inline::Note(label) => {
             // An anchor cannot split either; the empty side is pruned.
             if at == 0 {
@@ -515,6 +646,22 @@ fn inline_runs(text: &str, style: Style) -> Vec<Inline> {
                     i += 1;
                 }
             }
+            '@' => {
+                // `@eq:<name>` pasted back becomes a reference again, the
+                // same way `$…$` does. A reference the reader *typed* goes
+                // in one character at a time and never matches here.
+                if let Some(len) = eq_ref_at(&chars[i..]) {
+                    push_text(&mut runs, &mut buf, style);
+                    // The label is everything after the `@`: `eq:<name>`, the
+                    // tag without its `#`.
+                    let label: String = chars[i + 1..i + len].iter().collect();
+                    runs.push(Inline::EqRef(label));
+                    i += len;
+                } else {
+                    buf.push('@');
+                    i += 1;
+                }
+            }
             c => {
                 buf.push(c);
                 i += 1;
@@ -539,6 +686,21 @@ fn dollar_closer(chars: &[char], start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// The length of an equation reference at the start of `chars`: `@eq:` plus
+/// a `[A-Za-z0-9_-]+` name, or `None` when this `@` is ordinary text.
+fn eq_ref_at(chars: &[char]) -> Option<usize> {
+    if chars.len() < 5 || chars[1] != 'e' || chars[2] != 'q' || chars[3] != ':' {
+        return None;
+    }
+    let mut n = 4;
+    while n < chars.len()
+        && (chars[n].is_ascii_alphanumeric() || chars[n] == '_' || chars[n] == '-')
+    {
+        n += 1;
+    }
+    if n > 4 { Some(n) } else { None }
 }
 
 /// Append a pending text buffer as one text run, if it is non-empty.
@@ -717,6 +879,12 @@ impl Document {
                         out.push_str("[^");
                         out.push_str(label);
                         out.push(']');
+                    }
+                    Inline::EqRef(label) => {
+                        // The label carries its `eq:` prefix; the `@` is the
+                        // only spelling added back.
+                        out.push('@');
+                        out.push_str(label);
                     }
                 }
             }
@@ -1031,6 +1199,7 @@ impl Document {
                     // Slices cover the whole opaque atom or none of it.
                     Inline::Math(_) => result.push(run.clone()),
                     Inline::Note(_) => result.push(run.clone()),
+                    Inline::EqRef(_) => result.push(run.clone()),
                 }
             }
             cursor = run_end;
@@ -1055,15 +1224,23 @@ impl Document {
         match block {
             Block::Paragraph(_) => Block::Paragraph(runs),
             Block::Divider(_) => Block::Divider(runs),
-            Block::Math(_) => Block::Math(runs),
-            Block::Heading { level, .. } => Block::Heading {
+            Block::Math { tag, .. } => Block::Math {
+                list: runs,
+                tag: tag.clone(),
+            },
+            Block::Heading { level, folded, .. } => Block::Heading {
                 level: *level,
+                folded: *folded,
                 content: runs,
             },
             Block::CodeLine { first, lang, .. } => Block::CodeLine {
                 content: runs,
                 first: *first,
                 lang: lang.clone(),
+            },
+            Block::ListItem { marker, .. } => Block::ListItem {
+                marker: *marker,
+                content: runs,
             },
         }
     }
@@ -1361,8 +1538,29 @@ impl Document {
     /// no empty run outside the placeholder, caret in bounds.
     fn enforce(&mut self) {
         self.prune_runs();
+        self.renumber_ordered_runs();
         self.clamp_caret();
         debug_assert!(self.invariants_hold());
+    }
+
+    /// Ordered items are numbered 1,2,3… across each consecutive run; a
+    /// non-list block (or a bullet/task item) ends the run. Kept true after
+    /// every edit, so the marker drawn agrees with what serialization
+    /// writes — `markdown::serialize` renumbers the same way.
+    fn renumber_ordered_runs(&mut self) {
+        let mut ord = 0u32;
+        for block in &mut self.body {
+            match block {
+                Block::ListItem {
+                    marker: ListMarker::Number(n),
+                    ..
+                } => {
+                    ord += 1;
+                    *n = ord;
+                }
+                _ => ord = 0,
+            }
+        }
     }
 
     /// Drops empty runs; an all-empty block becomes a placeholder of the same
@@ -1444,18 +1642,23 @@ impl Document {
     // ---- caret movement (never dirt) ------------------------------------
 
     /// Click placement / jump. Clamps into bounds; the style context is the
-    /// style-before rule (§3).
+    /// style-before rule (§3). A block hidden by a fold holds no caret: the
+    /// placement lands on the fold's heading instead, the ground the reader
+    /// can actually see.
     pub fn set_caret(&mut self, block: usize, inline: usize, offset: usize) {
         self.clamp_caret();
-        let b = block.min(self.scope().len() - 1);
-        self.caret.block = b;
-        let runs = self.scope()[b].inlines();
+        let mut block = block.min(self.scope().len() - 1);
+        if let Some(owner) = fold_owner_of(self.scope(), block) {
+            block = owner;
+        }
+        self.caret.block = block;
+        let runs = self.scope()[block].inlines();
         let i = inline.min(runs.len().saturating_sub(1));
         let len = run_len(&runs[i]);
         self.caret.inline = i;
         self.caret.offset = offset.min(len);
         self.caret.style = self
-            .style_before(b, self.caret_flat(b))
+            .style_before(block, self.caret_flat(block))
             .unwrap_or(Style::PLAIN);
     }
 
@@ -1553,8 +1756,29 @@ impl Document {
             return;
         }
         self.clamp_caret();
-        let s = self.caret.style;
         let b = self.caret.block;
+        // A display block is one atom: there is no prose beside it to type
+        // into, so typed characters enter the tree at the side of the atom
+        // the caret rests on. Splicing prose here would demote the whole
+        // block in `prune_block` — the expression would vanish under the
+        // next keystroke.
+        if matches!(self.scope()[b], Block::Math { .. }) {
+            let len = match self.scope()[b].inlines() {
+                [Inline::Math(list)] => list.len(),
+                _ => unreachable!("display math must contain exactly one math atom"),
+            };
+            let index = if self.caret.offset > 0 { len } else { 0 };
+            self.set_caret(b, 0, 0);
+            self.math = Some(math::MathCursor {
+                path: Vec::new(),
+                index,
+            });
+            for c in text.chars() {
+                self.math_insert_char(c);
+            }
+            return;
+        }
+        let s = self.caret.style;
         let i = self.caret.inline;
         let o = self.caret.offset;
         let flat = self.caret_flat(b);
@@ -1654,6 +1878,12 @@ impl Document {
             return;
         }
         self.clamp_caret();
+        // Notation markers carry no meaning inside a display atom; the
+        // characters join the tree like any typed ones.
+        if matches!(self.scope()[self.caret.block], Block::Math { .. }) {
+            self.insert_text(text);
+            return;
+        }
         let s = self.caret.style;
         let b = self.caret.block;
         let i = self.caret.inline;
@@ -1692,7 +1922,9 @@ impl Document {
             let len = match &self.scope()[b].inlines()[inline] {
                 Inline::Math(list) => list.len(),
                 Inline::Text(_) => unreachable!("math target was checked above"),
-                Inline::Note(_) => unreachable!("math target was checked above"),
+                Inline::Note(_) | Inline::EqRef(_) => {
+                    unreachable!("math target was checked above")
+                }
             };
             if len > 0 || self.scope()[b].is_math() {
                 self.set_caret(b, inline, 0);
@@ -1738,6 +1970,15 @@ impl Document {
         } else if b > 0 && self.scope()[b].is_math() {
             self.set_caret(b, 0, 0);
             self.math = Some(math::MathCursor::default());
+            return;
+        } else if matches!(self.scope()[b], Block::ListItem { .. }) {
+            // Backspace at an item's start removes the marker first — one
+            // gesture, one meaning. The next one merges like any paragraph.
+            let content = std::mem::take(self.scope_mut()[b].inlines_mut());
+            self.scope_mut()[b] = Block::Paragraph(content);
+            self.dirty = true;
+            self.enforce();
+            self.refresh_context();
             return;
         } else if b > 0 {
             self.merge_into_previous();
@@ -1794,7 +2035,9 @@ impl Document {
             let empty = match &self.scope()[b].inlines()[inline] {
                 Inline::Math(list) => list.is_empty(),
                 Inline::Text(_) => unreachable!("math target was checked above"),
-                Inline::Note(_) => unreachable!("math target was checked above"),
+                Inline::Note(_) | Inline::EqRef(_) => {
+                    unreachable!("math target was checked above")
+                }
             };
             if !empty || self.scope()[b].is_math() {
                 self.set_caret(b, inline, 0);
@@ -1861,6 +2104,21 @@ impl Document {
         let b = self.caret.block;
         let i = self.caret.inline;
         let o = self.caret.offset;
+        // A list item continues itself: Enter below an item opens the next
+        // one of the same kind, and Enter on an empty item is the way out —
+        // the empty paragraph you asked for replaces the item.
+        let list_marker = match self.scope()[b] {
+            Block::ListItem { marker, .. } => {
+                if self.block_flat_len(b) == 0 {
+                    self.scope_mut()[b] = empty_block();
+                    self.dirty = true;
+                    self.enforce();
+                    return;
+                }
+                Some(continued(marker))
+            }
+            _ => None,
+        };
         let is_code = self.scope()[b].is_code();
         let (prefix, suffix) = split_run(self.scope_mut()[b].inlines_mut().remove(i), o);
         let mut taken = Vec::new();
@@ -1876,6 +2134,11 @@ impl Document {
                 first: false,
                 lang: None,
             }
+        } else if let Some(marker) = list_marker {
+            Block::ListItem {
+                marker,
+                content: new_content,
+            }
         } else {
             Block::Paragraph(new_content)
         };
@@ -1885,6 +2148,9 @@ impl Document {
         self.caret.block = b + 1;
         self.caret.inline = 0;
         self.caret.offset = 0;
+        // A paragraph born from Enter wants to be typed into: a fold that
+        // would hide it opens instead of swallowing the caret.
+        self.reveal_block(b + 1);
         // Style context preserved: you keep typing in the same style.
         self.enforce();
     }
@@ -1954,11 +2220,30 @@ impl Document {
         self.enforce();
     }
 
-    /// vim `o`: an empty Paragraph below the caret's block.
+    /// Unfold every fold covering `block`: an edit about to place the caret
+    /// there wants visible ground. The heading's own flag is the only state
+    /// touched; the content never changes.
+    pub fn reveal_block(&mut self, block: usize) {
+        while let Some(owner) = fold_owner_of(&self.body, block) {
+            match self.body.get_mut(owner) {
+                Some(Block::Heading { folded, .. }) if *folded => *folded = false,
+                _ => break,
+            }
+        }
+    }
+
+    /// vim `o`: an empty Paragraph below the caret's block — or, on a list
+    /// item, the next item of the same kind.
     pub fn open_below(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
-        self.scope_mut().insert(b + 1, empty_block());
+        self.reveal_block(b + 1);
+        let marker = match self.scope()[b] {
+            Block::ListItem { marker, .. } => Some(continued(marker)),
+            _ => None,
+        };
+        self.scope_mut()
+            .insert(b + 1, marker.map_or_else(empty_block, list_block));
         self.caret.block = b + 1;
         self.caret.inline = 0;
         self.caret.offset = 0;
@@ -1967,11 +2252,18 @@ impl Document {
         self.enforce();
     }
 
-    /// vim `O`: an empty Paragraph above the caret's block.
+    /// vim `O`: an empty Paragraph above the caret's block — or, on a list
+    /// item, an item of the same kind above it (renumbering fixes ordinals).
     pub fn open_above(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
-        self.scope_mut().insert(b, empty_block());
+        self.reveal_block(b);
+        let marker = match self.scope()[b] {
+            Block::ListItem { marker, .. } => Some(marker),
+            _ => None,
+        };
+        self.scope_mut()
+            .insert(b, marker.map_or_else(empty_block, list_block));
         self.caret.block = b;
         self.caret.inline = 0;
         self.caret.offset = 0;
@@ -2112,6 +2404,7 @@ impl Document {
             }
             self.scope_mut()[b] = Block::Heading {
                 level,
+                folded: false,
                 content: inlines,
             };
         } else {
@@ -2156,10 +2449,85 @@ impl Document {
         self.body[block] = match level {
             Some(level) => Block::Heading {
                 level,
+                folded: false,
                 content: inlines,
             },
             None => Block::Paragraph(inlines),
         };
+        self.dirty = true;
+        true
+    }
+
+    /// Convert the caret's block to a list item of `marker`, or back to a
+    /// paragraph with `None`. The command that carries the kind the block
+    /// already has (bullets match bullets, ordered matches ordered whatever
+    /// its ordinal, tasks match tasks) demotes it — the same gesture is the
+    /// way back out.
+    pub fn set_list(&mut self, marker: Option<ListMarker>) {
+        if matches!(self.focus, Focus::Note(_)) {
+            return;
+        }
+        self.clamp_caret();
+        let b = self.caret.block;
+        if self.scope()[b].is_code() {
+            return;
+        }
+        let same_kind = matches!(
+            (&marker, &self.scope()[b]),
+            (
+                Some(ListMarker::Bullet),
+                Block::ListItem {
+                    marker: ListMarker::Bullet,
+                    ..
+                }
+            ) | (
+                Some(ListMarker::Number(_)),
+                Block::ListItem {
+                    marker: ListMarker::Number(_),
+                    ..
+                }
+            ) | (
+                Some(ListMarker::Task { .. }),
+                Block::ListItem {
+                    marker: ListMarker::Task { .. },
+                    ..
+                }
+            )
+        );
+        let inlines = std::mem::take(self.scope_mut()[b].inlines_mut());
+        self.scope_mut()[b] = match (marker, same_kind) {
+            (Some(marker), false) => Block::ListItem {
+                marker,
+                content: inlines,
+            },
+            _ => Block::Paragraph(inlines),
+        };
+        self.dirty = true;
+        self.enforce();
+    }
+
+    /// Flip the checkbox of the task item the caret sits on. `false` when
+    /// the caret is not on a task item (or is inside a note, which cannot
+    /// hold one).
+    pub fn toggle_task_here(&mut self) -> bool {
+        if matches!(self.focus, Focus::Note(_)) {
+            return false;
+        }
+        let b = self.caret.block;
+        self.toggle_task_at(b)
+    }
+
+    /// Flip one task item's checkbox. The mark is content, not UI state: it
+    /// saves with the file and the struck-through dim rendering follows it.
+    pub fn toggle_task_at(&mut self, block: usize) -> bool {
+        let Some(Block::ListItem {
+            marker: ListMarker::Task { done },
+            ..
+        }) = self.body.get_mut(block)
+        else {
+            return false;
+        };
+        *done = !*done;
         self.dirty = true;
         true
     }
@@ -2306,6 +2674,55 @@ impl Document {
         self.math = Some(math::MathCursor::default());
         self.dirty = true;
         self.enforce();
+    }
+
+    /// Tags the display math block the caret sits in with the next free
+    /// `#eq:N` label, or removes its tag when it already carries one. The
+    /// numbers themselves are derived at layout time in document order, so
+    /// what is stored here can never disagree with what the page shows.
+    /// Returns whether the caret was on a math block.
+    pub fn toggle_math_tag(&mut self) -> bool {
+        self.clamp_caret();
+        let b = self.caret.block;
+        if !matches!(self.scope()[b], Block::Math { .. }) {
+            return false;
+        }
+        let had_tag = matches!(&self.scope()[b], Block::Math { tag: Some(_), .. });
+        if had_tag {
+            if let Block::Math { tag, .. } = &mut self.scope_mut()[b] {
+                *tag = None;
+            }
+        } else {
+            let label = self.next_free_eq_label();
+            if let Block::Math { tag, .. } = &mut self.scope_mut()[b] {
+                *tag = Some(label);
+            }
+        }
+        self.dirty = true;
+        self.enforce();
+        true
+    }
+
+    /// The lowest `eq:N` label no equation block in the focused scope
+    /// carries yet.
+    fn next_free_eq_label(&self) -> String {
+        let mut used: Vec<u32> = self
+            .scope()
+            .iter()
+            .filter_map(|block| match block {
+                Block::Math {
+                    tag: Some(label), ..
+                } => label.strip_prefix("eq:").and_then(|n| n.parse().ok()),
+                _ => None,
+            })
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        let mut n = 1;
+        while used.binary_search(&n).is_ok() {
+            n += 1;
+        }
+        format!("eq:{n}")
     }
 
     /// The focused atom's tree and cursor, or None when focus is stale.
@@ -2787,6 +3204,7 @@ mod tests {
             ]),
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![Inline::Text(Text {
                     text: "big note".into(),
                     style: Style::PLAIN,
@@ -2815,6 +3233,7 @@ mod tests {
         assert!(
             Block::Heading {
                 level: 2,
+                folded: false,
                 content: vec![]
             }
             .is_heading()
@@ -3059,6 +3478,7 @@ mod tests {
         let mut d = doc();
         d.body_mut()[0] = Block::Heading {
             level: 1,
+            folded: false,
             content: vec![plain_run("title")],
         };
         d.set_caret(0, 0, 5);
@@ -3069,6 +3489,203 @@ mod tests {
         assert_eq!(text_of_block(&d, 1), "");
         assert_eq!(d.caret.block, 1);
         assert_eq!((d.caret.inline, d.caret.offset), (0, 0));
+        assert_invariants(&d);
+    }
+
+    // ---- list item tests -------------------------------------------------
+
+    fn bullet_item(t: &str) -> Block {
+        Block::ListItem {
+            marker: ListMarker::Bullet,
+            content: vec![plain_run(t)],
+        }
+    }
+
+    fn ordered_item(n: u32, t: &str) -> Block {
+        Block::ListItem {
+            marker: ListMarker::Number(n),
+            content: vec![plain_run(t)],
+        }
+    }
+
+    fn task_item(done: bool, t: &str) -> Block {
+        Block::ListItem {
+            marker: ListMarker::Task { done },
+            content: vec![plain_run(t)],
+        }
+    }
+
+    fn marker_of(d: &Document, block: usize) -> ListMarker {
+        match &d.body()[block] {
+            Block::ListItem { marker, .. } => *marker,
+            other => panic!("block {block} is not a list item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_continues_a_list_item_of_the_same_kind() {
+        let mut d = doc();
+        *d.body_mut() = vec![ordered_item(1, "first"), ordered_item(2, "second")];
+        d.set_caret(1, 0, 6);
+        d.newline();
+        assert_eq!(d.body().len(), 3);
+        assert_eq!(marker_of(&d, 2), ListMarker::Number(3));
+        assert_eq!(text_of_block(&d, 2), "");
+        assert_eq!(d.caret.block, 2);
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn enter_on_an_empty_list_item_leaves_the_list() {
+        let mut d = doc();
+        *d.body_mut() = vec![bullet_item("tea"), bullet_item("")];
+        d.set_caret(1, 0, 0);
+        d.newline();
+        // The empty item becomes the empty paragraph the user asked for;
+        // the list above it is untouched.
+        assert_eq!(d.body().len(), 2);
+        assert!(matches!(d.body()[1], Block::Paragraph(_)));
+        assert!(matches!(d.body()[0], Block::ListItem { .. }));
+        assert_eq!(d.caret.block, 1);
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn enter_below_a_task_opens_an_unticked_one() {
+        let mut d = doc();
+        *d.body_mut() = vec![task_item(true, "done thing")];
+        d.set_caret(0, 0, 10);
+        d.newline();
+        assert_eq!(marker_of(&d, 1), ListMarker::Task { done: false });
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn backspace_at_an_item_start_demotes_it_to_a_paragraph() {
+        let mut d = doc();
+        *d.body_mut() = vec![bullet_item("tea")];
+        d.set_caret(0, 0, 0);
+        d.backspace();
+        assert!(matches!(d.body()[0], Block::Paragraph(_)));
+        assert_eq!(text_of_block(&d, 0), "tea");
+        assert_eq!((d.caret.block, d.caret.inline, d.caret.offset), (0, 0, 0));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn backspace_again_merges_like_any_paragraph() {
+        let mut d = doc();
+        *d.body_mut() = vec![
+            Block::Paragraph(vec![plain_run("keep")]),
+            bullet_item("tea"),
+        ];
+        d.set_caret(1, 0, 0);
+        d.backspace(); // demote
+        d.backspace(); // merge
+        assert_eq!(d.body().len(), 1);
+        assert!(matches!(d.body()[0], Block::Paragraph(_)));
+        assert_eq!(text_of_block(&d, 0), "keeptea");
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn backspace_twice_at_an_item_start_merges_into_the_item_above() {
+        let mut d = doc();
+        *d.body_mut() = vec![bullet_item("a"), bullet_item("b")];
+        d.set_caret(1, 0, 0);
+        d.backspace(); // the marker goes first
+        assert!(matches!(d.body()[1], Block::Paragraph(_)));
+        d.backspace(); // then the demoted paragraph merges like any other
+        assert!(matches!(d.body()[0], Block::ListItem { .. }));
+        assert_eq!(text_of_block(&d, 0), "ab");
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn o_and_o_continue_a_list_run() {
+        let mut d = doc();
+        *d.body_mut() = vec![ordered_item(1, "one"), ordered_item(2, "two")];
+        d.set_caret(1, 0, 3);
+        d.open_below();
+        assert_eq!(marker_of(&d, 2), ListMarker::Number(3));
+        d.open_above();
+        // `O` inserts above the caret: the new item takes the caret block's
+        // ordinal, and the renumbering pass keeps the run canonical.
+        assert_eq!(marker_of(&d, 2), ListMarker::Number(3));
+        assert_eq!(marker_of(&d, 3), ListMarker::Number(4));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn ordered_runs_renumber_after_deletions() {
+        let mut d = doc();
+        *d.body_mut() = vec![
+            ordered_item(1, "a"),
+            ordered_item(2, "b"),
+            ordered_item(3, "c"),
+        ];
+        d.delete_line(); // removes "a"; caret lands on the old "b"
+        assert_eq!(marker_of(&d, 0), ListMarker::Number(1));
+        assert_eq!(marker_of(&d, 1), ListMarker::Number(2));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn set_list_converts_and_toggles_off() {
+        let mut d = doc();
+        d.insert_text("step one");
+        d.set_list(Some(ListMarker::Number(1)));
+        assert!(matches!(
+            d.body()[0],
+            Block::ListItem {
+                marker: ListMarker::Number(1),
+                ..
+            }
+        ));
+        // Same kind again: back to prose.
+        d.set_list(Some(ListMarker::Number(1)));
+        assert!(matches!(d.body()[0], Block::Paragraph(_)));
+        assert_eq!(text_of_block(&d, 0), "step one");
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn a_converted_paragraph_keeps_its_runs() {
+        let mut d = doc();
+        d.body_mut()[0] = Block::Paragraph(vec![bold_run("bold"), plain_run(" rest")]);
+        d.set_list(Some(ListMarker::Bullet));
+        assert_eq!(
+            runs(&d.body()[0]),
+            vec![("bold".into(), bold()), (" rest".into(), Style::PLAIN)]
+        );
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn toggling_a_task_flips_its_checkbox_in_place() {
+        let mut d = doc();
+        *d.body_mut() = vec![task_item(false, "buy milk")];
+        assert!(d.toggle_task_at(0));
+        assert_eq!(marker_of(&d, 0), ListMarker::Task { done: true });
+        assert!(d.is_dirty());
+        assert!(d.toggle_task_at(0));
+        assert_eq!(marker_of(&d, 0), ListMarker::Task { done: false });
+        // A non-task block says no.
+        *d.body_mut() = vec![Block::Paragraph(vec![plain_run("prose")])];
+        assert!(!d.toggle_task_at(0));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn set_list_is_a_noop_inside_a_note() {
+        let mut d = doc();
+        d.insert_text("anchored");
+        d.insert_sidenote().expect("note created");
+        d.focus = Focus::Note(0);
+        d.set_caret(0, 0, 0);
+        d.set_list(Some(ListMarker::Bullet));
+        // A note body is one paragraph on disk; it cannot hold a list.
+        assert!(matches!(d.scope()[0], Block::Paragraph(_)));
         assert_invariants(&d);
     }
 
@@ -3458,7 +4075,10 @@ mod tests {
     fn backspace_from_prose_after_display_math_enters_without_merging_blocks() {
         let mut d = doc();
         *d.body_mut() = vec![
-            Block::Math(vec![Inline::Math(vec![math::MathNode::Sym('x')])]),
+            Block::Math {
+                list: vec![Inline::Math(vec![math::MathNode::Sym('x')])],
+                tag: None,
+            },
             Block::Paragraph(vec![plain_run("after")]),
         ];
         d.set_caret(1, 0, 0);
@@ -3466,8 +4086,9 @@ mod tests {
         d.backspace();
 
         assert_eq!(d.body().len(), 2);
-        assert!(matches!(d.body()[0], Block::Math(ref inlines)
-            if matches!(inlines.as_slice(), [Inline::Math(list)] if list.is_empty())));
+        assert!(matches!(d.body()[0], Block::Math {
+                list: ref inlines, ..
+            } if matches!(inlines.as_slice(), [Inline::Math(list)] if list.is_empty())));
         assert_eq!(d.block_text(1), "after");
         assert_eq!(d.caret.block, 0);
         assert_eq!(d.math, Some(math::MathCursor::default()));
@@ -3478,7 +4099,10 @@ mod tests {
         let mut d = doc();
         *d.body_mut() = vec![
             Block::Paragraph(vec![plain_run("before")]),
-            Block::Math(vec![Inline::Math(vec![math::MathNode::Sym('x')])]),
+            Block::Math {
+                list: vec![Inline::Math(vec![math::MathNode::Sym('x')])],
+                tag: None,
+            },
         ];
         d.set_caret(0, 0, 6);
 
@@ -3486,8 +4110,9 @@ mod tests {
 
         assert_eq!(d.body().len(), 2);
         assert_eq!(d.block_text(0), "before");
-        assert!(matches!(d.body()[1], Block::Math(ref inlines)
-            if matches!(inlines.as_slice(), [Inline::Math(list)] if list.is_empty())));
+        assert!(matches!(d.body()[1], Block::Math {
+                list: ref inlines, ..
+            } if matches!(inlines.as_slice(), [Inline::Math(list)] if list.is_empty())));
         assert_eq!(d.caret.block, 1);
         assert_eq!(d.math, Some(math::MathCursor::default()));
     }
@@ -3496,7 +4121,10 @@ mod tests {
     fn delete_after_display_math_retains_the_block_boundary() {
         let mut d = doc();
         *d.body_mut() = vec![
-            Block::Math(vec![Inline::Math(vec![math::MathNode::Sym('x')])]),
+            Block::Math {
+                list: vec![Inline::Math(vec![math::MathNode::Sym('x')])],
+                tag: None,
+            },
             Block::Paragraph(vec![plain_run("after")]),
         ];
         d.set_caret(0, 0, 1);
@@ -3514,13 +4142,150 @@ mod tests {
     #[test]
     fn a_math_block_that_gains_prose_demotes_to_a_paragraph() {
         let mut d = doc();
-        d.body_mut()[0] = Block::Math(vec![
-            Inline::Math(vec![math::MathNode::Sym('x')]),
-            plain_run(" prose"),
-        ]);
+        d.body_mut()[0] = Block::Math {
+            list: vec![
+                Inline::Math(vec![math::MathNode::Sym('x')]),
+                plain_run(" prose"),
+            ],
+            tag: None,
+        };
         d.enforce();
         assert!(matches!(d.body()[0], Block::Paragraph(_)));
         assert!(matches!(d.body()[0].inlines()[0], Inline::Math(_)));
+    }
+
+    #[test]
+    fn a_caret_placed_on_folded_ground_lands_on_the_fold() {
+        let mut d = doc();
+        d.insert_text("intro");
+        d.newline();
+        d.set_heading(Some(1));
+        d.insert_text("Section");
+        d.newline();
+        d.insert_text("body one");
+        d.newline();
+        d.insert_text("body two");
+        // Fold the heading (block 1); blocks 2 and 3 become hidden ground.
+        if let Block::Heading { folded, .. } = &mut d.body_mut()[1] {
+            *folded = true;
+        }
+        let owner = fold_owner_of(d.body(), 3).expect("block 3 is folded ground");
+        assert_eq!(owner, 1);
+        // A jump (vim G, gg, {, } all land here) must not park the caret
+        // where nothing is visible.
+        d.set_caret(3, 0, 0);
+        assert_eq!(d.caret.block, 1, "the caret lands on the fold's heading");
+    }
+
+    #[test]
+    fn opening_below_a_folded_heading_reveals_the_body() {
+        let mut d = doc();
+        d.set_heading(Some(1));
+        d.insert_text("Section");
+        d.newline();
+        d.insert_text("body");
+        if let Block::Heading { folded, .. } = &mut d.body_mut()[0] {
+            *folded = true;
+        }
+        // vim `o` ON the folded heading (the reviewer's repro): the caret
+        // sits on the heading, so the new paragraph would be born at block
+        // 1 — inside the fold. The fold must open instead of hiding it.
+        d.set_caret(0, 0, 0);
+        d.open_below();
+        assert!(
+            !d.body()[0].is_folded(),
+            "the fold opened to give the new paragraph light"
+        );
+        assert!(!fold_owner_of(d.body(), d.caret.block).is_some());
+    }
+
+    #[test]
+    fn typing_at_a_display_atom_joins_the_tree_instead_of_demoting_it() {
+        let mut d = doc();
+        d.insert_math_block();
+        d.math_insert_char('x');
+        // Exit to the right, then type: the characters must enter the atom
+        // after `x`, not splice prose beside it and demote the block.
+        d.math_exit_after();
+        d.insert_text("+y");
+        assert!(
+            matches!(d.body()[0], Block::Math { .. }),
+            "the display block must survive typing at its edge"
+        );
+        let list = match &d.body()[0].inlines()[0] {
+            Inline::Math(list) => list,
+            other => panic!("expected math, got {other:?}"),
+        };
+        let printed = math_notation::print(list);
+        assert!(printed.contains('x') && printed.contains('y'), "{printed}");
+    }
+
+    #[test]
+    fn typing_at_a_display_atom_rests_the_caret_on_the_side_it_had() {
+        let mut d = doc();
+        d.insert_math_block();
+        d.math_insert_char('a');
+        d.math_exit_before();
+        // Caret before the atom: new characters go to the front.
+        d.insert_text("b");
+        match &d.body()[0].inlines()[0] {
+            Inline::Math(list) => {
+                let printed = math_notation::print(list);
+                assert!(printed.starts_with('b'), "{printed}");
+            }
+            other => panic!("expected math, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_math_tag_assigns_the_next_free_label() {
+        let mut d = doc();
+        d.insert_math_block();
+        assert!(d.toggle_math_tag());
+        assert!(matches!(
+            &d.body()[0],
+            Block::Math { tag: Some(tag), .. } if tag == "eq:1"
+        ));
+
+        // A second tagged block never reuses the label; an untagged one in
+        // between takes no number and claims nothing.
+        d.insert_math_block();
+        d.toggle_math_tag();
+        assert!(matches!(
+            &d.body()[1],
+            Block::Math { tag: Some(tag), .. } if tag == "eq:2"
+        ));
+
+        // Toggling again removes the tag.
+        assert!(d.toggle_math_tag());
+        assert!(matches!(&d.body()[1], Block::Math { tag: None, .. }));
+
+        // The freed label is the next one handed out.
+        d.toggle_math_tag();
+        assert!(matches!(
+            &d.body()[1],
+            Block::Math { tag: Some(tag), .. } if tag == "eq:2"
+        ));
+    }
+
+    #[test]
+    fn toggle_math_tag_is_a_no_op_off_a_math_block() {
+        let mut d = doc();
+        assert!(!d.toggle_math_tag());
+        assert!(matches!(d.body()[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn a_pasted_reference_reopens_as_a_reference() {
+        let mut d = doc();
+        // Paste takes `insert_notation` — the copy path wrote this text.
+        d.insert_notation("by @eq:gain above");
+        assert!(
+            d.body()[0]
+                .inlines()
+                .iter()
+                .any(|run| matches!(run, Inline::EqRef(l) if l == "eq:gain"))
+        );
     }
 
     #[test]
@@ -3808,7 +4573,7 @@ mod tests {
         assert!(d.set_block_heading_at(0, Some(2)));
         assert!(matches!(
             &d.body()[0],
-            Block::Heading { level: 2, content: actual } if actual == &content
+            Block::Heading { level: 2, content: actual, .. } if actual == &content
         ));
         assert_eq!(d.caret, caret);
 
@@ -3873,6 +4638,7 @@ mod tests {
         assert!(
             !Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![]
             }
             .is_code()
@@ -4078,16 +4844,19 @@ mod tests {
         *d.body_mut() = vec![
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![plain_run("Top")],
             },
             Block::Paragraph(vec![plain_run("body (inside) and \"quoted\"")]),
             Block::Heading {
                 level: 2,
+                folded: false,
                 content: vec![plain_run("Nested")],
             },
             Block::Paragraph(vec![plain_run("child")]),
             Block::Heading {
                 level: 1,
+                folded: false,
                 content: vec![plain_run("Next")],
             },
         ];
