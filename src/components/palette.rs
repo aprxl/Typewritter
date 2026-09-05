@@ -10,7 +10,7 @@ use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
 
-use super::popup::{Slide, paint_shadow_slab};
+use super::popup::paint_shadow_slab;
 
 const ROW_RADIUS: f32 = 6.0;
 const CARD_W: f32 = 600.0;
@@ -106,14 +106,15 @@ pub struct Palette {
     /// The blurred layer this card paints its shadow slab into.
     shadow: Option<Layer>,
     reveal: f32,
-    slide: Slide,
-    started: bool,
     dirty: Dirty,
 }
 
 impl Palette {
     /// The command under the pointer, using the same rows as the painter.
     pub fn row_at(&self, viewport: Rect, point: (f32, f32)) -> Option<usize> {
+        if !self.open {
+            return None;
+        }
         (0..self
             .visible
             .len()
@@ -144,8 +145,6 @@ impl Palette {
             open: true,
             shadow: None,
             reveal: 0.0,
-            slide: Slide::new(),
-            started: false,
             dirty: Dirty::new(),
         }
     }
@@ -163,8 +162,6 @@ impl Palette {
             open: false,
             shadow: None,
             reveal: 1.0,
-            slide: Slide::new(),
-            started: false,
             dirty: Dirty::new(),
         }
     }
@@ -178,7 +175,7 @@ impl Palette {
     /// Paints the shadow slab from sync. A modal's halo fades in with the
     /// card; a closed palette clears the layer unconditionally so the last
     /// frame's halo always leaves with it.
-    fn paint_shadow(&mut self, owns: bool) {
+    fn paint_shadow(&mut self, owns: bool, viewport: Rect) {
         if !owns {
             return;
         }
@@ -189,7 +186,7 @@ impl Palette {
             paint_shadow_slab(&shadow, Rect::default(), -1.0);
             return;
         }
-        paint_shadow_slab(&shadow, card(Rect::default()), self.reveal);
+        paint_shadow_slab(&shadow, card(viewport), self.reveal);
     }
 }
 
@@ -208,28 +205,9 @@ impl Component for Palette {
             self.reveal = context.reveal;
             self.dirty.set();
         }
-        self.paint_shadow(context.owns_shadow);
+        self.paint_shadow(context.owns_shadow, context.self_rect);
         if self.open {
             self.dirty.write(&mut self.caret_on, context.caret_on);
-
-            // The pill follows the keyboard selection. The shell rebuilds
-            // this snapshot on every keystroke/move and `new` seeds the
-            // target from `selected`, so the pill parks once per snapshot
-            // and any selection change shows up as a fresh snapshot.
-            if !self.visible.is_empty() {
-                let row = self.selected.saturating_sub(self.first_visible);
-                let target = row_rect(card(Rect::default()), row);
-                if !self.started {
-                    self.slide.park(target);
-                    self.started = true;
-                } else if self.slide.slide_to(target) {
-                    self.dirty.set();
-                }
-            }
-        }
-        self.slide.advance(context.animation_dt);
-        if self.slide.advancing() {
-            self.dirty.set();
         }
     }
 
@@ -246,8 +224,7 @@ impl Component for Palette {
     }
 
     fn is_animating(&self) -> bool {
-        // Never report a never-advanced Slide on a closed snapshot.
-        self.open && (self.slide.advancing() || (self.reveal > 0.0 && self.reveal < 1.0))
+        self.open && self.reveal > 0.0 && self.reveal < 1.0
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
@@ -266,7 +243,7 @@ impl Component for Palette {
         let resting = card(rect);
         // A modal does not scale or overshoot — a palette-sized surface
         // wobbling reads as lag. It just fades up (and the rounded surface
-        // rises 4px into place on the same curve).
+        // rises 8px into place on the same curve).
         let travel = (1.0 - ea) * 8.0;
         let card = Rect::new(resting.x, resting.y + travel, resting.width, resting.height);
 
@@ -459,6 +436,28 @@ mod tests {
             group: group.into(),
             hint: String::new(),
         }
+    }
+
+    #[test]
+    fn clicking_a_scrolled_command_uses_its_filtered_index() {
+        let entries = (0..25)
+            .map(|i| entry(&format!("Command {i}"), "View"))
+            .collect();
+        let palette = Palette::new(entries, String::new(), 20);
+        let viewport = Rect::new(30.0, 50.0, 1280.0, 800.0);
+        let row = row_rect(card(viewport), MAX_ROWS - 1);
+        assert_eq!(
+            palette.row_at(viewport, (row.x + 20.0, row.y + 15.0)),
+            Some(20)
+        );
+        assert_eq!(
+            palette.row_at(viewport, (row.x + 20.0, card(viewport).y + 20.0)),
+            None
+        );
+        assert_eq!(
+            Palette::closed().row_at(viewport, (row.x + 20.0, row.y + 15.0)),
+            None
+        );
     }
 
     #[test]

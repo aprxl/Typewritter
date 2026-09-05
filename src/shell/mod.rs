@@ -384,8 +384,6 @@ pub struct Shell {
     math_menu_region: usize,
     /// Blinks the caret in the editor and the name prompt.
     caret: Stepped,
-    /// Fades the writing indicator.
-    pulse: Stepped,
     /// The entrance-reveal clock for whichever popup is opening — a menu
     /// grows out of its anchor as this weight climbs, a modal fades up with
     /// it (the curves live in the drawing: `popup::MENU_SLIDE_EASING`,
@@ -723,12 +721,8 @@ impl Shell {
             menu_region,
             format_region,
             math_menu_region,
-            // Two steps, because a caret is on or off: every frame between
-            // two flips repaints the same pixels. The writing indicator is
-            // a fade, but `Topics` already rounds it to sixteenths, so
-            // sixteen steps is every value that reaches the screen.
+            // Two steps: the caret should wake the renderer only when it flips.
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
-            pulse: Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16).ping_pong(),
             popup_reveal: Animation::new(
                 crate::components::popup::MENU_SLIDE_DURATION,
                 crate::components::popup::MENU_SLIDE_EASING,
@@ -811,12 +805,9 @@ impl Shell {
         let mut animating = self.sync_theme_swap(renderer, viewport, dt);
         self.sync_theme();
 
-        // The two stepped ones report a *step change*, not "still running",
-        // so they fall silent between steps and the loop can sleep. They
-        // keep their own wall clock; `dt` is clamped, and clamped time
-        // cannot drive something that sleeps longer than the clamp.
+        // The caret reports a step change and keeps its own wall clock,
+        // so the loop can sleep between visible changes.
         animating |= self.caret.advance();
-        animating |= self.pulse.advance();
         if self.any_overlay_open() || self.popup_reveal.is_playing() {
             animating |= self.popup_reveal.advance(dt);
         }
@@ -839,7 +830,7 @@ impl Shell {
             }
             animating = true;
         }
-        let animation_wake = Instant::now() + self.caret.wake_in().min(self.pulse.wake_in());
+        let animation_wake = Instant::now() + self.caret.wake_in();
         // A pending autosave is a deadline too: it must wake the loop from
         // its sleep even though no animation is asking for a frame. Without
         // this the save fires while typing and then never while idle.
@@ -895,7 +886,6 @@ impl Shell {
             divider_hot: self.divider_hot || self.dragging == Some(Divider::Tree),
             // Step-end, not a fade: a caret that fades looks like a bug.
             caret_on: self.caret.is_on(),
-            pulse: self.pulse.weight(),
             show_stats: self.show_stats,
             mouse: Mouse {
                 position: input.mouse_position(),
@@ -923,6 +913,11 @@ impl Shell {
             // A component hit-tests against its own rect; the shell is the
             // only one that knows where that rect is, so it hands it over.
             context.self_rect = self.layout.rect(region.node());
+            if !self.layout.style(region.node()).visible {
+                context.self_rect = Rect::default();
+                context.mouse = Mouse::default();
+                context.scroll_y = 0.0;
+            }
             context.owns_shadow = Some(index) == shadow_owner;
             region.sync(&context);
             animating |= region.is_animating();

@@ -103,7 +103,7 @@ impl Component for StatusLine {
                 &TextStyle::mono(11.0, theme::faint()),
             )
             + 90.0;
-        (left + right, HEIGHT)
+        ((left + right).min(620.0), HEIGHT)
     }
 
     fn sync(&mut self, context: &Context) {
@@ -182,8 +182,9 @@ impl Component for StatusLine {
             right -= 14.0;
         }
         if !self.saved.is_empty() {
-            theme::draw(layer, &self.saved, (right, middle), &body, theme::RIGHT);
-            right -= theme::width(layer, &self.saved, &body) + 7.0;
+            let saved = theme::elide(layer, &self.saved, (right - x - 70.0).max(0.0), &body);
+            theme::draw(layer, &saved, (right, middle), &body, theme::RIGHT);
+            right -= theme::width(layer, &saved, &body) + 7.0;
             theme::icon(
                 layer,
                 icons::CHECK,
@@ -202,11 +203,12 @@ impl Component for StatusLine {
         } else {
             &self.command
         };
-        let note_width = theme::width(layer, note, &body);
+        let note = theme::elide(layer, note, right - x - 12.0, &body);
+        let note_width = theme::width(layer, &note, &body);
         if x + note_width < right {
             theme::draw(
                 layer,
-                note,
+                &note,
                 (x, middle),
                 &body.clone().color(theme::ink()),
                 theme::LEFT,

@@ -33,6 +33,7 @@ pub struct Topics {
     active: usize,
     /// Filled in by `draw`, hit-tested by `sync` on the next frame.
     entry_rects: Vec<Rect>,
+    first_visible: Option<usize>,
     hovered: Option<usize>,
     hover: Hover,
 
@@ -54,6 +55,7 @@ impl Topics {
             entries,
             active,
             entry_rects: Vec::new(),
+            first_visible: None,
             hovered: None,
             hover: Hover::new(),
             dirty: Dirty::new(),
@@ -61,18 +63,25 @@ impl Topics {
     }
 }
 
+fn visible_rows(rect: Rect) -> usize {
+    ((rect.height - HEADER - 8.0).max(ROW) / ROW) as usize
+}
+
 impl Component for Topics {
-    fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        let style = TextStyle::sans(12.5, theme::dim());
-        let widest = self
-            .entries
-            .iter()
-            .map(|entry| theme::width(layer, &entry.name, &style))
-            .fold(0.0, f32::max);
-        ((widest * 0.7).max(90.0) + 60.0, 200.0)
+    fn measure(&mut self, _: &Layer) -> (f32, f32) {
+        (190.0, 200.0)
     }
 
     fn sync(&mut self, context: &Context) {
+        if context.hovering(context.self_rect) && context.scroll_y != 0.0 {
+            let max = self
+                .entries
+                .len()
+                .saturating_sub(visible_rows(context.self_rect));
+            let first = self.first_visible.unwrap_or(0) as f32;
+            let next = (first - context.scroll_y).round().clamp(0.0, max as f32) as usize;
+            self.dirty.write(&mut self.first_visible, Some(next));
+        }
         let hovered = context.hovered_index(&self.entry_rects);
         if self
             .hover
@@ -116,11 +125,18 @@ impl Component for Topics {
             theme::RIGHT,
         );
 
-        self.entry_rects.clear();
-        for (index, entry) in self.entries.iter().enumerate() {
-            let y = rect.y + HEADER + index as f32 * ROW;
+        let count = visible_rows(rect);
+        let max = self.entries.len().saturating_sub(count);
+        let first = self
+            .first_visible
+            .unwrap_or_else(|| self.active.saturating_sub(count / 2))
+            .min(max);
+        self.first_visible = Some(first);
+        self.entry_rects = vec![Rect::default(); self.entries.len()];
+        for (index, entry) in self.entries.iter().enumerate().skip(first).take(count) {
+            let y = rect.y + HEADER + (index - first) as f32 * ROW;
             let row = Rect::new(rect.x + 10.0, y - ROW / 2.0, rect.width - 20.0, ROW - 3.0);
-            self.entry_rects.push(row);
+            self.entry_rects[index] = row;
             let active = index == self.active;
             if active {
                 layer.draw_rectangle(
@@ -152,6 +168,17 @@ impl Component for Topics {
             );
             let label = theme::elide(layer, &entry.name, rect.right() - 22.0 - name_x, &style);
             theme::draw(layer, &label, (name_x, y - 1.5), &style, theme::LEFT);
+        }
+        if max > 0 {
+            let track = rect.height - HEADER - 12.0;
+            let height = (track * count as f32 / self.entries.len() as f32).max(18.0);
+            let y = rect.y + HEADER - ROW / 2.0 + (track - height) * first as f32 / max as f32;
+            layer.draw_rectangle(
+                (rect.right() - 5.0, y),
+                (2.0, height),
+                theme::non_text(),
+                Rounding::uniform(1.0),
+            );
         }
         if self.entries.is_empty() {
             theme::icon(

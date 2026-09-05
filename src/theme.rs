@@ -849,6 +849,7 @@ pub mod icons {
                               3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z";
     pub const CHEVRON_DOWN: &str = "M6 9L12 15L18 9";
     pub const CHEVRON_RIGHT: &str = "M9 18L15 12L9 6";
+    pub const CHEVRON_LEFT: &str = "M15 18L9 12L15 6";
     pub const SORT: &str = "M11 5h10M11 12h10M11 19h10M3 8l3-3 3 3M6 5v14";
     pub const CALENDAR: &str = "M3 4H21V22H3Z M16 2v4M8 2v4M3 10h18";
     pub const CLOCK: &str = "M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0 M12 7v5l3 2";

@@ -14,7 +14,7 @@ pub struct EmptyState {
 fn origin(rect: Rect) -> (f32, f32) {
     (
         rect.x + rect.width / 2.0,
-        rect.y + (rect.height * 0.36).clamp(110.0, 260.0),
+        rect.y + (rect.height * 0.36).clamp(124.0, 260.0),
     )
 }
 
@@ -132,5 +132,21 @@ impl EmptyState {
                 theme::CENTER,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_actions_fit_the_minimum_editor() {
+        let rect = Rect::new(100.0, 50.0, 420.0, 320.0);
+        let [new, open] = buttons(rect);
+        for button in [new, open] {
+            assert!(button.x >= rect.x && button.right() <= rect.right());
+            assert!(button.y >= rect.y && button.bottom() <= rect.bottom());
+        }
+        assert!(new.bottom() < open.y);
     }
 }

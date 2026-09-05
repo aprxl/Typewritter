@@ -49,12 +49,21 @@ const CARD_W: f32 = LIST_W + 400.0;
 
 /// The rect the card rests at, centered in `viewport`.
 pub fn card(viewport: Rect) -> Rect {
+    let width = CARD_W.min((viewport.width - 40.0).max(0.0));
     Rect::new(
-        viewport.x + (viewport.width - CARD_W) / 2.0,
+        viewport.x + (viewport.width - width) / 2.0,
         viewport.y + (viewport.height - CARD_H) / 2.0,
-        CARD_W,
+        width,
         CARD_H,
     )
+}
+
+fn list_width(card: Rect) -> f32 {
+    if card.width < 700.0 {
+        card.width
+    } else {
+        LIST_W
+    }
 }
 
 pub struct Finder {
@@ -73,6 +82,19 @@ pub struct Finder {
 }
 
 impl Finder {
+    pub fn row_at(&self, viewport: Rect, point: (f32, f32)) -> Option<usize> {
+        if !self.open {
+            return None;
+        }
+        (0..self
+            .rows
+            .len()
+            .saturating_sub(self.first_visible)
+            .min(MAX_ROWS))
+            .find(|&row| row_rect(card(viewport), row).contains(point))
+            .map(|row| self.first_visible + row)
+    }
+
     /// `selected` indexes into the *filtered* list.
     pub fn new(rows: Vec<Row>, query: String, selected: usize) -> Self {
         let selected = selected.min(rows.len().saturating_sub(1));
@@ -117,7 +139,7 @@ impl Finder {
     /// Paints the shadow slab from sync. A modal's halo fades in with the
     /// card; a closed finder clears the layer unconditionally so the last
     /// frame's halo always leaves with it.
-    fn paint_shadow(&mut self, owns: bool) {
+    fn paint_shadow(&mut self, owns: bool, viewport: Rect) {
         if !owns {
             return;
         }
@@ -128,7 +150,7 @@ impl Finder {
             paint_shadow_slab(&shadow, Rect::default(), -1.0);
             return;
         }
-        paint_shadow_slab(&shadow, card(Rect::default()), self.reveal);
+        paint_shadow_slab(&shadow, card(viewport), self.reveal);
     }
 }
 
@@ -147,7 +169,7 @@ impl Component for Finder {
             self.reveal = context.reveal;
             self.dirty.set();
         }
-        self.paint_shadow(context.owns_shadow);
+        self.paint_shadow(context.owns_shadow, context.self_rect);
         if self.open {
             self.dirty.write(&mut self.caret_on, context.caret_on);
         }
@@ -186,7 +208,7 @@ impl Component for Finder {
         // A modal does not scale or overshoot — a finder-sized surface
         // wobbling reads as lag. It just fades up (and the rounded surface
         // rises 4px into place on the same curve).
-        let travel = (1.0 - ea) * -4.0;
+        let travel = (1.0 - ea) * 8.0;
         let card = Rect::new(resting.x, resting.y + travel, resting.width, resting.height);
 
         layer.draw_rectangle(
@@ -216,16 +238,20 @@ impl Component for Finder {
             self.draw_empty(layer, card, ea);
         } else {
             self.draw_list(layer, card, ea);
-            self.draw_preview(layer, card, ea);
+            if list_width(card) < card.width {
+                self.draw_preview(layer, card, ea);
+            }
         }
         // The rule between the list and the preview.
-        theme::rule(
-            layer,
-            (card.x + LIST_W, card.y + QUERY_H),
-            1.0,
-            CARD_H - QUERY_H - FOOTER_H,
-            theme::fade(theme::border(), ea),
-        );
+        if list_width(card) < card.width {
+            theme::rule(
+                layer,
+                (card.x + LIST_W, card.y + QUERY_H),
+                1.0,
+                CARD_H - QUERY_H - FOOTER_H,
+                theme::fade(theme::border(), ea),
+            );
+        }
 
         theme::draw(
             layer,
@@ -244,7 +270,7 @@ fn row_rect(card: Rect, row: usize) -> Rect {
     Rect::new(
         card.x + LIST_PAD_X,
         card.y + QUERY_H + LIST_PAD_Y + row as f32 * ROW_HEIGHT,
-        LIST_W - 2.0 * LIST_PAD_X,
+        list_width(card) - 2.0 * LIST_PAD_X,
         ROW_HEIGHT,
     )
 }
@@ -253,26 +279,30 @@ impl Finder {
     fn draw_query(&self, layer: &Layer, card: Rect, ea: f32) {
         let style = TextStyle::sans(16.0, theme::fade(theme::ink(), ea));
         let middle = card.y + QUERY_H / 2.0;
+        let query = theme::elide(layer, &self.query, card.width - 130.0, &style);
+        theme::icon(
+            layer,
+            theme::icons::SEARCH,
+            (card.x + 23.0, middle - 8.0),
+            16.0,
+            theme::fade(theme::accent(), ea),
+            1.6,
+        );
+        theme::keycap(layer, "Esc", (card.right() - 54.0, middle), ea);
         if self.query.is_empty() {
             theme::draw(
                 layer,
                 "Search files and text",
-                (card.x + 20.0, middle),
+                (card.x + 52.0, middle),
                 &style.clone().color(theme::fade(theme::faint(), ea)),
                 theme::LEFT,
             );
         } else {
-            theme::draw(
-                layer,
-                &self.query,
-                (card.x + 20.0, middle),
-                &style,
-                theme::LEFT,
-            );
+            theme::draw(layer, &query, (card.x + 52.0, middle), &style, theme::LEFT);
         }
 
         if self.caret_on {
-            let x = card.x + 20.0 + theme::width(layer, &self.query, &style);
+            let x = card.x + 52.0 + theme::width(layer, &query, &style);
             layer.draw_rectangle(
                 (x, middle - 10.0),
                 (2.0, 20.0),
@@ -286,7 +316,7 @@ impl Finder {
         theme::draw(
             layer,
             "No matching file or text",
-            (card.x + LIST_W / 2.0, card.y + QUERY_H + 32.0),
+            (card.x + list_width(card) / 2.0, card.y + QUERY_H + 32.0),
             &TextStyle::sans(13.5, theme::fade(theme::faint(), ea)),
             theme::CENTER,
         );
@@ -317,7 +347,7 @@ impl Finder {
             .take(MAX_ROWS)
             .enumerate();
         for (offset, row) in window {
-            let row_rect = row_rect(card, self.first_visible + offset);
+            let row_rect = row_rect(card, offset);
             let middle = row_rect.y + row_rect.height / 2.0;
             // Left cell: the small label — "file", or the hit's file name.
             // Labels on the left read as a column, and can never collide
@@ -543,6 +573,38 @@ mod tests {
             path: PathBuf::from(name),
             name: name.into(),
         }
+    }
+
+    #[test]
+    fn compact_finder_fits_the_focus_window_and_uses_the_whole_list_width() {
+        let viewport = Rect::new(12.0, 25.0, 620.0, 520.0);
+        let card = card(viewport);
+        assert!(card.x >= viewport.x + 20.0);
+        assert!(card.right() <= viewport.right() - 20.0);
+        assert_eq!(list_width(card), card.width);
+        assert!(row_rect(card, MAX_ROWS - 1).bottom() <= card.bottom() - FOOTER_H);
+    }
+
+    #[test]
+    fn scrolled_result_hits_map_to_the_visible_file_not_the_hidden_prefix() {
+        let finder = Finder::new(
+            (0..20).map(|i| file_row(&format!("n{i}.md"))).collect(),
+            String::new(),
+            15,
+        );
+        let viewport = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        for offset in 0..MAX_ROWS {
+            let row = row_rect(card(viewport), offset);
+            assert_eq!(
+                finder.row_at(viewport, (row.x + 10.0, row.y + ROW_HEIGHT / 2.0)),
+                Some(finder.first_visible + offset)
+            );
+        }
+        assert_eq!(
+            finder.row_at(viewport, (card(viewport).right() - 10.0, 400.0)),
+            None
+        );
+        assert_eq!(Finder::closed().row_at(viewport, (300.0, 300.0)), None);
     }
 
     #[test]

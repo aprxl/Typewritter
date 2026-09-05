@@ -116,7 +116,7 @@ impl Dialog {
     }
 
     /// Paints the shadow slab from sync; closed clears unconditionally.
-    fn paint_shadow(&mut self, owns: bool) {
+    fn paint_shadow(&mut self, owns: bool, viewport: Rect) {
         if !owns {
             return;
         }
@@ -127,7 +127,7 @@ impl Dialog {
             paint_shadow_slab(&shadow, Rect::default(), -1.0);
             return;
         }
-        paint_shadow_slab(&shadow, card(Rect::default()), self.reveal);
+        paint_shadow_slab(&shadow, card(viewport), self.reveal);
     }
 
     /// Draws the name field, showing as much of the name as fits, with the
@@ -198,7 +198,7 @@ impl Component for Dialog {
             self.reveal = context.reveal;
             self.dirty.set();
         }
-        self.paint_shadow(context.owns_shadow);
+        self.paint_shadow(context.owns_shadow, context.self_rect);
         if self.prompt.is_some() {
             self.dirty.write(&mut self.caret_on, context.caret_on);
 

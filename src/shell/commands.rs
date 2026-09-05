@@ -224,8 +224,22 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.tree.toggle(),
     },
     Command {
+        id: "view.theme",
+        title: "Switch appearance",
+        group: "View",
+        chord: None,
+        run: |shell| {
+            let bar = shell.layout.rect(shell.regions[shell.title_region].node());
+            let switch = crate::components::theme_switch::switch_rect(bar);
+            shell.request_theme_swap((
+                switch.x + switch.width / 2.0,
+                switch.y + switch.height / 2.0,
+            ));
+        },
+    },
+    Command {
         id: "view.capture",
-        title: "Capture mode",
+        title: "Toggle focus mode",
         group: "View",
         chord: Some(Chord {
             mods: CTRL_SHIFT,

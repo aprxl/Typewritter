@@ -73,8 +73,6 @@ pub struct Context {
     pub divider_hot: bool,
     /// Caret visibility this frame — step-end, not a fade.
     pub caret_on: bool,
-    /// 0..1 from the writing-indicator animation.
-    pub pulse: f32,
     /// Whether the status line shows render instrumentation.
     pub show_stats: bool,
     /// Mouse state, for components that handle clicks and hovers.

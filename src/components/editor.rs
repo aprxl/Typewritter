@@ -1248,6 +1248,18 @@ pub fn max_scroll(content_height: f32, view_height: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_origin_centers_the_capped_measure_without_changing_narrow_insets() {
+        let narrow = Rect::new(200.0, 100.0, 420.0, 600.0);
+        assert_eq!(Editor::content_x(narrow), narrow.x + INSET);
+        let wide = Rect::new(200.0, 100.0, 1200.0, 600.0);
+        let left = Editor::content_x(wide) - wide.x - INSET;
+        let right =
+            wide.right() - RIGHT_MARGIN - Editor::content_x(wide) - Editor::content_width(wide);
+        assert_eq!(left, right);
+        assert_eq!(Editor::content_width(wide), MEASURE);
+    }
     use crate::document::math::MathNode;
     use crate::document::math_layout::BoxKind;
     use crate::document::{Document, Text};

@@ -1739,6 +1739,24 @@ impl Shell {
     }
 
     fn handle_finder_input(&mut self, input: &Input) {
+        if input.is_mouse_pressed(MouseButton::Left) && input.is_cursor_in_window() {
+            let viewport = self.layout.rect(crate::layout::Layout::ROOT);
+            let point = input.mouse_position();
+            let row = self.regions[self.finder_region]
+                .component_as::<Finder>()
+                .and_then(|finder| finder.row_at(viewport, point));
+            if let Some(row) = row {
+                if let Some(state) = &mut self.finder {
+                    state.selected = row;
+                }
+                self.open_selected_finder_file();
+                return;
+            }
+            if !crate::components::search::card(viewport).contains(point) {
+                self.close_finder();
+                return;
+            }
+        }
         if input.is_key_pressed(KeyCode::Escape) {
             self.close_finder();
             return;

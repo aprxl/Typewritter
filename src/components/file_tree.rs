@@ -97,7 +97,10 @@ impl FileTree {
             return None;
         }
         let local = position.1 - rect.y - CONTENT_TOP + self.scroll;
-        (local >= -ROW_HALF).then(|| ((local + ROW_HALF) / ROW_HEIGHT) as usize)
+        let index = (local >= -ROW_HALF).then(|| ((local + ROW_HALF) / ROW_HEIGHT) as usize)?;
+        // The pinned header hides a partially scrolled row. Hidden text
+        // must not remain clickable in the gap below the header.
+        (index as f32 * ROW_HEIGHT >= self.scroll).then_some(index)
     }
 
     fn row_path(&self, rect: Rect, position: (f32, f32)) -> Option<PathBuf> {
@@ -150,21 +153,16 @@ impl FileTree {
 }
 
 impl Component for FileTree {
-    fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        let style = TextStyle::sans(12.5, theme::ink());
-        let widest = self.vault.as_ref().map_or(0.0, |v| {
-            v.borrow()
-                .visible()
-                .iter()
-                .map(|row| theme::width(layer, row.name, &style))
-                .fold(0.0, f32::max)
-        });
+    fn measure(&mut self, _: &Layer) -> (f32, f32) {
         // A truncated filename is still a usable tree; the insets are not.
-        ((widest * 0.55).max(90.0) + 96.0, 200.0)
+        (186.0, 200.0)
     }
 
     fn sync(&mut self, context: &Context) {
         let rect = context.self_rect;
+        let max = (self.content_height() - rect.height).max(0.0);
+        let scroll = self.scroll.clamp(0.0, max);
+        self.dirty.write(&mut self.scroll, scroll);
         let over = context.hovering(rect);
         let next = over
             .then(|| self.row_path(rect, context.mouse.position))
@@ -301,7 +299,11 @@ impl Component for FileTree {
             if self.debug_rows {
                 // The exact band `sync` hit-tests, so a misaligned hit is
                 // visible instead of mysterious.
-                theme::outline(layer, band, theme::warning());
+                theme::outline(
+                    layer,
+                    Rect::new(rect.x, y - ROW_HALF, rect.width, ROW_HEIGHT),
+                    theme::warning(),
+                );
             }
             let selected = selected.as_deref() == Some(row.path);
             if selected {

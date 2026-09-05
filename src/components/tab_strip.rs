@@ -18,6 +18,26 @@ pub const HEIGHT: f32 = 46.0;
 /// Room for the icon, the padding either side, and the close button.
 const TAB_CHROME: f32 = 69.0;
 const PLUS_WIDTH: f32 = 42.0;
+const GAP: f32 = 5.0;
+const PAGE_BUTTON: f32 = 30.0;
+
+/// Consecutive pages of whole tabs; switching tabs always reveals the active one.
+fn tab_window(widths: &[f32], available: f32, active: usize) -> std::ops::Range<usize> {
+    let active = active.min(widths.len().saturating_sub(1));
+    let mut start = 0;
+    let mut used = 0.0;
+    for (index, width) in widths.iter().enumerate() {
+        if index > start && used + width > available {
+            if active < index {
+                return start..index;
+            }
+            start = index;
+            used = 0.0;
+        }
+        used += width + GAP;
+    }
+    start..widths.len()
+}
 
 /// One tab as the strip draws it.
 pub struct TabView {
@@ -39,6 +59,8 @@ pub struct TabStrip {
     /// Filled in by `draw`, hit-tested by `sync` on the next frame.
     tab_rects: Vec<Rect>,
     plus_rect: Rect,
+    previous: Option<(Rect, usize)>,
+    next: Option<(Rect, usize)>,
     hovered: Option<usize>,
     hover: Hover,
     plus_hover: Hover,
@@ -53,6 +75,8 @@ impl TabStrip {
             active,
             tab_rects: Vec::new(),
             plus_rect: Rect::default(),
+            previous: None,
+            next: None,
             hovered: None,
             hover: Hover::new(),
             plus_hover: Hover::new(),
@@ -82,16 +106,20 @@ impl Component for TabStrip {
         self
     }
 
-    fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        let width: f32 = self
-            .tabs
-            .iter()
-            .map(|tab| theme::width(layer, &tab.name, &Self::style(tab)) + TAB_CHROME)
-            .sum();
-        ((width + PLUS_WIDTH + 24.0).min(600.0), HEIGHT)
+    fn measure(&mut self, _: &Layer) -> (f32, f32) {
+        (310.0, HEIGHT)
     }
 
     fn sync(&mut self, context: &Context) {
+        if let Some(position) = context.click_position()
+            && let Some((_, index)) = [self.previous, self.next]
+                .into_iter()
+                .flatten()
+                .find(|(rect, _)| rect.contains(position))
+        {
+            self.docs.borrow_mut().activate(index);
+            return;
+        }
         let hovered = context.hovered_index(&self.tab_rects);
         if self
             .hover
@@ -149,12 +177,24 @@ impl Component for TabStrip {
         let middle = rect.y + (rect.height - 1.0) / 2.0;
 
         let mut x = rect.x + 12.0;
-        self.tab_rects.clear();
-        for (index, tab) in self.tabs.iter().enumerate() {
+        let available = (rect.width - 24.0 - PLUS_WIDTH - PAGE_BUTTON * 2.0).max(TAB_CHROME + 20.0);
+        let widths: Vec<f32> = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                (theme::width(layer, &tab.name, &Self::style(tab)) + TAB_CHROME)
+                    .clamp(120.0, 240.0)
+                    .min(available)
+            })
+            .collect();
+        let window = tab_window(&widths, available, self.active.unwrap_or(0));
+        self.tab_rects = vec![Rect::default(); self.tabs.len()];
+        for index in window.clone() {
+            let tab = &self.tabs[index];
             let style = Self::style(tab);
-            let width = theme::width(layer, &tab.name, &style) + TAB_CHROME;
+            let width = widths[index];
             let tab_rect = Rect::new(x, rect.y + 6.0, width, rect.height - 12.0);
-            self.tab_rects.push(tab_rect);
+            self.tab_rects[index] = tab_rect;
 
             let active = self.active == Some(index);
             if active {
@@ -181,7 +221,8 @@ impl Component for TabStrip {
                 },
                 1.7,
             );
-            theme::draw(layer, &tab.name, (x + 39.0, middle), &style, theme::LEFT);
+            let label = theme::elide(layer, &tab.name, width - TAB_CHROME, &style);
+            theme::draw(layer, &label, (x + 39.0, middle), &style, theme::LEFT);
 
             // An unsaved tab carries a dot, next to its close button.
             if tab.unsaved {
@@ -204,7 +245,49 @@ impl Component for TabStrip {
                 },
                 1.8,
             );
-            x += width + 5.0;
+            x += width + GAP;
+        }
+
+        self.previous = (window.start > 0).then(|| {
+            (
+                Rect::new(
+                    rect.right() - 12.0 - PLUS_WIDTH - PAGE_BUTTON * 2.0,
+                    rect.y + 7.0,
+                    PAGE_BUTTON,
+                    rect.height - 14.0,
+                ),
+                window.start - 1,
+            )
+        });
+        self.next = (window.end < self.tabs.len()).then(|| {
+            (
+                Rect::new(
+                    rect.right() - 12.0 - PLUS_WIDTH - PAGE_BUTTON,
+                    rect.y + 7.0,
+                    PAGE_BUTTON,
+                    rect.height - 14.0,
+                ),
+                window.end,
+            )
+        });
+        for (control, icon) in [
+            (self.previous, icons::CHEVRON_LEFT),
+            (self.next, icons::CHEVRON_RIGHT),
+        ] {
+            if let Some((button, _)) = control {
+                theme::surface(layer, button, theme::background(), 7.0);
+                theme::icon(
+                    layer,
+                    icon,
+                    (button.x + 8.0, middle - 7.0),
+                    14.0,
+                    theme::dim(),
+                    1.6,
+                );
+            }
+        }
+        if self.previous.is_some() || self.next.is_some() {
+            x = rect.right() - 12.0 - PLUS_WIDTH;
         }
 
         self.plus_rect = Rect::new(x, rect.y + 7.0, PLUS_WIDTH, rect.height - 14.0);
@@ -223,6 +306,29 @@ impl Component for TabStrip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflow_pages_keep_every_active_tab_reachable_without_clipping() {
+        let widths = [200.0, 120.0, 240.0, 190.0, 140.0, 220.0, 180.0];
+        for active in 0..widths.len() {
+            let page = tab_window(&widths, 500.0, active);
+            assert!(page.contains(&active));
+            let used = widths[page.clone()].iter().sum::<f32>() + GAP * (page.len() - 1) as f32;
+            assert!(used <= 500.0);
+            if page.end < widths.len() {
+                assert_eq!(tab_window(&widths, 500.0, page.end).start, page.end);
+            }
+            if page.start > 0 {
+                assert_eq!(tab_window(&widths, 500.0, page.start - 1).end, page.start);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_tabs_and_a_closed_last_tab_have_valid_windows() {
+        assert_eq!(tab_window(&[], 500.0, 0), 0..0);
+        assert_eq!(tab_window(&[220.0, 220.0], 250.0, 9), 1..2);
+    }
 
     #[test]
     fn the_close_button_lives_in_the_tab_and_hits_alone() {
