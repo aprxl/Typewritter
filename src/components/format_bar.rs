@@ -86,8 +86,8 @@ mod glyphs {
 
 const CARD_PAD_X: f32 = 6.0;
 const CARD_PAD_Y: f32 = 5.0;
-const CELL_H: f32 = 24.0;
-const ICON_W: f32 = 30.0;
+const CELL_H: f32 = 30.0;
+const ICON_W: f32 = 34.0;
 const CHIP_W: f32 = 38.0;
 const GAP: f32 = 4.0;
 /// The wider channel where a divider rule sits — between the letterforms
@@ -99,7 +99,7 @@ use super::popup::{MENU_SLIDE_EASING, Slide, paint_shadow_slab, revealed_card, s
 const RADIUS: f32 = super::popup::CARD_RADIUS;
 
 /// Thickness of the bright accent ring around a checked/active cell.
-const RING: f32 = 1.6;
+const RING: f32 = 1.0;
 
 /// Which visual rank a cell belongs to, for the divider placement — 0 the
 /// letterforms, 1 the effect chips, 2 the dismiss. Moving between ranks

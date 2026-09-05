@@ -20,7 +20,7 @@ use crate::ui::{Component, Context, Dirty};
 
 /// Top padding of the content area (the filename title is gone — the
 /// document's own H1 is the title).
-pub const TOP: f32 = 28.0;
+pub const TOP: f32 = 48.0;
 pub const INSET: f32 = 56.0;
 /// The equation number's size — the same margin-annotation register as the
 /// heading auto-number, never part of the math's own typography.
@@ -41,7 +41,7 @@ const CHECK_ROUNDING: Rounding = Rounding::uniform(CHECK_RADIUS);
 /// drawn v-centred on the same point, so the rule crosses the x-height.
 const STRIKE_THICKNESS: f32 = 1.4;
 /// The design's measure: the content column is never wider than this.
-pub const MEASURE: f32 = 634.0;
+pub const MEASURE: f32 = 704.0;
 /// Space kept past the right edge before a line may wrap.
 pub const RIGHT_MARGIN: f32 = 24.0;
 /// Radius of the Ctrl-drag selection brush in logical pixels.
@@ -51,7 +51,7 @@ pub const BRUSH_RADIUS: f32 = 9.0;
 /// the line apart.
 pub const BLOCK_PAD: (f32, f32) = (10.0, 6.0);
 const INLINE_PAD: (f32, f32) = (8.0, 4.0);
-pub const CODE_ROUNDING: Rounding = Rounding::uniform(6.0);
+pub const CODE_ROUNDING: Rounding = Rounding::uniform(10.0);
 const MATH_SELECTION_ROUNDING: Rounding = Rounding::uniform(4.0);
 /// The highlight bar: an underline, not a wash, so the glyphs keep the
 /// page's own contrast. `DROP` is measured down from the line's centre.
@@ -322,6 +322,7 @@ pub struct Editor {
     math_selection: Option<(usize, usize, NodeAddress)>,
     context_selections: Vec<ContextHit>,
     brush_point: Option<(f32, f32)>,
+    empty: super::empty_state::EmptyState,
     dirty: Dirty,
 }
 
@@ -355,6 +356,7 @@ impl Editor {
             brush_point: None,
             caret_on: true,
             glow: None,
+            empty: super::empty_state::EmptyState::default(),
             dirty: Dirty::new(),
         }
     }
@@ -412,8 +414,14 @@ impl Editor {
             brush_point: None,
             caret_on: true,
             glow: None,
+            empty: super::empty_state::EmptyState::default(),
             dirty: Dirty::new(),
         }
+    }
+
+    /// The page origin, shared by painting, mouse input and popup anchors.
+    pub fn content_x(rect: Rect) -> f32 {
+        rect.x + INSET + ((rect.width - INSET - RIGHT_MARGIN - MEASURE).max(0.0) / 2.0)
     }
 
     /// The content column's width in `rect` — the page's, since the shell's
@@ -449,6 +457,9 @@ impl Component for Editor {
     }
 
     fn sync(&mut self, context: &Context) {
+        if !self.has_file && self.empty.sync(context) {
+            self.dirty.set();
+        }
         // Only an editor with a caret blinks — the page while the body is
         // focused, or the focused note. The placeholder and an unfocused
         // note must not redraw twice a second for a caret neither draws.
@@ -465,6 +476,10 @@ impl Component for Editor {
         self.dirty.clear();
     }
 
+    fn is_animating(&self) -> bool {
+        !self.has_file && self.empty.is_animating()
+    }
+
     fn draw(&mut self, layer: &Layer, rect: Rect) {
         // The glow layer is ours to manage: nothing else clears it, and a
         // stale halo would outlive the bar it belongs to. Clearing up here
@@ -473,33 +488,14 @@ impl Component for Editor {
             glow.clear();
             glow.set_clip_rect(Some((rect.position(), rect.size())));
         }
-        // The page fills its whole rect; an editor embedded in a note does
-        // not, because its container already painted.
-        if self.metrics.page {
-            layer.draw_rectangle(
-                rect.position(),
-                rect.size(),
-                theme::background(),
-                Rounding::NONE,
-            );
-        }
-
-        let x = rect.x + self.metrics.inset;
+        // DocumentSurface owns the sheet beneath this region.
+        let x = if self.metrics.page {
+            Self::content_x(rect)
+        } else {
+            rect.x + self.metrics.inset
+        };
         if !self.has_file {
-            theme::draw(
-                layer,
-                "No file open",
-                (x, rect.y + 56.0),
-                &TextStyle::sans(17.5, theme::dim()),
-                theme::LEFT,
-            );
-            theme::draw(
-                layer,
-                "click a note in the tree — one click previews, two pins it",
-                (x, rect.y + 84.0),
-                &TextStyle::mono(10.5, theme::comment()),
-                theme::LEFT,
-            );
+            self.empty.draw(layer, rect);
             return;
         }
 
@@ -541,15 +537,15 @@ impl Component for Editor {
         // marker and rule beside it stay visible.
         if caret.is_some() {
             let (band_x, band_width) = if self.metrics.page {
-                (rect.x, rect.width)
+                (x - 12.0, self.metrics.content_width(rect) + 24.0)
             } else {
                 (x, self.metrics.content_width(rect))
             };
             layer.draw_rectangle(
                 (band_x, content + band_top - self.scroll),
                 (band_width, band_bottom - band_top),
-                theme::alt(),
-                Rounding::NONE,
+                theme::fade(theme::alt(), 0.65),
+                Rounding::uniform(6.0),
             );
         }
 
@@ -863,15 +859,24 @@ impl Component for Editor {
                 // it: the label is 9pt, and a box grown to the leading
                 // would read as a code block, not as a tag.
                 for (start, end, color) in badge_spans(&pieces) {
-                    theme::outline(
+                    let badge = Rect {
+                        x: start - theme::BADGE_PAD * self.layout.scale,
+                        y: baseline - theme::BADGE_HEIGHT * 0.5,
+                        width: end - start + theme::BADGE_PAD * 2.0 * self.layout.scale,
+                        height: theme::BADGE_HEIGHT,
+                    };
+                    layer.draw_rectangle(
+                        badge.position(),
+                        badge.size(),
+                        theme::fade(theme::badge_ink(color), 0.12),
+                        Rounding::uniform(4.0),
+                    );
+                    theme::rounded_outline(
                         layer,
-                        Rect {
-                            x: start - theme::BADGE_PAD * self.layout.scale,
-                            y: baseline - theme::BADGE_HEIGHT * 0.5,
-                            width: end - start + theme::BADGE_PAD * 2.0 * self.layout.scale,
-                            height: theme::BADGE_HEIGHT,
-                        },
-                        theme::badge_ink(color),
+                        badge.inset(0.5),
+                        3.5,
+                        1.0,
+                        theme::fade(theme::badge_ink(color), 0.28),
                     );
                 }
                 // The bar goes on this layer crisp; the glow layer takes a

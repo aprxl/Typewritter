@@ -10,11 +10,6 @@ pub struct Backdrop;
 
 impl Component for Backdrop {
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(
-            rect.position(),
-            rect.size(),
-            theme::background(),
-            Rounding::NONE,
-        );
+        layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
     }
 }

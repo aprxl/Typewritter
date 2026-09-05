@@ -419,8 +419,8 @@ impl SlashMenu {
     }
 
     fn draw_rows(&self, layer: &Layer, card: Rect, ea: f32) {
-        let title_style = TextStyle::sans(15.0, theme::fade(theme::ink(), ea));
-        let group_style = TextStyle::sans(11.5, theme::fade(theme::comment(), ea));
+        let title_style = TextStyle::sans(13.0, theme::fade(theme::ink(), ea));
+        let group_style = TextStyle::sans(10.5, theme::fade(theme::comment(), ea));
         let hint_style = TextStyle::mono(10.5, theme::fade(theme::faint(), ea));
 
         // The slide pill rides UNDER the text of whichever visible row was

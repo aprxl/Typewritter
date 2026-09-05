@@ -14,7 +14,7 @@ use super::popup::{CARD_RADIUS, Slide, paint_shadow_slab};
 const CARD_W: f32 = 460.0;
 const CARD_H: f32 = 216.0;
 const BUTTON_W: f32 = 96.0;
-const BUTTON_H: f32 = 30.0;
+const BUTTON_H: f32 = 36.0;
 
 /// What the card is asking.
 #[derive(Clone)]
@@ -94,7 +94,7 @@ pub struct Dialog {
 
 /// Corner radius of the field and buttons — nested smaller things round
 /// less than the card itself.
-const FIELD_RADIUS: f32 = 6.0;
+const FIELD_RADIUS: f32 = 8.0;
 
 impl Dialog {
     pub fn new(prompt: Option<Prompt>) -> Self {
@@ -242,7 +242,7 @@ impl Component for Dialog {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            theme::fade(theme::background(), 0.72 * ea),
+            theme::fade(theme::background(), 0.48 * ea),
             Rounding::NONE,
         );
 

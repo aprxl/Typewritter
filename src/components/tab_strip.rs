@@ -60,6 +60,10 @@ impl TabStrip {
         }
     }
 
+    pub fn new_note_at(&self, point: (f32, f32)) -> bool {
+        self.plus_rect.contains(point)
+    }
+
     fn style(tab: &TabView) -> TextStyle {
         let style = TextStyle::sans(
             12.5,
@@ -74,6 +78,10 @@ impl TabStrip {
 }
 
 impl Component for TabStrip {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn measure(&mut self, layer: &Layer) -> (f32, f32) {
         let width: f32 = self
             .tabs

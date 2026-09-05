@@ -12,7 +12,7 @@ use crate::components::editor::{Editor, Metrics};
 use crate::document::layout::DocLayout;
 use crate::document::{Caret, Style};
 use crate::layout::Rect;
-use crate::renderer::{Layer, Rounding};
+use crate::renderer::Layer;
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
 
@@ -181,20 +181,6 @@ impl Component for SidenoteMargin {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(
-            rect.position(),
-            rect.size(),
-            theme::background(),
-            Rounding::NONE,
-        );
-        theme::vertical_rule(
-            layer,
-            (rect.x, rect.y),
-            rect.height,
-            1.0,
-            theme::selection(),
-        );
-
         // Document coordinates become screen coordinates the same way the
         // editor does: content top, minus the shared scroll.
         let top = rect.y + self.top - self.scroll;

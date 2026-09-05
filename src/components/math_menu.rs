@@ -46,7 +46,7 @@ impl MathMenu {
 }
 
 const CARD_W: f32 = 320.0;
-const ROW_HEIGHT: f32 = 32.0;
+const ROW_HEIGHT: f32 = 36.0;
 const PAD_Y: f32 = 8.0;
 const GRID_PAD_X: f32 = 8.0;
 const GRID_HEADER_HEIGHT: f32 = 22.0;
@@ -358,7 +358,7 @@ impl Component for MathMenu {
             theme::fade(theme::non_text(), ea),
         );
 
-        let name_style = TextStyle::sans(15.0, theme::fade(theme::ink(), ea));
+        let name_style = TextStyle::sans(13.0, theme::fade(theme::ink(), ea));
         let group_style = TextStyle::sans(11.5, theme::fade(theme::comment(), ea));
         let preview_style = TextStyle::math(17.0, theme::fade(theme::ink(), ea));
 

@@ -329,7 +329,7 @@ impl Component for ContextMenu {
             theme::fade(theme::non_text(), ea),
         );
 
-        let title_style = TextStyle::sans(14.5, theme::fade(theme::ink(), ea));
+        let title_style = TextStyle::sans(13.0, theme::fade(theme::ink(), ea));
         let hint_style = TextStyle::mono(10.0, theme::fade(theme::faint(), ea));
 
         // The slide pill rides under the selected/hovered row — one

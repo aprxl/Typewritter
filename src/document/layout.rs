@@ -22,8 +22,8 @@ use crate::theme::{self, TextStyle};
 
 /// Visual line heights, in logical pixels.
 pub const LINE_BODY: f32 = 30.0;
-pub const LINE_H1: f32 = 42.0;
-pub const LINE_H2: f32 = 36.0;
+pub const LINE_H1: f32 = 50.0;
+pub const LINE_H2: f32 = 38.0;
 pub const LINE_H3: f32 = 32.0;
 pub const LINE_H4: f32 = 30.0;
 /// The band a rule occupies. Deliberately shorter than a body line: a rule
@@ -47,9 +47,9 @@ pub const GAP_PARAGRAPH: f32 = 14.0;
 /// top of [`MATH_PAD`], which is the breathing room *inside* the block.
 pub const GAP_MATH: f32 = 24.0;
 /// Space *above* a heading (the first block gets none).
-pub const GAP_HEADING: f32 = 26.0;
+pub const GAP_HEADING: f32 = 30.0;
 /// Space below a heading.
-pub const GAP_AFTER_HEADING: f32 = 8.0;
+pub const GAP_AFTER_HEADING: f32 = 12.0;
 /// Space below a rule — tighter than a paragraph's, for the same reason.
 pub const GAP_DIVIDER: f32 = 8.0;
 /// Space below a list item that has another item right after it — tighter
@@ -247,9 +247,9 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
     let mut base = match kind {
         Block::Heading { level, .. } => TextStyle::sans(
             match level {
-                1 => 24.0,
-                2 => 21.0,
-                3 => 18.5,
+                1 => 30.0,
+                2 => 23.0,
+                3 => 19.0,
                 _ => 17.5,
             } * scale,
             theme::ink(),
@@ -2598,7 +2598,7 @@ mod tests {
             fake_measure(text, style)
         };
         layout(&d, 300.0, &check);
-        assert_eq!(seen.get(), Some(24.0), "H1 text is measured at size 24");
+        assert_eq!(seen.get(), Some(30.0), "H1 text is measured at size 30");
         // The heading weight should be bold.
         let h1_style = text_style(&d.body()[0], Style::PLAIN, 1.0);
         assert!(h1_style.weight > 0.0, "headings are always bold");

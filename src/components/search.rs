@@ -178,7 +178,7 @@ impl Component for Finder {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            theme::fade(theme::background(), 0.72 * ea),
+            theme::fade(theme::background(), 0.48 * ea),
             Rounding::NONE,
         );
 
@@ -293,8 +293,8 @@ impl Finder {
     }
 
     fn draw_list(&self, layer: &Layer, card: Rect, ea: f32) {
-        let name_style = TextStyle::sans(14.0, theme::fade(theme::ink(), ea));
-        let hit_style = TextStyle::sans(13.0, theme::fade(theme::ink(), ea));
+        let name_style = TextStyle::sans(12.5, theme::fade(theme::ink(), ea));
+        let hit_style = TextStyle::sans(12.0, theme::fade(theme::ink(), ea));
         let kind_style = TextStyle::mono(10.0, theme::fade(theme::faint(), ea));
 
         // The selection highlight is a static band: the card is rebuilt
@@ -365,8 +365,8 @@ impl Finder {
     /// between paragraphs —; a text hit shows the line it matched with the
     /// matched characters in accent, under the note's name.
     fn draw_preview(&self, layer: &Layer, card: Rect, ea: f32) {
-        let title_style = TextStyle::sans(13.0, theme::fade(theme::comment(), ea));
-        let body_style = TextStyle::sans(13.0, theme::fade(theme::ink(), ea));
+        let title_style = TextStyle::sans(12.0, theme::fade(theme::comment(), ea));
+        let body_style = TextStyle::sans(12.0, theme::fade(theme::ink(), ea));
         let x = card.x + LIST_W + PREVIEW_PAD;
         let max_width = card.right() - PREVIEW_PAD - x;
         let bottom = card.bottom() - FOOTER_H - PREVIEW_PAD;

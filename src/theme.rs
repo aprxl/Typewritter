@@ -6,7 +6,7 @@
 //! colour past the frame it drew with it — [`set`] swaps the palette and
 //! every call site picks the new value up on its next read.
 //!
-//! Studio pairs porcelain and graphite surfaces with one blue focus accent.
+//! Studio pairs chalk and mulberry surfaces with a warm coral focus accent.
 //! Typography is embedded, so the interface has the same metrics on every OS.
 
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
@@ -84,68 +84,68 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Studio Porcelain.
+    /// Studio Chalk: warm paper, lavender surroundings, coral gestures.
     pub const LIGHT: Self = Self {
         mode: Mode::Light,
-        background: Color::rgb(0xFC, 0xFC, 0xFE),
-        panel: Color::rgb(0xF0, 0xF2, 0xF6),
-        popup: Color::rgb(0xFA, 0xFB, 0xFE),
-        alt: Color::rgb(0xF0, 0xF4, 0xFC),
-        chrome: Color::rgb(0xF5, 0xF6, 0xF9),
-        selection: Color::rgb(0xDC, 0xE8, 0xFC),
-        code: Color::rgb(0xED, 0xF0, 0xF6),
-        math: Color::rgb(0xEF, 0xF3, 0xFA),
-        border: Color::rgb(0xDF, 0xE3, 0xEC),
-        badge_ink: Color::rgb(0x9F, 0x57, 0x1C),
-        badge_blue: Color::rgb(0x28, 0x5F, 0xD0),
-        badge_green: Color::rgb(0x23, 0x7C, 0x65),
-        badge_purple: Color::rgb(0x75, 0x53, 0xBD),
-        highlight: Color::rgb(0xD7, 0xA6, 0x3E),
-        variable: Color::rgb(0xDB, 0xE7, 0xFC),
-        constant: Color::rgb(0xF4, 0xE5, 0xCB),
-        function: Color::rgb(0xD4, 0xEC, 0xE2),
-        faint: Color::rgb(0x70, 0x7A, 0x8E),
-        non_text: Color::rgb(0xBD, 0xC6, 0xD7),
-        ink: Color::rgb(0x24, 0x29, 0x36),
-        dim: Color::rgb(0x59, 0x64, 0x79),
-        comment: Color::rgb(0x72, 0x7C, 0x90),
-        accent: Color::rgb(0x32, 0x67, 0xDF),
-        structure: Color::rgb(0x5F, 0x72, 0xAF),
-        live: Color::rgb(0x23, 0x85, 0x69),
-        cool: Color::rgb(0x42, 0x6C, 0xDF),
-        warning: Color::rgb(0xAA, 0x70, 0x1C),
+        background: Color::rgb(0xFB, 0xF9, 0xF6),
+        panel: Color::rgb(0xEF, 0xEB, 0xF0),
+        popup: Color::rgb(0xFD, 0xFB, 0xF8),
+        alt: Color::rgb(0xF3, 0xEC, 0xEE),
+        chrome: Color::rgb(0xF5, 0xF1, 0xF3),
+        selection: Color::rgb(0xEE, 0xDB, 0xD9),
+        code: Color::rgb(0xEE, 0xE8, 0xEF),
+        math: Color::rgb(0xF0, 0xEA, 0xF2),
+        border: Color::rgb(0xDE, 0xD5, 0xE0),
+        badge_ink: Color::rgb(0xA6, 0x55, 0x32),
+        badge_blue: Color::rgb(0x4E, 0x6D, 0x9F),
+        badge_green: Color::rgb(0x35, 0x76, 0x6A),
+        badge_purple: Color::rgb(0x84, 0x5A, 0x9E),
+        highlight: Color::rgb(0xDB, 0xAA, 0x52),
+        variable: Color::rgb(0xDE, 0xE6, 0xF0),
+        constant: Color::rgb(0xF5, 0xE3, 0xC9),
+        function: Color::rgb(0xD8, 0xEA, 0xDF),
+        faint: Color::rgb(0x81, 0x71, 0x84),
+        non_text: Color::rgb(0xC1, 0xAF, 0xBF),
+        ink: Color::rgb(0x35, 0x2B, 0x3B),
+        dim: Color::rgb(0x6D, 0x5C, 0x72),
+        comment: Color::rgb(0x82, 0x71, 0x87),
+        accent: Color::rgb(0xB8, 0x4F, 0x48),
+        structure: Color::rgb(0x92, 0x64, 0x88),
+        live: Color::rgb(0x44, 0x81, 0x6C),
+        cool: Color::rgb(0x85, 0x61, 0x8D),
+        warning: Color::rgb(0xA7, 0x71, 0x31),
     };
 
-    /// Studio Graphite.
+    /// Studio Mulberry: plum-black surfaces and apricot light.
     pub const DARK: Self = Self {
         mode: Mode::Dark,
-        background: Color::rgb(0x1B, 0x1E, 0x26),
-        panel: Color::rgb(0x14, 0x17, 0x1E),
-        popup: Color::rgb(0x27, 0x2C, 0x38),
-        alt: Color::rgb(0x22, 0x28, 0x34),
-        chrome: Color::rgb(0x18, 0x1B, 0x23),
-        selection: Color::rgb(0x2C, 0x40, 0x63),
-        code: Color::rgb(0x25, 0x2B, 0x36),
-        math: Color::rgb(0x22, 0x2B, 0x3A),
-        border: Color::rgb(0x2A, 0x30, 0x3D),
-        badge_ink: Color::rgb(0xE6, 0xB2, 0x78),
-        badge_blue: Color::rgb(0x91, 0xB5, 0xFF),
-        badge_green: Color::rgb(0x82, 0xCF, 0xB6),
-        badge_purple: Color::rgb(0xC0, 0xA4, 0xF0),
-        highlight: Color::rgb(0xC8, 0xA6, 0x58),
-        variable: Color::rgb(0x30, 0x46, 0x6C),
-        constant: Color::rgb(0x57, 0x46, 0x30),
-        function: Color::rgb(0x28, 0x4E, 0x46),
-        faint: Color::rgb(0x89, 0x93, 0xA8),
-        non_text: Color::rgb(0x4D, 0x58, 0x6E),
-        ink: Color::rgb(0xE7, 0xEB, 0xF3),
-        dim: Color::rgb(0xAB, 0xB5, 0xC9),
-        comment: Color::rgb(0x8D, 0x97, 0xAD),
-        accent: Color::rgb(0x88, 0xAB, 0xFF),
-        structure: Color::rgb(0xA4, 0xB9, 0xEE),
-        live: Color::rgb(0x79, 0xCD, 0xB1),
-        cool: Color::rgb(0x96, 0xB4, 0xFF),
-        warning: Color::rgb(0xDE, 0xB1, 0x6D),
+        background: Color::rgb(0x27, 0x21, 0x2C),
+        panel: Color::rgb(0x1C, 0x18, 0x21),
+        popup: Color::rgb(0x35, 0x2C, 0x3C),
+        alt: Color::rgb(0x32, 0x29, 0x37),
+        chrome: Color::rgb(0x23, 0x1D, 0x2A),
+        selection: Color::rgb(0x51, 0x37, 0x40),
+        code: Color::rgb(0x33, 0x2A, 0x3A),
+        math: Color::rgb(0x30, 0x29, 0x39),
+        border: Color::rgb(0x3D, 0x31, 0x44),
+        badge_ink: Color::rgb(0xEA, 0xB8, 0x82),
+        badge_blue: Color::rgb(0xAB, 0xC0, 0xDF),
+        badge_green: Color::rgb(0x97, 0xC8, 0xB4),
+        badge_purple: Color::rgb(0xCF, 0xAB, 0xD9),
+        highlight: Color::rgb(0xD5, 0xAB, 0x63),
+        variable: Color::rgb(0x3A, 0x46, 0x5D),
+        constant: Color::rgb(0x5C, 0x46, 0x34),
+        function: Color::rgb(0x34, 0x4E, 0x44),
+        faint: Color::rgb(0xA1, 0x8B, 0xA5),
+        non_text: Color::rgb(0x66, 0x51, 0x6E),
+        ink: Color::rgb(0xF0, 0xE8, 0xEA),
+        dim: Color::rgb(0xC3, 0xB0, 0xC7),
+        comment: Color::rgb(0xA4, 0x8F, 0xA9),
+        accent: Color::rgb(0xF0, 0xA0, 0x88),
+        structure: Color::rgb(0xD5, 0xAB, 0xC6),
+        live: Color::rgb(0x98, 0xC7, 0xAE),
+        cool: Color::rgb(0xD2, 0xB0, 0xDC),
+        warning: Color::rgb(0xE7, 0xBD, 0x7B),
     };
 
     /// The built-in palette for `mode`. The pair the switch flips between,
@@ -170,7 +170,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::DARK
+        Self::LIGHT
     }
 }
 
@@ -256,7 +256,7 @@ impl ThemeServer {
 
 impl Default for ThemeServer {
     fn default() -> Self {
-        Self::new(Theme::DARK)
+        Self::new(Theme::LIGHT)
     }
 }
 
@@ -266,7 +266,7 @@ impl Default for ThemeServer {
 /// one down through the layout, the components, and the prose builders would
 /// put a `&Theme` in a few hundred signatures to say one thing that is true
 /// everywhere. It lives here instead, and is written only by [`set`].
-static SERVER: RwLock<ThemeServer> = RwLock::new(ThemeServer::new(Theme::DARK));
+static SERVER: RwLock<ThemeServer> = RwLock::new(ThemeServer::new(Theme::LIGHT));
 
 /// Reads the live server. A poisoned lock still holds a perfectly good
 /// palette, so it is taken rather than panicked on: a stale colour for one
@@ -628,9 +628,7 @@ pub fn elevated_popup(e: f32) -> Color {
         return fade(base, e);
     };
     let a = (e.clamp(0.0, 1.0) * 255.0) as u8;
-    // The lift is small enough that no palette channel can overflow —
-    // clippy knows it too, so there is deliberately no `.min(255)` here.
-    assert!(lift <= 15);
+    // Near-white surfaces clamp their highlight instead of wrapping a channel.
     let up = |c: u8| c.saturating_add(lift);
     Color::gradient(
         [up(r), up(g), up(b), a],
@@ -707,12 +705,10 @@ pub fn surface(layer: &Layer, rect: Rect, base: Color, radius: f32) {
     );
 }
 
-/// The app's folded-page mark, drawn as native paths at any scale.
+/// The app's handwritten tau, drawn as a native path at any scale.
 pub fn app_mark(layer: &Layer, rect: Rect) {
-    let color = mix(accent(), badge_ink(BadgeColor::Purple), 0.28);
-    let (Color::Solid(top), Color::Solid(bottom)) = (accent(), color) else {
-        return;
-    };
+    let top = [0xDA, 0x78, 0x5C, 0xFF];
+    let bottom = [0xAF, 0x50, 0x68, 0xFF];
     layer.draw_rectangle(
         rect.position(),
         rect.size(),
@@ -721,11 +717,11 @@ pub fn app_mark(layer: &Layer, rect: Rect) {
     );
     icon(
         layer,
-        icons::NOTE_MARK,
+        icons::TAU_MARK,
         (rect.x + rect.width * 0.2, rect.y + rect.height * 0.2),
         rect.width * 0.6,
         mark_ink(),
-        1.6,
+        2.3,
     );
 }
 
@@ -836,6 +832,7 @@ pub fn polyline(layer: &Layer, points: &[(f32, f32)], color: Color, thickness: f
 /// Circles and rects from the source SVG are written out as arcs and
 /// closed subpaths: `draw_svg_icon` takes one path's `d`, not a document.
 pub mod icons {
+    pub const TAU_MARK: &str = "M4 7C6 5 8 6 11 6H20 M13 6L10.5 16C9.5 20 13.5 20 17 17";
     pub const NOTE_MARK: &str =
         "M7 3H16L20 7V21H7A3 3 0 0 1 4 18V6A3 3 0 0 1 7 3Z M8 3V21 M12 10H16 M12 14H16";
     pub const SIDEBAR: &str =

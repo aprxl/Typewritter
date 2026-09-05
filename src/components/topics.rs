@@ -6,7 +6,9 @@ use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle, icons};
 use crate::ui::{Component, Context, Dirty, Hover};
 
-pub const WIDTH: f32 = 214.0;
+pub const WIDTH: f32 = 230.0;
+const HEADER: f32 = 70.0;
+const ROW: f32 = 32.0;
 
 /// One outline row. `depth` is the outline's nesting depth, not the
 /// heading's level — a document that opens at H3 still has depth-0 roots.
@@ -33,8 +35,7 @@ pub struct Topics {
     entry_rects: Vec<Rect>,
     hovered: Option<usize>,
     hover: Hover,
-    /// 0..1 from the writing-indicator animation.
-    pulse: f32,
+
     dirty: Dirty,
 }
 
@@ -55,7 +56,6 @@ impl Topics {
             entry_rects: Vec::new(),
             hovered: None,
             hover: Hover::new(),
-            pulse: 0.0,
             dirty: Dirty::new(),
         }
     }
@@ -63,7 +63,7 @@ impl Topics {
 
 impl Component for Topics {
     fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        let style = TextStyle::sans(14.5, theme::dim());
+        let style = TextStyle::sans(12.5, theme::dim());
         let widest = self
             .entries
             .iter()
@@ -73,11 +73,6 @@ impl Component for Topics {
     }
 
     fn sync(&mut self, context: &Context) {
-        // Quantised: the eye cannot see a 6% opacity step, and without this
-        // the panel would rebuild its layer on every single frame.
-        let pulse = (context.pulse * 16.0).round() / 16.0;
-        self.dirty.write(&mut self.pulse, pulse);
-
         let hovered = context.hovered_index(&self.entry_rects);
         if self
             .hover
@@ -99,90 +94,88 @@ impl Component for Topics {
         self.hover.is_animating()
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn draw(&mut self, layer: &Layer, rect: Rect) {
         layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
-        theme::vertical_rule(layer, (rect.x, rect.y), rect.height, 1.0, theme::border());
-
-        let mut y = rect.y + 24.0;
-        theme::icon(
+        theme::vertical_rule(layer, rect.position(), rect.height, 1.0, theme::border());
+        theme::draw(
             layer,
-            icons::TOPICS,
-            (rect.x + 18.0, y - 5.5),
-            11.0,
-            theme::comment(),
-            2.0,
+            "ON THIS PAGE",
+            (rect.x + 22.0, rect.y + 28.0),
+            &TextStyle::sans(9.5, theme::faint()).bold().tracked(0.1),
+            theme::LEFT,
         );
         theme::draw(
             layer,
-            "TOPICS",
-            (rect.x + 36.0, y),
-            &TextStyle::mono(10.0, theme::comment()).tracked(0.18),
-            theme::LEFT,
+            &format!("{:02}", self.entries.len()),
+            (rect.right() - 22.0, rect.y + 28.0),
+            &TextStyle::mono(10.0, theme::faint()),
+            theme::RIGHT,
         );
-        y += 28.0;
 
         self.entry_rects.clear();
         for (index, entry) in self.entries.iter().enumerate() {
-            let active = index == self.active;
-            let row = Rect::new(rect.x + 1.0, y - 11.0, rect.width - 1.0, 22.0);
+            let y = rect.y + HEADER + index as f32 * ROW;
+            let row = Rect::new(rect.x + 10.0, y - ROW / 2.0, rect.width - 20.0, ROW - 3.0);
             self.entry_rects.push(row);
+            let active = index == self.active;
             if active {
                 layer.draw_rectangle(
                     row.position(),
                     row.size(),
-                    theme::selection(),
-                    Rounding::NONE,
+                    theme::fade(theme::selection(), 0.6),
+                    Rounding::uniform(7.0),
                 );
-            }
-            // Same rule as the file tree: the active row's treatment wins
-            // over the hover surface.
-            if !active && self.hovered == Some(index) {
+                layer.draw_rectangle(
+                    (row.x + 1.0, y - 7.0),
+                    (2.0, 14.0),
+                    theme::accent(),
+                    Rounding::uniform(1.0),
+                );
+            } else if self.hovered == Some(index) {
                 theme::hover_fill(layer, row, self.hover.value());
             }
-            let depth = entry.depth.min(3);
-            let x = rect.x + 18.0 + depth as f32 * 13.0;
-            let size = 14.5 - depth as f32 * 0.6;
-            let color = if entry.depth == 0 {
-                theme::dim()
-            } else {
-                theme::comment()
-            };
-            let number_style = TextStyle::mono(
-                size - 3.0,
-                if active { theme::dim() } else { theme::faint() },
+            let x = rect.x + 22.0 + entry.depth.min(3) as f32 * 12.0;
+            let number = TextStyle::mono(9.0, theme::faint());
+            theme::draw(layer, &entry.number, (x, y - 1.5), &number, theme::LEFT);
+            let name_x = x + theme::width(layer, &entry.number, &number) + 9.0;
+            let style = TextStyle::sans(
+                12.0,
+                if active {
+                    theme::accent()
+                } else {
+                    theme::dim()
+                },
             );
-            theme::draw(layer, &entry.number, (x, y), &number_style, theme::LEFT);
-            // Measure number so long values do not collide with heading text.
-            let name_x = x + theme::width(layer, &entry.number, &number_style) + 10.0;
+            let label = theme::elide(layer, &entry.name, rect.right() - 22.0 - name_x, &style);
+            theme::draw(layer, &label, (name_x, y - 1.5), &style, theme::LEFT);
+        }
+        if self.entries.is_empty() {
+            theme::icon(
+                layer,
+                icons::TOPICS,
+                (rect.x + 23.0, rect.y + HEADER - 10.0),
+                16.0,
+                theme::non_text(),
+                1.5,
+            );
             theme::draw(
                 layer,
-                &entry.name,
-                (name_x, y),
-                &TextStyle::sans(size, if active { theme::ink() } else { color }),
+                "A little structure helps.",
+                (rect.x + 22.0, rect.y + HEADER + 26.0),
+                &TextStyle::sans(12.0, theme::dim()),
                 theme::LEFT,
             );
-            y += if entry.depth == 0 { 24.0 } else { 21.0 };
+            theme::draw(
+                layer,
+                "Your headings appear here.",
+                (rect.x + 22.0, rect.y + HEADER + 49.0),
+                &TextStyle::sans(11.0, theme::faint()),
+                theme::LEFT,
+            );
         }
-
-        y += 12.0;
-        theme::rule(
-            layer,
-            (rect.x + 18.0, y),
-            rect.width - 36.0,
-            1.0,
-            theme::border(),
-        );
-        y += 20.0;
-        // The indicator fades rather than blinking: a hard on/off in the
-        // corner of the eye reads as an error, a fade reads as a pulse.
-        let dot = theme::fade(theme::live(), 0.35 + 0.65 * self.pulse);
-        layer.draw_rectangle((rect.x + 18.0, y - 3.0), (6.0, 6.0), dot, Rounding::NONE);
-        theme::draw(
-            layer,
-            "WRITING NOW",
-            (rect.x + 32.0, y),
-            &TextStyle::mono(9.5, theme::faint()).tracked(0.16),
-            theme::LEFT,
-        );
     }
 }

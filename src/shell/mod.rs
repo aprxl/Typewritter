@@ -34,6 +34,7 @@ use winit::event::MouseButton;
 
 use crate::animation::{Animation, Easing};
 use crate::components::dialog::Prompt;
+use crate::components::document_surface::{self, DocumentSurface};
 use crate::components::sidenotes::Note;
 use crate::components::tab_strip::TabView;
 use crate::components::topics::Entry;
@@ -518,13 +519,22 @@ impl Shell {
         let title = layout.add_child(Layout::ROOT, Style::fixed(title_bar::HEIGHT));
         let tabs = layout.add_child(Layout::ROOT, Style::fixed(tab_strip::HEIGHT));
         let breadcrumb = layout.add_child(Layout::ROOT, Style::fixed(breadcrumb::HEIGHT));
-        let body = layout.add_child(Layout::ROOT, Style::flex(1.0).row());
+        let body = layout.add_child(
+            Layout::ROOT,
+            Style {
+                gap: document_surface::GAP,
+                ..Style::flex(1.0).row()
+            },
+        );
         let status = layout.add_child(Layout::ROOT, Style::fixed(status_line::HEIGHT));
 
         // The sidenote margin lives inside the canvas, which is what makes
         // it part of the document rather than a fourth panel.
         let tree = layout.add_child(body, Style::fixed(file_tree::WIDTH));
-        let canvas = layout.add_child(body, Style::flex(1.0).row());
+        let canvas_slot = layout.add_child(body, Style::flex(1.0));
+        layout.add_child(canvas_slot, Style::fixed(document_surface::GAP));
+        let canvas = layout.add_child(canvas_slot, Style::flex(1.0).row());
+        layout.add_child(canvas_slot, Style::fixed(document_surface::GAP));
         let topics = layout.add_child(body, Style::fixed(topics::WIDTH));
         let text_column = layout.add_child(canvas, Style::flex(1.0));
         let sidenotes = layout.add_child(canvas, Style::fixed(sidenotes::WIDTH));
@@ -559,6 +569,7 @@ impl Shell {
                     tree_menu_request.clone(),
                 )),
             ),
+            region(renderer, canvas, Box::new(DocumentSurface)),
             region(renderer, text_column, Box::new(Editor::placeholder())),
         ];
 
@@ -845,8 +856,13 @@ impl Shell {
         // Push the animated extents into the tree. Below half a pixel the
         // panel is hidden outright.
         let extents = self.panels().map(|p| (p.node, p.current()));
+        let has_margin = self
+            .docs
+            .borrow()
+            .active()
+            .is_some_and(|tab| !tab.document.notes.is_empty());
         for (node, extent) in extents {
-            let visible = extent >= 0.5;
+            let visible = extent >= 0.5 && (node != self.sidenotes.node || has_margin);
             self.layout.set_style(node, |s| {
                 s.size = Size::Fixed(extent);
                 s.visible = visible;
@@ -1360,7 +1376,7 @@ impl Shell {
             (Divider::Topics, &self.topics, true),
         ] {
             let rect = self.layout.rect(panel.node);
-            if !panel.open || rect.width < 1.0 {
+            if !panel.open || !self.layout.style(panel.node).visible || rect.width < 1.0 {
                 continue;
             }
             let edge = if from_right { rect.x } else { rect.right() };
@@ -1510,7 +1526,7 @@ impl Shell {
     fn editor_point(&self, rect: Rect, mouse: (f32, f32)) -> Option<(f32, f32)> {
         let docs = self.docs.borrow();
         docs.active()?;
-        let local_x = (mouse.0 - (rect.x + editor::INSET)).max(0.0);
+        let local_x = (mouse.0 - (Editor::content_x(rect))).max(0.0);
         let local_y = mouse.1 - rect.y - editor::TOP + docs.editor_scroll;
         if local_y < 0.0 {
             return None;

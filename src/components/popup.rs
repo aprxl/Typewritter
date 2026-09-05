@@ -160,7 +160,7 @@ pub fn slide_target(touched: Option<usize>, len: usize) -> Option<usize> {
     touched.map(|h| h.min(len - 1))
 }
 
-/// A floating card grown out of `anchor`: scaled from 88% up to full size
+/// A floating card grown out of `anchor`: scaled from 97% up to full size
 /// around the point it serves while sliding down a few pixels into place —
 /// the card grows out of what was clicked and settles downward, gravity
 /// agreeing with the direction it opens in. Clamped, so an overshooting
@@ -171,7 +171,7 @@ pub fn slide_target(touched: Option<usize>, len: usize) -> Option<usize> {
 pub fn revealed_card(card: Rect, anchor: (f32, f32), e: f32) -> Rect {
     let e = e.clamp(0.0, 1.0);
     let scale = 0.97 + 0.03 * e;
-    let travel = (1.0 - e) * -5.0; // starts 7px above, slides down into place
+    let travel = (1.0 - e) * -5.0; // starts 5px above, slides down into place
     let cx = anchor.0;
     let cy = anchor.1;
     let x = cx + (card.x - cx) * scale;

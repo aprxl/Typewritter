@@ -15,9 +15,9 @@ use super::commands;
 use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
-    ContextMenu, Dialog, FileTree, Finder, FormatBar, MathMenu, Onboarding, Palette, SlashMenu,
-    Topics, context_menu, editor, file_tree, format_bar, math_menu, onboarding, sidenotes,
-    theme_switch, title_bar,
+    ContextMenu, Dialog, Editor, FileTree, Finder, FormatBar, MathMenu, Onboarding, Palette,
+    SlashMenu, TabStrip, Topics, context_menu, editor, file_tree, format_bar, math_menu,
+    onboarding, sidenotes, theme_switch, title_bar,
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind};
@@ -152,6 +152,33 @@ impl Shell {
             return;
         }
 
+        if input.is_mouse_pressed(MouseButton::Left) && input.is_cursor_in_window() {
+            let point = input.mouse_position();
+            let new_tab = self.regions[self.tab_region]
+                .component_as::<TabStrip>()
+                .is_some_and(|tabs| tabs.new_note_at(point));
+            let empty_action = if self.docs.borrow().active().is_none() {
+                crate::components::empty_state::buttons(self.layout.rect(self.text_column))
+                    .iter()
+                    .position(|rect| rect.contains(point))
+            } else {
+                None
+            };
+            if new_tab || empty_action == Some(0) {
+                if let Some(command) = commands::COMMANDS
+                    .iter()
+                    .find(|command| command.id == "file.new")
+                {
+                    (command.run)(self);
+                }
+                return;
+            }
+            if empty_action == Some(1) {
+                self.open_finder();
+                return;
+            }
+        }
+
         // The topics panel jumps the caret to its heading — through the
         // fold-aware jump, so a row that lists a folded heading (folds never
         // leave the outline) unfolds over it instead of landing nowhere.
@@ -238,7 +265,7 @@ impl Shell {
             // text's own left edge. y keeps the page's scroll like clicks.
             let scroll = self.docs.borrow().editor_scroll;
             (
-                mouse.0 - (rect.x + editor::INSET),
+                mouse.0 - (Editor::content_x(rect)),
                 mouse.1 - rect.y - editor::TOP + scroll,
             )
         };
@@ -297,6 +324,9 @@ impl Shell {
     /// the note's own layout — never handed to a `body()`-resolving function,
     /// whose coordinates come from the page's layout and are wrong here.
     fn margin_note_at(&mut self, point: (f32, f32)) -> Option<(usize, Caret)> {
+        if !self.layout.style(self.sidenotes.node).visible {
+            return None;
+        }
         let rect = self.layout.rect(self.sidenotes.node);
         let (scroll, index_of) = {
             let docs = self.docs.borrow();
@@ -1554,6 +1584,25 @@ impl Shell {
     }
 
     fn handle_palette_input(&mut self, input: &Input) {
+        if input.is_mouse_pressed(MouseButton::Left) && input.is_cursor_in_window() {
+            let viewport = self.layout.rect(crate::layout::Layout::ROOT);
+            let point = input.mouse_position();
+            let row = self.regions[self.palette_region]
+                .component_as::<Palette>()
+                .and_then(|palette| palette.row_at(viewport, point));
+            if let Some(row) = row {
+                if let Some(state) = &mut self.palette {
+                    state.selected = row;
+                }
+                self.run_selected_palette_command();
+                return;
+            }
+            if !palette::card(viewport).contains(point) {
+                self.close_palette();
+                return;
+            }
+        }
+
         if input.is_key_pressed(KeyCode::Escape) {
             self.close_palette();
             return;
@@ -1748,7 +1797,7 @@ impl Shell {
             let (cx, cb, ch) = layout.caret_pos(tab.document.caret, &measure);
             (cx, cb, ch, docs.editor_scroll)
         };
-        let screen_x = rect.x + crate::components::editor::INSET + caret_x;
+        let screen_x = Editor::content_x(rect) + caret_x;
         let screen_y =
             rect.y + crate::components::editor::TOP + caret_baseline - scroll + caret_height / 2.0;
         (screen_x, screen_y)
@@ -2888,7 +2937,7 @@ impl Shell {
             let (ox, oy, _) = math_layout::cursor_pos(list, cursor, 0, layout.scale, &measure);
             (cx, cy, docs.editor_scroll, ox, oy)
         };
-        let screen_x = rect.x + crate::components::editor::INSET + base_x + offset_x;
+        let screen_x = Editor::content_x(rect) + base_x + offset_x;
         let screen_y = rect.y + crate::components::editor::TOP + base_y - offset_y - scroll;
         (screen_x, screen_y)
     }
