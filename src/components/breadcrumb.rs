@@ -7,7 +7,7 @@ use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle, icons};
 use crate::ui::{Component, Context, Dirty, Hover};
 
-pub const HEIGHT: f32 = 32.0;
+pub const HEIGHT: f32 = 34.0;
 
 pub struct Breadcrumb {
     path: Vec<String>,
@@ -25,7 +25,7 @@ impl Breadcrumb {
     }
 
     fn style() -> TextStyle {
-        TextStyle::mono(11.5, theme::dim())
+        TextStyle::sans(11.0, theme::faint())
     }
 }
 
@@ -65,18 +65,12 @@ impl Component for Breadcrumb {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(
-            rect.position(),
-            rect.size(),
-            theme::chrome(),
-            Rounding::NONE,
-        );
-        theme::hover_fill(layer, rect, self.hover.value());
+        layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
         theme::rule(
             layer,
-            (rect.x, rect.bottom() - 2.0),
+            (rect.x, rect.bottom() - 1.0),
             rect.width,
-            2.0,
+            1.0,
             theme::border(),
         );
         let middle = rect.y + (rect.height - 2.0) / 2.0;

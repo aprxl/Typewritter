@@ -6,8 +6,8 @@
 //! colour past the frame it drew with it — [`set`] swaps the palette and
 //! every call site picks the new value up on its next read.
 //!
-//! Palettes are transcribed from `~/.dev/Guara/COLOR.md`; the role names are
-//! that document's, so a value here can be checked against it directly.
+//! Studio pairs porcelain and graphite surfaces with one blue focus accent.
+//! Typography is embedded, so the interface has the same metrics on every OS.
 
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
@@ -47,177 +47,105 @@ pub struct Theme {
     /// guessing from a luminance threshold.
     pub mode: Mode,
 
-    // -- Surfaces --
-    /// The page itself.
+    // Surfaces, from the document to the surrounding chrome and floating cards.
     pub background: Color,
-    /// Panels that sit behind the page (Guara's gutter): the tree, topics,
-    /// the title bar, the status line.
     pub panel: Color,
-    /// A card floating *over* the page — the palette, the dialogs, the
-    /// menus. The same value as `panel` in Guara, a lighter one in Noir,
-    /// where a card that dropped to the gutter's value would sink into the
-    /// window instead of lifting off the page.
     pub popup: Color,
-    /// Cursor line / alternate background — also the math slot fill.
     pub alt: Color,
-    /// Chrome / statusline. Lighter than `panel`: the tab strip and
-    /// breadcrumb.
     pub chrome: Color,
     pub selection: Color,
-    /// Behind code, inline and fenced. A clear step down from `background` —
-    /// the boundary of a code span has to read at a glance, since nothing
-    /// else marks it.
     pub code: Color,
-    /// Behind a display math block. A sibling of `code` rather than the same
-    /// tint: both are slabs of machinery on a page of prose, and telling one
-    /// from the other at a glance is the whole point of tinting them at all.
-    /// Cooler and greyer than code's warm tan, which is what separates them
-    /// without introducing a colour the palette does not already live in.
-    ///
-    /// Read it through [`math_surface`] — `math` alone is the notation font.
     pub math: Color,
     pub border: Color,
 
-    // -- Badges and highlights --
-    /// A badge's label and its outline share one colour, as in the design —
-    /// the box is a hairline, not a filled tag.
+    // Document annotations and mathematical roles.
     pub badge_ink: Color,
     pub badge_blue: Color,
     pub badge_green: Color,
     pub badge_purple: Color,
-    /// Underline highlight. Drawn as a bar *below* the text rather than a
-    /// wash behind it, so the glyphs keep the page's own contrast.
     pub highlight: Color,
-    /// Saturated role colours behind resolved mathematical symbols. They sit
-    /// outside the page's warm surface palette so semantic tokens stand out.
     pub variable: Color,
     pub constant: Color,
     pub function: Color,
-    /// Quietest ink that is still ink: dates, hints, disabled glyphs.
-    pub faint: Color,
-    /// Non-text: separators inside a line of type, empty-slot outlines.
-    pub non_text: Color,
 
-    // -- Foreground --
+    // Text and non-text hierarchy.
+    pub faint: Color,
+    pub non_text: Color,
     pub ink: Color,
     pub dim: Color,
     pub comment: Color,
 
-    // -- Semantic accents (Guara's syntax hues, reused as UI roles) --
-    /// Keyword orange: the one loud colour. Mode badge, active markers,
-    /// caret.
+    // Interaction and state.
     pub accent: Color,
-    /// Type orange, a shade deeper: structural annotations.
     pub structure: Color,
-    /// Function green: things that are healthy or live.
     pub live: Color,
-    /// Global teal — the deliberate cool outlier in a warm palette.
     pub cool: Color,
     pub warning: Color,
 }
 
 impl Theme {
-    /// Guara light. Kept whole and current, but nothing loads it yet — the
-    /// application starts on [`Theme::NOIR`], and choosing between them is
-    /// its own piece of work.
+    /// Studio Porcelain.
     pub const LIGHT: Self = Self {
         mode: Mode::Light,
-        background: Color::rgb(0xF8, 0xED, 0xD0),
-        panel: Color::rgb(0xF0, 0xE3, 0xBE),
-        // Guara draws a float on the gutter's colour; only Noir splits them.
-        popup: Color::rgb(0xF0, 0xE3, 0xBE),
-        alt: Color::rgb(0xEF, 0xE0, 0xA8),
-        chrome: Color::rgb(0xFA, 0xF1, 0xDB),
-        selection: Color::rgb(0xD2, 0xB2, 0x6E),
-        code: Color::rgb(0xD9, 0xC9, 0x9E),
-        math: Color::rgb(0xD5, 0xCD, 0xB4),
-        border: Color::rgb(0xDD, 0xD0, 0xA0),
-        // The design gives a badge the structural orange rather than an ink
-        // of its own; the two entries carrying one value is that, written out.
-        badge_ink: Color::rgb(0xA8, 0x4C, 0x00),
-        badge_blue: Color::rgb(0x1F, 0x70, 0xA0),
-        badge_green: Color::rgb(0x3E, 0x7D, 0x59),
-        badge_purple: Color::rgb(0x7B, 0x52, 0xA0),
-        highlight: Color::rgb(0xE0, 0xA8, 0x2C),
-        variable: Color::rgb(0x6E, 0x9A, 0xF5),
-        constant: Color::rgb(0xEE, 0x91, 0x45),
-        function: Color::rgb(0x65, 0xB8, 0x78),
-        faint: Color::rgb(0xA0, 0x91, 0x83),
-        non_text: Color::rgb(0xC4, 0xB7, 0x9E),
-        ink: Color::rgb(0x3C, 0x38, 0x36),
-        dim: Color::rgb(0x7C, 0x6F, 0x64),
-        comment: Color::rgb(0x92, 0x83, 0x74),
-        accent: Color::rgb(0xC2, 0x4F, 0x1A),
-        structure: Color::rgb(0xA8, 0x4C, 0x00),
-        live: Color::rgb(0x3E, 0x7D, 0x59),
-        cool: Color::rgb(0x0D, 0x66, 0x78),
-        warning: Color::rgb(0xB0, 0x7B, 0x18),
+        background: Color::rgb(0xFC, 0xFC, 0xFE),
+        panel: Color::rgb(0xF0, 0xF2, 0xF6),
+        popup: Color::rgb(0xFA, 0xFB, 0xFE),
+        alt: Color::rgb(0xF0, 0xF4, 0xFC),
+        chrome: Color::rgb(0xF5, 0xF6, 0xF9),
+        selection: Color::rgb(0xDC, 0xE8, 0xFC),
+        code: Color::rgb(0xED, 0xF0, 0xF6),
+        math: Color::rgb(0xEF, 0xF3, 0xFA),
+        border: Color::rgb(0xDF, 0xE3, 0xEC),
+        badge_ink: Color::rgb(0x9F, 0x57, 0x1C),
+        badge_blue: Color::rgb(0x28, 0x5F, 0xD0),
+        badge_green: Color::rgb(0x23, 0x7C, 0x65),
+        badge_purple: Color::rgb(0x75, 0x53, 0xBD),
+        highlight: Color::rgb(0xD7, 0xA6, 0x3E),
+        variable: Color::rgb(0xDB, 0xE7, 0xFC),
+        constant: Color::rgb(0xF4, 0xE5, 0xCB),
+        function: Color::rgb(0xD4, 0xEC, 0xE2),
+        faint: Color::rgb(0x70, 0x7A, 0x8E),
+        non_text: Color::rgb(0xBD, 0xC6, 0xD7),
+        ink: Color::rgb(0x24, 0x29, 0x36),
+        dim: Color::rgb(0x59, 0x64, 0x79),
+        comment: Color::rgb(0x72, 0x7C, 0x90),
+        accent: Color::rgb(0x32, 0x67, 0xDF),
+        structure: Color::rgb(0x5F, 0x72, 0xAF),
+        live: Color::rgb(0x23, 0x85, 0x69),
+        cool: Color::rgb(0x42, 0x6C, 0xDF),
+        warning: Color::rgb(0xAA, 0x70, 0x1C),
     };
 
-    /// Guara Noir, and what the application currently loads.
-    ///
-    /// Every entry the palette document names is transcribed from its NOIR
-    /// column. Five roles are the application's own — the code and math
-    /// slabs, the three math-symbol pills, the purple badge — and the
-    /// document's rule for those is stated at the top of it: *semantic hues
-    /// are constant across variants; only brightness and surface shift*.
-    /// Each is that, and nothing more inventive: the light entry's hue,
-    /// moved to the other side of the page. Each carries its working below.
-    pub const NOIR: Self = Self {
+    /// Studio Graphite.
+    pub const DARK: Self = Self {
         mode: Mode::Dark,
-        background: Color::rgb(0x1B, 0x17, 0x14),
-        panel: Color::rgb(0x14, 0x11, 0x10),
-        popup: Color::rgb(0x22, 0x1D, 0x18),
-        alt: Color::rgb(0x3C, 0x38, 0x36),
-        // Noir gives chrome the gutter's value, so the title bar, the tab
-        // strip, and the side panels are one dark surround and the page is
-        // the lighter thing inside it. `border` is what separates them, and
-        // in Noir it is darker than either.
-        chrome: Color::rgb(0x14, 0x11, 0x10),
-        // The one entry with an alpha: Noir selects by laying a warm veil
-        // over the line rather than replacing its background, so a
-        // selection over a highlight still shows the highlight. The hex is
-        // the document's `#B7B09884` — its prose says ~72% next to an alpha
-        // byte that reads 52%, and the byte is the part that was shipped.
-        selection: Color::rgba(0xB7, 0xB0, 0x98, 0x84),
-        // Light drops the code slab a clear step *below* the page; Noir
-        // lifts it the same step above, at the same warm hue and the lower
-        // saturation a dark surface needs to read as the same tint. Lands
-        // in the register Noir's own washes use (diff-change is `#2E2A1A`).
-        code: Color::rgb(0x33, 0x2C, 0x22),
-        // Code's hue, greyed — the same separation the two carry in light,
-        // where math is code's tint with the tan taken out of it.
-        math: Color::rgb(0x2F, 0x2E, 0x2B),
-        border: Color::rgb(0x0D, 0x0B, 0x09),
-        badge_ink: Color::rgb(0xFF, 0x97, 0x42),
-        badge_blue: Color::rgb(0x13, 0x94, 0xAF),
-        badge_green: Color::rgb(0x58, 0xAF, 0x7D),
-        // The one badge with no role in the document. Light's violet, lifted
-        // to the same contrast against the page that it has against Guara's
-        // (4.9:1) — the hue is untouched at 271°.
-        badge_purple: Color::rgb(0xA2, 0x78, 0xC9),
-        // Noir's search highlight is a background wash; this is a bar drawn
-        // under the text, with a glow over it, so a wash's value would leave
-        // both invisible. It takes the gold Noir does carry — annotation.
-        highlight: Color::rgb(0xC2, 0x87, 0x1A),
-        // The three pills sit *behind* math glyphs, which are drawn in
-        // `ink` — so on a dark page they darken rather than brighten, or the
-        // cream glyph on top stops reading. Each keeps its light hue
-        // (cornflower 223°, orange 26°, green 135°) at the contrast light
-        // holds against its own ink, ~5:1.
-        variable: Color::rgb(0x47, 0x60, 0x9F),
-        constant: Color::rgb(0x8F, 0x4E, 0x1D),
-        function: Color::rgb(0x2E, 0x6B, 0x3D),
-        faint: Color::rgb(0x92, 0x83, 0x74),
-        non_text: Color::rgb(0x36, 0x2C, 0x26),
-        ink: Color::rgb(0xF0, 0xE4, 0xC2),
-        dim: Color::rgb(0xCC, 0xBB, 0x9E),
-        comment: Color::rgb(0x92, 0x83, 0x74),
-        accent: Color::rgb(0xC0, 0x5B, 0x2D),
-        structure: Color::rgb(0xFF, 0x97, 0x42),
-        live: Color::rgb(0x58, 0xAF, 0x7D),
-        cool: Color::rgb(0x13, 0x94, 0xAF),
-        warning: Color::rgb(0xB5, 0x76, 0x14),
+        background: Color::rgb(0x1B, 0x1E, 0x26),
+        panel: Color::rgb(0x14, 0x17, 0x1E),
+        popup: Color::rgb(0x27, 0x2C, 0x38),
+        alt: Color::rgb(0x22, 0x28, 0x34),
+        chrome: Color::rgb(0x18, 0x1B, 0x23),
+        selection: Color::rgb(0x2C, 0x40, 0x63),
+        code: Color::rgb(0x25, 0x2B, 0x36),
+        math: Color::rgb(0x22, 0x2B, 0x3A),
+        border: Color::rgb(0x2A, 0x30, 0x3D),
+        badge_ink: Color::rgb(0xE6, 0xB2, 0x78),
+        badge_blue: Color::rgb(0x91, 0xB5, 0xFF),
+        badge_green: Color::rgb(0x82, 0xCF, 0xB6),
+        badge_purple: Color::rgb(0xC0, 0xA4, 0xF0),
+        highlight: Color::rgb(0xC8, 0xA6, 0x58),
+        variable: Color::rgb(0x30, 0x46, 0x6C),
+        constant: Color::rgb(0x57, 0x46, 0x30),
+        function: Color::rgb(0x28, 0x4E, 0x46),
+        faint: Color::rgb(0x89, 0x93, 0xA8),
+        non_text: Color::rgb(0x4D, 0x58, 0x6E),
+        ink: Color::rgb(0xE7, 0xEB, 0xF3),
+        dim: Color::rgb(0xAB, 0xB5, 0xC9),
+        comment: Color::rgb(0x8D, 0x97, 0xAD),
+        accent: Color::rgb(0x88, 0xAB, 0xFF),
+        structure: Color::rgb(0xA4, 0xB9, 0xEE),
+        live: Color::rgb(0x79, 0xCD, 0xB1),
+        cool: Color::rgb(0x96, 0xB4, 0xFF),
+        warning: Color::rgb(0xDE, 0xB1, 0x6D),
     };
 
     /// The built-in palette for `mode`. The pair the switch flips between,
@@ -225,7 +153,7 @@ impl Theme {
     pub const fn of(mode: Mode) -> Self {
         match mode {
             Mode::Light => Self::LIGHT,
-            Mode::Dark => Self::NOIR,
+            Mode::Dark => Self::DARK,
         }
     }
 
@@ -242,7 +170,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::NOIR
+        Self::DARK
     }
 }
 
@@ -328,7 +256,7 @@ impl ThemeServer {
 
 impl Default for ThemeServer {
     fn default() -> Self {
-        Self::new(Theme::NOIR)
+        Self::new(Theme::DARK)
     }
 }
 
@@ -338,7 +266,7 @@ impl Default for ThemeServer {
 /// one down through the layout, the components, and the prose builders would
 /// put a `&Theme` in a few hundred signatures to say one thing that is true
 /// everywhere. It lives here instead, and is written only by [`set`].
-static SERVER: RwLock<ThemeServer> = RwLock::new(ThemeServer::new(Theme::NOIR));
+static SERVER: RwLock<ThemeServer> = RwLock::new(ThemeServer::new(Theme::DARK));
 
 /// Reads the live server. A poisoned lock still holds a perfectly good
 /// palette, so it is taken rather than panicked on: a stale colour for one
@@ -440,16 +368,16 @@ pub fn badge_ink(color: BadgeColor) -> Color {
 }
 
 /// Faux-bold outline expansion, as a fraction of font size.
-const FAUX_BOLD_WEIGHT_RATIO: f32 = 0.025;
+const FAUX_BOLD_WEIGHT_RATIO: f32 = 0.018;
 
-/// Prose. Georgia is what the design specifies and what is installed.
-pub fn serif() -> Font {
-    Font::Named("Georgia".into())
+/// Inter is embedded in the app and reused by both screen and PDF shaping.
+pub fn sans() -> Font {
+    Font::Bytes(include_bytes!("../resources/fonts/InterVariable.ttf"))
 }
 
 /// Labels, numbers, and anything that wants to read as machinery.
 pub fn mono() -> Font {
-    Font::Named("Essential PragmataPro".into())
+    Font::Named("monospace".into())
 }
 
 /// Math. Stays separate from `mono` because the two answer different
@@ -481,9 +409,9 @@ pub struct TextStyle {
 }
 
 impl TextStyle {
-    pub fn serif(size: f32, color: Color) -> Self {
+    pub fn sans(size: f32, color: Color) -> Self {
         Self {
-            font: serif(),
+            font: sans(),
             size,
             color,
             weight: 0.0,
@@ -517,16 +445,13 @@ impl TextStyle {
         }
     }
 
-    /// Faux bold. Georgia ships as a single regular cut here, so weight is
-    /// synthesised; a light expansion reads as 600 rather than filling in
-    /// the counters at body sizes.
+    /// A light optical expansion, shared by screen and PDF glyph outlines.
     pub fn bold(mut self) -> Self {
         self.weight = self.size * FAUX_BOLD_WEIGHT_RATIO;
         self
     }
 
-    /// Faux italic: a 12° shear. Georgia ships no italic cut, so — like
-    /// faux bold — the slant is synthesized by the renderer.
+    /// A 12° italic shear, shared by screen and PDF glyph outlines.
     pub fn italic(mut self) -> Self {
         self.slant = 0.21;
         self
@@ -686,7 +611,7 @@ pub fn shadow_ink() -> Color {
         // 0x80 (50%) by ear: scale_alpha finally lets this byte through
         // (see the slab painter), and the halved values from before read as
         // barely-there now that they are actually applied.
-        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x80),
+        Mode::Light => Color::rgba(0x22, 0x32, 0x55, 0x30),
         Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x80),
     }
 }
@@ -698,7 +623,7 @@ pub fn shadow_ink() -> Color {
 /// alpha carries it, so a gradient fades without per-pixel work.
 pub fn elevated_popup(e: f32) -> Color {
     let base = popup();
-    let lift = if mode() == Mode::Light { 6 } else { 9 };
+    let lift = if mode() == Mode::Light { 3 } else { 7 };
     let Color::Solid([r, g, b, _]) = base.clone() else {
         return fade(base, e);
     };
@@ -706,7 +631,7 @@ pub fn elevated_popup(e: f32) -> Color {
     // The lift is small enough that no palette channel can overflow —
     // clippy knows it too, so there is deliberately no `.min(255)` here.
     assert!(lift <= 15);
-    let up = |c: u8| c + lift;
+    let up = |c: u8| c.saturating_add(lift);
     Color::gradient(
         [up(r), up(g), up(b), a],
         [r, g, b, a],
@@ -757,10 +682,95 @@ pub fn hover_fill(layer: &Layer, rect: Rect, weight: f32) {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            fade(selection(), 0.32 * weight),
-            Rounding::NONE,
+            fade(selection(), 0.55 * weight),
+            Rounding::uniform(7.0),
         );
     }
+}
+
+/// A softly lit surface. The gradient is geometry rendered by Atomos;
+/// no texture allocation or continuously running effect is needed.
+pub fn surface(layer: &Layer, rect: Rect, base: Color, radius: f32) {
+    let top = mix(
+        base.clone(),
+        ink(),
+        if mode() == Mode::Dark { 0.018 } else { 0.006 },
+    );
+    let (Color::Solid(top), Color::Solid(bottom)) = (top, base) else {
+        return;
+    };
+    layer.draw_rectangle(
+        rect.position(),
+        rect.size(),
+        Color::gradient(top, bottom, GradientDirection::Vertical),
+        Rounding::uniform(radius),
+    );
+}
+
+/// The app's folded-page mark, drawn as native paths at any scale.
+pub fn app_mark(layer: &Layer, rect: Rect) {
+    let color = mix(accent(), badge_ink(BadgeColor::Purple), 0.28);
+    let (Color::Solid(top), Color::Solid(bottom)) = (accent(), color) else {
+        return;
+    };
+    layer.draw_rectangle(
+        rect.position(),
+        rect.size(),
+        Color::gradient(top, bottom, GradientDirection::Vertical),
+        Rounding::uniform(rect.width * 0.29),
+    );
+    icon(
+        layer,
+        icons::NOTE_MARK,
+        (rect.x + rect.width * 0.2, rect.y + rect.height * 0.2),
+        rect.width * 0.6,
+        mark_ink(),
+        1.6,
+    );
+}
+
+pub fn mark_ink() -> Color {
+    Color::rgb(0xFF, 0xFF, 0xFF)
+}
+
+/// A keyboard hint with a restrained physical edge. Returns its width.
+pub fn keycap(layer: &Layer, label: &str, at: (f32, f32), alpha: f32) -> f32 {
+    let style = TextStyle::sans(11.0, fade(dim(), alpha));
+    let width = width(layer, label, &style) + 12.0;
+    let rect = Rect::new(at.0, at.1 - 10.0, width, 20.0);
+    layer.draw_rectangle(
+        rect.position(),
+        rect.size(),
+        fade(alt(), alpha),
+        Rounding::uniform(5.0),
+    );
+    rounded_outline(layer, rect.inset(0.5), 4.5, 1.0, fade(border(), alpha));
+    draw(layer, label, (at.0 + width / 2.0, at.1), &style, CENTER);
+    width
+}
+
+/// Ellipsize before shaping the final label so it stays inside its control.
+pub fn elide(layer: &Layer, text: &str, max_width: f32, style: &TextStyle) -> String {
+    if width(layer, text, style) <= max_width {
+        return text.into();
+    }
+    if width(layer, "…", style) > max_width {
+        return String::new();
+    }
+    let mut ends: Vec<_> = text.char_indices().map(|(i, _)| i).collect();
+    ends.push(text.len());
+    let mut low = 0;
+    let mut high = ends.len() - 1;
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let label = format!("{}…", &text[..ends[mid]]);
+        if width(layer, &label, style) <= max_width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    format!("{}…", &text[..ends[low]])
 }
 
 /// Draws one of the [`icons`] paths, `at` being its top-left corner.
@@ -826,6 +836,11 @@ pub fn polyline(layer: &Layer, points: &[(f32, f32)], color: Color, thickness: f
 /// Circles and rects from the source SVG are written out as arcs and
 /// closed subpaths: `draw_svg_icon` takes one path's `d`, not a document.
 pub mod icons {
+    pub const NOTE_MARK: &str =
+        "M7 3H16L20 7V21H7A3 3 0 0 1 4 18V6A3 3 0 0 1 7 3Z M8 3V21 M12 10H16 M12 14H16";
+    pub const SIDEBAR: &str =
+        "M4 4H20A1 1 0 0 1 21 5V19A1 1 0 0 1 20 20H4A1 1 0 0 1 3 19V5A1 1 0 0 1 4 4Z M9 4V20";
+    pub const FOCUS: &str = "M8 3H3V8 M16 3H21V8 M3 16V21H8 M21 16V21H16";
     pub const CHECK: &str = "M20 6L9 17l-5-5";
     pub const FILE: &str =
         "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z M14 2L14 8L20 8";
@@ -941,9 +956,9 @@ mod tests {
                 Theme::of(Theme::of(mode).mode.flipped())
             );
         }
-        assert_ne!(Theme::LIGHT, Theme::NOIR);
+        assert_ne!(Theme::LIGHT, Theme::DARK);
         assert_eq!(Theme::of(Mode::Light), Theme::LIGHT);
-        assert_eq!(Theme::of(Mode::Dark), Theme::NOIR);
+        assert_eq!(Theme::of(Mode::Dark), Theme::DARK);
     }
 
     /// The redraw request is a one-shot: the shell takes it, redraws every

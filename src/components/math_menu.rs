@@ -358,8 +358,8 @@ impl Component for MathMenu {
             theme::fade(theme::non_text(), ea),
         );
 
-        let name_style = TextStyle::serif(15.0, theme::fade(theme::ink(), ea));
-        let group_style = TextStyle::serif(11.5, theme::fade(theme::comment(), ea));
+        let name_style = TextStyle::sans(15.0, theme::fade(theme::ink(), ea));
+        let group_style = TextStyle::sans(11.5, theme::fade(theme::comment(), ea));
         let preview_style = TextStyle::math(17.0, theme::fade(theme::ink(), ea));
 
         // The slide pill rides under the selected row/cell, replacing the

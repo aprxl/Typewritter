@@ -135,21 +135,21 @@ impl Component for Onboarding {
             layer,
             "Welcome to Typewritter",
             (center_x, card.y + 92.0),
-            &TextStyle::serif(24.0, theme::ink()).bold(),
+            &TextStyle::sans(24.0, theme::ink()).bold(),
             theme::CENTER,
         );
         theme::draw(
             layer,
             "Pick a folder to keep your notes in.",
             (center_x, card.y + 126.0),
-            &TextStyle::serif(13.5, theme::dim()),
+            &TextStyle::sans(13.5, theme::dim()),
             theme::CENTER,
         );
         theme::draw(
             layer,
             "It becomes your vault.",
             (center_x, card.y + 150.0),
-            &TextStyle::serif(13.5, theme::dim()),
+            &TextStyle::sans(13.5, theme::dim()),
             theme::CENTER,
         );
 
@@ -178,7 +178,7 @@ impl Component for Onboarding {
                 button.x + button.width / 2.0,
                 button.y + button.height / 2.0,
             ),
-            &TextStyle::serif(
+            &TextStyle::sans(
                 14.0,
                 theme::mix(theme::accent(), theme::background(), weight),
             ),

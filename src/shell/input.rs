@@ -118,6 +118,20 @@ impl Shell {
         // thousandth. A swap already running swallows the click — see
         // `ThemeSwap`.
         if input.is_mouse_pressed(MouseButton::Left) && input.is_cursor_in_window() {
+            let bar = self.layout.rect(self.regions[self.title_region].node());
+            let command_id = if title_bar::sidebar_rect(bar).contains(input.mouse_position()) {
+                Some("view.sidebar")
+            } else if title_bar::focus_rect(bar).contains(input.mouse_position()) {
+                Some("view.capture")
+            } else {
+                None
+            };
+            if let Some(command) =
+                command_id.and_then(|id| commands::COMMANDS.iter().find(|command| command.id == id))
+            {
+                (command.run)(self);
+                return;
+            }
             let switch =
                 theme_switch::switch_rect(self.layout.rect(self.regions[self.title_region].node()));
             if switch.contains(input.mouse_position()) {
@@ -131,11 +145,8 @@ impl Shell {
 
         if input.is_mouse_pressed(MouseButton::Left)
             && input.is_cursor_in_window()
-            && title_bar::search_box_rect(
-                self.regions[self.title_region].layer(),
-                self.layout.rect(self.regions[self.title_region].node()),
-            )
-            .contains(input.mouse_position())
+            && title_bar::search_box_rect(self.layout.rect(self.regions[self.title_region].node()))
+                .contains(input.mouse_position())
         {
             self.open_finder();
             return;
@@ -1645,11 +1656,7 @@ impl Shell {
 
     fn refresh_finder(&mut self) {
         let query = self.finder.as_ref().map(|state| state.query.clone());
-        self.regions[self.title_region].set_component(Box::new(title_bar::TitleBar::new(
-            "Typewritter",
-            "LECTURE CAPTURE",
-            query,
-        )));
+        self.regions[self.title_region].set_component(Box::new(title_bar::TitleBar::new(query)));
         let finder = match &self.finder {
             Some(state) => Finder::new(state.rows.clone(), state.query.clone(), state.selected),
             None => Finder::closed(),

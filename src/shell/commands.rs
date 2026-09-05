@@ -216,9 +216,13 @@ pub const COMMANDS: &[Command] = &[
         }),
         run: |shell| shell.open_picker(),
     },
-    // Ctrl+1..4 used to toggle the four regions. Those chords now pick a
-    // row in the finder (Ctrl+1..5), the only thing those keys do; the
-    // toggles themselves were reachable only from here and went with them.
+    Command {
+        id: "view.sidebar",
+        title: "Toggle sidebar",
+        group: "View",
+        chord: None,
+        run: |shell| shell.tree.toggle(),
+    },
     Command {
         id: "view.capture",
         title: "Capture mode",

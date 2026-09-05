@@ -490,7 +490,7 @@ impl Component for Editor {
                 layer,
                 "No file open",
                 (x, rect.y + 56.0),
-                &TextStyle::serif(17.5, theme::dim()),
+                &TextStyle::sans(17.5, theme::dim()),
                 theme::LEFT,
             );
             theme::draw(
@@ -970,7 +970,7 @@ impl Component for Editor {
                 } else {
                     format!("{} lines hidden", indicator.lines)
                 };
-                let style = TextStyle::serif(12.5 * scale, theme::comment()).italic();
+                let style = TextStyle::sans(12.5 * scale, theme::comment()).italic();
                 for dot in 0..3 {
                     layer.draw_circle(
                         (x + 4.0 * scale + dot as f32 * 4.5 * scale, mid),
@@ -1033,8 +1033,7 @@ impl Component for Editor {
             // legible. Falls back to a space's advance past the end of the
             // line, like the old line editor did.
             let sample = caret_char.map(String::from).unwrap_or_else(|| " ".into());
-            let width =
-                theme::width(layer, &sample, &TextStyle::serif(17.5, theme::ink())).max(1.0);
+            let width = theme::width(layer, &sample, &TextStyle::sans(17.5, theme::ink())).max(1.0);
             layer.draw_rectangle(
                 (screen_x, screen_y - caret_height * 0.5 + 2.0),
                 (width, caret_height - 4.0),
@@ -1430,7 +1429,7 @@ mod tests {
             Inline::Note(_) | Inline::EqRef(_) => unreachable!(),
         };
         assert_eq!(width, box_width);
-        assert!(width > measure(&atom, &TextStyle::serif(17.5, theme::ink())));
+        assert!(width > measure(&atom, &TextStyle::sans(17.5, theme::ink())));
     }
 
     /// The fold chevron's path is parsed by the renderer at draw time; the

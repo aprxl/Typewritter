@@ -539,11 +539,7 @@ impl Shell {
         };
         let mut regions = vec![
             region(renderer, Layout::ROOT, Box::new(Backdrop)),
-            region(
-                renderer,
-                title,
-                Box::new(TitleBar::new("Typewritter", "LECTURE CAPTURE", None)),
-            ),
+            region(renderer, title, Box::new(TitleBar::new(None))),
             region(
                 renderer,
                 tabs,
@@ -595,7 +591,7 @@ impl Shell {
                     "no file open".into(),
                     String::new(),
                     String::new(),
-                    true,
+                    false,
                     String::new(),
                 )),
             ),
@@ -729,7 +725,7 @@ impl Shell {
             wake_at: None,
             autosave_last_attempt: Instant::now(),
             autosave_revision: 0,
-            show_stats: true,
+            show_stats: false,
             debug_rows: false,
             dragging: None,
             divider_hot: false,

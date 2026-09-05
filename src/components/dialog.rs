@@ -148,7 +148,7 @@ impl Dialog {
             theme::border(),
         );
 
-        let style = TextStyle::serif(16.0, theme::ink());
+        let style = TextStyle::sans(16.0, theme::ink());
         let middle = field.y + field.height / 2.0;
         let mut shown = String::new();
         let mut shown_width = 0.0;
@@ -268,7 +268,7 @@ impl Component for Dialog {
             layer,
             prompt.title(),
             (card.x + card.width / 2.0, card.y + 34.0),
-            &TextStyle::serif(19.0, theme::fade(theme::ink(), ea)).bold(),
+            &TextStyle::sans(19.0, theme::fade(theme::ink(), ea)).bold(),
             theme::CENTER,
         );
 
@@ -281,14 +281,14 @@ impl Component for Dialog {
                     layer,
                     name,
                     (card.x + card.width / 2.0, card.y + 82.0),
-                    &TextStyle::serif(16.0, theme::fade(theme::ink(), ea)),
+                    &TextStyle::sans(16.0, theme::fade(theme::ink(), ea)),
                     theme::CENTER,
                 );
                 theme::draw(
                     layer,
                     "is deleted from disk. This cannot be undone.",
                     (card.x + card.width / 2.0, card.y + 108.0),
-                    &TextStyle::serif(13.5, theme::fade(theme::dim(), ea)),
+                    &TextStyle::sans(13.5, theme::fade(theme::dim(), ea)),
                     theme::CENTER,
                 );
             }
@@ -322,7 +322,7 @@ impl Component for Dialog {
                 confirm.x + confirm.width / 2.0,
                 confirm.y + confirm.height / 2.0,
             ),
-            &TextStyle::serif(13.0, theme::fade(theme::background(), ea)),
+            &TextStyle::sans(13.0, theme::fade(theme::background(), ea)),
             theme::CENTER,
         );
 
@@ -346,7 +346,7 @@ impl Component for Dialog {
                 cancel.x + cancel.width / 2.0,
                 cancel.y + cancel.height / 2.0,
             ),
-            &TextStyle::serif(13.0, theme::fade(theme::dim(), ea)),
+            &TextStyle::sans(13.0, theme::fade(theme::dim(), ea)),
             theme::CENTER,
         );
     }

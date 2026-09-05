@@ -14,7 +14,7 @@ use crate::tabs::Tabs;
 use crate::theme::{self, TextStyle, icons};
 use crate::ui::{Component, Context, Dirty, Hover};
 
-pub const HEIGHT: f32 = 39.0;
+pub const HEIGHT: f32 = 46.0;
 /// Room for the icon, the padding either side, and the close button.
 const TAB_CHROME: f32 = 69.0;
 const PLUS_WIDTH: f32 = 42.0;
@@ -61,14 +61,15 @@ impl TabStrip {
     }
 
     fn style(tab: &TabView) -> TextStyle {
-        TextStyle::serif(
-            14.0,
+        let style = TextStyle::sans(
+            12.5,
             if tab.preview {
                 theme::comment()
             } else {
                 theme::ink()
             },
-        )
+        );
+        if tab.preview { style.italic() } else { style }
     }
 }
 
@@ -79,7 +80,7 @@ impl Component for TabStrip {
             .iter()
             .map(|tab| theme::width(layer, &tab.name, &Self::style(tab)) + TAB_CHROME)
             .sum();
-        (width + PLUS_WIDTH, HEIGHT)
+        ((width + PLUS_WIDTH + 24.0).min(600.0), HEIGHT)
     }
 
     fn sync(&mut self, context: &Context) {
@@ -139,12 +140,12 @@ impl Component for TabStrip {
         );
         let middle = rect.y + (rect.height - 1.0) / 2.0;
 
-        let mut x = rect.x;
+        let mut x = rect.x + 12.0;
         self.tab_rects.clear();
         for (index, tab) in self.tabs.iter().enumerate() {
             let style = Self::style(tab);
             let width = theme::width(layer, &tab.name, &style) + TAB_CHROME;
-            let tab_rect = Rect::new(x, rect.y, width, rect.height - 1.0);
+            let tab_rect = Rect::new(x, rect.y + 6.0, width, rect.height - 12.0);
             self.tab_rects.push(tab_rect);
 
             let active = self.active == Some(index);
@@ -153,9 +154,9 @@ impl Component for TabStrip {
                     tab_rect.position(),
                     tab_rect.size(),
                     theme::background(),
-                    Rounding::NONE,
+                    Rounding::uniform(8.0),
                 );
-                theme::rule(layer, (x, rect.bottom() - 2.0), width, 2.0, theme::accent());
+                theme::rounded_outline(layer, tab_rect.inset(0.5), 7.5, 1.0, theme::border());
             }
             if self.hovered == Some(index) {
                 theme::hover_fill(layer, tab_rect, self.hover.value());
@@ -189,16 +190,16 @@ impl Component for TabStrip {
                 (close_rect(tab_rect).x + 4.0, middle - 6.5),
                 13.0,
                 if self.hovered == Some(index) {
-                    theme::non_text()
+                    theme::ink()
                 } else {
                     theme::faint()
                 },
                 1.8,
             );
-            x += width;
+            x += width + 5.0;
         }
 
-        self.plus_rect = Rect::new(x, rect.y, PLUS_WIDTH, rect.height);
+        self.plus_rect = Rect::new(x, rect.y + 7.0, PLUS_WIDTH, rect.height - 14.0);
         theme::hover_fill(layer, self.plus_rect, self.plus_hover.value());
         theme::icon(
             layer,

@@ -7,7 +7,7 @@ use crate::renderer::{Color, Layer, Rounding};
 use crate::theme::{self, TextStyle, icons};
 use crate::ui::{Component, Context, Dirty};
 
-pub const HEIGHT: f32 = 38.0;
+pub const HEIGHT: f32 = 36.0;
 
 /// What the bar says about the active note. Rebuilt by the shell whenever
 /// the tabs change; the instrumentation on the right comes from [`Context`]
@@ -77,7 +77,7 @@ impl Component for StatusLine {
         // Measured against a fixed-width sample, not the live numbers: a
         // minimum that changed with every frametime digit would dirty the
         // layout on every frame, which is the opposite of the point.
-        let body = TextStyle::serif(13.5, theme::dim());
+        let body = TextStyle::sans(11.5, theme::dim());
         let note = if self.command.is_empty() {
             &self.note
         } else {
@@ -126,16 +126,18 @@ impl Component for StatusLine {
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
         layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
-        theme::rule(layer, (rect.x, rect.y), rect.width, 2.0, theme::border());
+        theme::rule(layer, (rect.x, rect.y), rect.width, 1.0, theme::border());
         let middle = rect.y + 2.0 + (rect.height - 2.0) / 2.0;
 
-        let mode_style = TextStyle::mono(10.0, theme::background()).tracked(0.18);
+        let mode_style = TextStyle::sans(9.5, self.mode_color.clone())
+            .bold()
+            .tracked(0.06);
         let mode_width = theme::width(layer, &self.mode, &mode_style) + 20.0;
         layer.draw_rectangle(
             (rect.x + 18.0, middle - 9.0),
             (mode_width, 18.0),
-            self.mode_color.clone(),
-            Rounding::NONE,
+            theme::fade(self.mode_color.clone(), 0.13),
+            Rounding::uniform(5.0),
         );
         theme::draw(
             layer,
@@ -145,7 +147,7 @@ impl Component for StatusLine {
             theme::LEFT,
         );
 
-        let body = TextStyle::serif(13.5, theme::dim());
+        let body = TextStyle::sans(11.5, theme::dim());
         let x = rect.x + 18.0 + mode_width + 12.0;
 
         // The right cluster is laid out backwards from the right edge and
@@ -184,7 +186,7 @@ impl Component for StatusLine {
             right -= theme::width(layer, &self.saved, &body) + 7.0;
             theme::icon(
                 layer,
-                icons::BRANCH,
+                icons::CHECK,
                 (right - 13.0, middle - 6.5),
                 13.0,
                 theme::live(),

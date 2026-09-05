@@ -287,7 +287,7 @@ impl Component for Palette {
                 layer,
                 "No matching command",
                 (card.x + card.width / 2.0, card.y + QUERY_H + 32.0),
-                &TextStyle::serif(13.5, theme::fade(theme::faint(), ea)),
+                &TextStyle::sans(13.5, theme::fade(theme::faint(), ea)),
                 theme::CENTER,
             );
         } else {
@@ -317,7 +317,7 @@ fn row_rect(card: Rect, row: usize) -> Rect {
 
 impl Palette {
     fn draw_query(&self, layer: &Layer, card: Rect, ea: f32) {
-        let style = TextStyle::serif(16.0, theme::fade(theme::ink(), ea));
+        let style = TextStyle::sans(16.0, theme::fade(theme::ink(), ea));
         let middle = card.y + QUERY_H / 2.0;
         if self.query.is_empty() {
             theme::draw(
@@ -349,8 +349,8 @@ impl Palette {
     }
 
     fn draw_rows(&self, layer: &Layer, card: Rect, ea: f32) {
-        let title_style = TextStyle::serif(15.0, theme::fade(theme::ink(), ea));
-        let group_style = TextStyle::serif(11.5, theme::fade(theme::comment(), ea));
+        let title_style = TextStyle::sans(15.0, theme::fade(theme::ink(), ea));
+        let group_style = TextStyle::sans(11.5, theme::fade(theme::comment(), ea));
         let hint_style = TextStyle::mono(10.5, theme::fade(theme::faint(), ea));
 
         // The slide pill rides under the selected row — arrow keys move it

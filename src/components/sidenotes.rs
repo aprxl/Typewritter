@@ -60,7 +60,7 @@ const MARKER_SIZE: f32 = 10.0;
 /// [`layout::anchor_style`](crate::document::layout::anchor_style), which is
 /// the other half of this pair.
 pub fn marker_style() -> TextStyle {
-    TextStyle::serif(MARKER_SIZE, theme::accent())
+    TextStyle::sans(MARKER_SIZE, theme::accent())
 }
 
 /// The editor metrics a note draws with: the margin's own insets and measure,

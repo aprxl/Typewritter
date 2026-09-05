@@ -63,7 +63,7 @@ impl Topics {
 
 impl Component for Topics {
     fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        let style = TextStyle::serif(14.5, theme::dim());
+        let style = TextStyle::sans(14.5, theme::dim());
         let widest = self
             .entries
             .iter()
@@ -158,7 +158,7 @@ impl Component for Topics {
                 layer,
                 &entry.name,
                 (name_x, y),
-                &TextStyle::serif(size, if active { theme::ink() } else { color }),
+                &TextStyle::sans(size, if active { theme::ink() } else { color }),
                 theme::LEFT,
             );
             y += if entry.depth == 0 { 24.0 } else { 21.0 };

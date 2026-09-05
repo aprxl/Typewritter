@@ -245,7 +245,7 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
         .tracked(0.1);
     }
     let mut base = match kind {
-        Block::Heading { level, .. } => TextStyle::serif(
+        Block::Heading { level, .. } => TextStyle::sans(
             match level {
                 1 => 24.0,
                 2 => 21.0,
@@ -256,7 +256,7 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
         )
         .bold(),
         Block::Paragraph(_) | Block::Divider(_) | Block::Math { .. } => {
-            TextStyle::serif(17.5 * scale, theme::ink())
+            TextStyle::sans(17.5 * scale, theme::ink())
         }
         // A done task's text is dimmed: the drawn strike through it says
         // "done", the muted ink says "past tense". Together they quiet the
@@ -264,8 +264,8 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
         Block::ListItem {
             marker: ListMarker::Task { done: true },
             ..
-        } => TextStyle::serif(17.5 * scale, theme::dim()),
-        Block::ListItem { .. } => TextStyle::serif(17.5 * scale, theme::ink()),
+        } => TextStyle::sans(17.5 * scale, theme::dim()),
+        Block::ListItem { .. } => TextStyle::sans(17.5 * scale, theme::ink()),
         Block::CodeLine { .. } => TextStyle::mono(17.5 * scale, theme::ink()),
     };
     if style.bold {
@@ -281,7 +281,7 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
 /// auto-number and the colour is the accent, so an anchor reads as "this
 /// opens something" rather than as a word in the sentence.
 pub fn anchor_style() -> TextStyle {
-    TextStyle::serif(ANCHOR_SIZE, theme::accent())
+    TextStyle::sans(ANCHOR_SIZE, theme::accent())
 }
 
 /// The ink an inline equation reference draws with. Resolved, it takes the
@@ -291,7 +291,7 @@ pub fn anchor_style() -> TextStyle {
 /// a number.
 pub fn eq_ref_style(display: &str, scale: f32) -> TextStyle {
     if display.starts_with('(') {
-        TextStyle::serif(17.5 * scale, theme::accent())
+        TextStyle::sans(17.5 * scale, theme::accent())
     } else {
         TextStyle::mono(theme::BADGE_SIZE * scale, theme::comment())
     }

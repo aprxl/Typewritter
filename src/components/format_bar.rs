@@ -560,7 +560,7 @@ fn paint(layer: &Layer, cell: Rect, kind: Kind, checked: bool, e: f32) {
                 layer,
                 "B",
                 (cx, middle),
-                &TextStyle::serif(15.0, ink).bold(),
+                &TextStyle::sans(15.0, ink).bold(),
                 theme::CENTER,
             );
         }
@@ -569,7 +569,7 @@ fn paint(layer: &Layer, cell: Rect, kind: Kind, checked: bool, e: f32) {
                 layer,
                 "I",
                 (cx, middle),
-                &TextStyle::serif(15.0, ink).italic(),
+                &TextStyle::sans(15.0, ink).italic(),
                 theme::CENTER,
             );
         }
