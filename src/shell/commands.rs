@@ -16,6 +16,7 @@ use super::Shell;
 use crate::components::dialog::Prompt;
 use crate::components::palette;
 use crate::document::math::{AccentKind, BigOp, SymbolRole};
+use crate::document::math_style::{HighlightShape, MathHue};
 use crate::document::{BadgeColor, ListMarker};
 use crate::input::Input;
 
@@ -75,6 +76,34 @@ pub struct Command {
     pub group: &'static str,
     pub chord: Option<Chord>,
     pub run: fn(&mut Shell),
+}
+
+/// One command per hue and per highlight shape. `Command::run` is a plain
+/// function pointer rather than a closure, so each needs a body of its own;
+/// the title comes from the same `label()` the menu reads, so a rename
+/// cannot leave the two spellings disagreeing.
+macro_rules! hue_command {
+    ($id:literal, $hue:ident) => {
+        Command {
+            id: $id,
+            title: MathHue::$hue.label(),
+            group: "Colour",
+            chord: None,
+            run: |shell| shell.context_set_math_hue(MathHue::$hue),
+        }
+    };
+}
+
+macro_rules! shape_command {
+    ($id:literal, $shape:ident) => {
+        Command {
+            id: $id,
+            title: HighlightShape::$shape.label(),
+            group: "Highlight",
+            chord: None,
+            run: |shell| shell.context_set_math_shape(HighlightShape::$shape),
+        }
+    };
 }
 
 const CTRL: ModifiersState = ModifiersState::CONTROL;
@@ -534,6 +563,26 @@ pub const COMMANDS: &[Command] = &[
         chord: None,
         run: |shell| shell.context_set_math_role(SymbolRole::Function),
     },
+    hue_command!("context.hue.rose", Rose),
+    hue_command!("context.hue.coral", Coral),
+    hue_command!("context.hue.amber", Amber),
+    hue_command!("context.hue.olive", Olive),
+    hue_command!("context.hue.green", Green),
+    hue_command!("context.hue.teal", Teal),
+    hue_command!("context.hue.sky", Sky),
+    hue_command!("context.hue.indigo", Indigo),
+    hue_command!("context.hue.violet", Violet),
+    hue_command!("context.hue.magenta", Magenta),
+    shape_command!("context.shape.fill", Fill),
+    shape_command!("context.shape.outline", Outline),
+    shape_command!("context.shape.both", Both),
+    Command {
+        id: "context.symbol.automatic",
+        title: "Back to automatic",
+        group: "Symbol",
+        chord: None,
+        run: |shell| shell.context_reset_math_style(),
+    },
     Command {
         id: "context.variant.plain",
         title: "Plain",
@@ -796,6 +845,33 @@ pub const SYMBOL_ROLE_MENU: &[&str] = &[
     "context.symbol.constant",
     "context.symbol.function",
 ];
+
+/// The ten identity hues, in wheel order — the same order `MathHue::ALL`
+/// lists them, so the swatch grid reads as a colour wheel rather than an
+/// alphabetised list.
+pub const SYMBOL_HUE_MENU: &[&str] = &[
+    "context.hue.rose",
+    "context.hue.coral",
+    "context.hue.amber",
+    "context.hue.olive",
+    "context.hue.green",
+    "context.hue.teal",
+    "context.hue.sky",
+    "context.hue.indigo",
+    "context.hue.violet",
+    "context.hue.magenta",
+];
+
+pub const SYMBOL_SHAPE_MENU: &[&str] = &[
+    "context.shape.fill",
+    "context.shape.outline",
+    "context.shape.both",
+];
+
+/// Putting a symbol back on the hue its letter falls on and the shape its
+/// role asks for. One row, because a reader who has customised nothing
+/// should still be able to see what automatic looks like.
+pub const SYMBOL_AUTOMATIC_MENU: &[&str] = &["context.symbol.automatic"];
 
 pub const GROUP_MENU: &[&str] = &[
     "context.group.parentheses",

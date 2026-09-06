@@ -75,8 +75,8 @@ pub struct Theme {
     /// joins.
     pub math_operator: Color,
     /// The identity washes behind symbols, in [`MathHue::ALL`] order. Fills
-    /// only — an outline is derived from its fill by [`shade`], so a border
-    /// can never drift off the hue it belongs to.
+    /// only — an outline is derived from its fill by [`Theme::shade`], so a
+    /// border can never drift off the hue it belongs to.
     pub math_hues: [Color; MathHue::ALL.len()],
 
     // Text and non-text hierarchy.
@@ -188,6 +188,40 @@ impl Theme {
             Mode::Light => Self::LIGHT,
             Mode::Dark => Self::DARK,
         }
+    }
+
+    /// The wash behind a symbol carrying `hue`.
+    pub fn math_fill(&self, hue: MathHue) -> Color {
+        self.math_hues[hue as usize].clone()
+    }
+
+    /// The border around a symbol carrying `hue`: its own fill, shaded.
+    pub fn math_edge(&self, hue: MathHue) -> Color {
+        let index = usize::from(self.mode == Mode::Dark);
+        self.shade(self.math_fill(hue), EDGE_STEP[index], EDGE_CHROMA[index])
+    }
+
+    /// The same colour, pushed `step` away from *this palette's* page and
+    /// `chroma` times as saturated: darker on a light appearance, lighter
+    /// on a dark one.
+    ///
+    /// Done in HSL rather than by mixing toward the ink, because mixing
+    /// drags every hue toward the ink's own — on the mulberry palette that
+    /// turns ten distinguishable borders into ten shades of plum-grey.
+    /// Rotating value and saturation leaves the hue exactly where it was,
+    /// which is the whole promise: a border is a shade of its fill, not a
+    /// second colour.
+    pub fn shade(&self, color: Color, step: f32, chroma: f32) -> Color {
+        let Color::Solid([r, g, b, a]) = color else {
+            return color;
+        };
+        let (hue, saturation, lightness) = to_hsl(r, g, b);
+        let lightness = match self.mode {
+            Mode::Light => lightness * (1.0 - step),
+            Mode::Dark => lightness + (1.0 - lightness) * step,
+        };
+        let (r, g, b) = from_hsl(hue, (saturation * chroma).min(1.0), lightness);
+        Color::rgba(r, g, b, a)
     }
 
     /// The ink a badge of `color` is drawn in — label and hairline box both.
@@ -608,43 +642,23 @@ pub fn mix(from: Color, to: Color, t: f32) -> Color {
 /// How far [`math_edge`] pushes a fill away from the page. Higher in the
 /// dark appearance because a border there is climbing out of a deep tint
 /// rather than down out of a pale one, and the same step reads as less.
-const EDGE_STEP: [f32; 2] = [0.38, 0.40];
+const EDGE_STEP: [f32; 2] = [0.50, 0.42];
 /// How far [`math_edge`] lifts a fill's saturation. A one-pixel line has
-/// almost no area to carry a hue with, so it is given more chroma than the
-/// wash it edges — otherwise it reads as grey.
-const EDGE_CHROMA: [f32; 2] = [1.45, 1.40];
+/// almost no area to carry a hue with, so it is given a little more chroma
+/// than the wash it edges — but only a little. The pale hues start out
+/// light enough that a bigger lift sends amber and olive fluorescent, and a
+/// highlighter pen is not what a page of mathematics wants.
+const EDGE_CHROMA: [f32; 2] = [1.15, 1.25];
 
 /// The wash behind a symbol carrying `hue`.
 pub fn math_fill(hue: MathHue) -> Color {
-    server().theme().math_hues[hue as usize].clone()
+    server().theme().math_fill(hue)
 }
 
 /// The border around a symbol carrying `hue`: its own fill, shaded. Never a
-/// colour of its own — see [`shade`].
+/// colour of its own — see [`Theme::shade`].
 pub fn math_edge(hue: MathHue) -> Color {
-    let index = usize::from(mode() == Mode::Dark);
-    shade(math_fill(hue), EDGE_STEP[index], EDGE_CHROMA[index])
-}
-
-/// The same colour, pushed `step` away from the page and `chroma` times as
-/// saturated: darker on a light appearance, lighter on a dark one.
-///
-/// Done in HSL rather than by mixing toward the ink, because mixing drags
-/// every hue toward the ink's own — on the mulberry palette that turns ten
-/// distinguishable borders into ten shades of plum-grey. Rotating value and
-/// saturation leaves the hue exactly where it was, which is the whole
-/// promise: a border is a shade of its fill, not a second colour.
-pub fn shade(color: Color, step: f32, chroma: f32) -> Color {
-    let Color::Solid([r, g, b, a]) = color else {
-        return color;
-    };
-    let (hue, saturation, lightness) = to_hsl(r, g, b);
-    let lightness = match mode() {
-        Mode::Light => lightness * (1.0 - step),
-        Mode::Dark => lightness + (1.0 - lightness) * step,
-    };
-    let (r, g, b) = from_hsl(hue, (saturation * chroma).min(1.0), lightness);
-    Color::rgba(r, g, b, a)
+    server().theme().math_edge(hue)
 }
 
 /// sRGB to HSL, hue in turns. Straight from the definition; the only care
@@ -1002,6 +1016,53 @@ pub mod icons {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `shade` is what makes a border "a shade of its fill" true rather
+    /// than aspirational: the hue must come out where it went in, and the
+    /// value must move away from the page — down on chalk, up on mulberry.
+    #[test]
+    fn a_shade_keeps_its_hue_and_moves_away_from_the_page() {
+        for (mode, brighter) in [(Mode::Light, false), (Mode::Dark, true)] {
+            let theme = Theme::of(mode);
+            for hue in MathHue::ALL {
+                let Color::Solid([r, g, b, _]) = theme.math_fill(hue) else {
+                    panic!("a hue is a solid colour");
+                };
+                let Color::Solid([sr, sg, sb, _]) = theme.math_edge(hue) else {
+                    panic!("a shade of a solid colour is solid");
+                };
+                let (fill_hue, _, fill_light) = to_hsl(r, g, b);
+                let (edge_hue, _, edge_light) = to_hsl(sr, sg, sb);
+
+                let turned = (fill_hue - edge_hue)
+                    .abs()
+                    .min(1.0 - (fill_hue - edge_hue).abs());
+                assert!(
+                    turned < 0.02,
+                    "{hue:?} in {mode:?} turned {turned} of a wheel"
+                );
+                assert_eq!(
+                    edge_light > fill_light,
+                    brighter,
+                    "{hue:?} in {mode:?} moved the wrong way"
+                );
+            }
+        }
+    }
+
+    /// Ten hues that a reader has to tell apart cannot be nine.
+    #[test]
+    fn every_hue_is_its_own_colour_in_both_appearances() {
+        for mode in [Mode::Light, Mode::Dark] {
+            let theme = Theme::of(mode);
+            for (index, hue) in theme.math_hues.iter().enumerate() {
+                assert!(
+                    !theme.math_hues[..index].contains(hue),
+                    "{mode:?} repeats a hue at {index}"
+                );
+            }
+        }
+    }
 
     /// `rounded_outline` strokes generated path data with `.expect` — a
     /// typo in the generator would panic at draw time, so the exact shape

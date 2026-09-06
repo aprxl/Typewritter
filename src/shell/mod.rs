@@ -51,6 +51,7 @@ use crate::document::Focus;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind, layout_blocks};
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_conversion;
+use crate::document::math_style;
 use crate::document::outline;
 use crate::export;
 use crate::frame::FrameScheduler;
@@ -119,11 +120,21 @@ impl ViewUpdate {
     };
 }
 
+/// The two servers a laid-out document depends on: the palette, whose
+/// colours are baked into the `TextStyle`s that were measured, and symbol
+/// styling, which math layout resolves into every highlight as it measures.
+/// Either one moving invalidates a cached layout.
+type PaintRevision = (u64, u64);
+
+fn paint_revision() -> PaintRevision {
+    (theme::revision(), math_style::revision())
+}
+
 type LayoutCache = (
     u64,
     Option<usize>,
     Option<std::path::PathBuf>,
-    u64,
+    PaintRevision,
     f32,
     Rc<DocLayout>,
 );
@@ -132,7 +143,7 @@ type StackedNoteCache = (
     u64,
     Option<usize>,
     Option<std::path::PathBuf>,
-    u64,
+    PaintRevision,
     f32,
     Vec<StackedNote>,
 );
@@ -211,9 +222,11 @@ enum MenuDismiss {
         /// Which row the pill had parked on.
         pointer_row: Option<usize>,
     },
-    /// The right-click context menu: rows and live checkmarks as they stood.
+    /// The right-click context menu: whichever face it was wearing, as it
+    /// stood. One variant rather than two because it is one surface — same
+    /// region, same reveal clock, same anchor — showing one of two things.
     Context {
-        state: crate::components::context_menu::Snapshot,
+        state: ContextGhost,
         anchor: (f32, f32),
         pill_row: usize,
     },
@@ -223,6 +236,23 @@ enum MenuDismiss {
         anchor: (f32, f32),
         pill_row: usize,
     },
+}
+
+/// What a closing context menu was showing: a list of commands, or the
+/// symbol inspector.
+enum ContextGhost {
+    Commands(crate::components::context_menu::Snapshot),
+    Symbol(crate::components::symbol_menu::Snapshot),
+}
+
+impl ContextGhost {
+    /// A menu that offered nothing has no ghost worth showing.
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Commands(snapshot) => snapshot.entries.is_empty(),
+            Self::Symbol(snapshot) => snapshot.sections.is_empty(),
+        }
+    }
 }
 
 /// The in-math completion card while it is showing: the precise tree query,
@@ -1348,7 +1378,12 @@ impl Shell {
     /// [`TextStyle`]: crate::theme::TextStyle
     /// [`ThemeServer::take_change`]: crate::theme::ThemeServer::take_change
     fn sync_theme(&mut self) {
-        if !theme::take_change() {
+        // Both flags are taken every frame, never short-circuited: leaving
+        // one armed would replay this whole invalidation on the next frame
+        // for a change that has already landed.
+        let palette = theme::take_change();
+        let symbols = math_style::take_change();
+        if !palette && !symbols {
             return;
         }
         self.doc_layout = None;
@@ -1410,6 +1445,10 @@ impl Shell {
     /// The active document laid out at the given width, cached by
     /// `(revision, width)`. The measure source is the editor region's own
     /// layer, so what is measured here is exactly what the editor draws.
+    ///
+    /// Two revisions ride the key rather than one. Math layout resolves each
+    /// symbol's highlight as it measures, so recolouring a symbol invalidates
+    /// laid-out boxes exactly the way swapping the palette does.
     fn current_layout(&mut self, width: f32) -> Rc<DocLayout> {
         let (revision, active, path, theme_revision) = {
             let docs = self.docs.borrow();
@@ -1417,7 +1456,7 @@ impl Shell {
                 docs.layout_revision(),
                 docs.active_index(),
                 docs.active().map(|tab| tab.path().to_path_buf()),
-                theme::revision(),
+                paint_revision(),
             )
         };
         if let Some((r, a, p, t, w, layout)) = &self.doc_layout
@@ -1682,7 +1721,7 @@ impl Shell {
                 docs.layout_revision(),
                 docs.active_index(),
                 docs.active().map(|tab| tab.path().to_path_buf()),
-                theme::revision(),
+                paint_revision(),
             )
         };
         if let Some((r, a, p, t, w, notes)) = &self.stacked_note_layout

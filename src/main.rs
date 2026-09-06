@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use typewritter::config::Config;
+use typewritter::document::math_style;
 use typewritter::layout::Rect;
 use typewritter::renderer::Renderer;
 use typewritter::shell::Shell;
@@ -254,6 +255,13 @@ fn main() -> Result<(), winit::error::EventLoopError> {
     // folder dialog from there — the dialog never comes out of thin air.
     let onboard = std::env::args().any(|arg| arg == "--onboard");
     let config = Config::load().filter(|_| !onboard);
+
+    // Before the first frame: symbol styling is read from every math draw
+    // call, and installing it later would mean one frame drawn in colours
+    // the reader replaced.
+    if let Some(config) = &config {
+        math_style::install(config.math.clone());
+    }
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App {

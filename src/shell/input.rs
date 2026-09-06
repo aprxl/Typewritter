@@ -16,12 +16,14 @@ use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
     ContextMenu, Dialog, Editor, FileTree, Finder, FormatBar, MathMenu, Onboarding, Palette,
-    SlashMenu, TabStrip, Topics, context_menu, editor, file_tree, format_bar, math_menu,
-    onboarding, sidenotes, theme_switch, title_bar,
+    SlashMenu, SymbolMenu, TabStrip, Topics, context_menu, editor, file_tree, format_bar,
+    math_menu, onboarding, sidenotes, symbol_menu, theme_switch, title_bar,
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind};
 use crate::document::math::{self, AccentKind, BigOp, MathNode, NodeAddress, Slot, SymbolRole};
+use crate::document::math_style::{self, HighlightShape, MathHue};
+use crate::document::math_symbols;
 use crate::document::{
     BadgeColor, Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, Style, math_conversion,
     math_layout,
@@ -40,8 +42,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    ContextMenuState, MathMenuState, MenuDismiss, PaletteState, Shell, SlashMenuState,
-    WordFormatState,
+    ContextGhost, ContextMenuState, MathMenuState, MenuDismiss, PaletteState, Shell,
+    SlashMenuState, WordFormatState,
 };
 
 impl Shell {
@@ -1884,9 +1886,12 @@ impl Shell {
                 match node {
                     Some(MathNode::Sym(ch)) if ch.is_alphabetic() => symbol_context_ids(*ch),
                     Some(MathNode::Resolved { variant, body, .. }) => {
+                        // A multi-letter identity like `sin` has no
+                        // mathematical-alphanumeric variants, but role and
+                        // styling still apply to it.
                         symbol_base_glyph(body, variant)
                             .map(symbol_context_ids)
-                            .unwrap_or_else(|| commands::SYMBOL_ROLE_MENU.to_vec())
+                            .unwrap_or_else(symbol_style_ids)
                     }
                     Some(MathNode::Group { .. }) => commands::GROUP_MENU.to_vec(),
                     Some(MathNode::Accent { .. }) => commands::ACCENT_MENU.to_vec(),
@@ -2003,6 +2008,13 @@ impl Shell {
                         Inline::Math(list) => math::node_at(list, &address),
                         Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
                     });
+                // Hue and shape are not stored on the node — they are the
+                // reader's own vocabulary, kept in the vault config — so
+                // they are answered from the style server rather than from
+                // the tree, before the arms that read the tree.
+                if let Some(checked) = node.and_then(|node| symbol_style_checked(id, node)) {
+                    return checked;
+                }
                 match (id, node) {
                     ("context.symbol.variable", Some(MathNode::Resolved { role, .. })) => {
                         *role == SymbolRole::Variable
@@ -2013,6 +2025,10 @@ impl Shell {
                     ("context.symbol.function", Some(MathNode::Resolved { role, .. })) => {
                         *role == SymbolRole::Function
                     }
+                    // A bare letter is a variable nobody has said anything
+                    // else about — which is a role, and the card should
+                    // show it as the one the symbol already stands on.
+                    ("context.symbol.variable", Some(MathNode::Sym(ch))) => ch.is_alphabetic(),
                     ("context.variant.plain", Some(MathNode::Sym(ch))) => ch.is_alphabetic(),
                     ("context.variant.plain", Some(MathNode::Resolved { variant, .. })) => {
                         variant == "plain"
@@ -2206,6 +2222,75 @@ impl Shell {
         }
     }
 
+    /// The node the open formatting surface points at, if it is a math one.
+    fn context_math_node(&self) -> Option<MathNode> {
+        let (block, inline, address) = self.context_math_target()?;
+        let docs = self.docs.borrow();
+        docs.active()
+            .and_then(|tab| tab.document.body().get(block))
+            .and_then(|block| block.inlines().get(inline))
+            .and_then(|run| match run {
+                Inline::Math(list) => math::node_at(list, &address),
+                Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
+            })
+            .cloned()
+    }
+
+    /// The role and identity of the symbol under the open menu — the key its
+    /// styling is stored against.
+    ///
+    /// A bare letter has no `Resolved` wrapper and so no stored role; it is
+    /// a variable nobody has said anything else about, and it is keyed by
+    /// the letter itself. That is the same key math layout styles it under,
+    /// so recolouring an unresolved `x` reaches every `x` in the vault.
+    pub(super) fn context_symbol(&self) -> Option<(SymbolRole, String)> {
+        match self.context_math_node()? {
+            MathNode::Sym(ch) if ch.is_alphabetic() => Some((SymbolRole::Variable, ch.to_string())),
+            MathNode::Resolved { id, role, .. } => Some((role, id)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn context_set_math_hue(&mut self, hue: MathHue) {
+        self.edit_symbol_style(|edit| edit.hue = Some(hue));
+    }
+
+    pub(super) fn context_set_math_shape(&mut self, shape: HighlightShape) {
+        self.edit_symbol_style(|edit| edit.shape = Some(shape));
+    }
+
+    /// Puts a symbol back on its automatic look — the hue its letter falls
+    /// on and the shape its role asks for.
+    pub(super) fn context_reset_math_style(&mut self) {
+        self.edit_symbol_style(|edit| *edit = math_style::Override::default());
+    }
+
+    /// Applies `edit` to the targeted symbol's override, installs the result,
+    /// and writes it to the vault config.
+    ///
+    /// Persisting here rather than on exit is deliberate: this is a
+    /// preference the reader set by hand, and a crash between setting it and
+    /// closing the window should not quietly take it back.
+    fn edit_symbol_style(&mut self, edit: impl FnOnce(&mut math_style::Override)) {
+        let Some((_, id)) = self.context_symbol() else {
+            return;
+        };
+        let mut overrides = math_style::overrides();
+        let mut entry = overrides.get(&id);
+        edit(&mut entry);
+        overrides.set(&id, entry);
+        if !math_style::install(overrides.clone()) {
+            return;
+        }
+        if let Some(config) = &mut self.config {
+            config.math = overrides;
+            if let Err(e) = config.save() {
+                eprintln!("could not save symbol styling: {e}");
+            }
+        }
+        self.refresh_context_menu();
+    }
+
     fn open_context_menu(&mut self, ids: &[&str], anchor: (f32, f32)) {
         self.open_context_target(ids, anchor, None);
     }
@@ -2239,7 +2324,18 @@ impl Shell {
 
     /// Shadow layer rides every arm — ghosts included — so a closing menu
     /// always takes its halo away (see `refresh_slash_menu`).
+    ///
+    /// One region, two faces. Over a symbol the card is the inspector; over
+    /// anything else it is the command list. Which one is not stored state:
+    /// it follows from the target, and the sections are rebuilt on every
+    /// refresh so a colour picked from the card is on the card by the time
+    /// the click finishes.
     pub(super) fn refresh_context_menu(&mut self) {
+        if let Some(menu) = self.symbol_menu_component() {
+            self.regions[self.menu_region]
+                .set_component(Box::new(menu.with_shadow(self.popup_shadow.clone())));
+            return;
+        }
         let menu = match &self.context_menu {
             Some(state) => {
                 let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
@@ -2257,7 +2353,7 @@ impl Shell {
             }
             None => match &self.menu_dismiss {
                 Some(MenuDismiss::Context {
-                    state,
+                    state: ContextGhost::Commands(state),
                     anchor,
                     pill_row,
                 }) => ContextMenu::dismissing(state, *anchor, *pill_row),
@@ -2268,22 +2364,140 @@ impl Shell {
         self.regions[self.menu_region].set_component(Box::new(menu));
     }
 
+    /// The head and sections the inspector draws, or `None` when the open
+    /// menu is not over a symbol.
+    ///
+    /// Every cell shows its own outcome rather than naming it, so each one
+    /// is built from the style `resolve` *would* return after that choice —
+    /// not from the choice's own defaults. That matters once the reader has
+    /// pinned a shape by hand: picking a different role then leaves the
+    /// shape alone, and the role rows have to say so.
+    fn symbol_menu_content(&self) -> Option<(symbol_menu::Head, Vec<symbol_menu::Section>)> {
+        let state = self.context_menu.as_ref()?;
+        let (role, id) = self.context_symbol()?;
+        let glyph = self.context_symbol_glyph()?;
+        let current = math_style::resolve(role, &id);
+        let pinned = math_style::overrides().get(&id);
+        let automatic = math_style::automatic(role, &id);
+
+        let mut sections: Vec<symbol_menu::Section> = Vec::new();
+        for command in &state.items {
+            let art = symbol_art(command.id, current, pinned, automatic);
+            let cell = symbol_menu::Cell {
+                label: command.title.to_string(),
+                glyph: match art {
+                    symbol_menu::Art::Bare => variant_glyph(command.id, &id, &glyph),
+                    symbol_menu::Art::Preview(_) => glyph.clone(),
+                },
+                art,
+                checked: self.context_command_checked(command.id),
+            };
+            match sections.last_mut() {
+                Some(section) if section.title == command.group => section.cells.push(cell),
+                _ => sections.push(symbol_menu::Section {
+                    title: command.group.to_string(),
+                    shelf: shelf_for(command.group),
+                    cells: vec![cell],
+                }),
+            }
+        }
+
+        let head = symbol_menu::Head {
+            glyph,
+            name: id,
+            role: format!(
+                "{} \u{00b7} {} {}",
+                role_label(role),
+                current.hue.label(),
+                current.shape.label().to_lowercase()
+            ),
+            style: current,
+        };
+        Some((head, sections))
+    }
+
+    /// The snapshot a closing inspector leaves behind, and the cell its pill
+    /// had parked on.
+    fn symbol_menu_snapshot(&self) -> Option<(symbol_menu::Snapshot, Option<usize>)> {
+        let component = self.regions[self.menu_region].component_as::<SymbolMenu>();
+        let (head, sections) = self.symbol_menu_content()?;
+        let selected = self.context_menu.as_ref().map_or(0, |state| state.selected);
+        Some((
+            symbol_menu::Snapshot {
+                head,
+                sections,
+                selected,
+            },
+            component.and_then(|menu| menu.pill_cell()),
+        ))
+    }
+
+    /// The characters the symbol is actually set with — the current variant's
+    /// letterform, not the identity it stands for, so a bold `x` previews as
+    /// a bold `x`.
+    fn context_symbol_glyph(&self) -> Option<String> {
+        match self.context_math_node()? {
+            MathNode::Sym(ch) if ch.is_alphabetic() => Some(ch.to_string()),
+            MathNode::Resolved { body, .. } => Some(
+                body.iter()
+                    .filter_map(|node| match node {
+                        MathNode::Sym(ch) => Some(*ch),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The inspector for this menu, or `None` when the menu is not over a
+    /// symbol — in which case the command list takes the region instead.
+    fn symbol_menu_component(&self) -> Option<SymbolMenu> {
+        let standing = self.regions[self.menu_region]
+            .component_as::<SymbolMenu>()
+            .and_then(SymbolMenu::resting);
+        if let Some(state) = &self.context_menu {
+            let (head, sections) = self.symbol_menu_content()?;
+            return Some(
+                SymbolMenu::new(head, sections, state.selected, state.anchor).resuming(standing),
+            );
+        }
+        match &self.menu_dismiss {
+            Some(MenuDismiss::Context {
+                state: ContextGhost::Symbol(state),
+                anchor,
+                pill_row,
+            }) => Some(SymbolMenu::dismissing(state, *anchor, *pill_row)),
+            _ => None,
+        }
+    }
+
     fn close_context_menu(&mut self) {
         // Ghost fodder comes from the LIVE menu (rows with current checks +
         // the pill's row) — read before `take` empties it.
+        let symbol = self.symbol_menu_snapshot();
         let ghost = self.context_menu.take().map(|state| {
-            let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
-            let checked: Vec<bool> = state
-                .items
-                .iter()
-                .map(|command| self.context_command_checked(command.id))
-                .collect();
-            let entries = commands::menu_entries(&ids);
-            let snap = crate::components::context_menu::Snapshot { entries, checked };
-            let pill_row = self.regions[self.menu_region]
-                .component_as::<ContextMenu>()
-                .and_then(|m| m.pill_row())
-                .unwrap_or(state.selected.min(snap.entries.len().saturating_sub(1)));
+            let (snap, pill_row) = match symbol {
+                Some((snap, pill)) => {
+                    let fallback = state.selected;
+                    (ContextGhost::Symbol(snap), pill.unwrap_or(fallback))
+                }
+                None => {
+                    let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
+                    let checked: Vec<bool> = state
+                        .items
+                        .iter()
+                        .map(|command| self.context_command_checked(command.id))
+                        .collect();
+                    let entries = commands::menu_entries(&ids);
+                    let snap = crate::components::context_menu::Snapshot { entries, checked };
+                    let pill_row = self.regions[self.menu_region]
+                        .component_as::<ContextMenu>()
+                        .and_then(|m| m.pill_row())
+                        .unwrap_or(state.selected.min(snap.entries.len().saturating_sub(1)));
+                    (ContextGhost::Commands(snap), pill_row)
+                }
+            };
             MenuDismiss::Context {
                 state: snap,
                 anchor: state.anchor,
@@ -2293,7 +2507,7 @@ impl Shell {
         // Zero-row menus have no ghost to show.
         let spawn = matches!(
             &ghost,
-            Some(MenuDismiss::Context { state, .. }) if !state.entries.is_empty()
+            Some(MenuDismiss::Context { state, .. }) if !state.is_empty()
         );
         if spawn {
             self.menu_dismiss = ghost;
@@ -2589,13 +2803,27 @@ impl Shell {
             return true;
         }
 
+        if self.context_menu.is_none() {
+            return true;
+        }
+        // Whichever face the card is wearing, its own geometry answers —
+        // never the other one's, or a click would land on the row a
+        // different card would have drawn there.
+        let sections = self.symbol_menu_content().map(|(_, sections)| sections);
         let Some(state) = &self.context_menu else {
             return true;
         };
-        let card = context_menu::card_anchored(viewport, state.anchor, state.items.len());
+        let card = match &sections {
+            Some(sections) => symbol_menu::card_anchored(viewport, state.anchor, sections),
+            None => context_menu::card_anchored(viewport, state.anchor, state.items.len()),
+        };
         let point = input.mouse_position();
         if input.is_cursor_in_window() {
-            if let Some(row) = context_menu::row_at(card, state.items.len(), point) {
+            let hit = match &sections {
+                Some(sections) => symbol_menu::cell_at(card, sections, point),
+                None => context_menu::row_at(card, state.items.len(), point),
+            };
+            if let Some(row) = hit {
                 let changed = self
                     .context_menu
                     .as_ref()
@@ -3644,8 +3872,158 @@ fn math_menu_variant_start(offers: &[math_conversion::Offer]) -> usize {
         .unwrap_or(offers.len())
 }
 
-fn symbol_context_ids(glyph: char) -> Vec<&'static str> {
+/// What the inspector offers about a symbol's meaning and look, before any
+/// question of letterform. Every symbol has these, whatever it is spelled
+/// with.
+///
+/// Grouped by each command's own `group`, which is what turns this flat
+/// list into the card's sections — so a command's place in the table and
+/// its place on the card cannot disagree.
+fn symbol_style_ids() -> Vec<&'static str> {
     let mut ids = commands::SYMBOL_ROLE_MENU.to_vec();
+    ids.extend(commands::SYMBOL_HUE_MENU);
+    ids.extend(commands::SYMBOL_SHAPE_MENU);
+    ids.extend(commands::SYMBOL_AUTOMATIC_MENU);
+    ids
+}
+
+/// Whether `command` names the hue or shape `node` already carries, or
+/// whether `node` is already on its automatic look. `None` for every
+/// command that is about something else.
+fn symbol_style_checked(command: &str, node: &MathNode) -> Option<bool> {
+    let (role, id) = match node {
+        MathNode::Sym(ch) if ch.is_alphabetic() => (SymbolRole::Variable, ch.to_string()),
+        MathNode::Resolved { id, role, .. } => (*role, id.clone()),
+        _ => return None,
+    };
+    if command == "context.symbol.automatic" {
+        return Some(math_style::overrides().get(&id).is_empty());
+    }
+    let current = math_style::resolve(role, &id);
+    if let Some(hue) = command
+        .strip_prefix("context.hue.")
+        .and_then(MathHue::from_keyword)
+    {
+        return Some(hue == current.hue);
+    }
+    command
+        .strip_prefix("context.shape.")
+        .and_then(HighlightShape::from_keyword)
+        .map(|shape| shape == current.shape)
+}
+
+/// How each section of the inspector arranges its cells. A choice whose
+/// whole content is how it looks belongs in a grid — ten hues read as a
+/// palette, where ten rows spelling colours out read as a list.
+fn shelf_for(group: &str) -> symbol_menu::Shelf {
+    match group {
+        "Colour" => symbol_menu::Shelf::Grid {
+            columns: 5,
+            height: 28.0,
+        },
+        "Highlight" => symbol_menu::Shelf::Grid {
+            columns: 3,
+            height: 34.0,
+        },
+        "Variant" => symbol_menu::Shelf::Grid {
+            columns: 5,
+            height: 32.0,
+        },
+        _ => symbol_menu::Shelf::Rows,
+    }
+}
+
+/// What one cell of the inspector draws: the style the symbol would carry if
+/// that cell were chosen. `pinned` is what the reader has fixed by hand, and
+/// it survives every choice that does not name the same axis — so picking a
+/// role does not quietly undo a shape they set.
+fn symbol_art(
+    command: &str,
+    current: math_style::SymbolStyle,
+    pinned: math_style::Override,
+    automatic: math_style::SymbolStyle,
+) -> symbol_menu::Art {
+    use math_style::SymbolStyle;
+    let preview = symbol_menu::Art::Preview;
+    if command == "context.symbol.automatic" {
+        return preview(automatic);
+    }
+    if let Some(role) = command
+        .strip_prefix("context.symbol.")
+        .and_then(SymbolRole::from_keyword)
+    {
+        return preview(SymbolStyle {
+            hue: current.hue,
+            shape: pinned.shape.unwrap_or_else(|| math_style::role_shape(role)),
+        });
+    }
+    if let Some(hue) = command
+        .strip_prefix("context.hue.")
+        .and_then(MathHue::from_keyword)
+    {
+        // A swatch is a colour sample, so it shows the hue whole — fill and
+        // edge — whatever shape the symbol is currently wearing. Previewing
+        // an outlined symbol here would leave ten hues to be judged from
+        // ten hairlines, which is the one thing a palette must not ask.
+        return preview(SymbolStyle {
+            hue,
+            shape: HighlightShape::Both,
+        });
+    }
+    if let Some(shape) = command
+        .strip_prefix("context.shape.")
+        .and_then(HighlightShape::from_keyword)
+    {
+        return preview(SymbolStyle {
+            hue: current.hue,
+            shape,
+        });
+    }
+    // A variant is a letterform, and a wash over it would hide the one
+    // thing being chosen.
+    symbol_menu::Art::Bare
+}
+
+fn role_label(role: SymbolRole) -> &'static str {
+    match role {
+        SymbolRole::Variable => "Variable",
+        SymbolRole::Constant => "Constant",
+        SymbolRole::Function => "Function",
+    }
+}
+
+/// The letterform a variant command would spell `identity` with. `plain` is
+/// the symbol's own base; everything else comes out of the mathematical
+/// alphanumeric block.
+fn variant_glyph(command: &str, identity: &str, current: &str) -> String {
+    let Some(key) = command.strip_prefix("context.variant.") else {
+        return current.to_string();
+    };
+    let base = math_symbols::exact(identity)
+        .map(|symbol| symbol.glyph)
+        .or_else(|| {
+            let mut chars = identity.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        });
+    let Some(base) = base else {
+        return current.to_string();
+    };
+    if key == "plain" {
+        return base.to_string();
+    }
+    math_symbols::variants(base)
+        .into_iter()
+        .find(|variant| variant.key == key)
+        .map(|variant| variant.glyph.to_string())
+        .unwrap_or_else(|| base.to_string())
+}
+
+/// The same, plus the letterforms a single letter can be spelled with.
+fn symbol_context_ids(glyph: char) -> Vec<&'static str> {
+    let mut ids = symbol_style_ids();
     ids.push("context.variant.plain");
     ids.extend(
         crate::document::math_symbols::variants(glyph)
