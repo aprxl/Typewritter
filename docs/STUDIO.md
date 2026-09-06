@@ -14,6 +14,28 @@ The visual hierarchy has three levels:
 
 Inter is bundled under the SIL Open Font License for interface and prose. Mathematics retains JuliaMono for its symbol coverage; code and small numeric labels use the system monospace. This pass changes screen and exported prose typography together, so their measurements continue to agree.
 
+## Notation
+
+An expression used to be prose with a highlight behind it. It now has a typography of its own, on three axes that never say the same thing twice.
+
+**Identity is colour.** Every symbol carries a hue, so `x` and `y` differ the way two words differ rather than only by position. The default comes from where a letter sits in its own alphabet, not from a hash of it, so the letters you actually reach for together — `x y z`, `i j k`, `m n` — cannot collide; the Greek alphabets are offset so an alpha is never an `x`. Ten hues cannot uniquely colour a hundred symbols, and the per-symbol override is what the rest is for.
+
+**Role is shape.** A variable is a filled wash, a constant an outline, a function both. An outline is never a colour of its own: it is its fill, rotated in HSL away from the page and slightly up in chroma, so a border is always a shade of the thing it borders. Because the distinction is a shape and not a hue, it survives greyscale, a projector, and a printed page.
+
+**Grammar recedes.** Operators, relations and punctuation are set in a quieter ink than the terms they join. Numerals get an ink of their own — a quantity is not a name — and long ones group in threes outward from the decimal point, ISO 31-0 style, so `299792458` reads as `299 792 458`. The separator is an advance rather than a node: the caret cannot stop in it and backspace has nothing to delete.
+
+Both axes are per symbol and both are optional. Overrides live in `~/.typewritter/config.toml` rather than in the documents, because a symbol's colour is a fact about your vocabulary and not about one note:
+
+```toml
+[math.symbols.epsilon]
+hue = "coral"
+shape = "outline"
+```
+
+Clicking a symbol in Normal mode opens the **symbol inspector**, which replaces the old list of words for choices whose whole content is how they look. A head shows the symbol as it stands and the identity its styling is keyed on. Role rows carry their shapes; colour is a ten-swatch palette (a swatch shows its hue whole, fill and edge, because ten hairlines are not a palette); highlight is three chips of the same symbol; variants show the letterforms themselves. Every cell draws the outcome of choosing it, including "back to automatic". The card speaks the same popup vocabulary as the in-math completion card, and choices land in the config immediately.
+
+Painting is shared with PDF export, so a page carries the same hues, shapes and inks the screen does.
+
 ## Try it
 
 ```powershell
@@ -28,12 +50,15 @@ cargo run
 - Use the **+** tab control or **Ctrl+N** to create a note. The empty editor offers the same new/open actions.
 - Long tabs elide their labels and page through whole tabs. The active tab remains visible. Long outlines scroll independently; deep breadcrumb paths preserve their tail.
 - Render statistics and row hit bands remain available through the command palette, with statistics hidden by default.
+- Click a symbol inside an expression in **Normal** mode to open the symbol inspector. Pick a hue or a highlight shape and every occurrence in the vault follows; **Back to automatic** drops the override again.
 
 ## Native implementation
 
 No browser surface or bitmap mockup is involved. The tau is a vector path; surfaces use Atomos gradients and rounded geometry; popup depth uses its blur layer. Existing theme transitions, menu springs, and manual region invalidation remain in use. The old decorative writing pulse and unused modal slide state were removed.
 
 `theme.rs` owns the palette, font sources, mark, and shared painting. `document_surface.rs` owns the sheet, `empty_state.rs` owns the empty editor, and each navigation or overlay component owns its own geometry. The shell routes controls through the command table. The editor's centered origin is shared by painting, hit testing, caret placement, and popup anchors.
+
+Notation splits the same way. `math_style.rs` holds the semantics — which hue an identity falls on, which shape a role asks for, and what the reader has overridden — while `theme.rs` holds the ten-hue ramp, the two notation inks, and the HSL shade that derives a border from its fill. Math layout resolves a symbol's style as it measures, so the style server carries a revision into the document layout cache and a change flag into the frame's invalidation, exactly as the palette does. `symbol_menu.rs` is a new component; it shares the context menu's region and reveal clock, and which of the two faces is showing follows from the target rather than from stored state.
 
 The interaction pass also fixes scrolled finder rows being painted at the wrong offsets, centered modal shadows being painted around an empty viewport, and hidden panels continuing to receive pointer input.
 
@@ -52,5 +77,7 @@ cargo test
 ```
 
 The Windows verification includes live native rendering in both appearances, the editor with math and sidenotes, command palette, finder, focus mode, and resizing between 620×520 and 1600×1000. The native runtime log is checked for panics and wgpu validation failures. Geometry tests cover centered text, compact finder bounds, scrolled row targeting, tab overflow, and empty-state actions.
+
+The notation pass was checked the same way: an expression with ten letters, both Greek cases, all three roles, grouped numerals and a full set of operators, read in both appearances; the inspector opened over a constant, a hue picked and seen to reach every occurrence and `config.toml`, then reset; and the note exported to PDF from a debug build, where a highlight outline that failed to parse would assert rather than pass quietly.
 
 macOS and Linux runtime rendering have not been exercised in this Windows session. Theme choice remains session-only, as before this experiment.
