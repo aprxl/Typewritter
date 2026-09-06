@@ -1,11 +1,9 @@
 //! The shell: the layout tree, the regions that fill it, and the frame loop
 //! that drives both.
 //!
-//! This is `design/Main View.dc.html`, rebuilt against the real renderer.
-//! The left tree reads the actual vault on disk (see [`crate::vault`]) and
-//! the centre column is a working buffer: files open into tabs (a click
-//! previews, a double-click pins), the text is editable, and `Ctrl+S` saves.
-//! Still mock: the sidenote margin, which belongs to document anchors.
+//! The native Studio workspace: vault navigation, editable document tabs,
+//! and sidenotes attached to document anchors. See `docs/STUDIO.md` for the
+//! visual direction and the boundaries of the experiment.
 //!
 //! Everything visible is a [`Component`] in its own [`Region`], so each part
 //! measures itself, redraws only when it changes, and is scissored to its
@@ -256,10 +254,11 @@ impl ContextGhost {
 }
 
 /// The in-math completion card while it is showing: the precise tree query,
-/// selected row, and anchor point. It has no open/closed state of its own.
+/// selected row, visible interpretations, and anchor point.
 struct MathMenuState {
     query: math_conversion::Query,
     selected: usize,
+    first_visible: usize,
     anchor: (f32, f32),
 }
 

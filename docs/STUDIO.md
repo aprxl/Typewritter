@@ -2,6 +2,23 @@
 
 An alternative native interface, developed on `codex/studio-ui`. The experiment replaces the previous visual system rather than adding a second set of widgets. `master` is unchanged.
 
+## Completion review — 6 September 2026
+
+The original interface overhaul is implemented. This document is the retained design record; there is no separate unfinished redesign plan. The review includes the subsequent notation and symbol-inspector commits (`b4cddea`, `cc17502`, `816e8a8`).
+
+| Area | Delivered |
+| --- | --- |
+| Visual identity | Chalk/lavender/coral and mulberry/apricot palettes, bundled Inter, vector tau mark, shared native surfaces |
+| Workspace | Toolbar, tabs, file tree, breadcrumbs, status, search and panel controls, compact navigation |
+| Writing | Centered document sheet, heading hierarchy, empty-state actions, anchored sidenotes and outline |
+| Actions | Command palette, finder, slash and math menus, symbol inspector, format bar, dialogs and onboarding |
+| Focus | Centered active visual line, GPU fading of surrounding content, restoration of the previous panels |
+| Rendering | Native gradients, blurred popup shadows, transitions, corrected bold outlines, shared screen/PDF notation painting |
+
+The completion audit found and closed two compact-window gaps: the slash menu could flip above the screen, and a long math completion list could panic while placing its card. Math interpretations now use a six-row window with a visible match count; arrows, Ctrl+N/P and the wheel reach the remaining choices while variants stay visible. Painting and hit testing share the scroll offset. Variant selection paints above its cell surface, and dismissal retains the visible rows without computing geometry against an empty viewport.
+
+The final audit passes formatting, Clippy with warnings denied, and 743 tests. Windows native checks cover the previously crashing `s` completion at 620×484, scrolling to later interpretations and variant cells, acceptance and dismissal, the compact slash menu, and the full workspace at 1600×1000. Both appearances were inspected using an isolated scratch vault. The final runtime log contains no panic or wgpu validation error. The platform and persistence limits at the end of this document still apply.
+
 ## Direction
 
 The reference is a personal writing instrument: a quiet place for serious mathematics, with enough warmth to feel owned. The first steel-blue palette was too anonymous. This version pairs chalk paper with lavender surroundings and coral gestures; the dark appearance uses mulberry surfaces with apricot accents. A handwritten tau gives the application its own mark.

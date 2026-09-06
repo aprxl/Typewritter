@@ -3055,12 +3055,25 @@ impl Shell {
         let card = math_menu::card_anchored(viewport, state.anchor, offers.len(), variant_start);
         if input.is_cursor_in_window() {
             let point = input.mouse_position();
-            if let Some(index) = math_menu::item_at(card, offers.len(), variant_start, point) {
+            if card.contains(point) && input.scroll_delta().1 != 0.0 {
+                self.move_math_menu(if input.scroll_delta().1 > 0.0 { -1 } else { 1 });
+                return true;
+            }
+            if let Some(index) = math_menu::item_at(
+                card,
+                offers.len(),
+                variant_start,
+                state.first_visible,
+                point,
+            ) {
                 let changed = self
                     .math_menu
                     .as_ref()
                     .is_some_and(|state| state.selected != index);
-                if changed {
+                if changed
+                    && (input.mouse_delta() != (0.0, 0.0)
+                        || input.is_mouse_pressed(MouseButton::Left))
+                {
                     if let Some(state) = &mut self.math_menu {
                         state.selected = index;
                     }
@@ -3085,6 +3098,7 @@ impl Shell {
     /// back.
     fn dismiss_math_menu(&mut self) {
         self.math_dismissed = self.math_menu.as_ref().map(|state| state.query.clone());
+        self.spawn_math_ghost_from_live();
         self.math_menu = None;
         self.refresh_math_menu();
     }
@@ -3101,6 +3115,7 @@ impl Shell {
         let Some(offer) = math_conversion::offers(&query).offers.get(index).cloned() else {
             return;
         };
+        self.spawn_math_ghost_from_live();
         self.docs
             .borrow_mut()
             .math_accept_conversion(&query, &offer);
@@ -3113,13 +3128,19 @@ impl Shell {
         let Some(state) = &mut self.math_menu else {
             return;
         };
-        let count = math_conversion::offers(&state.query).offers.len();
+        let offers = math_conversion::offers(&state.query).offers;
+        let count = offers.len();
         if count == 0 {
             return;
         }
         let next = moved_math_menu_selection(state.selected, count, delta);
         if next != state.selected {
             state.selected = next;
+            state.first_visible = math_menu::follow_selection(
+                math_menu_variant_start(&offers),
+                next,
+                state.first_visible,
+            );
             self.refresh_math_menu();
         }
     }
@@ -3130,7 +3151,9 @@ impl Shell {
     pub(super) fn sync_math_menu(&mut self) {
         let query = self.docs.borrow().math_conversion_query();
         let Some(query) = query else {
-            if self.math_menu.take().is_some() {
+            if self.math_menu.is_some() {
+                self.spawn_math_ghost_from_live();
+                self.math_menu = None;
                 self.refresh_math_menu();
             }
             return;
@@ -3138,15 +3161,25 @@ impl Shell {
         if self.math_dismissed.as_ref() == Some(&query)
             || math_conversion::offers(&query).offers.is_empty()
         {
-            if self.math_menu.take().is_some() {
+            if self.math_menu.is_some() {
                 // The card just closed with content on screen: leave a
                 // ghost falling away instead of popping to nothing. (An
                 // empty-offers close has no rows; the spawn check below
                 // covers it.)
                 self.spawn_math_ghost_from_live();
+                self.math_menu = None;
                 self.refresh_math_menu();
             }
             return;
+        }
+        if self.math_menu.is_none() {
+            // A new word supersedes a fading card immediately, including
+            // when typing resumes before its dismissal has finished.
+            if matches!(self.menu_dismiss, Some(MenuDismiss::Math { .. })) {
+                self.menu_dismiss = None;
+                self.menu_dismiss_clock = 0.0;
+            }
+            self.popup_reveal.restart();
         }
         let anchor = self.compute_math_menu_anchor();
         let changed = match &self.math_menu {
@@ -3156,6 +3189,7 @@ impl Shell {
         let state = self.math_menu.get_or_insert_with(|| MathMenuState {
             query: query.clone(),
             selected: 0,
+            first_visible: 0,
             anchor,
         });
         let moved = state.anchor != anchor;
@@ -3164,6 +3198,7 @@ impl Shell {
         if changed {
             state.query = query;
             state.selected = 0;
+            state.first_visible = 0;
         }
         if changed || moved {
             self.refresh_math_menu();
@@ -3208,6 +3243,7 @@ impl Shell {
                 rows: math_menu_rows(&offers),
                 variant_start: math_menu_variant_start(&offers),
                 selected: state.selected,
+                first_visible: state.first_visible,
             }
         });
         let anchor = self.math_menu.as_ref().map(|state| state.anchor);
@@ -3241,8 +3277,10 @@ impl Shell {
                     math_menu_rows(&offers),
                     math_menu_variant_start(&offers),
                     state.selected,
+                    state.first_visible,
                     state.anchor,
                 )
+                .resuming(self.regions[self.math_menu_region].component_as::<MathMenu>())
             }
             None => match &self.menu_dismiss {
                 Some(MenuDismiss::Math {
