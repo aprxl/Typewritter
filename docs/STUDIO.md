@@ -53,6 +53,14 @@ Clicking a symbol in Normal mode opens the **symbol inspector**, which replaces 
 
 Painting is shared with PDF export, so a page carries the same hues, shapes and inks the screen does.
 
+## Scrolling
+
+The page has a camera rather than an offset. A wheel notch moves three lines and the page eases onto that target over 150 ms, so a burst of notches reads as one push: each one adds its distance to where the page is *heading*, not to where it happens to be, which is what keeps a fast scroll from getting shorter as it goes. Following the caret uses the same camera, so typing past the bottom of the window glides rather than jumps. A different document cuts instead, because gliding one page's offset across another page's content reads as the wrong file scrolling. A dragged thumb cuts too — an eased thumb drifts away from the pointer holding it.
+
+Opening a popup no longer moves the page. A rebuild used to mean "redraw everything and chase the caret", and since the caret is wherever it was last left, a reader who had scrolled without clicking was thrown back to the top the moment the format bar or the symbol inspector appeared. Rebuilding and moving the camera are now separate requests, and only three things ask for the camera: switching tabs, a reflow from a resize or panel toggle, and Focus mode.
+
+The scroll bar takes a twelve-pixel column of its own at the sheet's right edge, past the annotation margin, rather than floating over the text. An overlay bar has to fade out to stop covering words, and a bar that fades out is gone exactly when a reader glances at it to ask how much is left — the question it exists to answer on a document long enough to have one. The thumb is a hairline in the non-text register that widens and warms under the pointer; the whole column is the grab target, so aim is never a matter of pixels. The column gives its width back when there is nothing to scroll, no file open, or Focus mode is on.
+
 ## Try it
 
 ```powershell
@@ -67,6 +75,7 @@ cargo run
 - Use the **+** tab control or **Ctrl+N** to create a note. The empty editor offers the same new/open actions.
 - Long tabs elide their labels and page through whole tabs. The active tab remains visible. Long outlines scroll independently; deep breadcrumb paths preserve their tail.
 - Render statistics and row hit bands remain available through the command palette, with statistics hidden by default.
+- Scroll the document with the wheel anywhere over the sheet, including over the annotation margin. Drag the thumb at the right edge, or click the strip above or below it to throw the thumb there and keep dragging.
 - Click a symbol inside an expression in **Normal** mode to open the symbol inspector. Pick a hue or a highlight shape and every occurrence in the vault follows; **Back to automatic** drops the override again.
 
 ## Native implementation
@@ -78,6 +87,8 @@ No browser surface or bitmap mockup is involved. The tau is a vector path; surfa
 Notation splits the same way. `math_style.rs` holds the semantics — which hue an identity falls on, which shape a role asks for, and what the reader has overridden — while `theme.rs` holds the ten-hue ramp, the two notation inks, and the HSL shade that derives a border from its fill. Math layout resolves a symbol's style as it measures, so the style server carries a revision into the document layout cache and a change flag into the frame's invalidation, exactly as the palette does. `symbol_menu.rs` is a new component; it shares the context menu's region and reveal clock, and which of the two faces is showing follows from the target rather than from stored state.
 
 The interaction pass also fixes scrolled finder rows being painted at the wrong offsets, centered modal shadows being painted around an empty viewport, and hidden panels continuing to receive pointer input.
+
+Scrolling splits into three owners. `ui.rs` gains `Glide`, a number that eases toward a target which may move while it travels — `Hover`'s shape for a value that is not a weight. The shell holds one for the page and is the only writer of `Tabs::editor_scroll`, which becomes the frame's *published* offset for everything that paints and hit-tests; the glide's target, not that offset, is what the wheel and the caret camera aim from. `scrollbar.rs` owns the strip's metrics, its thumb geometry and that geometry's exact inverse, so the bar the component draws and the drag the shell hit-tests cannot disagree. The shell shares one `Cell` of the numbers with the component rather than rebuilding it per scrolled pixel, which is what lets the hover transition survive a scroll.
 
 Focus uses a GPU opacity band on the editor's own layer, with a short fade and soft edges. The band follows the same wrapped-line bounds used by the caret and scroll camera. Its uniforms update in place, and the effect releases its output texture outside Focus. The document surface remains fully opaque beneath it.
 
@@ -96,5 +107,7 @@ cargo test
 The Windows verification includes live native rendering in both appearances, the editor with math and sidenotes, command palette, finder, focus mode, and resizing between 620×520 and 1600×1000. The native runtime log is checked for panics and wgpu validation failures. Geometry tests cover centered text, compact finder bounds, scrolled row targeting, tab overflow, and empty-state actions.
 
 The notation pass was checked the same way: an expression with ten letters, both Greek cases, all three roles, grouped numerals and a full set of operators, read in both appearances; the inspector opened over a constant, a hue picked and seen to reach every occurrence and `config.toml`, then reset; and the note exported to PDF from a debug build, where a highlight outline that failed to parse would assert rather than pass quietly.
+
+The scrolling pass adds geometry tests for the thumb (length as the fraction on screen, both ends exact, a floor so a long document stays draggable, drag and its inverse round-tripping, a range that starts below zero for Focus mode) and for the glide (a re-aim mid-flight keeping the distance the first had left, an unchanged target not restarting it, and the landing frame counted as a change so the last pixel is drawn).
 
 macOS and Linux runtime rendering have not been exercised in this Windows session. Theme choice remains session-only, as before this experiment.

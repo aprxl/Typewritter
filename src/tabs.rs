@@ -135,8 +135,12 @@ impl Tabs {
 
     /// Scroll changes are view-only, but they must still rebuild the editor
     /// pane, so a real change bumps like any other.
+    ///
+    /// Compared exactly. The shell's glide is the only writer and it reports
+    /// its own changes, so there is no jitter left for a deadband to absorb —
+    /// only the last sub-pixel of every settle, which one would swallow.
     pub fn set_editor_scroll(&mut self, scroll: f32) {
-        if (self.editor_scroll - scroll).abs() > 0.5 {
+        if self.editor_scroll != scroll {
             self.editor_scroll = scroll;
             self.bump_view();
         }

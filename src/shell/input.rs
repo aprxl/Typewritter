@@ -17,7 +17,7 @@ use crate::components::palette;
 use crate::components::{
     ContextMenu, Dialog, Editor, FileTree, Finder, FormatBar, MathMenu, Onboarding, Palette,
     SlashMenu, SymbolMenu, TabStrip, Topics, context_menu, editor, file_tree, format_bar,
-    math_menu, onboarding, sidenotes, symbol_menu, theme_switch, title_bar,
+    math_menu, onboarding, scrollbar, sidenotes, symbol_menu, theme_switch, title_bar,
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind};
@@ -486,12 +486,19 @@ impl Shell {
         let has_tab = self.docs.borrow().active().is_some();
         let in_math = self.docs.borrow().in_math();
 
-        if has_tab && over_editor && input.scroll_delta().1 != 0.0 {
+        // Anywhere over the sheet, not just over the text: a pointer that
+        // has drifted onto a margin note is still pointing at the document.
+        let over_canvas =
+            input.is_cursor_in_window() && self.layout.rect(self.canvas).contains(mouse);
+        if has_tab && over_canvas && input.scroll_delta().1 != 0.0 {
             let (min, max) = self.editor_scroll_bounds();
-            let scroll = self.docs.borrow().editor_scroll;
-            let next = (scroll - input.scroll_delta().1 * crate::document::layout::LINE_BODY)
-                .clamp(min, max);
-            self.docs.borrow_mut().set_editor_scroll(next);
+            // Aimed from where the page is heading, not from where it is:
+            // a second notch mid-glide must add its own distance rather
+            // than measure from a journey that has not finished.
+            let step =
+                input.scroll_delta().1 * super::SCROLL_LINES * crate::document::layout::LINE_BODY;
+            self.scroll
+                .aim((self.scroll.target() - step).clamp(min, max));
         }
 
         if has_tab && !in_math && !self.vim.command_active() {
@@ -586,6 +593,7 @@ impl Shell {
         }
 
         self.divider_drag(input);
+        self.scrollbar_drag(input);
     }
 
     /// Arrow keys, Home, End. Vertical motion goes through the layout so it
@@ -3432,6 +3440,49 @@ impl Shell {
         }
         .with_shadow(self.popup_shadow.clone());
         self.regions[self.math_menu_region].set_component(Box::new(menu));
+    }
+
+    /// The scroll thumb's drag, shaped like [`Shell::divider_drag`]: the
+    /// press takes hold, the release lets go, and every frame in between
+    /// puts the page where the pointer says.
+    fn scrollbar_drag(&mut self, input: &Input) {
+        if !input.is_mouse_down(MouseButton::Left) || !self.layout.style(self.scroll_column).visible
+        {
+            self.scroll_grab = None;
+            return;
+        }
+        let strip = self.layout.rect(self.scroll_column);
+        let track = scrollbar::track(strip);
+        // Last frame's span — the one the thumb on screen was drawn from,
+        // which is the thumb the reader just aimed at.
+        let span = self.scroll_span.get();
+        let mouse = input.mouse_position();
+
+        if input.is_mouse_pressed(MouseButton::Left) {
+            if !input.is_cursor_in_window() || !strip.contains(mouse) {
+                return;
+            }
+            let Some(thumb) = scrollbar::thumb(track, span) else {
+                return;
+            };
+            // On the thumb, hold it exactly where it was taken. On the track
+            // above or below, throw it to the pointer and hold it by the
+            // middle, so the jump and the drag that may follow are one
+            // movement rather than a jump and then a second one.
+            self.scroll_grab = Some(if thumb.contains(mouse) {
+                mouse.1 - thumb.y
+            } else {
+                thumb.height / 2.0
+            });
+        }
+        let Some(grab) = self.scroll_grab else {
+            return;
+        };
+        let (min, max) = self.editor_scroll_bounds();
+        let to = scrollbar::scroll_at(track, mouse.1 - grab, span).clamp(min, max);
+        // Under the hand, not behind it: a thumb that eased toward the
+        // pointer holding it would drift away from the pointer holding it.
+        self.scroll.settle(to);
     }
 
     fn divider_drag(&mut self, input: &Input) {

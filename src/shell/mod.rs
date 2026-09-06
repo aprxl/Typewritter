@@ -39,9 +39,9 @@ use crate::components::tab_strip::TabView;
 use crate::components::topics::Entry;
 use crate::components::{
     Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileTree, Finder, FormatBar, MathMenu,
-    Onboarding, Palette, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics,
-    breadcrumb, editor, file_tree, format_bar, sidenotes, status_line, tab_strip, title_bar,
-    topics,
+    Onboarding, Palette, Scrollbar, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar,
+    Topics, breadcrumb, editor, file_tree, format_bar, scrollbar, sidenotes, status_line,
+    tab_strip, title_bar, topics,
 };
 use crate::config::Config;
 use crate::document::Caret;
@@ -58,7 +58,7 @@ use crate::layout::{Layout, NodeId, Rect, Size, Style};
 use crate::renderer::{Layer, LayerInvalidation, Renderer, ShaderEffect};
 use crate::tabs::Tabs;
 use crate::theme::{self, TextStyle};
-use crate::ui::{Component, Context, Hover, Mouse, Region};
+use crate::ui::{Component, Context, Glide, Hover, Mouse, Region};
 use crate::vault::Vault;
 use crate::vim::{Edit, Operator, OperatorTarget, Vim, VimMode, VisualMode};
 
@@ -84,6 +84,18 @@ struct FinderState {
     query: String,
     selected: usize,
 }
+
+/// How long the page takes to settle once the wheel stops, and the curve
+/// it settles on. Short on purpose: past about a fifth of a second a smooth
+/// scroll stops reading as momentum and starts reading as lag. `EaseOut`
+/// because a scroll begins with the reader's hand and ends on its own.
+const SCROLL_GLIDE: Duration = Duration::from_millis(150);
+const SCROLL_EASING: Easing = Easing::EaseOut;
+
+/// How far one wheel notch takes the page, in lines — the desktop default.
+/// A notch used to move exactly one line, which was already a little mean
+/// and under a glide reads as a stutter rather than as a scroll.
+const SCROLL_LINES: f32 = 3.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ViewUpdate {
@@ -362,6 +374,26 @@ pub struct Shell {
     topics: Panel,
     status: Panel,
     text_column: NodeId,
+    /// The document sheet: the text column, the sidenote margin beside it,
+    /// and the scroll strip. What the wheel scrolls, so that the pointer
+    /// drifting onto a margin note does not stop the page.
+    canvas: NodeId,
+    /// The strip the scroll thumb lives in, to the right of the sidenote
+    /// margin and inside the document sheet. Hidden when there is nothing
+    /// to scroll it with — no file, or Focus mode, which is chromeless by
+    /// definition.
+    scroll_column: NodeId,
+    /// What the scrollbar draws, shared with its component so the page can
+    /// move without rebuilding it. See [`scrollbar`].
+    scroll_span: Rc<Cell<scrollbar::Span>>,
+    /// The page's scroll offset, and the authority on it: `Tabs::editor_scroll`
+    /// is where this frame's value is *published*, for everything that
+    /// paints and hit-tests against it.
+    scroll: Glide,
+    /// How far below the thumb's top the pointer took hold of it, while a
+    /// drag is running. Held rather than recomputed so the thumb stays under
+    /// the finger instead of jumping its centre there on the first move.
+    scroll_grab: Option<f32>,
     /// `None` until a vault is chosen (first run / `--onboard`).
     config: Option<Config>,
     vault: Option<Rc<RefCell<Vault>>>,
@@ -571,6 +603,7 @@ impl Shell {
         let topics = layout.add_child(body, Style::fixed(topics::WIDTH));
         let text_column = layout.add_child(canvas, Style::flex(1.0));
         let sidenotes = layout.add_child(canvas, Style::fixed(sidenotes::WIDTH));
+        let scroll_column = layout.add_child(canvas, Style::fixed(scrollbar::WIDTH));
 
         // One layer each, created bottom-to-top.
         let region = |renderer: &mut Renderer, node, component: Box<dyn Component>| {
@@ -619,11 +652,17 @@ impl Shell {
             radius: editor::GLOW_RADIUS,
         }));
 
+        let scroll_span = Rc::new(Cell::new(scrollbar::Span::default()));
         regions.extend([
             region(
                 renderer,
                 sidenotes,
                 Box::new(SidenoteMargin::new(Vec::new(), editor::TOP, 0.0)),
+            ),
+            region(
+                renderer,
+                scroll_column,
+                Box::new(Scrollbar::new(scroll_span.clone())),
             ),
             region(renderer, topics, Box::new(Topics::new(Vec::new(), 0))),
             region(
@@ -719,6 +758,11 @@ impl Shell {
             topics: Panel::new(topics, topics::WIDTH),
             status: Panel::new(status, status_line::HEIGHT),
             text_column,
+            canvas,
+            scroll_column,
+            scroll_span,
+            scroll: Glide::new(SCROLL_GLIDE, SCROLL_EASING),
+            scroll_grab: None,
             config,
             vault,
             docs,
@@ -833,6 +877,9 @@ impl Shell {
         let dt = FrameScheduler::animation_delta(frametime);
 
         self.handle_input(input, viewport);
+        // Straight after the input that aimed it, and before the regions
+        // sync: the scrollbar reads the span this publishes.
+        let scrolling = self.drive_scroll(dt);
         self.reveal_focused_note();
         self.autosave();
         self.sync_math_menu();
@@ -843,6 +890,7 @@ impl Shell {
         // same frame or the window would spend one frame in the old colours
         // underneath a still image of the old colours.
         let mut animating = self.sync_theme_swap(renderer, viewport, dt);
+        animating |= scrolling;
         self.sync_theme();
 
         // The caret reports a step change and keeps its own wall clock,
@@ -1513,6 +1561,37 @@ impl Shell {
         layout
     }
 
+    /// Advances the page's scroll by one frame and publishes it: the offset
+    /// everything paints and hit-tests against, and the span the scrollbar
+    /// draws. Reports whether the page moved.
+    ///
+    /// The target is re-clamped here rather than only where it is aimed,
+    /// because the bounds move on their own — a section folded away, a
+    /// resize that re-wraps the text — and a target left past the new
+    /// ceiling would strand the reader below the last line.
+    fn drive_scroll(&mut self, dt: Duration) -> bool {
+        let (min, max) = self.editor_scroll_bounds();
+        self.scroll.aim(self.scroll.target().clamp(min, max));
+        let moved = self.scroll.advance(dt);
+        self.docs
+            .borrow_mut()
+            .set_editor_scroll(self.scroll.value());
+
+        // Nothing to scroll, nothing open to scroll, or Focus mode, which
+        // is chromeless by definition: the strip gives its width back.
+        let has_tab = self.docs.borrow().active().is_some();
+        let shown = max > min && has_tab && !self.focus_mode();
+        self.layout
+            .set_style(self.scroll_column, |s| s.visible = shown);
+        self.scroll_span.set(scrollbar::Span {
+            scroll: self.scroll.value(),
+            range: (min, max),
+            view: (self.layout.rect(self.text_column).height - editor::TOP).max(0.0),
+            held: self.scroll_grab.is_some(),
+        });
+        moved
+    }
+
     /// Brings the caret's visual line into the editor's visible band, if
     /// scrolling is needed to do it. Only called when the caret actually
     /// moved — a wheel scroll must be able to take the caret out of view.
@@ -1539,7 +1618,10 @@ impl Shell {
                 layout.caret_band(tab.document.caret)
             }
         };
-        let scroll = self.docs.borrow().editor_scroll;
+        // Measured from where the page is *heading*, not from where it is:
+        // following a caret against a scroll still in flight would answer
+        // for a viewport that is already on its way somewhere else.
+        let scroll = self.scroll.target();
         let scroll = if self.focus_mode() {
             editor::focus_scroll(band, rect, self.layout.rect(Layout::ROOT))
         } else {
@@ -1553,7 +1635,7 @@ impl Shell {
                 max,
             )
         };
-        self.docs.borrow_mut().set_editor_scroll(scroll);
+        self.scroll.aim(scroll);
     }
 
     /// The focused note's placed band in document coordinates — `(top,
@@ -1870,8 +1952,15 @@ impl Shell {
             )
         };
         if update.follow_caret || caret_key != self.followed {
+            // A different document under the same offset is not travel:
+            // gliding would smear one page's scroll across another's
+            // content, which reads as the wrong file scrolling.
+            let switched = caret_key.0 != self.followed.0;
             self.followed = caret_key;
             self.ensure_caret_visible();
+            if switched {
+                self.scroll.settle(self.scroll.target());
+            }
             // A caret being moved or typed at should read as steady, not
             // strobing — restarting snaps the blink to weight 0, which
             // `Context::caret_on` reads as solid-on, for a full half-cycle.

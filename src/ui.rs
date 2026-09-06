@@ -227,6 +227,84 @@ impl Default for Hover {
     }
 }
 
+/// A number that eases toward a target which may move while it travels.
+///
+/// [`Hover`]'s shape, for a value that is not a 0..1 weight — the page's
+/// scroll offset. Two properties make it the right primitive for that:
+///
+/// - **Re-aiming picks up from wherever the value is now**, so a second
+///   wheel notch during the first one's travel reads as one continuous push
+///   rather than a jump back to the old resting place.
+/// - **Aiming where it is already going does nothing**, so a target that is
+///   recomputed and re-aimed every frame does not hold the glide at its
+///   start forever.
+///
+/// [`Glide::advance`] reports the frame it *lands* on as a change, not just
+/// the frames before it: the landing frame is the one that moves the value
+/// onto the target, and a caller that stopped asking for frames a moment
+/// early would leave the last pixel of travel undrawn.
+#[derive(Debug)]
+pub struct Glide {
+    animation: Animation,
+    from: f32,
+    to: f32,
+    duration: Duration,
+    easing: Easing,
+}
+
+impl Glide {
+    /// A glide resting at zero. `duration` is one full travel, whatever the
+    /// distance: a scroll should take the same time to settle whether it
+    /// moved a line or a screen.
+    pub fn new(duration: Duration, easing: Easing) -> Self {
+        Self {
+            animation: Animation::new(duration, easing).paused(),
+            from: 0.0,
+            to: 0.0,
+            duration,
+            easing,
+        }
+    }
+
+    /// Travel to `to`, starting from wherever the value is now.
+    pub fn aim(&mut self, to: f32) {
+        if to == self.to {
+            return;
+        }
+        self.from = self.value();
+        self.to = to;
+        self.animation = Animation::new(self.duration, self.easing);
+    }
+
+    /// Arrive at `to` this instant. For the moves that are not travel at
+    /// all: a different document under the same offset, or a thumb the
+    /// reader is dragging, which must stay under the pointer holding it.
+    pub fn settle(&mut self, to: f32) {
+        self.from = to;
+        self.to = to;
+        self.animation = Animation::new(self.duration, self.easing).paused();
+    }
+
+    /// Steps the clock and reports whether anything visible changed.
+    pub fn advance(&mut self, dt: Duration) -> bool {
+        let before = self.value();
+        let running = self.animation.advance(dt);
+        running || before != self.value()
+    }
+
+    pub fn value(&self) -> f32 {
+        self.animation.value(self.from, self.to)
+    }
+
+    /// Where it is heading — what to read when deciding where to go next.
+    /// Accumulating onto [`Glide::value`] instead would make each notch of
+    /// a fast scroll shorter than the one before it, because every one
+    /// would start from a journey that had not finished.
+    pub fn target(&self) -> f32 {
+        self.to
+    }
+}
+
 /// One piece of interface. Every method has a default except [`draw`], so
 /// a static component is a single function.
 ///
@@ -481,6 +559,61 @@ mod tests {
 
         dirty.write(&mut frametime, Duration::from_millis(6));
         assert!(dirty.get());
+    }
+
+    /// The scroll case, in miniature: a notch lands, a second notch arrives
+    /// mid-travel, and the page must carry both without losing the distance
+    /// the first one had left to run.
+    #[test]
+    fn a_second_aim_mid_flight_keeps_the_distance_the_first_had_left() {
+        let mut glide = Glide::new(Duration::from_millis(100), Easing::Linear);
+        glide.aim(100.0);
+        glide.advance(Duration::from_millis(50));
+        assert!((glide.value() - 50.0).abs() < 0.001, "halfway");
+
+        // A second notch: the target grows, and travel resumes from 50 —
+        // not from 0, and not by teleporting to the old target first.
+        glide.aim(200.0);
+        assert!((glide.value() - 50.0).abs() < 0.001, "no jump on re-aim");
+        assert_eq!(glide.target(), 200.0);
+        glide.advance(Duration::from_millis(50));
+        assert!((glide.value() - 125.0).abs() < 0.001);
+        glide.advance(Duration::from_millis(50));
+        assert_eq!(glide.value(), 200.0, "arrives exactly");
+    }
+
+    /// The camera aims at the same offset every frame it is asked to follow
+    /// a caret that has not moved. Restarting there would pin the value at
+    /// the start of a travel it never finishes.
+    #[test]
+    fn aiming_where_it_is_already_going_is_not_a_restart() {
+        let mut glide = Glide::new(Duration::from_millis(100), Easing::Linear);
+        glide.aim(100.0);
+        for _ in 0..4 {
+            glide.aim(100.0);
+            glide.advance(Duration::from_millis(25));
+        }
+        assert_eq!(glide.value(), 100.0);
+    }
+
+    /// A frame that lands the value has to be reported, or the caller stops
+    /// asking for frames one short and the last pixel is never drawn.
+    #[test]
+    fn the_landing_frame_counts_as_a_change_and_the_rest_do_not() {
+        let mut glide = Glide::new(Duration::from_millis(100), Easing::Linear);
+        glide.aim(10.0);
+        assert!(glide.advance(Duration::from_millis(60)), "still travelling");
+        assert!(
+            glide.advance(Duration::from_millis(60)),
+            "landed this frame"
+        );
+        assert!(!glide.advance(Duration::from_millis(60)), "at rest");
+
+        // Settling is arrival without travel: nothing to animate afterwards.
+        glide.settle(400.0);
+        assert_eq!(glide.value(), 400.0);
+        assert_eq!(glide.target(), 400.0);
+        assert!(!glide.advance(Duration::from_millis(16)));
     }
 
     #[test]
