@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub mod code;
 mod code_metadata;
+pub mod decoration;
 pub mod layout;
 pub mod markdown;
 pub mod math;

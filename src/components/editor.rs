@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::document::decoration::{self, Painted};
 use crate::document::layout::{
     self, CHEVRON_WIDTH, ContextHit, DocLayout, FOLD_INDICATOR_HEIGHT, NUMBER_GUTTER, NUMBER_SIZE,
     RangeKind,
@@ -12,7 +13,7 @@ use crate::document::layout::{
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_layout::{self, MathBox};
 use crate::document::math_paint;
-use crate::document::{ATOM, BadgeColor, Block, Caret, FlatRange, Inline, ListMarker, Style};
+use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style};
 use crate::layout::Rect;
 use crate::renderer::{Layer, PathPaint, Rounding, ShaderEffect};
 use crate::theme::{self, TextStyle};
@@ -28,42 +29,23 @@ pub const EQ_NUMBER_SIZE: f32 = 11.0;
 /// Room kept between the equation number and the band's right edge, so the
 /// widest reading of the band never crowds it.
 pub const EQ_NUMBER_INSET: f32 = 18.0;
-/// A bullet's dot: inset from the content column and sized to read as a
-/// mark, not as a glyph. `BULLET_INSET` is from the column's left edge to
-/// the dot's centre.
-const BULLET_INSET: f32 = 11.0;
-const BULLET_RADIUS: f32 = 2.5;
-/// A task checkbox's corner radius — between the row radius and a code
-/// span's, so it reads as a control, not as a box of text.
-const CHECK_RADIUS: f32 = 4.5;
-const CHECK_ROUNDING: Rounding = Rounding::uniform(CHECK_RADIUS);
-/// A done task's strike: centred on the line's own centre — the text is
-/// drawn v-centred on the same point, so the rule crosses the x-height.
-const STRIKE_THICKNESS: f32 = 1.4;
 /// The design's measure: the content column is never wider than this.
 pub const MEASURE: f32 = 704.0;
 /// Space kept past the right edge before a line may wrap.
 pub const RIGHT_MARGIN: f32 = 24.0;
 /// Radius of the Ctrl-drag selection brush in logical pixels.
 pub const BRUSH_RADIUS: f32 = 9.0;
-/// Padding of the tint behind code: a fenced block gets the generous one,
-/// an inline span the tight one, so a `` `run` `` mid-sentence doesn't push
-/// the line apart.
+/// Padding of the tint behind a fenced code block, which is the generous
+/// one; an inline span's tighter pad belongs to [`decoration`], with the
+/// box that uses it.
 pub const BLOCK_PAD: (f32, f32) = (10.0, 6.0);
-const INLINE_PAD: (f32, f32) = (8.0, 4.0);
 pub const CODE_ROUNDING: Rounding = Rounding::uniform(10.0);
 const MATH_SELECTION_ROUNDING: Rounding = Rounding::uniform(4.0);
-/// The highlight bar: an underline, not a wash, so the glyphs keep the
-/// page's own contrast. `DROP` is measured down from the line's centre.
-const HIGHLIGHT_DROP: f32 = 8.0;
-const HIGHLIGHT_THICKNESS: f32 = 2.5;
-const HIGHLIGHT_PAD: f32 = 2.0;
-const HIGHLIGHT_ROUNDING: Rounding = Rounding::uniform(1.25);
-/// The halo drawn on the glow layer: a fatter, fainter copy of the bar that
-/// the layer's blur turns into the falloff. One shader pass over one layer,
-/// rather than a stack of hand-faded rectangles. Kept close to the bar —
-/// the glow is meant to read as the mark's own light, not as a second
-/// object under it.
+/// The halo drawn on the glow layer: a fatter, fainter copy of the
+/// highlight bar that the layer's blur turns into the falloff. One shader
+/// pass over one layer, rather than a stack of hand-faded rectangles. Kept
+/// close to the bar — the glow is meant to read as the mark's own light,
+/// not as a second object under it.
 const GLOW_SPREAD: f32 = 1.0;
 const GLOW_ALPHA: f32 = 0.45;
 pub const GLOW_RADIUS: f32 = 2.5;
@@ -119,9 +101,6 @@ impl Metrics {
     }
 }
 
-/// One measured piece of a visual line: `(text, style, x, width)`.
-type Painted = (String, Style, f32, f32);
-
 /// The wash behind a selected expression, or behind one addressed node of
 /// it. Editor-only: a page has no selection, which is why this stayed here
 /// while the notation itself moved to [`math_paint`].
@@ -164,123 +143,6 @@ fn draw_math_selection(
 
 fn draw_brush(layer: &Layer, center: (f32, f32)) {
     layer.draw_circle(center, BRUSH_RADIUS, theme::fade(theme::accent(), 0.14));
-}
-
-/// A list item's marker, hung in the gutter left of the content column.
-/// Virtual like a heading's auto-number: drawn, never laid out, so the
-/// caret cannot reach it and it never shifts the text it labels. Bullets
-/// are drawn glyphs, numbers are right-aligned mono in a fixed column, and
-/// a task's box is a control — filled and ticked when done. `content_x` is
-/// the content column the item's text hangs from; `baseline` the line's
-/// vertical centre.
-fn draw_list_marker(layer: &Layer, marker: &ListMarker, content_x: f32, baseline: f32, scale: f32) {
-    match marker {
-        ListMarker::Bullet => {
-            // Optically centred: a dot a hair above the true centre reads
-            // as aligned with lowercase text.
-            layer.draw_circle(
-                (content_x - BULLET_INSET * scale, baseline - 1.0),
-                BULLET_RADIUS * scale,
-                theme::accent(),
-            );
-        }
-        ListMarker::Number(n) => {
-            theme::draw(
-                layer,
-                &n.to_string(),
-                (content_x - NUMBER_GUTTER, baseline),
-                &TextStyle::mono(NUMBER_SIZE, theme::non_text()),
-                theme::RIGHT,
-            );
-        }
-        ListMarker::Task { done } => {
-            let size = crate::document::layout::CHECK_SIZE * scale;
-            let gap = crate::document::layout::CHECK_GAP * scale;
-            let rect = Rect {
-                x: content_x - gap - size,
-                y: baseline - size * 0.5,
-                width: size,
-                height: size,
-            };
-            if *done {
-                layer.draw_rectangle(
-                    rect.position(),
-                    rect.size(),
-                    theme::fade(theme::accent(), 0.18),
-                    CHECK_ROUNDING,
-                );
-                theme::rounded_outline(
-                    layer,
-                    rect.inset(0.5),
-                    CHECK_RADIUS - 0.5,
-                    1.0,
-                    theme::accent(),
-                );
-                theme::polyline(
-                    layer,
-                    &[
-                        (rect.x + size * 0.24, rect.y + size * 0.52),
-                        (rect.x + size * 0.42, rect.y + size * 0.70),
-                        (rect.x + size * 0.76, rect.y + size * 0.30),
-                    ],
-                    theme::accent(),
-                    1.6,
-                );
-            } else {
-                theme::rounded_outline(
-                    layer,
-                    rect.inset(0.5),
-                    CHECK_RADIUS - 0.5,
-                    1.0,
-                    theme::non_text(),
-                );
-            }
-        }
-    }
-}
-
-/// Maximal runs of adjacent pieces matching `pred`, as `(start_x, end_x)`.
-/// Adjacent pieces merge into one span so a decoration split across runs —
-/// a bold word inside a highlight, two code spans touching — reads as a
-/// single mark rather than beading up at every seam.
-fn spans(pieces: &[Painted], pred: impl Fn(&Painted) -> bool) -> Vec<(f32, f32)> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < pieces.len() {
-        if !pred(&pieces[i]) {
-            i += 1;
-            continue;
-        }
-        let mut end = i;
-        while pieces.get(end + 1).is_some_and(&pred) {
-            end += 1;
-        }
-        out.push((pieces[i].2, pieces[end].2 + pieces[end].3));
-        i = end + 1;
-    }
-    out
-}
-
-fn badge_spans(pieces: &[Painted]) -> Vec<(f32, f32, BadgeColor)> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < pieces.len() {
-        if !pieces[i].1.badge {
-            i += 1;
-            continue;
-        }
-        let color = pieces[i].1.badge_color;
-        let mut end = i;
-        while pieces
-            .get(end + 1)
-            .is_some_and(|piece| piece.1.badge && piece.1.badge_color == color)
-        {
-            end += 1;
-        }
-        out.push((pieces[i].2, pieces[end].2 + pieces[end].3, color));
-        i = end + 1;
-    }
-    out
 }
 
 pub struct Editor {
@@ -686,15 +548,6 @@ impl Component for Editor {
                 }
                 continue;
             }
-            // A done task is quiet twice over: dim ink (via `text_style`)
-            // and a real drawn rule through the run.
-            let done_task = matches!(
-                kind,
-                Block::ListItem {
-                    marker: ListMarker::Task { done: true },
-                    ..
-                }
-            );
             for (line_index, line) in block.lines.iter().enumerate() {
                 let top = content + line.y - self.scroll;
                 if top + line.height < rect.y || top > rect.bottom() {
@@ -706,7 +559,14 @@ impl Component for Editor {
                 if line_index == 0
                     && let Block::ListItem { marker, .. } = kind
                 {
-                    draw_list_marker(layer, marker, x + line.x, baseline, self.layout.scale);
+                    let mut canvas = layer;
+                    decoration::marker(
+                        &mut canvas,
+                        marker,
+                        x + line.x,
+                        baseline,
+                        self.layout.scale,
+                    );
                 }
                 // The line's text starts at its own left edge — indented
                 // for a list item's content, the gutter for everything else.
@@ -756,19 +616,13 @@ impl Component for Editor {
                         let style = layout::eq_ref_style(&text, self.layout.scale);
                         theme::draw(layer, &text, (cursor, baseline), &style, theme::LEFT);
                     }
-                    let label_x = cursor
-                        + if segment.style.badge {
-                            theme::BADGE_PAD * self.layout.scale
-                        } else {
-                            0.0
-                        };
-                    let painted_width = width
-                        - if segment.style.badge {
-                            theme::BADGE_PAD * 2.0 * self.layout.scale
-                        } else {
-                            0.0
-                        };
-                    pieces.push((text, segment.style, label_x, painted_width));
+                    pieces.push(decoration::piece(
+                        text,
+                        segment.style,
+                        cursor,
+                        width,
+                        self.layout.scale,
+                    ));
                     if is_math {
                         let Inline::Math(list) = run else {
                             unreachable!("math flag must match math run")
@@ -860,66 +714,32 @@ impl Component for Editor {
                     }
                     cursor += width;
                 }
-                // A run inside a fenced block already sits on the slab drawn
-                // above; only a code span in prose needs its own box.
-                for (start, end) in spans(&pieces, |p| p.1.code && !kind.is_code()) {
-                    layer.draw_rectangle(
-                        (start - INLINE_PAD.0, top + INLINE_PAD.1),
-                        (
-                            end - start + INLINE_PAD.0 * 2.0,
-                            line.height - INLINE_PAD.1 * 2.0,
-                        ),
-                        theme::code(),
-                        CODE_ROUNDING,
-                    );
-                }
-                // A chip's box is centred on the line rather than sized to
-                // it: the label is 9pt, and a box grown to the leading
-                // would read as a code block, not as a tag.
-                for (start, end, color) in badge_spans(&pieces) {
-                    let badge = Rect {
-                        x: start - theme::BADGE_PAD * self.layout.scale,
-                        y: baseline - theme::BADGE_HEIGHT * 0.5,
-                        width: end - start + theme::BADGE_PAD * 2.0 * self.layout.scale,
-                        height: theme::BADGE_HEIGHT,
-                    };
-                    layer.draw_rectangle(
-                        badge.position(),
-                        badge.size(),
-                        theme::fade(theme::badge_ink(color), 0.12),
-                        Rounding::uniform(4.0),
-                    );
-                    theme::rounded_outline(
-                        layer,
-                        badge.inset(0.5),
-                        3.5,
-                        1.0,
-                        theme::fade(theme::badge_ink(color), 0.28),
-                    );
-                }
-                // The bar goes on this layer crisp; the glow layer takes a
-                // fatter, fainter copy and its blur does the falloff.
-                for (start, end) in spans(&pieces, |p| p.1.highlight) {
-                    let at = (start - HIGHLIGHT_PAD, baseline + HIGHLIGHT_DROP);
-                    let size = (end - start + HIGHLIGHT_PAD * 2.0, HIGHLIGHT_THICKNESS);
-                    layer.draw_rectangle(at, size, theme::highlight(), HIGHLIGHT_ROUNDING);
-                    if let Some(glow) = &self.glow {
+                // Every mark these runs carry — the box behind a code
+                // span, a chip, a highlight's bar, a done task's strike —
+                // drawn by the painter the page draws them with.
+                let mut canvas = layer;
+                decoration::runs(
+                    &mut canvas,
+                    &pieces,
+                    kind,
+                    top,
+                    line.height,
+                    baseline,
+                    self.layout.scale,
+                );
+                // The crisp bar is `decoration`'s; the glow layer takes a
+                // fatter, fainter copy of the same rect and its blur does
+                // the falloff. A page has no such layer, which is why this
+                // half stays here.
+                if let Some(glow) = &self.glow {
+                    for (at, size) in decoration::highlight_bars(&pieces, baseline) {
                         glow.draw_rectangle(
                             (at.0 - GLOW_SPREAD, at.1 - GLOW_SPREAD),
                             (size.0 + GLOW_SPREAD * 2.0, size.1 + GLOW_SPREAD * 2.0),
                             theme::fade(theme::highlight(), GLOW_ALPHA * (1.0 - self.focus_amount)),
-                            HIGHLIGHT_ROUNDING,
+                            decoration::HIGHLIGHT_ROUNDING,
                         );
                     }
-                }
-                if done_task && let (Some(first), Some(last)) = (pieces.first(), pieces.last()) {
-                    theme::rule(
-                        layer,
-                        (first.2 - 1.0, baseline - STRIKE_THICKNESS * 0.5),
-                        last.2 + last.3 - first.2 + 2.0,
-                        STRIKE_THICKNESS,
-                        theme::dim(),
-                    );
                 }
                 for ((text, _, at, _), segment) in pieces.iter().zip(&line.segments) {
                     if matches!(
@@ -1299,55 +1119,6 @@ mod tests {
     use crate::document::math_layout::BoxKind;
     use crate::document::{Document, Text};
     use std::path::Path;
-
-    #[test]
-    fn adjacent_decorated_pieces_merge_into_one_span() {
-        let mark = Style {
-            highlight: true,
-            ..Style::PLAIN
-        };
-        let bold_mark = Style { bold: true, ..mark };
-        let piece = |style, x: f32, w: f32| (String::new(), style, x, w);
-        let pieces = vec![
-            piece(Style::PLAIN, 0.0, 10.0),
-            // Two marked runs touching — a bold word inside the mark. One
-            // bar, not two, or the seam shows as a notch.
-            piece(mark, 10.0, 20.0),
-            piece(bold_mark, 30.0, 15.0),
-            piece(Style::PLAIN, 45.0, 5.0),
-            piece(mark, 50.0, 8.0),
-        ];
-        assert_eq!(
-            spans(&pieces, |p| p.1.highlight),
-            vec![(10.0, 45.0), (50.0, 58.0)]
-        );
-        assert!(spans(&pieces, |p| p.1.code).is_empty());
-    }
-
-    #[test]
-    fn badge_outlines_split_when_their_colors_differ() {
-        let orange = Style {
-            badge: true,
-            ..Style::PLAIN
-        };
-        let blue = Style {
-            badge: true,
-            badge_color: BadgeColor::Blue,
-            ..Style::PLAIN
-        };
-        let pieces = vec![
-            ("A".into(), orange, 4.0, 10.0),
-            ("B".into(), orange, 22.0, 10.0),
-            ("C".into(), blue, 40.0, 10.0),
-        ];
-        assert_eq!(
-            badge_spans(&pieces),
-            vec![
-                (4.0, 32.0, BadgeColor::Orange),
-                (40.0, 50.0, BadgeColor::Blue),
-            ]
-        );
-    }
 
     #[test]
     fn follow_scroll_brings_a_band_in_without_runaway() {

@@ -18,7 +18,7 @@
 //! how it is drawn — a shared painter like `document::math_paint`.
 
 use crate::layout::Rect;
-use crate::renderer::{Alignment, Color, Layer, LineJoin, PathPaint, Rounding, Stroke};
+use crate::renderer::{Alignment, Color, Layer, LineCap, LineJoin, PathPaint, Rounding, Stroke};
 use crate::theme::{self, TextStyle};
 
 /// Coordinates are logical pixels, top-left origin, y down. Whose origin is
@@ -103,6 +103,25 @@ pub fn outline(canvas: &mut dyn Canvas, rect: Rect, color: Color) {
 pub fn rounded_outline(canvas: &mut dyn Canvas, rect: Rect, radius: f32, width: f32, color: Color) {
     let d = theme::rounded_rect_path(rect, radius);
     let mut pen = Stroke::new(color, width);
+    pen.join = LineJoin::Round;
+    canvas.draw_path(&d, (0.0, 0.0), 0.0, &PathPaint::Stroke(pen));
+}
+
+/// An open polyline in logical pixels, as [`theme::polyline`] strokes it:
+/// round caps and joins, so a two-segment tick reads as one drawn stroke
+/// rather than three shapes meeting. The `d` is built here rather than
+/// taken as one, because a caller with a list of points has no business
+/// formatting SVG.
+pub fn polyline(canvas: &mut dyn Canvas, points: &[(f32, f32)], color: Color, thickness: f32) {
+    let Some(((first_x, first_y), rest)) = points.split_first() else {
+        return;
+    };
+    let mut d = format!("M{first_x} {first_y}");
+    for (x, y) in rest {
+        d.push_str(&format!("L{x} {y}"));
+    }
+    let mut pen = Stroke::new(color, thickness);
+    pen.cap = LineCap::Round;
     pen.join = LineJoin::Round;
     canvas.draw_path(&d, (0.0, 0.0), 0.0, &PathPaint::Stroke(pen));
 }
