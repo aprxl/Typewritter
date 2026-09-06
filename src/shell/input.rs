@@ -1789,9 +1789,17 @@ impl Shell {
         {
             let mut docs = self.docs.borrow_mut();
             docs.open_preview(row.path());
+            if !docs.active().is_some_and(|tab| tab.path() == row.path()) {
+                return;
+            }
+            docs.tree_selected = Some(row.path().to_path_buf());
             if let Some((block, offset)) = row.position() {
                 docs.jump_to_flat(block, offset);
             }
+        }
+        if let Some(vault) = &self.vault {
+            vault.borrow_mut().reveal(row.path());
+            self.regions[self.tree_region].poke();
         }
         self.close_finder();
     }

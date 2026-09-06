@@ -8,7 +8,7 @@
 use crate::layout::Rect;
 use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
-use crate::ui::{Component, Context, Dirty};
+use crate::ui::{Component, Context, Dirty, Hover};
 
 use super::popup::paint_shadow_slab;
 
@@ -106,6 +106,8 @@ pub struct Palette {
     /// The blurred layer this card paints its shadow slab into.
     shadow: Option<Layer>,
     reveal: f32,
+    hovered: Option<usize>,
+    hover: Hover,
     dirty: Dirty,
 }
 
@@ -145,6 +147,8 @@ impl Palette {
             open: true,
             shadow: None,
             reveal: 0.0,
+            hovered: None,
+            hover: Hover::new(),
             dirty: Dirty::new(),
         }
     }
@@ -162,6 +166,8 @@ impl Palette {
             open: false,
             shadow: None,
             reveal: 1.0,
+            hovered: None,
+            hover: Hover::new(),
             dirty: Dirty::new(),
         }
     }
@@ -208,6 +214,17 @@ impl Component for Palette {
         self.paint_shadow(context.owns_shadow, context.self_rect);
         if self.open {
             self.dirty.write(&mut self.caret_on, context.caret_on);
+            let hovered = context
+                .mouse
+                .in_window
+                .then(|| self.row_at(context.self_rect, context.mouse.position))
+                .flatten();
+            if self
+                .hover
+                .track(&mut self.hovered, hovered, context.animation_dt)
+            {
+                self.dirty.set();
+            }
         }
     }
 
@@ -224,7 +241,7 @@ impl Component for Palette {
     }
 
     fn is_animating(&self) -> bool {
-        self.open && self.reveal > 0.0 && self.reveal < 1.0
+        self.open && (self.hover.is_animating() || (self.reveal > 0.0 && self.reveal < 1.0))
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
@@ -386,6 +403,8 @@ impl Palette {
                     theme::fade(theme::selection(), ea),
                     Rounding::uniform(ROW_RADIUS),
                 );
+            } else if self.hovered == Some(self.first_visible + offset) {
+                theme::hover_fill(layer, row.inset(4.0), self.hover.value() * ea);
             }
             let icon = match entry.group.as_str() {
                 "File" => theme::icons::FILE_LINES,

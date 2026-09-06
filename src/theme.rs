@@ -7,7 +7,7 @@
 //! every call site picks the new value up on its next read.
 //!
 //! Studio pairs chalk and mulberry surfaces with a warm coral focus accent.
-//! Typography is embedded, so the interface has the same metrics on every OS.
+//! Inter is embedded, so UI and prose have the same metrics on every OS.
 
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
@@ -608,10 +608,7 @@ pub fn outline(layer: &Layer, rect: Rect, color: Color) {
 /// reads as a smudge.
 pub fn shadow_ink() -> Color {
     match mode() {
-        // 0x80 (50%) by ear: scale_alpha finally lets this byte through
-        // (see the slab painter), and the halved values from before read as
-        // barely-there now that they are actually applied.
-        Mode::Light => Color::rgba(0x22, 0x32, 0x55, 0x30),
+        Mode::Light => Color::rgba(0x35, 0x23, 0x3F, 0x30),
         Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x80),
     }
 }

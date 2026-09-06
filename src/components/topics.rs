@@ -34,6 +34,7 @@ pub struct Topics {
     /// Filled in by `draw`, hit-tested by `sync` on the next frame.
     entry_rects: Vec<Rect>,
     first_visible: Option<usize>,
+    scroll_remainder: f32,
     hovered: Option<usize>,
     hover: Hover,
 
@@ -56,6 +57,7 @@ impl Topics {
             active,
             entry_rects: Vec::new(),
             first_visible: None,
+            scroll_remainder: 0.0,
             hovered: None,
             hover: Hover::new(),
             dirty: Dirty::new(),
@@ -79,7 +81,9 @@ impl Component for Topics {
                 .len()
                 .saturating_sub(visible_rows(context.self_rect));
             let first = self.first_visible.unwrap_or(0) as f32;
-            let next = (first - context.scroll_y).round().clamp(0.0, max as f32) as usize;
+            let movement = self.scroll_remainder - context.scroll_y;
+            self.scroll_remainder = movement.fract();
+            let next = (first + movement.trunc()).clamp(0.0, max as f32) as usize;
             self.dirty.write(&mut self.first_visible, Some(next));
         }
         let hovered = context.hovered_index(&self.entry_rects);

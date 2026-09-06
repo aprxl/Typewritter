@@ -14,6 +14,7 @@ pub struct TitleBar {
     search_hover: Hover,
     sidebar_hover: Hover,
     focus_hover: Hover,
+    focus_mode: bool,
     switch_hover: Hover,
     locked: bool,
     dirty: Dirty,
@@ -52,6 +53,7 @@ impl TitleBar {
             search_hover: Hover::new(),
             sidebar_hover: Hover::new(),
             focus_hover: Hover::new(),
+            focus_mode: false,
             switch_hover: Hover::new(),
             locked: false,
             dirty: Dirty::new(),
@@ -81,6 +83,7 @@ impl Component for TitleBar {
             context.animation_dt,
         );
         self.dirty.write(&mut self.locked, context.theme_locked);
+        self.dirty.write(&mut self.focus_mode, context.focus_mode);
         if self.query.is_some() {
             self.dirty.write(&mut self.caret_on, context.caret_on);
         }
@@ -188,20 +191,34 @@ impl Component for TitleBar {
         }
 
         let focus = focus_rect(bar);
+        if self.focus_mode {
+            theme::surface(layer, focus, theme::selection(), 8.0);
+        }
         theme::hover_fill(layer, focus, self.focus_hover.value());
         theme::icon(
             layer,
             icons::FOCUS,
             (focus.x + 8.0, middle - 7.0),
             14.0,
-            theme::dim(),
+            if self.focus_mode {
+                theme::accent()
+            } else {
+                theme::dim()
+            },
             1.6,
         );
         theme::draw(
             layer,
             "Focus",
             (focus.x + 30.0, middle),
-            &TextStyle::sans(12.0, theme::dim()),
+            &TextStyle::sans(
+                12.0,
+                if self.focus_mode {
+                    theme::accent()
+                } else {
+                    theme::dim()
+                },
+            ),
             theme::LEFT,
         );
         theme_switch::draw(

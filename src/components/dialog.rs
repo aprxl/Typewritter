@@ -9,7 +9,7 @@ use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
 
-use super::popup::{CARD_RADIUS, Slide, paint_shadow_slab};
+use super::popup::{CARD_RADIUS, paint_shadow_slab};
 
 const CARD_W: f32 = 460.0;
 const CARD_H: f32 = 216.0;
@@ -87,8 +87,6 @@ pub struct Dialog {
     /// The blurred layer this card paints its shadow slab into.
     shadow: Option<Layer>,
     reveal: f32,
-    slide: Slide,
-    started: bool,
     dirty: Dirty,
 }
 
@@ -103,8 +101,6 @@ impl Dialog {
             caret_on: true,
             shadow: None,
             reveal: 0.0,
-            slide: Slide::new(),
-            started: false,
             dirty: Dirty::new(),
         }
     }
@@ -201,18 +197,6 @@ impl Component for Dialog {
         self.paint_shadow(context.owns_shadow, context.self_rect);
         if self.prompt.is_some() {
             self.dirty.write(&mut self.caret_on, context.caret_on);
-
-            // The pill lands nowhere: a dialog has no row highlight. The
-            // Slide is only along for the shared construction; park it off
-            // screen so it never draws.
-            if !self.started {
-                self.slide.park(Rect::default());
-                self.started = true;
-            }
-        }
-        self.slide.advance(context.animation_dt);
-        if self.slide.advancing() {
-            self.dirty.set();
         }
     }
 
@@ -247,7 +231,7 @@ impl Component for Dialog {
         );
 
         let resting = card(rect);
-        let travel = (1.0 - ea) * -4.0;
+        let travel = (1.0 - ea) * 8.0;
         let card = Rect::new(resting.x, resting.y + travel, resting.width, resting.height);
 
         layer.draw_rectangle(

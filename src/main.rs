@@ -4,10 +4,8 @@
 //! [`Shell`](typewritter::shell::Shell), which owns the layout tree, the
 //! components, and one Atomos layer per region.
 //!
-//! Onboarding lives here, in front of the window: first launch (and
-//! `--onboard`) has no saved config, so `main` raises the native folder
-//! dialog, writes `~/.typewritter/config.toml`, and only then starts the
-//! app pointed at that vault.
+//! First launch (and `--onboard`) opens the welcome screen. Its button
+//! raises the native folder picker and remembers the chosen vault.
 //!
 //! Frames are demand-driven — the loop sleeps until input changes state or
 //! an animation asks for another one — and within a frame, only the
@@ -16,10 +14,9 @@
 //!
 //! Keys: vim modes drive the editor (Normal/Insert; `h j k l`, `w b e`,
 //! `0 ^ $`, `gg`/`G`, `x`, `dd`, `o`/`O`, `i a I A`), and the space leader
-//! opens the command palette every binding is routed through. Outside vim's
-//! own keys: `Ctrl+1..4` toggle the tree/sidenotes/topics/status,
-//! `Ctrl+Shift+C` is capture mode (all four at once). Drag the tree's right
-//! edge to resize it.
+//! opens the command palette every binding is routed through.
+//! `Ctrl+Shift+C` toggles focus mode; the toolbar also exposes focus,
+//! sidebar, search, and appearance. Drag panel dividers to resize them.
 
 use std::sync::Arc;
 use std::time::Instant;

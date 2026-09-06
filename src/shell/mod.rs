@@ -517,19 +517,16 @@ impl Shell {
         let title = layout.add_child(Layout::ROOT, Style::fixed(title_bar::HEIGHT));
         let tabs = layout.add_child(Layout::ROOT, Style::fixed(tab_strip::HEIGHT));
         let breadcrumb = layout.add_child(Layout::ROOT, Style::fixed(breadcrumb::HEIGHT));
-        let body = layout.add_child(
-            Layout::ROOT,
-            Style {
-                gap: document_surface::GAP,
-                ..Style::flex(1.0).row()
-            },
-        );
+        let body = layout.add_child(Layout::ROOT, Style::flex(1.0).row());
         let status = layout.add_child(Layout::ROOT, Style::fixed(status_line::HEIGHT));
 
         // The sidenote margin lives inside the canvas, which is what makes
         // it part of the document rather than a fourth panel.
         let tree = layout.add_child(body, Style::fixed(file_tree::WIDTH));
-        let canvas_slot = layout.add_child(body, Style::flex(1.0));
+        let canvas_outer = layout.add_child(body, Style::flex(1.0).row());
+        layout.add_child(canvas_outer, Style::fixed(document_surface::GAP));
+        let canvas_slot = layout.add_child(canvas_outer, Style::flex(1.0));
+        layout.add_child(canvas_outer, Style::fixed(document_surface::GAP));
         layout.add_child(canvas_slot, Style::fixed(document_surface::GAP));
         let canvas = layout.add_child(canvas_slot, Style::flex(1.0).row());
         layout.add_child(canvas_slot, Style::fixed(document_surface::GAP));
@@ -887,6 +884,7 @@ impl Shell {
             // Step-end, not a fade: a caret that fades looks like a bug.
             caret_on: self.caret.is_on(),
             show_stats: self.show_stats,
+            focus_mode: self.panels().iter().all(|panel| !panel.open),
             mouse: Mouse {
                 position: input.mouse_position(),
                 left_pressed: input.is_mouse_pressed(MouseButton::Left),

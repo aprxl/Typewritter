@@ -241,16 +241,16 @@ impl Component for FileTree {
         let Some(vault_ref) = &self.vault else {
             theme::draw(
                 layer,
-                "No vault loaded",
+                "Choose a home for your notes",
                 (rect.x + 18.0, rect.y + 48.0),
                 &TextStyle::sans(12.5, theme::ink()),
                 theme::LEFT,
             );
             theme::draw(
                 layer,
-                "run with --onboard to choose one",
+                "Open a vault from the command palette",
                 (rect.x + 18.0, rect.y + 78.0),
-                &TextStyle::mono(10.5, theme::comment()),
+                &TextStyle::sans(10.5, theme::comment()),
                 theme::LEFT,
             );
             return;

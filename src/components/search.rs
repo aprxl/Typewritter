@@ -14,7 +14,7 @@ use crate::layout::Rect;
 use crate::renderer::{Layer, Rounding};
 use crate::search::Row;
 use crate::theme::{self, TextStyle};
-use crate::ui::{Component, Context, Dirty};
+use crate::ui::{Component, Context, Dirty, Hover};
 
 use super::popup::{CARD_RADIUS, paint_shadow_slab};
 
@@ -78,6 +78,8 @@ pub struct Finder {
     /// The blurred layer this card paints its shadow slab into.
     shadow: Option<Layer>,
     reveal: f32,
+    hovered: Option<usize>,
+    hover: Hover,
     dirty: Dirty,
 }
 
@@ -110,6 +112,8 @@ impl Finder {
             open: true,
             shadow: None,
             reveal: 0.0,
+            hovered: None,
+            hover: Hover::new(),
             dirty: Dirty::new(),
         }
     }
@@ -126,6 +130,8 @@ impl Finder {
             open: false,
             shadow: None,
             reveal: 1.0,
+            hovered: None,
+            hover: Hover::new(),
             dirty: Dirty::new(),
         }
     }
@@ -172,6 +178,17 @@ impl Component for Finder {
         self.paint_shadow(context.owns_shadow, context.self_rect);
         if self.open {
             self.dirty.write(&mut self.caret_on, context.caret_on);
+            let hovered = context
+                .mouse
+                .in_window
+                .then(|| self.row_at(context.self_rect, context.mouse.position))
+                .flatten();
+            if self
+                .hover
+                .track(&mut self.hovered, hovered, context.animation_dt)
+            {
+                self.dirty.set();
+            }
         }
     }
 
@@ -188,7 +205,7 @@ impl Component for Finder {
     }
 
     fn is_animating(&self) -> bool {
-        self.open && self.reveal > 0.0 && self.reveal < 1.0
+        self.open && (self.hover.is_animating() || (self.reveal > 0.0 && self.reveal < 1.0))
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
@@ -207,7 +224,7 @@ impl Component for Finder {
         let resting = card(rect);
         // A modal does not scale or overshoot — a finder-sized surface
         // wobbling reads as lag. It just fades up (and the rounded surface
-        // rises 4px into place on the same curve).
+        // rises 8px into place on the same curve).
         let travel = (1.0 - ea) * 8.0;
         let card = Rect::new(resting.x, resting.y + travel, resting.width, resting.height);
 
@@ -348,6 +365,11 @@ impl Finder {
             .enumerate();
         for (offset, row) in window {
             let row_rect = row_rect(card, offset);
+            if self.hovered == Some(self.first_visible + offset)
+                && self.first_visible + offset != self.selected
+            {
+                theme::hover_fill(layer, row_rect.inset(3.0), self.hover.value() * ea);
+            }
             let middle = row_rect.y + row_rect.height / 2.0;
             // Left cell: the small label — "file", or the hit's file name.
             // Labels on the left read as a column, and can never collide

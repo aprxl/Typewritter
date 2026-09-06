@@ -133,7 +133,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         id: "file.open",
-        title: "Open File",
+        title: "Open file",
         group: "File",
         chord: None,
         run: |shell| shell.open_finder(),
