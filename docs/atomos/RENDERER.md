@@ -104,7 +104,7 @@ scale_factor() -> f32
   or `Font::File(path)`. Registration is cached — passing the same `Font`
   every frame is cheap.
 - `FontParameters::new(size)` then set fields: `size` (px), `weight` (faux-bold,
-  `0.0` = normal, continuous), `width` (faux-condense ratio, `1.0` = normal),
+  `0.0` = normal, continuous; filled and stroked outlines), `width` (faux-condense ratio, `1.0` = normal),
   `tracking` (extra letter-spacing in EM).
 - `Alignment { horizontal, vertical }` says which point of the text's bounding
   box `position` anchors: `Alignment::TOP_LEFT`, `Alignment::CENTER`, or build
