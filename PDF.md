@@ -309,31 +309,45 @@ A piece is *a block, a slice of its lines, and where the slice lands*. One
 type covers both a whole block and a paragraph split across a break, so
 the painter has one path, not two.
 
-Rules, in order:
+The document is one column of visual lines, and the only question is
+where that column may be cut. Between two adjacent lines there either is a
+**break opportunity** or there is not; the run of lines between two
+opportunities is a *chunk*, and a chunk lands whole on a page or starts the
+next one. Every keep-rule is a statement about a *missing* opportunity, so
+all of them live in one predicate (`breakable`) rather than in four special
+cases in the packing loop.
 
-1. Break between blocks. A block that fits on the rest of the page goes
-   there; otherwise the page ends.
-2. A block taller than a whole page splits between its `VisLine`s.
-   Paragraphs, list items and code may split; nothing else reaches this
-   rule.
-3. **Keep-together** (`atomic`): `Block::Math` moves to the next page
-   whole rather than split — notation broken across a sheet is not a
-   smaller equation, it is two wrong ones. A fenced code block wants the
-   same rule but is a *run* of `CodeLine` blocks rather than one block, so
-   it needs the run found first.
-4. **Keep-with-next**: a `Block::Heading` never ends a page. If the block
-   after it does not fit, the heading goes with it.
-5. Inter-block gaps (`GAP_PARAGRAPH` and friends) are swallowed at a page
-   break — a page never opens with leading whitespace.
+Where an opportunity is missing:
 
-Rules 1–3 and 5 exist today; 4 arrives next, and the code half of 3 with
-the code row of §6. Sidenotes add a sixth that is not about height at all
-— see below.
+1. **Inside a block that is not prose.** Only `Paragraph` and `ListItem`
+   split between their own lines. `Math` does not — notation broken across
+   a sheet is not a smaller equation, it is two wrong ones. `CodeLine` does
+   not, and neither does `Heading`, for rule 3's reason.
+2. **Before a `CodeLine { first: false }`** — keep-together. A fence is a
+   *run* of `CodeLine` blocks rather than one block, and this is where the
+   run is found: gluing every continuation line to the line that opened the
+   fence makes the whole fence one chunk.
+3. **After a `Heading`** — keep-with-next. A heading is glued to whatever
+   follows it, so its chunk reaches into the next block's first line and a
+   heading can never be the last thing on a page.
 
-Rule 3 yields to the loop's own hang guard: a block too tall for any page
-takes the page it is on and overflows, atomic or not, because the
-alternative is asking for a fresh page forever. `paint` therefore measures
-a math band from the *piece*, not the block — see the arm's comment.
+Inter-block gaps (`GAP_PARAGRAPH` and friends) are swallowed at a page
+break — a page never opens with leading whitespace, because the page's top
+is set to the chunk that opens it. Sidenotes add a rule that is not about
+height at all — see below.
+
+A chunk taller than the whole sheet is the one case nothing can keep
+together, and `demand` drops it to a single line so the rest of it packs
+line by line. The alternative — insisting, and taking one page for a chunk
+that overflows it — loses content off the bottom edge of the paper, which
+is worse than an equation that prints in two halves. That is also why
+`paint` measures a math band from the *piece*, not the block: on the rare
+sheet where a band is split, a band drawn from the block's own extent would
+run off both pages it appears on.
+
+Consecutive lines of one block on one page are merged into a single
+`Piece`, which is what lets a painter draw one slab under all of them
+instead of notching a rounded corner at every line join.
 
 Folded blocks are expanded before pagination (decision 3), so
 `BlockLayout::hidden` is ignored and `indicator` is never painted. **This
@@ -410,12 +424,12 @@ thing would be indirection with no reader.
 | Element | Layout | Paint | Paginate |
 |---|---|---|---|
 | Paragraph | ✅ shared | ✅ | ✅ |
-| Heading (+ auto-number) | ✅ shared | ✅ | keep-with-next ⬜ |
+| Heading (+ auto-number) | ✅ shared | ✅ | ✅ keep-with-next |
 | bold / italic / plain runs | ✅ shared | ✅ | — |
 | Divider | ✅ shared | ✅ | ✅ |
 | Math, inline and display | ✅ shared | ✅ shared | ✅ |
 | Equation numbers, `@eq:` references | ✅ shared | ✅ | — |
-| Inline code, code blocks | ✅ shared | ⬜ | keep-together ⬜ |
+| Inline code, code blocks | ✅ shared | ⬜ | ✅ keep-together |
 | Lists: bullet, number, task | ✅ shared | ⬜ | ✅ |
 | Badges | ✅ shared | ⬜ | — |
 | Highlights | ✅ shared | ⬜ | — |
