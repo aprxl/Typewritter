@@ -39,7 +39,7 @@ An expression used to be prose with a highlight behind it. It now has a typograp
 
 **Role is shape.** A variable is a filled wash, a constant an outline, a function both. An outline is never a colour of its own: it is its fill, rotated in HSL away from the page and slightly up in chroma, so a border is always a shade of the thing it borders. Because the distinction is a shape and not a hue, it survives greyscale, a projector, and a printed page.
 
-**Grammar recedes.** Operators, relations and punctuation are set in a quieter ink than the terms they join. Numerals get an ink of their own — a quantity is not a name — and long ones group in threes outward from the decimal point, ISO 31-0 style, so `299792458` reads as `299 792 458`. The separator is an advance rather than a node: the caret cannot stop in it and backspace has nothing to delete.
+**Grammar recedes.** Operators, relations, punctuation, large operators and delimiters are set in a quieter ink than the terms they join. The summation sign is optically narrowed and lifted to match the weight and axis of the integral family. Numerals get an ink of their own — a quantity is not a name — and long ones group in threes outward from the decimal point, ISO 31-0 style, so `299792458` reads as `299 792 458`. The separator is an advance rather than a node: the caret cannot stop in it and backspace has nothing to delete.
 
 Both axes are per symbol and both are optional. Overrides live in `~/.typewritter/config.toml` rather than in the documents, because a symbol's colour is a fact about your vocabulary and not about one note:
 

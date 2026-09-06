@@ -128,8 +128,12 @@ fn draw_inner(
             canvas::outline(canvas, rect, theme::non_text());
         }
         BoxKind::Primitive(primitive) => match primitive {
-            MathPrimitive::Stroke { path, thickness } => {
-                let mut stroke = Stroke::new(theme::ink(), *thickness);
+            MathPrimitive::Stroke {
+                path,
+                thickness,
+                ink,
+            } => {
+                let mut stroke = Stroke::new(notation_ink(*ink), *thickness);
                 stroke.cap = LineCap::Round;
                 stroke.join = LineJoin::Round;
                 canvas.draw_path(path, origin, 0.0, &PathPaint::Stroke(stroke));
@@ -267,10 +271,20 @@ mod tests {
 
     /// Three notation inks, three different colours on the page.
     #[test]
-    fn numerals_and_operators_are_set_in_their_own_inks() {
+    fn numerals_operators_delimiters_and_large_operators_use_their_own_inks() {
         let canvas = painted(&vec![
             MathNode::Sym('2'),
             MathNode::Sym('+'),
+            MathNode::Group {
+                open: '(',
+                close: ')',
+                body: vec![MathNode::Sym('z')],
+            },
+            MathNode::BigOp {
+                kind: crate::document::math::BigOp::Sum,
+                lower: Vec::new(),
+                upper: Vec::new(),
+            },
             MathNode::Sym('z'),
         ]);
 
@@ -283,6 +297,22 @@ mod tests {
             canvas
                 .calls
                 .contains(&Call::Text("+".into(), theme::math_operator()))
+        );
+        assert!(
+            canvas
+                .calls
+                .contains(&Call::Text("∑".into(), theme::math_operator()))
+        );
+        assert_eq!(
+            canvas
+                .calls
+                .iter()
+                .filter(
+                    |call| matches!(call, Call::Stroke(color) if *color == theme::math_operator())
+                )
+                .count(),
+            2,
+            "both group delimiters use the quiet grammar ink"
         );
         assert!(canvas.calls.contains(&Call::Text("z".into(), theme::ink())));
     }
