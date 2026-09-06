@@ -878,8 +878,10 @@ impl Shell {
 
         self.handle_input(input, viewport);
         // Straight after the input that aimed it, and before the regions
-        // sync: the scrollbar reads the span this publishes.
-        let scrolling = self.drive_scroll(dt);
+        // sync: the scrollbar reads the span this publishes. It takes no
+        // frame delta — the glide keeps its own clock, because this frame's
+        // delta may be an idle gap that its target did not live through.
+        let scrolling = self.drive_scroll();
         self.reveal_focused_note();
         self.autosave();
         self.sync_math_menu();
@@ -1569,10 +1571,10 @@ impl Shell {
     /// because the bounds move on their own — a section folded away, a
     /// resize that re-wraps the text — and a target left past the new
     /// ceiling would strand the reader below the last line.
-    fn drive_scroll(&mut self, dt: Duration) -> bool {
+    fn drive_scroll(&mut self) -> bool {
         let (min, max) = self.editor_scroll_bounds();
         self.scroll.aim(self.scroll.target().clamp(min, max));
-        let moved = self.scroll.advance(dt);
+        let moved = self.scroll.advance();
         self.docs
             .borrow_mut()
             .set_editor_scroll(self.scroll.value());
