@@ -398,6 +398,7 @@ impl Editor {
                 height: 0.0,
                 scale: 1.0,
                 source: Vec::new(),
+                code_colors: Vec::new(),
                 anchors: Vec::new(),
                 equation_numbers: HashMap::new(),
             }),
@@ -920,15 +921,26 @@ impl Component for Editor {
                         theme::dim(),
                     );
                 }
-                for ((text, style, at, _), segment) in pieces.iter().zip(&line.segments) {
+                for ((text, _, at, _), segment) in pieces.iter().zip(&line.segments) {
                     if matches!(
                         kind.inlines()[segment.inline],
                         Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_)
                     ) {
                         continue;
                     }
-                    let style = layout::text_style(kind, *style, self.layout.scale);
-                    theme::draw(layer, text, (*at, baseline), &style, theme::LEFT);
+                    let spans = crate::document::code::painted(&self.layout, bi, segment, text);
+                    let spans: Vec<_> = spans
+                        .iter()
+                        .map(|(text, style)| {
+                            crate::renderer::TextSpan::new(
+                                *text,
+                                style.font.clone(),
+                                style.parameters(),
+                                style.color.clone(),
+                            )
+                        })
+                        .collect();
+                    layer.draw_styled_text(&spans, (*at, baseline), theme::LEFT);
                 }
                 // The auto-number, hung in the margin: virtual, so it is
                 // drawn rather than laid out — the caret cannot reach it and

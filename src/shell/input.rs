@@ -371,10 +371,44 @@ impl Shell {
     }
 
     fn handle_brush_input(&mut self, input: &Input) -> bool {
+        let revision = self.docs.borrow().revision();
+        if self.brush_document_revision != revision {
+            if reset_brush_selection(
+                &mut self.brush_selected,
+                &mut self.brush_inside,
+                &mut self.brush_point,
+            ) {
+                self.brush_revision = self.brush_revision.wrapping_add(1);
+            }
+            self.brush_document_revision = revision;
+        }
         if !(input.ctrl() && input.is_mouse_down(MouseButton::Left)) {
-            if self.brush_point.take().is_some() || !self.brush_inside.is_empty() {
+            let released = self.brush_point.take().is_some();
+            if released || !self.brush_inside.is_empty() {
                 self.brush_inside.clear();
                 self.brush_revision = self.brush_revision.wrapping_add(1);
+            }
+            if released
+                && let Some(target) = self
+                    .brush_selected
+                    .iter()
+                    .find(|hit| {
+                        matches!(
+                            hit,
+                            ContextHit::Range {
+                                kind: RangeKind::CodeWord,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+            {
+                self.open_context_target(
+                    commands::CODE_COLOR_MENU,
+                    input.mouse_position(),
+                    Some(target),
+                );
+                return true;
             }
             return false;
         }
@@ -489,6 +523,17 @@ impl Shell {
                 if self.click_anchor(rect, mouse) {
                     // The click focused a note; nothing else to do with it.
                 } else if let Some(target) = self.context_at(rect, mouse) {
+                    if matches!(
+                        target,
+                        ContextHit::Range {
+                            kind: RangeKind::CodeWord,
+                            ..
+                        }
+                    ) && !self.brush_selected.contains(&target)
+                    {
+                        self.brush_selected.clear();
+                        self.brush_revision = self.brush_revision.wrapping_add(1);
+                    }
                     if matches!(
                         target,
                         ContextHit::Range {
@@ -1866,6 +1911,7 @@ impl Shell {
                 RangeKind::Badge => commands::BADGE_MENU.to_vec(),
                 RangeKind::InlineCode => commands::INLINE_CODE_MENU.to_vec(),
                 RangeKind::CodeBlock => commands::CODE_BLOCK_MENU.to_vec(),
+                RangeKind::CodeWord => commands::CODE_COLOR_MENU.to_vec(),
             },
             ContextHit::Math {
                 block,
@@ -1954,6 +2000,24 @@ impl Shell {
     fn context_command_checked_for(document: &Document, target: ContextHit, id: &str) -> bool {
         match target {
             ContextHit::Range { range, .. } => {
+                if let Some(choice) = id.strip_prefix("context.code.") {
+                    let block = &document.body()[range.start.block];
+                    let syntax = document.code_style_at(range.start).unwrap_or_default();
+                    if let Some(color) = choice.strip_prefix("color.") {
+                        return syntax.manual && syntax.color == MathHue::from_keyword(color);
+                    }
+                    let language = syntax.language.or_else(|| match block {
+                        Block::CodeLine { lang, .. } => lang
+                            .as_deref()
+                            .and_then(crate::document::code::Language::from_name),
+                        _ => None,
+                    });
+                    return match choice {
+                        "manual" => syntax.manual,
+                        "plain" => !syntax.manual && language.is_none(),
+                        _ => !syntax.manual && language.is_some_and(|lang| lang.name() == choice),
+                    };
+                }
                 let mask = match id {
                     "context.bold" => Style {
                         bold: true,
@@ -2163,6 +2227,74 @@ impl Shell {
                 },
             );
         }
+    }
+
+    pub(super) fn context_code_settings(&mut self) {
+        if let Some(state) = &self.context_menu {
+            let target = state.target.clone();
+            let anchor = state.anchor;
+            let is_block = target
+                .as_ref()
+                .and_then(|hit| match hit {
+                    ContextHit::Range { range, .. } => Some(range.start.block),
+                    _ => None,
+                })
+                .is_some_and(|index| {
+                    self.docs
+                        .borrow()
+                        .active()
+                        .is_some_and(|tab| tab.document.body()[index].is_code())
+                });
+            self.open_context_target(
+                if is_block {
+                    commands::CODE_BLOCK_MENU
+                } else {
+                    commands::INLINE_CODE_MENU
+                },
+                anchor,
+                target,
+            );
+        }
+    }
+
+    pub(super) fn context_code_options(
+        &mut self,
+        language: Option<crate::document::code::Language>,
+        manual: bool,
+    ) {
+        if let Some(range) = self.context_range() {
+            self.docs
+                .borrow_mut()
+                .set_code_options(range, language, manual);
+        }
+        self.brush_selected.clear();
+        self.brush_revision = self.brush_revision.wrapping_add(1);
+    }
+
+    pub(super) fn context_code_color(&mut self, color: Option<MathHue>) {
+        let mut ranges: Vec<_> = self
+            .brush_selected
+            .iter()
+            .filter_map(|hit| match hit {
+                ContextHit::Range {
+                    range,
+                    kind: RangeKind::CodeWord,
+                } => Some(*range),
+                _ => None,
+            })
+            .collect();
+        if ranges.is_empty()
+            && let Some(range) = self.context_range()
+        {
+            ranges.push(range);
+        }
+        self.docs.borrow_mut().transaction(|docs| {
+            for range in ranges {
+                docs.set_code_color(range, color);
+            }
+        });
+        self.brush_selected.clear();
+        self.brush_revision = self.brush_revision.wrapping_add(1);
     }
 
     pub(super) fn context_set_badge_color(&mut self, color: BadgeColor) {
@@ -2815,7 +2947,11 @@ impl Shell {
         };
         let card = match &sections {
             Some(sections) => symbol_menu::card_anchored(viewport, state.anchor, sections),
-            None => context_menu::card_anchored(viewport, state.anchor, state.items.len()),
+            None => crate::components::popup::revealed_card(
+                context_menu::card_anchored(viewport, state.anchor, state.items.len()),
+                state.anchor,
+                crate::components::popup::MENU_SLIDE_EASING.apply(self.popup_reveal.weight()),
+            ),
         };
         let point = input.mouse_position();
         if input.is_cursor_in_window() {
@@ -2853,6 +2989,9 @@ impl Shell {
             .copied();
         if let Some(command) = command {
             (command.run)(self);
+            if command.id == "context.code.settings" {
+                return;
+            }
         }
         self.close_context_menu();
     }

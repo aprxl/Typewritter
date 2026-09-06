@@ -258,8 +258,12 @@ fn line(
 
         match run {
             Inline::Text(_) => {
-                let style = layout::text_style(kind, segment.style, layout.scale);
-                canvas.draw_text(&text, (cursor, baseline), &style, theme::LEFT);
+                let mut prefix = String::new();
+                for (part, style) in crate::document::code::painted(layout, index, segment, &text) {
+                    let x = cursor + canvas.measure(&prefix, &style);
+                    canvas.draw_text(part, (x, baseline), &style, theme::LEFT);
+                    prefix.push_str(part);
+                }
             }
             // Notation, drawn through the painter the editor draws it with
             // — see `document::math_paint`. `slots` is false: an empty slot

@@ -491,6 +491,23 @@ impl Tabs {
         self.edit(|doc| doc.toggle_style_range(range, mask));
     }
 
+    pub fn set_code_options(
+        &mut self,
+        range: FlatRange,
+        language: Option<crate::document::code::Language>,
+        manual: bool,
+    ) {
+        self.edit(|doc| doc.set_code_options(range, language, manual));
+    }
+
+    pub fn set_code_color(
+        &mut self,
+        range: FlatRange,
+        color: Option<crate::document::math_style::MathHue>,
+    ) {
+        self.edit(|doc| doc.set_code_color(range, color));
+    }
+
     pub fn set_badge_color(&mut self, range: FlatRange, color: BadgeColor) {
         self.edit(|doc| doc.set_badge_color(range, color));
     }
@@ -1512,6 +1529,43 @@ mod tests {
             crate::document::Inline::Text(text)
                 if text.style.badge_color == BadgeColor::Blue
         ));
+    }
+
+    #[test]
+    fn code_brush_colors_are_one_undo_step_and_survive_save() {
+        use crate::document::{FlatPos, code, math_style::MathHue};
+        let path = temp_file("code-colors", "```rust\nfoo + bar\n```");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        let range = |start, end| {
+            FlatRange::new(
+                FlatPos {
+                    block: 0,
+                    offset: start,
+                },
+                FlatPos {
+                    block: 0,
+                    offset: end,
+                },
+            )
+        };
+        tabs.set_code_options(range(0, 3), None, true);
+        tabs.transaction(|tabs| {
+            tabs.set_code_color(range(0, 3), Some(MathHue::Rose));
+            tabs.set_code_color(range(6, 9), Some(MathHue::Rose));
+        });
+        let colors = code::colors(tabs.active().unwrap().document.body());
+        tabs.undo();
+        assert!(
+            code::colors(tabs.active().unwrap().document.body())[0]
+                .iter()
+                .all(Option::is_none)
+        );
+        tabs.redo();
+        assert_eq!(code::colors(tabs.active().unwrap().document.body()), colors);
+        tabs.save_active().unwrap();
+        assert_eq!(code::colors(Document::load(&path).unwrap().body()), colors);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

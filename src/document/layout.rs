@@ -193,6 +193,7 @@ pub struct DocLayout {
     /// A snapshot of the source blocks, so the editor can index a visual
     /// block back to its kind and runs without holding the live document.
     pub source: Vec<Block>,
+    pub code_colors: Vec<Vec<Option<super::code::Ink>>>,
     /// Each sidenote anchor, in document order, with its derived number and
     /// the y of the line it sits on. Nothing stores these — like the heading
     /// outline, they are derived from position so a number can never
@@ -224,6 +225,7 @@ pub enum RangeKind {
     Badge,
     InlineCode,
     CodeBlock,
+    CodeWord,
 }
 
 /// The font a run renders with. Body is serif 17.5; headings are serif at
@@ -749,6 +751,7 @@ pub fn layout_blocks(
     DocLayout {
         blocks: laid,
         source: blocks.to_vec(),
+        code_colors: super::code::colors(blocks),
         height: y,
         scale,
         anchors,
@@ -804,7 +807,32 @@ fn segment_text(run: &Inline, segment: &Segment) -> String {
         .collect()
 }
 
-/// The char index (block-flat) that a segment covers up to, exclusive.
+/// Bounds of the contiguous code span, independent of color-run boundaries.
+fn code_span_bounds(block: &Block, inline: usize) -> (usize, usize) {
+    if block.is_code() {
+        return (0, block_flat_len(block));
+    }
+    let runs = block.inlines();
+    let mut first = inline;
+    let mut last = inline + 1;
+    while first > 0 && runs[first - 1].style().code {
+        first -= 1;
+    }
+    while last < runs.len() && runs[last].style().code {
+        last += 1;
+    }
+    let start = runs[..first]
+        .iter()
+        .map(|run| run_text(run).chars().count())
+        .sum();
+    let end = runs[..last]
+        .iter()
+        .map(|run| run_text(run).chars().count())
+        .sum();
+    (start, end)
+}
+
+/// Character count of a block, counting opaque atoms as one.
 fn block_flat_len(block: &Block) -> usize {
     block
         .inlines()
@@ -1241,8 +1269,11 @@ impl DocLayout {
         let line = &layout_block.lines[line_idx];
         let block = &self.source[block_idx];
         let x = x - line.x;
+        if block.is_code() && block_flat_len(block) == 0 {
+            return Some(self.code_block_target(block_idx));
+        }
 
-        if block.is_code() {
+        if block.is_code() && !block.inlines()[0].style().syntax.manual {
             let mut first = block_idx;
             while first > 0
                 && matches!(
@@ -1309,7 +1340,7 @@ impl DocLayout {
                         kind: RangeKind::Badge,
                     });
                 }
-                if segment.style.code {
+                if segment.style.code && !segment.style.syntax.manual {
                     return Some(ContextHit::Range {
                         range: whole_run,
                         kind: RangeKind::InlineCode,
@@ -1329,7 +1360,20 @@ impl DocLayout {
                     .chars()
                     .nth(within_segment)
                     .expect("segment length matches segment text");
-                if !ch.is_alphanumeric() && ch != '_' {
+                if ch.is_whitespace() && segment.style.code && segment.style.syntax.manual {
+                    return Some(if block.is_code() {
+                        self.code_block_target(block_idx)
+                    } else {
+                        ContextHit::Range {
+                            range: whole_run,
+                            kind: RangeKind::InlineCode,
+                        }
+                    });
+                }
+                if !ch.is_alphanumeric()
+                    && ch != '_'
+                    && !(segment.style.code && segment.style.syntax.manual && !ch.is_whitespace())
+                {
                     return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
                 }
                 let chars: Vec<char> = block
@@ -1337,12 +1381,23 @@ impl DocLayout {
                     .iter()
                     .flat_map(|run| run_text(run).chars())
                     .collect();
+                let (lower, upper) = if segment.style.code {
+                    code_span_bounds(block, segment.inline)
+                } else {
+                    (0, chars.len())
+                };
                 let mut start = clicked;
-                while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+                while (ch.is_alphanumeric() || ch == '_')
+                    && start > lower
+                    && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_')
+                {
                     start -= 1;
                 }
                 let mut end = clicked + 1;
-                while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                while (ch.is_alphanumeric() || ch == '_')
+                    && end < upper
+                    && (chars[end].is_alphanumeric() || chars[end] == '_')
+                {
                     end += 1;
                 }
                 return Some(ContextHit::Range {
@@ -1356,7 +1411,11 @@ impl DocLayout {
                             offset: end,
                         },
                     ),
-                    kind: RangeKind::Word,
+                    kind: if segment.style.code {
+                        RangeKind::CodeWord
+                    } else {
+                        RangeKind::Word
+                    },
                 });
             }
             advance_x += width;
@@ -1382,7 +1441,7 @@ impl DocLayout {
 
         for (block_idx, layout_block) in self.blocks.iter().enumerate() {
             let block = &self.source[block_idx];
-            if block.is_code() {
+            if block.is_code() && !block.inlines()[0].style().syntax.manual {
                 let target = self.code_block_target(block_idx);
                 for line in &layout_block.lines {
                     if circle_intersects_rect(
@@ -1491,7 +1550,7 @@ impl DocLayout {
                                     },
                                 );
                             }
-                        } else if segment.style.code {
+                        } else if segment.style.code && !segment.style.syntax.manual {
                             if circle_intersects_rect(
                                 point,
                                 radius,
@@ -1515,7 +1574,9 @@ impl DocLayout {
                                     &ch.to_string(),
                                     &text_style(block, segment.style, self.scale),
                                 );
-                                if (ch.is_alphanumeric() || ch == '_')
+                                if (ch.is_alphanumeric()
+                                    || ch == '_'
+                                    || (segment.style.code && !ch.is_whitespace()))
                                     && circle_intersects_rect(
                                         point,
                                         radius,
@@ -1526,15 +1587,22 @@ impl DocLayout {
                                     )
                                 {
                                     let clicked = run_start + segment.start + within_segment;
+                                    let (lower, upper) = if segment.style.code {
+                                        code_span_bounds(block, segment.inline)
+                                    } else {
+                                        (0, chars.len())
+                                    };
                                     let mut start = clicked;
-                                    while start > 0
+                                    while (ch.is_alphanumeric() || ch == '_')
+                                        && start > lower
                                         && (chars[start - 1].is_alphanumeric()
                                             || chars[start - 1] == '_')
                                     {
                                         start -= 1;
                                     }
                                     let mut end = clicked + 1;
-                                    while end < chars.len()
+                                    while (ch.is_alphanumeric() || ch == '_')
+                                        && end < upper
                                         && (chars[end].is_alphanumeric() || chars[end] == '_')
                                     {
                                         end += 1;
@@ -1552,7 +1620,11 @@ impl DocLayout {
                                                     offset: end,
                                                 },
                                             ),
-                                            kind: RangeKind::Word,
+                                            kind: if segment.style.code {
+                                                RangeKind::CodeWord
+                                            } else {
+                                                RangeKind::Word
+                                            },
                                         },
                                     );
                                 }

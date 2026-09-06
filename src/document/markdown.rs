@@ -472,6 +472,14 @@ fn note_block(body: &str) -> Block {
 /// Build a `Document` from Markdown text. `path` only seeds `Document`'s
 /// `path`/`name` fields. Pure — no IO.
 pub fn parse(path: &Path, text: &str) -> Document {
+    let normalized;
+    let text = if text.contains("\r\n") {
+        normalized = text.replace("\r\n", "\n");
+        normalized.as_str()
+    } else {
+        text
+    };
+    let (text, metadata) = super::code_metadata::detach(text);
     let text = text.strip_suffix('\n').unwrap_or(text);
     let mut blocks: Vec<Block> = Vec::new();
     let mut para: Vec<String> = Vec::new();
@@ -675,7 +683,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
         })
         .collect();
 
-    Document {
+    let mut doc = Document {
         body: blocks,
         path: path.to_path_buf(),
         name,
@@ -689,7 +697,9 @@ pub fn parse(path: &Path, text: &str) -> Document {
         math: None,
         notes,
         focus: Focus::Body,
-    }
+    };
+    super::code_metadata::apply(&mut doc, metadata);
+    doc
 }
 
 /// Escape the literal text of a run: `\` → `\\`, `*` → `\*`.
@@ -795,6 +805,13 @@ fn serialize_runs(runs: &[Inline]) -> String {
 
 /// Write a document back out, deterministically.
 pub fn serialize(doc: &Document) -> String {
+    let plain = super::code_metadata::plain(doc);
+    let mut text = serialize_plain(&plain);
+    super::code_metadata::append(doc, &mut text);
+    text
+}
+
+fn serialize_plain(doc: &Document) -> String {
     // Empty document (one empty paragraph) serializes to ""; "" parses
     // back to one empty paragraph, so "" is the fixpoint. An empty
     // Heading must NOT take this path — it would lose its heading-ness.

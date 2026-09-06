@@ -387,6 +387,7 @@ pub struct Shell {
     brush_inside: Vec<ContextHit>,
     brush_point: Option<(f32, f32)>,
     brush_revision: u64,
+    brush_document_revision: u64,
     last_brush_revision: u64,
     /// The in-math completion card while it is showing.
     math_menu: Option<MathMenuState>,
@@ -730,6 +731,7 @@ impl Shell {
             brush_inside: Vec::new(),
             brush_point: None,
             brush_revision: 0,
+            brush_document_revision: 0,
             last_brush_revision: 0,
             math_menu: None,
             math_dismissed: None,
@@ -1481,6 +1483,7 @@ impl Shell {
                     height: 0.0,
                     scale: 1.0,
                     source: Vec::new(),
+                    code_colors: Vec::new(),
                     anchors: Vec::new(),
                     equation_numbers: std::collections::HashMap::new(),
                 },

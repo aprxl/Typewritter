@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod code;
+mod code_metadata;
 pub mod layout;
 pub mod markdown;
 pub mod math;
@@ -153,6 +155,7 @@ pub enum BadgeColor {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Style {
+    pub syntax: code::CodeStyle,
     pub bold: bool,
     pub italic: bool,
     pub code: bool,
@@ -219,6 +222,7 @@ impl FlatRange {
 
 impl Style {
     pub const PLAIN: Style = Style {
+        syntax: code::CodeStyle::PLAIN,
         bold: false,
         italic: false,
         code: false,
@@ -231,6 +235,17 @@ impl Style {
     /// code spans and badges. Nothing else may be layered onto one.
     pub fn is_boxed(&self) -> bool {
         self.code || self.badge
+    }
+
+    /// Saved code annotations do not add style-context stops to arrow motions.
+    fn same_context(self, other: Self) -> bool {
+        Self {
+            syntax: code::CodeStyle::PLAIN,
+            ..self
+        } == Self {
+            syntax: code::CodeStyle::PLAIN,
+            ..other
+        }
     }
 
     pub fn is_plain(&self) -> bool {
@@ -452,6 +467,11 @@ fn continued(marker: ListMarker) -> ListMarker {
 /// every note body, so invariants hold in every scope rather than only where
 /// the caret is.
 fn prune_block(block: &mut Block) {
+    let syntax = block
+        .inlines()
+        .first()
+        .map(|run| run.style().syntax)
+        .unwrap_or_default();
     let runs = std::mem::take(block.inlines_mut());
     let mut merged = Vec::with_capacity(runs.len());
     for run in runs {
@@ -498,6 +518,7 @@ fn prune_block(block: &mut Block) {
                     text: String::new(),
                     style: Style {
                         code: true,
+                        syntax,
                         ..Style::PLAIN
                     },
                 })],
@@ -1683,7 +1704,7 @@ impl Document {
         let at_seam = o == 0 || o == run_len_i;
         let after = self.style_at(b, self.caret_flat(b));
         let target = after.unwrap_or(Style::PLAIN);
-        if at_seam && self.caret.style != target {
+        if at_seam && !self.caret.style.same_context(target) {
             self.caret.style = target; // pop out of the run — no movement
             return;
         }
@@ -1712,7 +1733,7 @@ impl Document {
         let at_seam = o == 0 || o == run_len_i;
         let before = self.style_before(b, self.caret_flat(b));
         let target = before.unwrap_or(Style::PLAIN);
-        if at_seam && self.caret.style != target {
+        if at_seam && !self.caret.style.same_context(target) {
             self.caret.style = target; // re-enter the run to the left
             return;
         }
@@ -1786,7 +1807,15 @@ impl Document {
             }
             return;
         }
-        let s = self.caret.style;
+        let s = if self.scope()[b].is_code() {
+            Style {
+                code: true,
+                syntax: self.scope()[b].inlines()[self.caret.inline].style().syntax,
+                ..Style::PLAIN
+            }
+        } else {
+            self.caret.style
+        };
         let i = self.caret.inline;
         let o = self.caret.offset;
         let flat = self.caret_flat(b);
@@ -2417,6 +2446,7 @@ impl Document {
                 for run in &mut inlines {
                     run.set_style(Style {
                         code: false,
+                        syntax: code::CodeStyle::PLAIN,
                         ..run.style()
                     });
                 }
@@ -2435,6 +2465,7 @@ impl Document {
                 for run in &mut inlines {
                     run.set_style(Style {
                         code: false,
+                        syntax: code::CodeStyle::PLAIN,
                         ..run.style()
                     });
                 }

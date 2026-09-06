@@ -173,6 +173,7 @@ mod tests {
             blocks,
             height: y,
             scale: 1.0,
+            code_colors: vec![Vec::new(); heights.len()],
             source: heights
                 .iter()
                 .map(|_| Block::Paragraph(Vec::new()))
@@ -204,6 +205,7 @@ mod tests {
             height: total,
             scale: 1.0,
             source: vec![Block::Paragraph(Vec::new())],
+            code_colors: vec![Vec::new()],
             anchors: Vec::new(),
             equation_numbers: HashMap::new(),
         }

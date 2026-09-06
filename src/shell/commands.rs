@@ -515,6 +515,182 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.context_set_heading(None),
     },
     Command {
+        id: "context.code.c",
+        title: "C",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::C), false),
+    },
+    Command {
+        id: "context.code.cpp",
+        title: "C++",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::Cpp), false),
+    },
+    Command {
+        id: "context.code.rust",
+        title: "Rust",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::Rust), false),
+    },
+    Command {
+        id: "context.code.lua",
+        title: "Lua",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::Lua), false),
+    },
+    Command {
+        id: "context.code.python",
+        title: "Python",
+        group: "Language",
+        chord: None,
+        run: |shell| {
+            shell.context_code_options(Some(crate::document::code::Language::Python), false)
+        },
+    },
+    Command {
+        id: "context.code.javascript",
+        title: "JavaScript",
+        group: "Language",
+        chord: None,
+        run: |shell| {
+            shell.context_code_options(Some(crate::document::code::Language::JavaScript), false)
+        },
+    },
+    Command {
+        id: "context.code.typescript",
+        title: "TypeScript",
+        group: "Language",
+        chord: None,
+        run: |shell| {
+            shell.context_code_options(Some(crate::document::code::Language::TypeScript), false)
+        },
+    },
+    Command {
+        id: "context.code.java",
+        title: "Java",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::Java), false),
+    },
+    Command {
+        id: "context.code.csharp",
+        title: "C#",
+        group: "Language",
+        chord: None,
+        run: |shell| {
+            shell.context_code_options(Some(crate::document::code::Language::CSharp), false)
+        },
+    },
+    Command {
+        id: "context.code.go",
+        title: "Go",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::Go), false),
+    },
+    Command {
+        id: "context.code.settings",
+        title: "Language and mode…",
+        group: "Highlighting",
+        chord: None,
+        run: |shell| shell.context_code_settings(),
+    },
+    Command {
+        id: "context.code.plain",
+        title: "Plain code",
+        group: "Highlighting",
+        chord: None,
+        run: |shell| shell.context_code_options(None, false),
+    },
+    Command {
+        id: "context.code.manual",
+        title: "DIY colors",
+        group: "Highlighting",
+        chord: None,
+        run: |shell| shell.context_code_options(None, true),
+    },
+    Command {
+        id: "context.code.color.rose",
+        title: "Rose",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Rose)),
+    },
+    Command {
+        id: "context.code.color.coral",
+        title: "Coral",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Coral)),
+    },
+    Command {
+        id: "context.code.color.amber",
+        title: "Amber",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Amber)),
+    },
+    Command {
+        id: "context.code.color.olive",
+        title: "Olive",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Olive)),
+    },
+    Command {
+        id: "context.code.color.green",
+        title: "Green",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Green)),
+    },
+    Command {
+        id: "context.code.color.teal",
+        title: "Teal",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Teal)),
+    },
+    Command {
+        id: "context.code.color.sky",
+        title: "Sky",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Sky)),
+    },
+    Command {
+        id: "context.code.color.indigo",
+        title: "Indigo",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Indigo)),
+    },
+    Command {
+        id: "context.code.color.violet",
+        title: "Violet",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Violet)),
+    },
+    Command {
+        id: "context.code.color.magenta",
+        title: "Magenta",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Magenta)),
+    },
+    Command {
+        id: "context.code.color.clear",
+        title: "Clear color",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(None),
+    },
+    Command {
         id: "context.badge.orange",
         title: "Orange",
         group: "Color",
@@ -836,9 +1012,51 @@ pub const BADGE_MENU: &[&str] = &[
     "context.badge",
 ];
 
-pub const INLINE_CODE_MENU: &[&str] = &["context.inline_code", "context.badge"];
+pub const INLINE_CODE_MENU: &[&str] = &[
+    "context.code.plain",
+    "context.code.manual",
+    "context.code.c",
+    "context.code.cpp",
+    "context.code.rust",
+    "context.code.lua",
+    "context.code.python",
+    "context.code.javascript",
+    "context.code.typescript",
+    "context.code.java",
+    "context.code.csharp",
+    "context.code.go",
+    "context.inline_code",
+];
 
-pub const CODE_BLOCK_MENU: &[&str] = &["context.body"];
+pub const CODE_BLOCK_MENU: &[&str] = &[
+    "context.code.plain",
+    "context.code.manual",
+    "context.code.c",
+    "context.code.cpp",
+    "context.code.rust",
+    "context.code.lua",
+    "context.code.python",
+    "context.code.javascript",
+    "context.code.typescript",
+    "context.code.java",
+    "context.code.csharp",
+    "context.code.go",
+    "context.body",
+];
+pub const CODE_COLOR_MENU: &[&str] = &[
+    "context.code.color.rose",
+    "context.code.color.coral",
+    "context.code.color.amber",
+    "context.code.color.olive",
+    "context.code.color.green",
+    "context.code.color.teal",
+    "context.code.color.sky",
+    "context.code.color.indigo",
+    "context.code.color.violet",
+    "context.code.color.magenta",
+    "context.code.color.clear",
+    "context.code.settings",
+];
 
 pub const SYMBOL_ROLE_MENU: &[&str] = &[
     "context.symbol.variable",

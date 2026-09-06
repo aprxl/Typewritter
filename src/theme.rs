@@ -600,6 +600,25 @@ pub fn width(layer: &Layer, text: &str, style: &TextStyle) -> f32 {
         .0
 }
 
+/// Shared syntax and DIY ink palette, following the current appearance.
+pub fn code_ink(ink: crate::document::code::Ink) -> Color {
+    use crate::document::code::{Ink, capture};
+    match ink {
+        Ink::Manual(hue) => math_edge(hue),
+        Ink::Syntax(index) => match capture(index) {
+            "comment" => comment(),
+            "string" => math_edge(MathHue::Green),
+            "number" | "constant" => math_edge(MathHue::Amber),
+            "keyword" => math_edge(MathHue::Violet),
+            "type" | "constructor" => math_edge(MathHue::Teal),
+            "function" => math_edge(MathHue::Sky),
+            "property" | "attribute" | "tag" => math_edge(MathHue::Rose),
+            "operator" | "punctuation" => dim(),
+            _ => self::ink(),
+        },
+    }
+}
+
 /// The same colour at a different opacity. Non-solid colours are returned
 /// unchanged — there is no single alpha to set on a gradient.
 pub fn fade(color: Color, alpha: f32) -> Color {
