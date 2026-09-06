@@ -97,6 +97,11 @@ struct ViewUpdate {
 }
 
 impl ViewUpdate {
+    /// Redraw every region. Deliberately *not* a caret chase: a rebuild is
+    /// about what is on screen, not about where the caret is, and most of
+    /// the things that ask for one — a popup opening, a save, a repaint
+    /// after the palette moved — leave the caret exactly where it was. Only
+    /// the callers that really moved the camera set `follow_caret`.
     const ALL: Self = Self {
         tabs: true,
         breadcrumb: true,
@@ -104,7 +109,7 @@ impl ViewUpdate {
         editor: true,
         status: true,
         sidenotes: true,
-        follow_caret: true,
+        follow_caret: false,
     };
 
     const NONE: Self = Self {
@@ -1058,6 +1063,13 @@ impl Shell {
             let mut update = ViewUpdate::NONE;
             if layout_changed || active_changed || geometry_changed || focus_changed {
                 update = ViewUpdate::ALL;
+                // Reflows and camera changes: a resize or a panel toggle
+                // re-wraps the text under the reader, switching tabs lands
+                // on a document whose caret is elsewhere, and Focus mode is
+                // a camera by definition. An edit is not on this list —
+                // typing moves the caret, which follows on its own below,
+                // while folding does not and must keep the reader's place.
+                update.follow_caret = active_changed || geometry_changed || focus_changed;
             } else {
                 update.breadcrumb = caret_changed;
                 update.topics = caret_changed;
@@ -1827,7 +1839,8 @@ impl Shell {
 
     /// Rebuilds the view regions (tab strip, breadcrumb, editor, status
     /// line) from a live snapshot. Called when [`Tabs::revision`] moves, and
-    /// after the picker swaps the vault.
+    /// after the picker swaps the vault. It repaints; it does not move the
+    /// page — see [`ViewUpdate::ALL`].
     fn rebuild_views(&mut self) {
         self.rebuild_views_with(ViewUpdate::ALL);
     }
@@ -2092,9 +2105,24 @@ fn dragged_width(rect: Rect, mouse_x: f32, from_right: bool) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AUTOSAVE_IDLE, autosave_due, dragged_width, grab_zone};
+    use super::{AUTOSAVE_IDLE, ViewUpdate, autosave_due, dragged_width, grab_zone};
     use crate::layout::Rect;
     use std::time::{Duration, Instant};
+
+    /// A popup opening, a save, a repaint after the palette moved: all of
+    /// them ask for a full rebuild, and none of them touched the caret. If
+    /// a rebuild chased the caret, the reader who had scrolled away from it
+    /// would be thrown back to it the moment a menu appeared.
+    #[test]
+    fn a_full_rebuild_redraws_everything_without_moving_the_page() {
+        let all = ViewUpdate::ALL;
+        assert!(all.tabs && all.breadcrumb && all.topics);
+        assert!(all.editor && all.status && all.sidenotes);
+        assert!(
+            !all.follow_caret,
+            "a rebuild repaints; only a moved camera follows the caret"
+        );
+    }
 
     #[test]
     fn an_edit_restarts_the_idle_clock() {
