@@ -13,6 +13,7 @@ pub mod math_conversion;
 pub mod math_layout;
 pub mod math_notation;
 pub mod math_paint;
+pub mod math_style;
 pub mod math_symbols;
 pub mod outline;
 

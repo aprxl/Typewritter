@@ -12,6 +12,7 @@
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
 use crate::document::BadgeColor;
+use crate::document::math_style::MathHue;
 use crate::layout::Rect;
 use crate::renderer::{
     Alignment, Color, Font, FontParameters, GradientDirection, HorizontalAlign, Layer, LineCap,
@@ -64,9 +65,19 @@ pub struct Theme {
     pub badge_green: Color,
     pub badge_purple: Color,
     pub highlight: Color,
-    pub variable: Color,
-    pub constant: Color,
-    pub function: Color,
+    /// The ink a numeral is set in. Numbers are quantities, not names, and
+    /// reading one is a different act from reading a variable — so they get
+    /// an ink of their own rather than borrowing the prose's.
+    pub math_number: Color,
+    /// The ink an operator, relation, or piece of punctuation is set in.
+    /// Quieter than [`Self::ink`] on purpose: `+` and `=` are the grammar
+    /// of an expression, and grammar should not compete with the terms it
+    /// joins.
+    pub math_operator: Color,
+    /// The identity washes behind symbols, in [`MathHue::ALL`] order. Fills
+    /// only — an outline is derived from its fill by [`shade`], so a border
+    /// can never drift off the hue it belongs to.
+    pub math_hues: [Color; MathHue::ALL.len()],
 
     // Text and non-text hierarchy.
     pub faint: Color,
@@ -101,9 +112,20 @@ impl Theme {
         badge_green: Color::rgb(0x35, 0x76, 0x6A),
         badge_purple: Color::rgb(0x84, 0x5A, 0x9E),
         highlight: Color::rgb(0xDB, 0xAA, 0x52),
-        variable: Color::rgb(0xDE, 0xE6, 0xF0),
-        constant: Color::rgb(0xF5, 0xE3, 0xC9),
-        function: Color::rgb(0xD8, 0xEA, 0xDF),
+        math_number: Color::rgb(0x4A, 0x5C, 0x91),
+        math_operator: Color::rgb(0x7D, 0x6E, 0x85),
+        math_hues: [
+            Color::rgb(0xF5, 0xDC, 0xDD),
+            Color::rgb(0xF8, 0xDF, 0xCF),
+            Color::rgb(0xF3, 0xE6, 0xC6),
+            Color::rgb(0xE4, 0xEB, 0xC9),
+            Color::rgb(0xD3, 0xEA, 0xD8),
+            Color::rgb(0xCC, 0xE8, 0xE5),
+            Color::rgb(0xD5, 0xE4, 0xF1),
+            Color::rgb(0xDC, 0xDC, 0xF0),
+            Color::rgb(0xE7, 0xD9, 0xF0),
+            Color::rgb(0xF4, 0xD8, 0xE7),
+        ],
         faint: Color::rgb(0x81, 0x71, 0x84),
         non_text: Color::rgb(0xC1, 0xAF, 0xBF),
         ink: Color::rgb(0x35, 0x2B, 0x3B),
@@ -133,9 +155,20 @@ impl Theme {
         badge_green: Color::rgb(0x97, 0xC8, 0xB4),
         badge_purple: Color::rgb(0xCF, 0xAB, 0xD9),
         highlight: Color::rgb(0xD5, 0xAB, 0x63),
-        variable: Color::rgb(0x3A, 0x46, 0x5D),
-        constant: Color::rgb(0x5C, 0x46, 0x34),
-        function: Color::rgb(0x34, 0x4E, 0x44),
+        math_number: Color::rgb(0xA6, 0xB4, 0xE4),
+        math_operator: Color::rgb(0xAC, 0x98, 0xB3),
+        math_hues: [
+            Color::rgb(0x52, 0x31, 0x38),
+            Color::rgb(0x57, 0x3A, 0x2F),
+            Color::rgb(0x50, 0x44, 0x2C),
+            Color::rgb(0x3F, 0x49, 0x30),
+            Color::rgb(0x2C, 0x4B, 0x3C),
+            Color::rgb(0x28, 0x49, 0x4B),
+            Color::rgb(0x32, 0x44, 0x58),
+            Color::rgb(0x3B, 0x3A, 0x5C),
+            Color::rgb(0x48, 0x35, 0x56),
+            Color::rgb(0x52, 0x30, 0x49),
+        ],
         faint: Color::rgb(0xA1, 0x8B, 0xA5),
         non_text: Color::rgb(0x66, 0x51, 0x6E),
         ink: Color::rgb(0xF0, 0xE8, 0xEA),
@@ -347,9 +380,8 @@ palette! {
     math_surface => math,
     border => border,
     highlight => highlight,
-    variable => variable,
-    constant => constant,
-    function => function,
+    math_number => math_number,
+    math_operator => math_operator,
     faint => faint,
     non_text => non_text,
     ink => ink,
@@ -573,6 +605,88 @@ pub fn mix(from: Color, to: Color, t: f32) -> Color {
     }
 }
 
+/// How far [`math_edge`] pushes a fill away from the page. Higher in the
+/// dark appearance because a border there is climbing out of a deep tint
+/// rather than down out of a pale one, and the same step reads as less.
+const EDGE_STEP: [f32; 2] = [0.38, 0.40];
+/// How far [`math_edge`] lifts a fill's saturation. A one-pixel line has
+/// almost no area to carry a hue with, so it is given more chroma than the
+/// wash it edges — otherwise it reads as grey.
+const EDGE_CHROMA: [f32; 2] = [1.45, 1.40];
+
+/// The wash behind a symbol carrying `hue`.
+pub fn math_fill(hue: MathHue) -> Color {
+    server().theme().math_hues[hue as usize].clone()
+}
+
+/// The border around a symbol carrying `hue`: its own fill, shaded. Never a
+/// colour of its own — see [`shade`].
+pub fn math_edge(hue: MathHue) -> Color {
+    let index = usize::from(mode() == Mode::Dark);
+    shade(math_fill(hue), EDGE_STEP[index], EDGE_CHROMA[index])
+}
+
+/// The same colour, pushed `step` away from the page and `chroma` times as
+/// saturated: darker on a light appearance, lighter on a dark one.
+///
+/// Done in HSL rather than by mixing toward the ink, because mixing drags
+/// every hue toward the ink's own — on the mulberry palette that turns ten
+/// distinguishable borders into ten shades of plum-grey. Rotating value and
+/// saturation leaves the hue exactly where it was, which is the whole
+/// promise: a border is a shade of its fill, not a second colour.
+pub fn shade(color: Color, step: f32, chroma: f32) -> Color {
+    let Color::Solid([r, g, b, a]) = color else {
+        return color;
+    };
+    let (hue, saturation, lightness) = to_hsl(r, g, b);
+    let lightness = match mode() {
+        Mode::Light => lightness * (1.0 - step),
+        Mode::Dark => lightness + (1.0 - lightness) * step,
+    };
+    let (r, g, b) = from_hsl(hue, (saturation * chroma).min(1.0), lightness);
+    Color::rgba(r, g, b, a)
+}
+
+/// sRGB to HSL, hue in turns. Straight from the definition; the only care
+/// needed is a grey, whose hue is undefined and is reported as zero.
+fn to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) / 2.0;
+    let chroma = max - min;
+    if chroma <= f32::EPSILON {
+        return (0.0, 0.0, lightness);
+    }
+    let saturation = chroma / (1.0 - (2.0 * lightness - 1.0).abs());
+    let hue = if max == r {
+        ((g - b) / chroma).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / chroma + 2.0
+    } else {
+        (r - g) / chroma + 4.0
+    };
+    (hue / 6.0, saturation, lightness)
+}
+
+/// The inverse of [`to_hsl`].
+fn from_hsl(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let sector = hue.rem_euclid(1.0) * 6.0;
+    let second = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match sector as u32 {
+        0 => (chroma, second, 0.0),
+        1 => (second, chroma, 0.0),
+        2 => (0.0, chroma, second),
+        3 => (0.0, second, chroma),
+        4 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+    let base = lightness - chroma / 2.0;
+    let channel = |v: f32| ((v + base).clamp(0.0, 1.0) * 255.0).round() as u8;
+    (channel(r), channel(g), channel(b))
+}
+
 pub fn rule(layer: &Layer, at: (f32, f32), length: f32, thickness: f32, color: Color) {
     layer.draw_rectangle(at, (length, thickness), color, Rounding::NONE);
 }
@@ -664,7 +778,11 @@ pub fn rounded_outline(layer: &Layer, rect: Rect, radius: f32, width: f32, color
 /// edge — the exact shape [`rounded_outline`] strokes. The radius is
 /// clamped to half the shorter side, so degenerate rects come out as
 /// stadia rather than nonsense arcs.
-fn rounded_rect_path(rect: Rect, radius: f32) -> String {
+///
+/// Public because the document painters stroke the same shape through a
+/// [`Canvas`](crate::canvas::Canvas) rather than a [`Layer`], and two
+/// generators for one border would be two borders.
+pub fn rounded_rect_path(rect: Rect, radius: f32) -> String {
     let r = radius.max(0.0).min(rect.width / 2.0).min(rect.height / 2.0);
     let (x, y) = rect.position();
     let right = rect.right();

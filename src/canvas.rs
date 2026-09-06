@@ -18,7 +18,7 @@
 //! how it is drawn — a shared painter like `document::math_paint`.
 
 use crate::layout::Rect;
-use crate::renderer::{Alignment, Color, Layer, PathPaint, Rounding};
+use crate::renderer::{Alignment, Color, Layer, LineJoin, PathPaint, Rounding, Stroke};
 use crate::theme::{self, TextStyle};
 
 /// Coordinates are logical pixels, top-left origin, y down. Whose origin is
@@ -90,6 +90,21 @@ pub fn outline(canvas: &mut dyn Canvas, rect: Rect, color: Color) {
         color,
         Rounding::NONE,
     );
+}
+
+/// A rounded border inside `rect`, as [`theme::rounded_outline`] draws it:
+/// one stroked path, so the corners are real quarter arcs that match a fill
+/// drawn at the same radius. [`outline`]'s four rules cannot do that — they
+/// square off whatever radius they are drawn around.
+///
+/// The geometry comes from [`theme::rounded_rect_path`], the same generator
+/// the `Layer` painter strokes, so a highlight's border is the same shape on
+/// screen and on a page.
+pub fn rounded_outline(canvas: &mut dyn Canvas, rect: Rect, radius: f32, width: f32, color: Color) {
+    let d = theme::rounded_rect_path(rect, radius);
+    let mut pen = Stroke::new(color, width);
+    pen.join = LineJoin::Round;
+    canvas.draw_path(&d, (0.0, 0.0), 0.0, &PathPaint::Stroke(pen));
 }
 
 /// Another canvas with the origin moved. Everything drawn through it lands
