@@ -165,6 +165,9 @@ To shade one shape, give it its own layer. Setting `None` clears.
 - `ShaderEffect::ColorMatrix(m)` — `ColorMatrix::{IDENTITY, grayscale(), invert(),
   sepia(), saturate(x), brightness(x), contrast(x), tint(color, amount)}`, or a
   raw 4×5 row-major `ColorMatrix([f32; 20])` (same model as SVG `feColorMatrix`).
+- `ShaderEffect::FocusBand { top, bottom, feather, opacity }` — preserves a horizontal
+  band at full opacity and dims the rest. Bounds and feather are logical screen pixels;
+  surrounding opacity is 0..1. Changes patch the uniform buffer in place.
 - `ShaderEffect::Custom(&'static str)` — full WGSL module against a fixed
   contract (copy the template in `src/renderer/shader.rs`'s rustdoc and edit
   only `fs_main`'s body; `vs_main` + `@group(0)` bindings must match exactly).

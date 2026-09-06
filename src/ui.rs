@@ -77,6 +77,8 @@ pub struct Context {
     pub show_stats: bool,
     /// Every auxiliary panel is closed for focused writing.
     pub focus_mode: bool,
+    /// Animated emphasis, independent of the editor snapshot's lifetime.
+    pub focus_amount: f32,
     /// Mouse state, for components that handle clicks and hovers.
     pub mouse: Mouse,
     /// Whether THIS region owns the shared popup shadow layer this frame —

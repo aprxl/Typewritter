@@ -569,6 +569,8 @@ pub(super) struct LayerPipelines {
     blur_bind_group_layout: wgpu::BindGroupLayout,
     colormatrix_pipeline: wgpu::RenderPipeline,
     colormatrix_bind_group_layout: wgpu::BindGroupLayout,
+    focus_band_pipeline: wgpu::RenderPipeline,
+    focus_band_bind_group_layout: wgpu::BindGroupLayout,
     radial_wipe_pipeline: wgpu::RenderPipeline,
     radial_wipe_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -872,6 +874,19 @@ impl LayerPipelines {
             &radial_wipe_bind_group_layout,
         );
 
+        let focus_band_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("atomos-layer-focus-band-bgl"),
+                entries: &effect_bind_group_layout_entries,
+            });
+        let focus_band_pipeline = build_fullscreen_pipeline(
+            device,
+            surface_format,
+            "atomos-layer-focus-band",
+            super::focus_band::SHADER,
+            &focus_band_bind_group_layout,
+        );
+
         Self {
             solid_pipeline,
             screen_size_bind_group_layout,
@@ -888,6 +903,8 @@ impl LayerPipelines {
             colormatrix_bind_group_layout,
             radial_wipe_pipeline,
             radial_wipe_bind_group_layout,
+            focus_band_pipeline,
+            focus_band_bind_group_layout,
         }
     }
 }
@@ -1047,6 +1064,10 @@ enum EffectGpuKind {
     },
     /// One pass: `texture_view` -> `EffectGpu::output_view`.
     RadialWipe {
+        params_buffer: wgpu::Buffer,
+        bind_group: wgpu::BindGroup,
+    },
+    FocusBand {
         params_buffer: wgpu::Buffer,
         bind_group: wgpu::BindGroup,
     },
@@ -1238,6 +1259,8 @@ pub(super) struct LayerInner {
     blur_bind_group_layout: wgpu::BindGroupLayout,
     colormatrix_pipeline: wgpu::RenderPipeline,
     colormatrix_bind_group_layout: wgpu::BindGroupLayout,
+    focus_band_pipeline: wgpu::RenderPipeline,
+    focus_band_bind_group_layout: wgpu::BindGroupLayout,
     radial_wipe_pipeline: wgpu::RenderPipeline,
     radial_wipe_bind_group_layout: wgpu::BindGroupLayout,
     // The caller's last `set_effect` request, in *logical* pixels (mirrors
@@ -1409,6 +1432,8 @@ impl LayerInner {
             colormatrix_pipeline: pipelines.colormatrix_pipeline.clone(),
             colormatrix_bind_group_layout: pipelines.colormatrix_bind_group_layout.clone(),
             radial_wipe_pipeline: pipelines.radial_wipe_pipeline.clone(),
+            focus_band_pipeline: pipelines.focus_band_pipeline.clone(),
+            focus_band_bind_group_layout: pipelines.focus_band_bind_group_layout.clone(),
             radial_wipe_bind_group_layout: pipelines.radial_wipe_bind_group_layout.clone(),
             effect: None,
             effect_gpu: None,
@@ -1609,6 +1634,12 @@ impl LayerInner {
                     .write_buffer(params_buffer, 0, bytemuck::bytes_of(&uniform));
                 true
             }
+            (EffectGpuKind::FocusBand { params_buffer, .. }, ShaderEffect::FocusBand { .. }) => {
+                let uniform = super::focus_band::Uniform::new(effect, self.scale_factor);
+                self.queue
+                    .write_buffer(params_buffer, 0, bytemuck::bytes_of(&uniform));
+                true
+            }
             _ => false,
         }
     }
@@ -1707,6 +1738,29 @@ impl LayerInner {
                     bind_group,
                 }
             }
+            ShaderEffect::FocusBand { .. } => {
+                let params_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("atomos-layer-focus-band-params"),
+                            contents: bytemuck::bytes_of(&super::focus_band::Uniform::new(
+                                &effect,
+                                self.scale_factor,
+                            )),
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        });
+                let bind_group = create_effect_bind_group(
+                    &self.device,
+                    &self.focus_band_bind_group_layout,
+                    &params_buffer,
+                    &self.texture_view,
+                    &self.composite_sampler,
+                );
+                EffectGpuKind::FocusBand {
+                    params_buffer,
+                    bind_group,
+                }
+            }
             ShaderEffect::Custom(source) => {
                 let Some(pipeline) = build_custom_effect_pipeline(
                     &self.device,
@@ -1782,6 +1836,15 @@ impl LayerInner {
                 run_fullscreen_pass(
                     encoder,
                     &self.radial_wipe_pipeline,
+                    bind_group,
+                    &effect_gpu.output_view,
+                    &self.composite_quad_vbuf,
+                );
+            }
+            EffectGpuKind::FocusBand { bind_group, .. } => {
+                run_fullscreen_pass(
+                    encoder,
+                    &self.focus_band_pipeline,
                     bind_group,
                     &effect_gpu.output_view,
                     &self.composite_quad_vbuf,

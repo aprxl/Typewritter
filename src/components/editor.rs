@@ -14,7 +14,7 @@ use crate::document::math_layout::{self, MathBox};
 use crate::document::math_paint;
 use crate::document::{ATOM, BadgeColor, Block, Caret, FlatRange, Inline, ListMarker, Style};
 use crate::layout::Rect;
-use crate::renderer::{Layer, PathPaint, Rounding};
+use crate::renderer::{Layer, PathPaint, Rounding, ShaderEffect};
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
 
@@ -294,6 +294,7 @@ pub struct Editor {
     caret: Option<Caret>,
     /// Content offset in logical pixels.
     scroll: f32,
+    focus_amount: f32,
     /// False draws the "no file open" placeholder instead of a document.
     has_file: bool,
     /// Vim Normal mode: a block over the character under the caret, rather
@@ -344,6 +345,7 @@ impl Editor {
             metrics,
             caret,
             scroll,
+            focus_amount: 0.0,
             has_file: true,
             block_caret,
             caret_style,
@@ -402,6 +404,7 @@ impl Editor {
             metrics: Metrics::PAGE,
             caret: None,
             scroll: 0.0,
+            focus_amount: 0.0,
             has_file: false,
             block_caret: false,
             caret_style: Style::PLAIN,
@@ -457,6 +460,10 @@ impl Component for Editor {
     }
 
     fn sync(&mut self, context: &Context) {
+        if self.metrics.page {
+            self.dirty
+                .write(&mut self.focus_amount, context.focus_amount);
+        }
         if !self.has_file && self.empty.sync(context) {
             self.dirty.set();
         }
@@ -495,6 +502,7 @@ impl Component for Editor {
             rect.x + self.metrics.inset
         };
         if !self.has_file {
+            layer.set_effect(None);
             self.empty.draw(layer, rect);
             return;
         }
@@ -530,6 +538,15 @@ impl Component for Editor {
                 None
             }
         });
+
+        layer.set_effect((self.focus_amount > 0.0 && caret.is_some()).then(|| {
+            ShaderEffect::FocusBand {
+                top: content + band_top - self.scroll,
+                bottom: content + band_bottom - self.scroll,
+                feather: 4.0,
+                opacity: theme::focus_opacity(self.focus_amount),
+            }
+        }));
 
         // The current-line band does not blink — it identifies the line the
         // caret is on, regardless of caret visibility. The page's spans the
@@ -889,7 +906,7 @@ impl Component for Editor {
                         glow.draw_rectangle(
                             (at.0 - GLOW_SPREAD, at.1 - GLOW_SPREAD),
                             (size.0 + GLOW_SPREAD * 2.0, size.1 + GLOW_SPREAD * 2.0),
-                            theme::fade(theme::highlight(), GLOW_ALPHA),
+                            theme::fade(theme::highlight(), GLOW_ALPHA * (1.0 - self.focus_amount)),
                             HIGHLIGHT_ROUNDING,
                         );
                     }
@@ -1245,6 +1262,12 @@ pub fn max_scroll(content_height: f32, view_height: f32) -> f32 {
     (content_height - view_height * (1.0 - OVERSCROLL)).max(0.0)
 }
 
+/// Center the active visual line in the window. Negative offsets provide
+/// breathing room above the first line; the same transform drives hits.
+pub fn focus_scroll(band: (f32, f32), editor: Rect, window: Rect) -> f32 {
+    editor.y + TOP + (band.0 + band.1) * 0.5 - (window.y + window.height * 0.5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1344,6 +1367,67 @@ mod tests {
         assert_eq!(max_scroll(100.0, 800.0), 0.0);
         // Document exactly at the threshold: ceiling is zero.
         assert_eq!(max_scroll(400.0, 800.0), 0.0);
+    }
+
+    #[test]
+    fn focused_wrapped_lines_stay_centered_and_hit_the_same_caret_after_resize() {
+        let measure = |s: &str, _: &TextStyle| s.chars().count() as f32 * 10.0;
+        let doc = crate::document::markdown::parse(
+            Path::new("focus.md"),
+            "# First\n\nA paragraph long enough to wrap onto several visual lines and remain editable.\n\nLast line.",
+        );
+        for (width, height) in [(620.0, 520.0), (1600.0, 1000.0)] {
+            let window = Rect::new(0.0, 0.0, width, height);
+            let editor = Rect::new(12.0, 152.0, width - 24.0, height - 164.0);
+            let laid = layout::layout(&doc, Editor::content_width(editor), &measure);
+            for (block, source) in laid.source.iter().enumerate() {
+                for offset in 0..source.inlines().first().map_or(0, |run| match run {
+                    Inline::Text(t) => t.text.chars().count(),
+                    _ => 0,
+                }) {
+                    let caret = Caret {
+                        block,
+                        inline: 0,
+                        offset,
+                        style: Style::PLAIN,
+                    };
+                    let band = laid.caret_band(caret);
+                    let scroll = focus_scroll(band, editor, window);
+                    let (cx, cy, _) = laid.caret_pos(caret, &measure);
+                    let screen_y = editor.y + TOP + cy - scroll;
+                    assert!((screen_y - height * 0.5).abs() < 0.01);
+                    let hit = laid.hit(cx, screen_y - editor.y - TOP + scroll, &measure);
+                    assert_eq!((hit.block, hit.inline, hit.offset), (block, 0, offset));
+                }
+            }
+            let first = laid.caret_band(Caret {
+                block: 0,
+                inline: 0,
+                offset: 0,
+                style: Style::PLAIN,
+            });
+            assert!(
+                focus_scroll(first, editor, window) < 0.0,
+                "first line needs top breathing room"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_centers_tall_equations_and_releases_negative_scroll_on_exit() {
+        let window = Rect::new(0.0, 0.0, 1200.0, 900.0);
+        let editor = Rect::new(12.0, 152.0, 1176.0, 736.0);
+        for band in [(0.0, 30.0), (2500.0, 2680.0)] {
+            let scroll = focus_scroll(band, editor, window);
+            let top = editor.y + TOP + band.0 - scroll;
+            let bottom = editor.y + TOP + band.1 - scroll;
+            assert_eq!((top + bottom) / 2.0, 450.0);
+        }
+        let scroll = focus_scroll((0.0, 30.0), editor, window);
+        assert_eq!(
+            follow_scroll(scroll, 0.0, 30.0, editor.y + TOP, editor.bottom(), 1000.0),
+            0.0
+        );
     }
 
     #[test]

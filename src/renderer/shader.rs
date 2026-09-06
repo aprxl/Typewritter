@@ -30,6 +30,16 @@ pub enum ShaderEffect {
     Blur { radius: f32 },
     /// A 4x5 color transform applied to every pixel — see [`ColorMatrix`].
     ColorMatrix(ColorMatrix),
+    /// Keep a horizontal band at full opacity and dim the surrounding
+    /// content. Band bounds and edge feather are logical screen pixels;
+    /// `opacity` is the surrounding content's opacity, in 0..1.
+    /// Updating these values patches a uniform without rebuilding textures.
+    FocusBand {
+        top: f32,
+        bottom: f32,
+        feather: f32,
+        opacity: f32,
+    },
     /// A soft-edged circular wipe: the layer keeps its pixels on one side
     /// of a circle and fades to fully transparent on the other, so
     /// whatever is composited *under* the layer shows through there.

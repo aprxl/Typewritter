@@ -391,6 +391,17 @@ pub fn math() -> Font {
     Font::Named("JuliaMono".into())
 }
 
+/// Surrounding text stays readable while the active line keeps full ink.
+pub fn focus_opacity(amount: f32) -> f32 {
+    // Alpha blends in linear light. Dark ink needs more coverage against
+    // chalk to look as readable as pale ink against mulberry.
+    let surrounding = match mode() {
+        Mode::Light => 0.58,
+        Mode::Dark => 0.28,
+    };
+    1.0 - (1.0 - surrounding) * amount.clamp(0.0, 1.0)
+}
+
 /// A font plus everything `draw_text` needs to reproduce one look.
 #[derive(Clone, Debug)]
 pub struct TextStyle {

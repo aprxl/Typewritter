@@ -122,7 +122,7 @@ impl Shell {
             let command_id = if title_bar::sidebar_rect(bar).contains(input.mouse_position()) {
                 Some("view.sidebar")
             } else if title_bar::focus_rect(bar).contains(input.mouse_position()) {
-                Some("view.capture")
+                Some("view.focus")
             } else {
                 None
             };
@@ -245,6 +245,7 @@ impl Shell {
             note_at_caret(&tab.document, tab.document.caret)
         };
         if let Some(index) = index {
+            self.sidenotes.set_open(true);
             focus_note(&mut self.docs.borrow_mut(), index);
         }
     }
@@ -315,6 +316,7 @@ impl Shell {
         };
         let Some(index) = index else { return false };
         self.goal_x = None;
+        self.sidenotes.set_open(true);
         focus_note(&mut self.docs.borrow_mut(), index);
         true
     }
@@ -449,10 +451,10 @@ impl Shell {
         let in_math = self.docs.borrow().in_math();
 
         if has_tab && over_editor && input.scroll_delta().1 != 0.0 {
-            let max = self.editor_max_scroll();
+            let (min, max) = self.editor_scroll_bounds();
             let scroll = self.docs.borrow().editor_scroll;
             let next = (scroll - input.scroll_delta().1 * crate::document::layout::LINE_BODY)
-                .clamp(0.0, max);
+                .clamp(min, max);
             self.docs.borrow_mut().set_editor_scroll(next);
         }
 
@@ -1378,7 +1380,7 @@ impl Shell {
         );
     }
 
-    fn exit_visual(&mut self) {
+    pub(super) fn exit_visual(&mut self) {
         self.vim.set_mode(Mode::Normal);
         self.visual_anchor = None;
         self.visual_override = None;
@@ -3489,7 +3491,7 @@ fn focus_note_at(docs: &mut Tabs, index: usize, caret: Caret) {
 /// Escape still leaves Insert and stays in the note, so leaving a note while
 /// typing is two presses, the same shape as leaving Insert and then leaving
 /// anything else.
-fn return_to_anchor(docs: &mut Tabs) {
+pub(super) fn return_to_anchor(docs: &mut Tabs) {
     let anchor = {
         let Some(tab) = docs.active() else { return };
         let Focus::Note(i) = tab.document.focus else {

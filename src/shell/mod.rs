@@ -22,6 +22,7 @@
 //! [`Region::set_component`] is for.
 
 mod commands;
+mod focus;
 mod input;
 mod panel;
 mod stepped;
@@ -475,9 +476,11 @@ pub struct Shell {
     repeat: Option<RepeatOp>,
     insert_repeat: Vec<InsertEvent>,
     insert_prefix: Option<RepeatOp>,
-    /// The text region's width views were last rebuilt from. A panel toggle
-    /// resizes it without moving `Tabs::revision`, and the wrap must follow.
-    last_width: f32,
+    /// Geometry affects wrapping and the focus camera even without an edit.
+    last_editor_rect: Rect,
+    focus_panels: Option<[bool; 4]>,
+    focus_fade: Hover,
+    last_focus_mode: bool,
     /// The blurred layer above the editor, carrying highlight glow. Held
     /// here because `rebuild_views` swaps the editor component out and the
     /// layer has to outlive that.
@@ -765,7 +768,10 @@ impl Shell {
             repeat: None,
             insert_repeat: Vec::new(),
             insert_prefix: None,
-            last_width: 0.0,
+            last_editor_rect: Rect::default(),
+            focus_panels: None,
+            focus_fade: Hover::new(),
+            last_focus_mode: false,
             glow,
             popup_shadow,
             last_shadow_owner: None,
@@ -791,6 +797,7 @@ impl Shell {
         let dt = FrameScheduler::animation_delta(frametime);
 
         self.handle_input(input, viewport);
+        self.reveal_focused_note();
         self.autosave();
         self.sync_math_menu();
         self.export_yank();
@@ -837,6 +844,8 @@ impl Shell {
         );
         animating |= self.divider_hover.update(self.divider_hot, dt);
         animating |= self.divider_hover.is_animating();
+        animating |= self.focus_fade.update(self.focus_mode(), dt);
+        animating |= self.focus_fade.is_animating();
         for panel in self.panels_mut() {
             animating |= panel.animation.advance(dt);
         }
@@ -884,7 +893,8 @@ impl Shell {
             // Step-end, not a fade: a caret that fades looks like a bug.
             caret_on: self.caret.is_on(),
             show_stats: self.show_stats,
-            focus_mode: self.panels().iter().all(|panel| !panel.open),
+            focus_mode: self.focus_mode(),
+            focus_amount: self.focus_fade.value(),
             mouse: Mouse {
                 position: input.mouse_position(),
                 left_pressed: input.is_mouse_pressed(MouseButton::Left),
@@ -987,8 +997,9 @@ impl Shell {
             self.visual_override,
             self.visual_line_mode,
         );
-        let width = self.layout.rect(self.text_column).width;
-        let width_changed = width != self.last_width;
+        let editor_rect = self.layout.rect(self.text_column);
+        let geometry_changed = editor_rect != self.last_editor_rect;
+        let focus_changed = self.focus_mode() != self.last_focus_mode;
         let search = self
             .search
             .as_ref()
@@ -1000,7 +1011,8 @@ impl Shell {
         if revision_changed
             || mode_changed
             || visual_changed
-            || width_changed
+            || geometry_changed
+            || focus_changed
             || search_changed
             || brush_changed
             || error_changed
@@ -1008,11 +1020,12 @@ impl Shell {
             self.last_revision = revision;
             self.last_mode = mode;
             self.last_visual_state = visual_state;
-            self.last_width = width;
+            self.last_editor_rect = editor_rect;
+            self.last_focus_mode = self.focus_mode();
             self.rendered_search = search;
             self.last_brush_revision = self.brush_revision;
             let mut update = ViewUpdate::NONE;
-            if layout_changed || active_changed || width_changed {
+            if layout_changed || active_changed || geometry_changed || focus_changed {
                 update = ViewUpdate::ALL;
             } else {
                 update.breadcrumb = caret_changed;
@@ -1447,18 +1460,6 @@ impl Shell {
         layout
     }
 
-    /// How far the editor can scroll — the layout's total height, which the
-    /// old line-counting estimate could not see.
-    fn editor_max_scroll(&mut self) -> f32 {
-        let rect = self.layout.rect(self.text_column);
-        match &self.doc_layout {
-            Some((_, _, _, _, _, layout)) => {
-                editor::max_scroll(layout.height, rect.height - editor::TOP)
-            }
-            None => 0.0,
-        }
-    }
-
     /// Brings the caret's visual line into the editor's visible band, if
     /// scrolling is needed to do it. Only called when the caret actually
     /// moved — a wheel scroll must be able to take the caret out of view.
@@ -1486,15 +1487,19 @@ impl Shell {
             }
         };
         let scroll = self.docs.borrow().editor_scroll;
-        let max = self.editor_max_scroll();
-        let scroll = editor::follow_scroll(
-            scroll,
-            band.0,
-            band.1,
-            rect.y + editor::TOP,
-            rect.bottom(),
-            max,
-        );
+        let scroll = if self.focus_mode() {
+            editor::focus_scroll(band, rect, self.layout.rect(Layout::ROOT))
+        } else {
+            let (_, max) = self.editor_scroll_bounds();
+            editor::follow_scroll(
+                scroll,
+                band.0,
+                band.1,
+                rect.y + editor::TOP,
+                rect.bottom(),
+                max,
+            )
+        };
         self.docs.borrow_mut().set_editor_scroll(scroll);
     }
 

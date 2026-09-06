@@ -80,13 +80,6 @@ pub struct Command {
 const CTRL: ModifiersState = ModifiersState::CONTROL;
 const CTRL_SHIFT: ModifiersState = ModifiersState::CONTROL.union(ModifiersState::SHIFT);
 
-fn capture_mode_target<I>(mut panels: I) -> bool
-where
-    I: Iterator<Item = bool>,
-{
-    !panels.all(|open| open)
-}
-
 pub const COMMANDS: &[Command] = &[
     Command {
         id: "file.new",
@@ -221,7 +214,7 @@ pub const COMMANDS: &[Command] = &[
         title: "Toggle sidebar",
         group: "View",
         chord: None,
-        run: |shell| shell.tree.toggle(),
+        run: Shell::toggle_sidebar,
     },
     Command {
         id: "view.theme",
@@ -238,21 +231,14 @@ pub const COMMANDS: &[Command] = &[
         },
     },
     Command {
-        id: "view.capture",
+        id: "view.focus",
         title: "Toggle focus mode",
         group: "View",
         chord: Some(Chord {
             mods: CTRL_SHIFT,
             key: KeyCode::KeyC,
         }),
-        // Spec §3.2: one key to bare text and back — open if any panel is
-        // closed, close all of them if every panel is already open.
-        run: |shell| {
-            let open = capture_mode_target(shell.panels().iter().map(|p| p.open));
-            for panel in shell.panels_mut() {
-                panel.set_open(open);
-            }
-        },
+        run: Shell::toggle_focus,
     },
     Command {
         id: "view.stats",
@@ -882,13 +868,6 @@ mod tests {
     }
 
     #[test]
-    fn capture_mode_opens_mixed_or_closed_panels_and_closes_open_ones() {
-        assert!(capture_mode_target([false, false, false].into_iter()));
-        assert!(capture_mode_target([true, false, true].into_iter()));
-        assert!(!capture_mode_target([true, true, true].into_iter()));
-    }
-
-    #[test]
     fn chord_labels_read_as_the_spec_names_them() {
         assert_eq!(
             COMMANDS
@@ -903,7 +882,7 @@ mod tests {
         assert_eq!(
             COMMANDS
                 .iter()
-                .find(|c| c.id == "view.capture")
+                .find(|c| c.id == "view.focus")
                 .unwrap()
                 .chord
                 .unwrap()
