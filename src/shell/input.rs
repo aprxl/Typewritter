@@ -31,7 +31,7 @@ use crate::document::{
 use crate::input::Input;
 use crate::layout::Rect;
 use crate::tabs::Tabs;
-use crate::theme::{self, TextStyle};
+use crate::theme::{self, TextStyle, Theme};
 use crate::vault::Vault;
 use crate::vim::{
     Edit, ExtendedAction, Key, Mode, Motion, Operator, OperatorTarget, Vim, VimMode, VisualAction,
@@ -3541,6 +3541,23 @@ impl Shell {
 
     fn handle_dialog_input(&mut self, input: &Input, viewport: Rect) {
         let mut changed = false;
+        let click = input
+            .is_mouse_pressed(MouseButton::Left)
+            .then(|| input.mouse_position());
+
+        if let Some(Prompt::ExportPdf { dark }) = &mut self.dialog {
+            // The pill is a click target and the space bar is its keyboard
+            // equal. Neither reaches the buttons below — the switch's rect
+            // is nowhere near them — so a flick of the switch cannot
+            // confirm the card by accident.
+            if input.is_key_typed(KeyCode::Space)
+                || click.is_some_and(|at| dialog::toggle(viewport).contains(at))
+            {
+                *dark = !*dark;
+                changed = true;
+            }
+        }
+
         if let Some(
             Prompt::NewNote { input: name, caret } | Prompt::NewFolder { input: name, caret },
         ) = &mut self.dialog
@@ -3571,9 +3588,6 @@ impl Shell {
         }
 
         let (confirm_button, cancel_button) = dialog::buttons(viewport);
-        let click = input
-            .is_mouse_pressed(MouseButton::Left)
-            .then(|| input.mouse_position());
         let confirmed = input.is_key_typed(KeyCode::Enter)
             || click.is_some_and(|at| confirm_button.contains(at));
         let cancelled = input.is_key_pressed(KeyCode::Escape)
@@ -3598,6 +3612,13 @@ impl Shell {
                 self.create_folder(&input.iter().collect::<String>())
             }
             Some(Prompt::DeleteNote { .. }) => self.delete_selected(),
+            // Closed before the file dialog opens, not after it returns: it
+            // is a native modal, and a card left standing behind one is a
+            // card asking a question that has already been answered.
+            Some(Prompt::ExportPdf { dark }) => {
+                self.close_dialog();
+                self.run_export(if dark { Theme::DARK } else { Theme::LIGHT });
+            }
             None => {}
         }
     }

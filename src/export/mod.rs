@@ -125,6 +125,8 @@ pub fn render(document: &Document, layer: &Layer, options: Options) -> Result<Ve
         );
         let mut sheet = pdf.start_page_with(settings);
         let mut canvas = pdf::PdfCanvas::new(sheet.surface(), &shaper, layer, &mut fonts, geometry);
+        // First, and edge to edge: everything below is drawn on it.
+        paint::ground(&mut canvas, geometry.sheet());
         paint::page(&mut canvas, &layout, page, &numbers, geometry.content_width);
         paint::notes(&mut canvas, notes);
     }
