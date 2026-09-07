@@ -593,15 +593,10 @@ impl Component for Editor {
                         Inline::Note(_) => segment.number.clone().unwrap_or_default(),
                         Inline::EqRef(_) => segment.number.clone().unwrap_or_default(),
                     };
-                    let width = layout::advance(
-                        run,
-                        &text,
-                        kind,
-                        segment.style,
-                        segment.number.as_deref(),
-                        self.layout.scale,
-                        &|text, style| theme::width(layer, text, style),
-                    );
+                    let width =
+                        segment.advance(run, &text, kind, self.layout.scale, &|text, style| {
+                            theme::width(layer, text, style)
+                        });
                     if is_note {
                         let style = layout::anchor_style();
                         theme::draw(
@@ -622,6 +617,7 @@ impl Component for Editor {
                         cursor,
                         width,
                         self.layout.scale,
+                        segment.padding,
                     ));
                     if is_math {
                         let Inline::Math(list) = run else {
@@ -1034,20 +1030,12 @@ impl Editor {
                 Inline::EqRef(_) => ATOM.to_string(),
             };
             if flat >= cursor + segment.len {
-                x += layout::advance(
-                    run,
-                    &text,
-                    block,
-                    segment.style,
-                    segment.number.as_deref(),
-                    scale,
-                    &|text, style| theme::width(layer, text, style),
-                );
+                x += segment.advance(run, &text, block, scale, &|text, style| {
+                    theme::width(layer, text, style)
+                });
             } else {
                 let count = flat.saturating_sub(cursor);
-                if segment.style.badge {
-                    x += theme::BADGE_PAD * scale;
-                }
+                x += segment.text_inset(scale);
                 let prefix: String = text.chars().take(count).collect();
                 x += theme::width(
                     layer,

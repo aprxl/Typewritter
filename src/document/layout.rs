@@ -22,6 +22,10 @@ use crate::theme::{self, TextStyle};
 
 /// Visual line heights, in logical pixels.
 pub const LINE_BODY: f32 = 30.0;
+/// Horizontal inset of inline code's background, plus clear space outside it.
+pub const INLINE_CODE_INSET: f32 = 6.0;
+pub const INLINE_CODE_GAP: f32 = 3.0;
+const INLINE_CODE_SPACE: f32 = INLINE_CODE_INSET + INLINE_CODE_GAP;
 pub const LINE_H1: f32 = 50.0;
 pub const LINE_H2: f32 = 38.0;
 pub const LINE_H3: f32 = 32.0;
@@ -108,6 +112,8 @@ pub const ANCHOR_RISE: f32 = 6.0;
 /// `[start, start + len)` chars of it. Ranges on a line are contiguous and
 /// exact — no gaps, no overlaps — which is what makes caret math trivial.
 pub struct Segment {
+    /// Space before/after the label; only the outside edges of inline code reserve it.
+    pub padding: (f32, f32),
     /// Index of the source run in the block's `inlines`.
     pub inline: usize,
     /// Char offset within that run's text.
@@ -120,6 +126,36 @@ pub struct Segment {
     /// run. Carried here so the caret, the hit tests, and the editor's
     /// drawing all read the same number instead of deriving it each.
     pub number: Option<String>,
+}
+
+impl Segment {
+    pub fn advance(
+        &self,
+        run: &Inline,
+        text: &str,
+        block: &Block,
+        scale: f32,
+        measure: &dyn Fn(&str, &TextStyle) -> f32,
+    ) -> f32 {
+        advance(
+            run,
+            text,
+            block,
+            self.style,
+            self.number.as_deref(),
+            scale,
+            measure,
+        ) + (self.padding.0 + self.padding.1) * scale
+    }
+    pub fn text_inset(&self, scale: f32) -> f32 {
+        (self.padding.0
+            + if self.style.badge {
+                theme::BADGE_PAD
+            } else {
+                0.0
+            })
+            * scale
+    }
 }
 
 /// One visual line: a contiguous slice of the source block's flat text.
@@ -397,24 +433,32 @@ fn wrap(
     let mut first = true;
 
     for (i, piece) in pieces.iter().enumerate() {
-        if piece.space {
-            cursor += piece_width(piece, block, scale, measure);
-            current.push(i);
-            continue;
-        }
-        let word_width = piece_width(piece, block, scale, measure);
-        if first {
-            // First piece starts the line at the left, whatever it is.
-        } else if cursor + word_width <= width {
-            // Fits.
-        } else {
-            // The trailing space stays on the line we are closing.
+        let code = piece.style.code && !block.is_code();
+        let continues_code = current
+            .last()
+            .is_some_and(|&previous| pieces[previous].style.code);
+        let base = piece_width(piece, block, scale, measure);
+        let mut word_width = base
+            + if code && !continues_code {
+                INLINE_CODE_SPACE * 2.0 * scale
+            } else {
+                0.0
+            };
+        if !piece.space && !first && cursor + word_width > width {
             lines.push(std::mem::take(&mut current));
             cursor = 0.0;
+            word_width = base
+                + if code {
+                    INLINE_CODE_SPACE * 2.0 * scale
+                } else {
+                    0.0
+                };
         }
         current.push(i);
         cursor += word_width;
-        first = false;
+        if !piece.space {
+            first = false;
+        }
     }
     if !current.is_empty() {
         lines.push(current);
@@ -461,7 +505,7 @@ fn tokens(
 
 /// Merge a line's piece indices into segments, folding together adjacent
 /// pieces from the same run so the output is one segment per source stretch.
-fn segments_for(pieces: &[Piece], line: &[usize]) -> Vec<Segment> {
+fn segments_for(pieces: &[Piece], line: &[usize], block: &Block) -> Vec<Segment> {
     let mut segs: Vec<Segment> = Vec::new();
     for &i in line {
         let p = &pieces[i];
@@ -470,12 +514,25 @@ fn segments_for(pieces: &[Piece], line: &[usize]) -> Vec<Segment> {
                 s.len += p.len;
             }
             _ => segs.push(Segment {
+                padding: (0.0, 0.0),
                 inline: p.inline,
                 start: p.start,
                 len: p.len,
                 style: p.style,
                 number: p.number.clone(),
             }),
+        }
+    }
+    if !block.is_code() {
+        for i in 0..segs.len() {
+            if segs[i].style.code {
+                let left = i == 0 || !segs[i - 1].style.code;
+                let right = i + 1 == segs.len() || !segs[i + 1].style.code;
+                segs[i].padding = (
+                    if left { INLINE_CODE_SPACE } else { 0.0 },
+                    if right { INLINE_CODE_SPACE } else { 0.0 },
+                );
+            }
         }
     }
     segs
@@ -674,7 +731,7 @@ pub fn layout_blocks(
                     y: line_y,
                     x: indent,
                     height,
-                    segments: segments_for(&pieces, line_pieces),
+                    segments: segments_for(&pieces, line_pieces, block),
                 };
                 line_y += height;
                 line
@@ -895,15 +952,7 @@ fn x_of_flat(
         let text = segment_text(run, segment);
         let seg_len = segment.len;
         if flat >= seg_flat + seg_len {
-            x += advance(
-                run,
-                &text,
-                block,
-                segment.style,
-                segment.number.as_deref(),
-                scale,
-                measure,
-            );
+            x += segment.advance(run, &text, block, scale, measure);
             seg_flat += seg_len;
         } else {
             // The caret is inside this segment: measure its prefix, past
@@ -911,9 +960,7 @@ fn x_of_flat(
             // inside the box, so the caret has to as well.
             let up_to = flat - seg_flat;
             let prefix: String = text.chars().take(up_to).collect();
-            if segment.style.badge {
-                x += theme::BADGE_PAD * scale;
-            }
+            x += segment.text_inset(scale);
             x += measure(&prefix, &text_style(block, segment.style, scale));
             break;
         }
@@ -1086,15 +1133,7 @@ fn caret_for_click(
     'segments: for segment in &line.segments {
         let run = &block.inlines()[segment.inline];
         let text = segment_text(run, segment);
-        let width = advance(
-            run,
-            &text,
-            block,
-            segment.style,
-            segment.number.as_deref(),
-            scale,
-            measure,
-        );
+        let width = segment.advance(run, &text, block, scale, measure);
         // The label sits inside its box; skip the left edge so a click
         // lands on the character the user aimed at.
         if matches!(run, Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_)) {
@@ -1104,12 +1143,7 @@ fn caret_for_click(
             }
         } else {
             let style = text_style(block, segment.style, scale);
-            let text_x = cum
-                + if segment.style.badge {
-                    theme::BADGE_PAD * scale
-                } else {
-                    0.0
-                };
+            let text_x = cum + segment.text_inset(scale);
             let ci = caret_char_for_x(&text, text_x, x, &style, measure);
             if ci < segment.len {
                 pos = seg_flat + ci;
@@ -1313,15 +1347,7 @@ impl DocLayout {
                 .map(|run| run_text(run).chars().count())
                 .sum();
             let text = segment_text(run, segment);
-            let width = advance(
-                run,
-                &text,
-                block,
-                segment.style,
-                segment.number.as_deref(),
-                self.scale,
-                measure,
-            );
+            let width = segment.advance(run, &text, block, self.scale, measure);
             if x >= advance_x && x <= advance_x + width {
                 let run_len = run_text(run).chars().count();
                 let whole_run = FlatRange::new(
@@ -1348,12 +1374,7 @@ impl DocLayout {
                 }
 
                 let style = text_style(block, segment.style, self.scale);
-                let text_x = advance_x
-                    + if segment.style.badge {
-                        theme::BADGE_PAD * self.scale
-                    } else {
-                        0.0
-                    };
+                let text_x = advance_x + segment.text_inset(self.scale);
                 let within_segment = context_char_for_x(&text, text_x, x, &style, measure);
                 let clicked = run_start + segment.start + within_segment;
                 let ch = text
@@ -1471,15 +1492,7 @@ impl DocLayout {
                 for segment in &line.segments {
                     let run = &block.inlines()[segment.inline];
                     let text = segment_text(run, segment);
-                    let width = advance(
-                        run,
-                        &text,
-                        block,
-                        segment.style,
-                        segment.number.as_deref(),
-                        self.scale,
-                        measure,
-                    );
+                    let width = segment.advance(run, &text, block, self.scale, measure);
                     let run_start: usize = block.inlines()[..segment.inline]
                         .iter()
                         .map(|run| run_text(run).chars().count())
@@ -1568,7 +1581,7 @@ impl DocLayout {
                                 );
                             }
                         } else {
-                            let mut char_x = advance_x;
+                            let mut char_x = advance_x + segment.text_inset(self.scale);
                             for (within_segment, ch) in text.chars().enumerate() {
                                 let char_width = measure(
                                     &ch.to_string(),
@@ -1713,15 +1726,7 @@ impl DocLayout {
         for segment in &line.segments {
             let run = &block.inlines()[segment.inline];
             let text = segment_text(run, segment);
-            let width = advance(
-                run,
-                &text,
-                block,
-                segment.style,
-                segment.number.as_deref(),
-                self.scale,
-                measure,
-            );
+            let width = segment.advance(run, &text, block, self.scale, measure);
             if let Inline::Math(list) = run {
                 let local = (x - advance_x, line.y + line.height / 2.0 - y);
                 let expression = math_layout::layout(list, 0, self.scale, measure);
@@ -1793,15 +1798,7 @@ impl DocLayout {
         for segment in &line.segments {
             let run = &block.inlines()[segment.inline];
             let text = segment_text(run, segment);
-            let width = advance(
-                run,
-                &text,
-                block,
-                segment.style,
-                segment.number.as_deref(),
-                self.scale,
-                measure,
-            );
+            let width = segment.advance(run, &text, block, self.scale, measure);
             if let Inline::Math(list) = run {
                 let local_x = x - advance_x;
                 // Math boxes use positive-up y; the line baseline is its centre.

@@ -441,9 +441,12 @@ pub fn sans() -> Font {
     Font::Bytes(include_bytes!("../resources/fonts/InterVariable.ttf"))
 }
 
-/// Labels, numbers, and anything that wants to read as machinery.
+/// JetBrains Mono is embedded so code and monospace labels use the same
+/// distinct letterforms on screen, in exports, and on every platform.
 pub fn mono() -> Font {
-    Font::Named("monospace".into())
+    Font::Bytes(include_bytes!(
+        "../resources/fonts/JetBrainsMono-Regular.ttf"
+    ))
 }
 
 /// Math. Stays separate from `mono` because the two answer different

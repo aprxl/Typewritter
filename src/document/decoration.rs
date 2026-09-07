@@ -30,11 +30,10 @@ use super::layout::{CHECK_GAP, CHECK_SIZE, NUMBER_GUTTER, NUMBER_SIZE};
 use super::{BadgeColor, Block, ListMarker, Style};
 
 /// Padding of the tint behind an inline code span. Tighter than the
-/// [`BLOCK_PAD`] a fenced block gets, so a `` `run` `` mid-sentence doesn't
-/// push the line apart.
+/// [`BLOCK_PAD`] a fenced block gets. Horizontal space is owned by layout.
 ///
 /// [`BLOCK_PAD`]: crate::components::editor::BLOCK_PAD
-const INLINE_PAD: (f32, f32) = (8.0, 4.0);
+const INLINE_PAD_Y: f32 = 4.0;
 /// A bullet's dot: inset from the content column and sized to read as a
 /// mark, not as a glyph. `BULLET_INSET` is from the column's left edge to
 /// the dot's centre.
@@ -65,20 +64,32 @@ const BADGE_OUTLINE_RADIUS: f32 = 3.5;
 pub type Painted = (String, Style, f32, f32);
 
 /// One run of a line, measured: where its label starts and how wide the
-/// label sets, given the pen position and the advance `layout::advance`
+/// label sets, given the pen position and the advance `Segment::advance`
 /// reserved for it.
 ///
-/// The two differ only for a badge, which reserves a pad on each side of
-/// its label for the chip drawn around it. Both painters build their pieces
+/// Badges and inline code reserve space around their labels. Code reserves
+/// that space only at the outside edges of a contiguous span. Both painters build their pieces
 /// through here so the label and the box can never be measured from two
 /// different readings of that pad.
-pub fn piece(text: String, style: Style, cursor: f32, advance: f32, scale: f32) -> Painted {
+pub fn piece(
+    text: String,
+    style: Style,
+    cursor: f32,
+    advance: f32,
+    scale: f32,
+    padding: (f32, f32),
+) -> Painted {
     let pad = if style.badge {
         theme::BADGE_PAD * scale
     } else {
         0.0
     };
-    (text, style, cursor + pad, advance - pad * 2.0)
+    (
+        text,
+        style,
+        cursor + pad + padding.0 * scale,
+        advance - pad * 2.0 - (padding.0 + padding.1) * scale,
+    )
 }
 
 /// Every mark this line's runs carry, under the text and in the editor's
@@ -101,10 +112,13 @@ pub fn runs(
     // under the whole fence; only a code span in prose needs its own box.
     for (start, end) in spans(pieces, |piece| piece.1.code && !block.is_code()) {
         canvas.draw_rectangle(
-            (start - INLINE_PAD.0, top + INLINE_PAD.1),
             (
-                end - start + INLINE_PAD.0 * 2.0,
-                height - INLINE_PAD.1 * 2.0,
+                start - super::layout::INLINE_CODE_INSET * scale,
+                top + INLINE_PAD_Y * scale,
+            ),
+            (
+                end - start + super::layout::INLINE_CODE_INSET * 2.0 * scale,
+                height - INLINE_PAD_Y * 2.0 * scale,
             ),
             theme::code(),
             CODE_ROUNDING,
@@ -365,7 +379,7 @@ mod tests {
             badge: true,
             ..Style::PLAIN
         };
-        let (_, _, x, width) = piece("TODO".into(), style, 100.0, 60.0, 1.0);
+        let (_, _, x, width) = piece("TODO".into(), style, 100.0, 60.0, 1.0, (0.0, 0.0));
         assert_eq!(x, 100.0 + theme::BADGE_PAD);
         assert_eq!(width, 60.0 - theme::BADGE_PAD * 2.0);
         assert_eq!(x + width + theme::BADGE_PAD, 160.0, "the advance is spent");
@@ -373,7 +387,7 @@ mod tests {
 
     #[test]
     fn a_plain_run_reserves_exactly_what_it_sets() {
-        let (_, _, x, width) = piece("word".into(), Style::PLAIN, 100.0, 60.0, 1.0);
+        let (_, _, x, width) = piece("word".into(), Style::PLAIN, 100.0, 60.0, 1.0, (0.0, 0.0));
         assert_eq!((x, width), (100.0, 60.0));
     }
 

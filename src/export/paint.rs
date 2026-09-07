@@ -342,15 +342,9 @@ fn line(
             // and `advance` read one value.
             Inline::Note(_) | Inline::EqRef(_) => segment.number.clone().unwrap_or_default(),
         };
-        let width = layout::advance(
-            run,
-            &text,
-            kind,
-            segment.style,
-            segment.number.as_deref(),
-            layout.scale,
-            &|text, style| canvas.measure(text, style),
-        );
+        let width = segment.advance(run, &text, kind, layout.scale, &|text, style| {
+            canvas.measure(text, style)
+        });
 
         match run {
             // Text waits for the pass below: it is drawn over every mark
@@ -398,6 +392,7 @@ fn line(
             cursor,
             width,
             layout.scale,
+            segment.padding,
         ));
         cursor += width;
     }
@@ -940,16 +935,25 @@ mod tests {
                 ..Style::PLAIN
             },
         });
-        let layout = laid_out(vec![Block::Paragraph(vec![text("a "), code_run])], 500.0);
+        let layout = laid_out(
+            vec![Block::Paragraph(vec![text("a"), code_run, text("b")])],
+            500.0,
+        );
         let painted = paint(&layout, &whole(&layout), 500.0);
         let boxes = painted.rectangles(theme::code());
-        let [(at, _)] = boxes[..] else {
+        let [(at, size)] = boxes[..] else {
             panic!("a code span is boxed, got {:?}", painted.calls);
         };
         assert!(
-            at.0 < 2.0 * GLYPH,
-            "the box overhangs the run's left edge, not {}",
-            at.0
+            at.0 > GLYPH,
+            "the background must leave space after the preceding prose"
+        );
+        let Some(Call::Text { at: after, .. }) = painted.saying("b") else {
+            panic!("following prose must be drawn")
+        };
+        assert!(
+            at.0 + size.0 < after.0,
+            "the background must stop before following prose"
         );
     }
 
