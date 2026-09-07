@@ -11,12 +11,25 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::document::math_style::Overrides;
+
 const CONFIG_DIR: &str = ".typewritter";
 const CONFIG_FILE: &str = "config.toml";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub vault: PathBuf,
+    /// How the reader wants individual symbols highlighted. Kept here
+    /// rather than in the documents because a symbol's colour is a fact
+    /// about the reader's vocabulary, not about one note: an epsilon should
+    /// look the same in every file it appears in. Defaulted, so a config
+    /// written before anything was customised still loads.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub math: Overrides,
+}
+
+fn is_default(overrides: &Overrides) -> bool {
+    *overrides == Overrides::default()
 }
 
 impl Config {
@@ -58,6 +71,7 @@ impl Config {
         }
         let config = Config {
             vault: dialog.pick_folder()?,
+            math: Overrides::default(),
         };
         if let Err(e) = config.save() {
             eprintln!("could not save the vault config: {e}");
@@ -77,6 +91,49 @@ fn home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::math_style::{HighlightShape, MathHue, Override};
+
+    /// Symbol styling arrived after the first configs were written, so a
+    /// file that predates it has no `[math]` table at all. It must still
+    /// open the reader's vault rather than failing to parse.
+    #[test]
+    fn a_config_without_symbol_styling_still_loads() {
+        let config: Config = toml::from_str("vault = \"notes\"").expect("a bare config parses");
+
+        assert_eq!(config.vault, PathBuf::from("notes"));
+        assert_eq!(config.math, Overrides::default());
+    }
+
+    /// And one that says nothing about symbols does not grow an empty table
+    /// on the next save.
+    #[test]
+    fn an_untouched_table_is_not_written_back() {
+        let config = Config {
+            vault: PathBuf::from("notes"),
+            math: Overrides::default(),
+        };
+
+        assert!(!toml::to_string_pretty(&config).unwrap().contains("math"));
+    }
+
+    #[test]
+    fn symbol_overrides_round_trip_through_the_file() {
+        let mut math = Overrides::default();
+        math.set(
+            "epsilon",
+            Override {
+                hue: Some(MathHue::Coral),
+                shape: Some(HighlightShape::Outline),
+            },
+        );
+        let config = Config {
+            vault: PathBuf::from("notes"),
+            math,
+        };
+
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);
+    }
 
     /// The onboarding bug this guards: `home()` read `$HOME` directly, which
     /// is unset on Windows, so `dir()` was `None`, `save()` failed, and
@@ -93,6 +150,7 @@ mod tests {
     fn a_config_round_trips_through_toml() {
         let config = Config {
             vault: PathBuf::from("vault"),
+            math: Overrides::default(),
         };
         let text = toml::to_string_pretty(&config).unwrap();
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), config);

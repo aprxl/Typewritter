@@ -1,7 +1,7 @@
 //! Custom glyph rasterization for text effects that cosmic-text's built-in
 //! pipeline doesn't support: continuous faux-bold and faux-condense on any
-//! static font (no variable-font axis required), via swash's `embolden`
-//! and `transform` applied directly during rasterization.
+//! static font (no variable-font axis required), via filled/stroked outlines
+//! and affine transforms applied during rasterization.
 //!
 //! Shaping and layout (BiDi, kerning, line-breaking) still come from
 //! cosmic-text's `Buffer`/`layout_runs` — only the rasterization step is
@@ -9,7 +9,7 @@
 //! own built-in `SwashCache` never calls `embolden`/`transform` for regular
 //! text (verified against its source), so getting either effect means
 //! driving swash ourselves, the same way cosmic-text's own (private)
-//! `swash.rs` module does internally, just with those two calls added.
+//! `swash.rs` module does internally, with the additional outline effects.
 
 use std::collections::HashMap;
 
@@ -18,7 +18,7 @@ use glyphon::{
     RasterizeCustomGlyphRequest, RasterizedCustomGlyph, fontdb,
 };
 use swash::scale::{Render, ScaleContext, Source, StrikeWith, image::Content, image::Image};
-use swash::zeno::{Format, Transform};
+use swash::zeno::{Format, Mask, Origin, Placement, Stroke, Transform};
 
 /// The synthetic per-glyph effect parameters carried by
 /// [`super::FontParameters`], in the form the placement/measurement code
@@ -330,11 +330,9 @@ fn effect_transform(condense: f32, slant: f32) -> Option<Transform> {
     (condense != 1.0 || slant != 0.0).then(|| Transform::new(condense, 0.0, slant, 1.0, 0.0, 0.0))
 }
 
-/// Rasterize one glyph via swash directly, applying `embolden` (continuous
-/// faux-bold outline expansion) and, if `condense != 1.0` or `slant != 0.0`,
-/// a single composed `transform` (faux condense/expand + faux italic shear).
-/// Mirrors the recipe cosmic-text's own private `swash.rs` uses internally,
-/// minus the two calls it never makes.
+/// Rasterize one glyph, preserving color sources and applying synthetic
+/// effects to monochrome outlines. Bold uses a fill plus a centered stroke,
+/// the same construction as PDF export.
 fn rasterize_glyph(
     scale_context: &mut ScaleContext,
     font_system: &mut FontSystem,
@@ -351,25 +349,79 @@ fn rasterize_glyph(
         .size(size)
         .hint(true)
         .build();
-    // Color sources first (embedded-bitmap emoji, then COLR layered-outline
-    // emoji), falling back to the plain monochrome outline every other
-    // glyph uses. Each source is a no-op fallthrough when the font doesn't
-    // have it (`has_color_bitmaps`/`has_color_outlines`/`has_outlines`,
-    // checked internally by swash's `render_into`) — so this is exactly
-    // the previous behavior for every non-emoji glyph. `embolden`/
-    // `transform` only apply where swash's own `render_into` applies them
-    // (`Outline` unconditionally, `ColorOutline` for `transform` only) —
-    // harmlessly ignored for the embedded-bitmap source, which has no
-    // outline to dilate/skew in the first place.
-    Render::new(&[
+    let transform = effect_transform(condense, slant);
+    if let Some(image) = Render::new(&[
         Source::ColorBitmap(StrikeWith::BestFit),
         Source::ColorOutline(0),
-        Source::Outline,
     ])
-    .format(Format::Alpha)
-    .embolden(embolden)
-    .transform(effect_transform(condense, slant))
+    .transform(transform)
     .render(&mut scaler, key.glyph_id)
+    {
+        return Some(image);
+    }
+    if embolden > 0.0 {
+        let outline = scaler.scale_outline(key.glyph_id)?;
+        Some(bold_outline(&outline, embolden, transform))
+    } else {
+        Render::new(&[Source::Outline])
+            .format(Format::Alpha)
+            .transform(transform)
+            .render(&mut scaler, key.glyph_id)
+    }
+}
+
+/// Swash's point-based winding estimate can reverse its dilation on
+/// multi-contour glyphs (Inter's `f` becomes thinner when emboldened).
+/// Stroke the actual curves instead, then union with their original fill.
+/// Separate masks preserve holes regardless of each contour's orientation.
+fn bold_outline(
+    outline: &swash::scale::outline::Outline,
+    strength: f32,
+    transform: Option<Transform>,
+) -> Image {
+    let (fill, fill_bounds) = Mask::new(outline.path())
+        .origin(Origin::BottomLeft)
+        .transform(transform)
+        // Zeno needs its measured height before resolving a bottom-left
+        // placement; render() alone leaves that height uninitialized.
+        .inspect(|_, _, _| {})
+        .render();
+    let (stroke, stroke_bounds) = Mask::new(outline.path())
+        .origin(Origin::BottomLeft)
+        .style(Stroke::new(strength * 2.0))
+        .transform(transform)
+        .inspect(|_, _, _| {})
+        .render();
+    let left = fill_bounds.left.min(stroke_bounds.left);
+    let top = fill_bounds.top.max(stroke_bounds.top);
+    let right = (fill_bounds.left + fill_bounds.width as i32)
+        .max(stroke_bounds.left + stroke_bounds.width as i32);
+    let bottom = (fill_bounds.top - fill_bounds.height as i32)
+        .min(stroke_bounds.top - stroke_bounds.height as i32);
+    let placement = Placement {
+        left,
+        top,
+        width: (right - left) as u32,
+        height: (top - bottom) as u32,
+    };
+    let mut data = vec![0; (placement.width * placement.height) as usize];
+    for (mask, bounds) in [(fill, fill_bounds), (stroke, stroke_bounds)] {
+        for y in 0..bounds.height {
+            for x in 0..bounds.width {
+                let at = ((y + (top - bounds.top) as u32) * placement.width
+                    + x
+                    + (bounds.left - left) as u32) as usize;
+                let coverage = mask[(y * bounds.width + x) as usize];
+                data[at] = data[at].max(coverage);
+            }
+        }
+    }
+    Image {
+        source: Source::Outline,
+        content: Content::Mask,
+        placement,
+        data,
+    }
 }
 
 #[cfg(test)]
@@ -427,5 +479,45 @@ mod tests {
     #[test]
     fn neutral_effects_omit_the_transform() {
         assert!(effect_transform(1.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn bold_inter_adds_ink_to_f_and_preserves_counters() {
+        use swash::scale::{Render, ScaleContext, Source};
+        use swash::zeno::Format;
+        let font = swash::FontRef::from_index(
+            include_bytes!("../../resources/fonts/InterVariable.ttf"),
+            0,
+        )
+        .unwrap();
+        let mut context = ScaleContext::new();
+        for size in [12.0, 17.5, 23.0, 30.0, 46.0] {
+            for ch in ['f', 'i', 'o', 'B', 'ã'] {
+                let glyph = font.charmap().map(ch);
+                let mut scaler = context.builder(font).size(size).hint(true).build();
+                let regular = Render::new(&[Source::Outline])
+                    .format(Format::Alpha)
+                    .render(&mut scaler, glyph)
+                    .unwrap();
+                let outline = scaler.scale_outline(glyph).unwrap();
+                let bold = super::bold_outline(&outline, size * 0.018, None);
+                assert!(
+                    (bold.placement.top - regular.placement.top).abs() <= 2,
+                    "bold {ch} at {size}px moved off its baseline"
+                );
+                let ink = |image: &swash::scale::image::Image| {
+                    image.data.iter().map(|&a| u64::from(a)).sum::<u64>()
+                };
+                assert!(ink(&bold) > ink(&regular), "bold {ch} at {size}px lost ink");
+                if ch == 'o' {
+                    let center = (bold.placement.height / 2 * bold.placement.width
+                        + bold.placement.width / 2) as usize;
+                    assert!(
+                        bold.data[center] < 32,
+                        "bold o closed its counter at {size}px"
+                    );
+                }
+            }
+        }
     }
 }

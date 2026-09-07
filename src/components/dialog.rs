@@ -9,12 +9,19 @@ use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
 
-use super::popup::{CARD_RADIUS, Slide, paint_shadow_slab};
+use super::popup::{CARD_RADIUS, paint_shadow_slab};
 
 const CARD_W: f32 = 460.0;
 const CARD_H: f32 = 216.0;
 const BUTTON_W: f32 = 96.0;
-const BUTTON_H: f32 = 30.0;
+const BUTTON_H: f32 = 36.0;
+/// A switch's pill. Wide enough that the knob's travel reads as travel
+/// rather than a twitch, and no taller than the row it shares with its
+/// label.
+const SWITCH_W: f32 = 44.0;
+const SWITCH_H: f32 = 24.0;
+/// Gap between the knob and the pill it slides inside.
+const KNOB_INSET: f32 = 3.0;
 
 /// What the card is asking.
 #[derive(Clone)]
@@ -26,6 +33,10 @@ pub enum Prompt {
     /// Deleting is not undoable and there is no trash, so it is never done
     /// on a keystroke alone — this asks first, and names the file it means.
     DeleteNote { name: String },
+    /// Export the open note as a PDF. The palette the page prints in is the
+    /// only thing an export gets to decide (`PDF.md` §2), so it is the only
+    /// thing this asks. Enter goes on to the file dialog.
+    ExportPdf { dark: bool },
 }
 
 impl Prompt {
@@ -34,6 +45,7 @@ impl Prompt {
             Self::NewNote { .. } => "New note",
             Self::NewFolder { .. } => "New folder",
             Self::DeleteNote { .. } => "Delete note",
+            Self::ExportPdf { .. } => "Export as PDF",
         }
     }
 
@@ -42,6 +54,7 @@ impl Prompt {
             Self::NewNote { .. } => "Create",
             Self::NewFolder { .. } => "Create",
             Self::DeleteNote { .. } => "Delete",
+            Self::ExportPdf { .. } => "Export",
         }
     }
 
@@ -50,6 +63,7 @@ impl Prompt {
             Self::NewNote { .. } => "Enter creates · Esc cancels",
             Self::NewFolder { .. } => "Enter creates · Esc cancels",
             Self::DeleteNote { .. } => "Enter deletes · Esc cancels",
+            Self::ExportPdf { .. } => "Space switches · Enter exports · Esc cancels",
         }
     }
 }
@@ -65,6 +79,21 @@ pub fn card(viewport: Rect) -> Rect {
 
 fn field(card: Rect) -> Rect {
     Rect::new(card.x + 18.0, card.y + 64.0, card.width - 36.0, 34.0)
+}
+
+/// The palette switch's pill — the same rect the shell hit-tests, so a
+/// click lands on the switch that was drawn there.
+///
+/// It sits in the row a named prompt puts its field in, so both cards have
+/// one vertical rhythm rather than two.
+pub fn toggle(viewport: Rect) -> Rect {
+    let row = field(card(viewport));
+    Rect::new(
+        row.right() - SWITCH_W,
+        row.y + (row.height - SWITCH_H) * 0.5,
+        SWITCH_W,
+        SWITCH_H,
+    )
 }
 
 /// `(confirm, cancel)` — the same rects the shell hit-tests, so a click
@@ -87,14 +116,12 @@ pub struct Dialog {
     /// The blurred layer this card paints its shadow slab into.
     shadow: Option<Layer>,
     reveal: f32,
-    slide: Slide,
-    started: bool,
     dirty: Dirty,
 }
 
 /// Corner radius of the field and buttons — nested smaller things round
 /// less than the card itself.
-const FIELD_RADIUS: f32 = 6.0;
+const FIELD_RADIUS: f32 = 8.0;
 
 impl Dialog {
     pub fn new(prompt: Option<Prompt>) -> Self {
@@ -103,8 +130,6 @@ impl Dialog {
             caret_on: true,
             shadow: None,
             reveal: 0.0,
-            slide: Slide::new(),
-            started: false,
             dirty: Dirty::new(),
         }
     }
@@ -116,7 +141,7 @@ impl Dialog {
     }
 
     /// Paints the shadow slab from sync; closed clears unconditionally.
-    fn paint_shadow(&mut self, owns: bool) {
+    fn paint_shadow(&mut self, owns: bool, viewport: Rect) {
         if !owns {
             return;
         }
@@ -127,7 +152,7 @@ impl Dialog {
             paint_shadow_slab(&shadow, Rect::default(), -1.0);
             return;
         }
-        paint_shadow_slab(&shadow, card(Rect::default()), self.reveal);
+        paint_shadow_slab(&shadow, card(viewport), self.reveal);
     }
 
     /// Draws the name field, showing as much of the name as fits, with the
@@ -148,7 +173,7 @@ impl Dialog {
             theme::border(),
         );
 
-        let style = TextStyle::serif(16.0, theme::ink());
+        let style = TextStyle::sans(16.0, theme::ink());
         let middle = field.y + field.height / 2.0;
         let mut shown = String::new();
         let mut shown_width = 0.0;
@@ -184,6 +209,68 @@ impl Dialog {
             );
         }
     }
+
+    /// The palette row: what the switch is called, what it changes, and the
+    /// pill itself.
+    ///
+    /// The knob snaps rather than slides. This card is redrawn from a
+    /// snapshot the shell hands it on every change and owns no state of its
+    /// own, so an animated knob would need somewhere to keep its position
+    /// across those rebuilds — a whole mechanism for a 20-pixel slide.
+    fn draw_switch(&self, layer: &Layer, card: Rect, track: Rect, on: bool, ea: f32) {
+        let middle = track.y + track.height / 2.0;
+        theme::draw(
+            layer,
+            "Dark page",
+            (card.x + 18.0, middle),
+            &TextStyle::sans(16.0, theme::fade(theme::ink(), ea)),
+            theme::LEFT,
+        );
+        theme::draw(
+            layer,
+            "Ink and paper both come from the dark palette.",
+            (card.x + 18.0, track.bottom() + 22.0),
+            &TextStyle::sans(13.5, theme::fade(theme::dim(), ea)),
+            theme::LEFT,
+        );
+
+        // A stadium: the radius is half the height, so the pill's ends are
+        // the same circle the knob is.
+        let radius = track.height / 2.0;
+        layer.draw_rectangle(
+            track.position(),
+            track.size(),
+            theme::fade(if on { theme::accent() } else { theme::alt() }, ea),
+            Rounding::uniform(radius),
+        );
+        // Off, the pill is the same quiet surface the name field is, and it
+        // needs the field's border to read as a control at all. On, the
+        // accent is the edge.
+        if !on {
+            theme::rounded_outline(
+                layer,
+                track.inset(0.5),
+                radius - 0.5,
+                1.0,
+                theme::fade(theme::border(), ea),
+            );
+        }
+        layer.draw_circle(
+            (
+                track.x + radius + if on { track.width - track.height } else { 0.0 },
+                middle,
+            ),
+            radius - KNOB_INSET,
+            theme::fade(
+                if on {
+                    theme::background()
+                } else {
+                    theme::non_text()
+                },
+                ea,
+            ),
+        );
+    }
 }
 
 impl Component for Dialog {
@@ -198,21 +285,9 @@ impl Component for Dialog {
             self.reveal = context.reveal;
             self.dirty.set();
         }
-        self.paint_shadow(context.owns_shadow);
+        self.paint_shadow(context.owns_shadow, context.self_rect);
         if self.prompt.is_some() {
             self.dirty.write(&mut self.caret_on, context.caret_on);
-
-            // The pill lands nowhere: a dialog has no row highlight. The
-            // Slide is only along for the shared construction; park it off
-            // screen so it never draws.
-            if !self.started {
-                self.slide.park(Rect::default());
-                self.started = true;
-            }
-        }
-        self.slide.advance(context.animation_dt);
-        if self.slide.advancing() {
-            self.dirty.set();
         }
     }
 
@@ -242,12 +317,12 @@ impl Component for Dialog {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            theme::fade(theme::background(), 0.72 * ea),
+            theme::fade(theme::background(), 0.48 * ea),
             Rounding::NONE,
         );
 
         let resting = card(rect);
-        let travel = (1.0 - ea) * -4.0;
+        let travel = (1.0 - ea) * 8.0;
         let card = Rect::new(resting.x, resting.y + travel, resting.width, resting.height);
 
         layer.draw_rectangle(
@@ -268,7 +343,7 @@ impl Component for Dialog {
             layer,
             prompt.title(),
             (card.x + card.width / 2.0, card.y + 34.0),
-            &TextStyle::serif(19.0, theme::fade(theme::ink(), ea)).bold(),
+            &TextStyle::sans(19.0, theme::fade(theme::ink(), ea)).bold(),
             theme::CENTER,
         );
 
@@ -281,17 +356,21 @@ impl Component for Dialog {
                     layer,
                     name,
                     (card.x + card.width / 2.0, card.y + 82.0),
-                    &TextStyle::serif(16.0, theme::fade(theme::ink(), ea)),
+                    &TextStyle::sans(16.0, theme::fade(theme::ink(), ea)),
                     theme::CENTER,
                 );
                 theme::draw(
                     layer,
                     "is deleted from disk. This cannot be undone.",
                     (card.x + card.width / 2.0, card.y + 108.0),
-                    &TextStyle::serif(13.5, theme::fade(theme::dim(), ea)),
+                    &TextStyle::sans(13.5, theme::fade(theme::dim(), ea)),
                     theme::CENTER,
                 );
             }
+            // `rect` and not `card`: the switch is hit-tested from the
+            // viewport, so it is drawn from the viewport too, and the two
+            // cannot drift.
+            Prompt::ExportPdf { dark } => self.draw_switch(layer, card, toggle(rect), *dark, ea),
         }
 
         theme::draw(
@@ -304,7 +383,9 @@ impl Component for Dialog {
 
         let (confirm, cancel) = buttons(rect);
         let accent = match prompt {
-            Prompt::NewNote { .. } | Prompt::NewFolder { .. } => theme::accent(),
+            Prompt::NewNote { .. } | Prompt::NewFolder { .. } | Prompt::ExportPdf { .. } => {
+                theme::accent()
+            }
             // A destructive default deserves a different colour from the
             // one the whole interface uses for "this is where you are".
             Prompt::DeleteNote { .. } => theme::structure(),
@@ -322,7 +403,7 @@ impl Component for Dialog {
                 confirm.x + confirm.width / 2.0,
                 confirm.y + confirm.height / 2.0,
             ),
-            &TextStyle::serif(13.0, theme::fade(theme::background(), ea)),
+            &TextStyle::sans(13.0, theme::fade(theme::background(), ea)),
             theme::CENTER,
         );
 
@@ -346,8 +427,57 @@ impl Component for Dialog {
                 cancel.x + cancel.width / 2.0,
                 cancel.y + cancel.height / 2.0,
             ),
-            &TextStyle::serif(13.0, theme::fade(theme::dim(), ea)),
+            &TextStyle::sans(13.0, theme::fade(theme::dim(), ea)),
             theme::CENTER,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VIEWPORT: Rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 1440.0,
+        height: 900.0,
+    };
+
+    /// The switch is hit-tested from one function and drawn from another
+    /// call to the same one, so what has to hold is that the rect it names
+    /// is somewhere a click can reach and nowhere a click already means
+    /// something else.
+    #[test]
+    fn the_switch_sits_inside_the_card_and_clear_of_its_buttons() {
+        let card = card(VIEWPORT);
+        let track = toggle(VIEWPORT);
+        assert!(
+            track.x >= card.x && track.right() <= card.right(),
+            "the pill is inside the card: {track:?} in {card:?}"
+        );
+        assert!(track.y >= card.y && track.bottom() <= card.bottom());
+
+        let (confirm, cancel) = buttons(VIEWPORT);
+        for button in [confirm, cancel] {
+            assert!(
+                track.bottom() <= button.y,
+                "the pill clears the buttons, or a flick of it confirms the card: \
+                 {track:?} against {button:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_switch_is_a_stadium_the_knob_can_travel_in() {
+        let track = toggle(VIEWPORT);
+        assert!(
+            track.width > track.height,
+            "a pill as wide as it is tall has nowhere to slide"
+        );
+        assert!(
+            track.height / 2.0 > KNOB_INSET,
+            "the knob must have a positive radius"
         );
     }
 }

@@ -5,78 +5,36 @@
 use crate::layout::Rect;
 use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle, icons};
-use crate::ui::{Component, Context, Dirty, Hover};
+use crate::ui::Component;
 
-pub const HEIGHT: f32 = 32.0;
+pub const HEIGHT: f32 = 34.0;
 
 pub struct Breadcrumb {
     path: Vec<String>,
-    hover: Hover,
-    dirty: Dirty,
 }
 
 impl Breadcrumb {
     pub fn new(path: Vec<String>) -> Self {
-        Self {
-            path,
-            hover: Hover::new(),
-            dirty: Dirty::new(),
-        }
+        Self { path }
     }
 
     fn style() -> TextStyle {
-        TextStyle::mono(11.5, theme::dim())
+        TextStyle::sans(11.0, theme::faint())
     }
 }
 
 impl Component for Breadcrumb {
-    fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        // Only the last two crumbs are a floor: a deep path elides, and a
-        // minimum that grew with the depth would push the window wider for
-        // a file that happens to be nested.
-        let style = Self::style();
-        let tail: f32 = self
-            .path
-            .iter()
-            .rev()
-            .take(2)
-            .map(|c| theme::width(layer, c, &style) + 22.0)
-            .sum();
-        (tail + 46.0, HEIGHT)
-    }
-
-    fn sync(&mut self, context: &Context) {
-        let over = context.hovering(context.self_rect);
-        if self.hover.update(over, context.animation_dt) {
-            self.dirty.set();
-        }
-    }
-
-    fn is_dirty(&self) -> bool {
-        self.dirty.get()
-    }
-
-    fn clear_dirty(&mut self) {
-        self.dirty.clear();
-    }
-
-    fn is_animating(&self) -> bool {
-        self.hover.is_animating()
+    fn measure(&mut self, _: &Layer) -> (f32, f32) {
+        (300.0, HEIGHT)
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(
-            rect.position(),
-            rect.size(),
-            theme::chrome(),
-            Rounding::NONE,
-        );
-        theme::hover_fill(layer, rect, self.hover.value());
+        layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
         theme::rule(
             layer,
-            (rect.x, rect.bottom() - 2.0),
+            (rect.x, rect.bottom() - 1.0),
             rect.width,
-            2.0,
+            1.0,
             theme::border(),
         );
         let middle = rect.y + (rect.height - 2.0) / 2.0;
@@ -92,15 +50,32 @@ impl Component for Breadcrumb {
         let crumb = Self::style();
         let separator = TextStyle::mono(11.5, theme::non_text());
         let mut x = rect.x + 37.0;
-        for (index, name) in self.path.iter().enumerate() {
+        let available = (rect.right() - x - 20.0).max(0.0);
+        // Preserve the end of a deep path: that is the current note and heading.
+        let mut start = 0;
+        let mut total: f32 = self
+            .path
+            .iter()
+            .map(|name| theme::width(layer, name, &crumb) + 22.0)
+            .sum();
+        while total > available && start + 1 < self.path.len() {
+            total -= theme::width(layer, &self.path[start], &crumb) + 22.0;
+            start += 1;
+        }
+        if start > 0 {
+            theme::draw(layer, "…  ›", (x, middle), &crumb, theme::LEFT);
+            x += 32.0;
+        }
+        for (index, name) in self.path.iter().enumerate().skip(start) {
             let last = index + 1 == self.path.len();
             let style = if last {
                 crumb.clone().color(theme::ink())
             } else {
                 crumb.clone()
             };
-            theme::draw(layer, name, (x, middle), &style, theme::LEFT);
-            x += theme::width(layer, name, &style) + 7.0;
+            let label = theme::elide(layer, name, rect.right() - 20.0 - x, &style);
+            theme::draw(layer, &label, (x, middle), &style, theme::LEFT);
+            x += theme::width(layer, &label, &style) + 7.0;
             if !last {
                 theme::draw(layer, "›", (x, middle), &separator, theme::LEFT);
                 x += theme::width(layer, "›", &separator) + 7.0;

@@ -15,10 +15,10 @@ use super::popup::CARD_RADIUS;
 /// Corner radius of the splash button — nested smaller things round less.
 const BUTTON_RADIUS: f32 = 6.0;
 
-const CARD_W: f32 = 440.0;
-const CARD_H: f32 = 250.0;
+const CARD_W: f32 = 480.0;
+const CARD_H: f32 = 340.0;
 const BUTTON_W: f32 = 210.0;
-const BUTTON_H: f32 = 34.0;
+const BUTTON_H: f32 = 42.0;
 
 fn card(viewport: Rect) -> Rect {
     Rect::new(
@@ -35,7 +35,7 @@ pub fn button(viewport: Rect) -> Rect {
     let card = card(viewport);
     Rect::new(
         card.x + (card.width - BUTTON_W) / 2.0,
-        card.bottom() - BUTTON_H - 24.0,
+        card.bottom() - BUTTON_H - 44.0,
         BUTTON_W,
         BUTTON_H,
     )
@@ -114,42 +114,27 @@ impl Component for Onboarding {
             theme::non_text(),
         );
 
-        // The mark, echoing the title bar's.
         let center_x = card.x + card.width / 2.0;
-        let mark = Rect::new(center_x - 12.0, card.y + 32.0, 24.0, 24.0);
-        layer.draw_rectangle(
-            mark.position(),
-            mark.size(),
-            theme::accent(),
-            Rounding::NONE,
-        );
+        theme::app_mark(layer, Rect::new(center_x - 28.0, card.y + 36.0, 56.0, 56.0));
         theme::draw(
             layer,
-            "T",
-            (mark.x + 12.0, mark.y + 12.0),
-            &TextStyle::mono(14.0, theme::background()).bold(),
-            theme::CENTER,
-        );
-
-        theme::draw(
-            layer,
-            "Welcome to Typewritter",
-            (center_x, card.y + 92.0),
-            &TextStyle::serif(24.0, theme::ink()).bold(),
+            "A home for your thinking.",
+            (center_x, card.y + 132.0),
+            &TextStyle::sans(26.0, theme::ink()).bold().tracked(-0.035),
             theme::CENTER,
         );
         theme::draw(
             layer,
-            "Pick a folder to keep your notes in.",
-            (center_x, card.y + 126.0),
-            &TextStyle::serif(13.5, theme::dim()),
+            "Lecture notes. Beautiful mathematics.",
+            (center_x, card.y + 172.0),
+            &TextStyle::sans(13.0, theme::dim()),
             theme::CENTER,
         );
         theme::draw(
             layer,
-            "It becomes your vault.",
-            (center_x, card.y + 150.0),
-            &TextStyle::serif(13.5, theme::dim()),
+            "Choose a folder and make it yours.",
+            (center_x, card.y + 197.0),
+            &TextStyle::sans(13.0, theme::dim()),
             theme::CENTER,
         );
 
@@ -178,7 +163,7 @@ impl Component for Onboarding {
                 button.x + button.width / 2.0,
                 button.y + button.height / 2.0,
             ),
-            &TextStyle::serif(
+            &TextStyle::sans(
                 14.0,
                 theme::mix(theme::accent(), theme::background(), weight),
             ),
@@ -187,7 +172,7 @@ impl Component for Onboarding {
         theme::draw(
             layer,
             "or press Enter / Ctrl+O",
-            (center_x, button.bottom() + 10.0),
+            (center_x, button.bottom() + 12.0),
             &TextStyle::mono(10.0, theme::faint()),
             theme::CENTER,
         );

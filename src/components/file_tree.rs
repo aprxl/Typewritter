@@ -17,7 +17,7 @@ use crate::theme::{self, TextStyle, icons};
 use crate::ui::{Component, Context, Dirty, Hover};
 use crate::vault::Vault;
 
-pub const WIDTH: f32 = 250.0;
+pub const WIDTH: f32 = 244.0;
 
 /// What a right-click in the file tree landed on: a row, or the empty space
 /// below the rows. The tree owns the row hit-test, so it is the only thing
@@ -35,13 +35,13 @@ pub type MenuRequest = Rc<Cell<Option<((f32, f32), MenuTarget)>>>;
 /// extent is `[y - ROW_HALF, y - ROW_HALF + ROW_HEIGHT)` and the hit-test
 /// must use exactly that band — a click at a row's visual middle has to
 /// land on that row.
-const ROW_HEIGHT: f32 = 27.0;
-const ROW_HALF: f32 = 13.0;
+const ROW_HEIGHT: f32 = 32.0;
+const ROW_HALF: f32 = 16.0;
 /// Depth indent per level.
 const INDENT: f32 = 14.0;
 /// The vault name is pinned at the top; scrolling starts below it.
-const HEADER_Y: f32 = 24.0;
-const CONTENT_TOP: f32 = HEADER_Y + 26.0;
+const HEADER_Y: f32 = 28.0;
+const CONTENT_TOP: f32 = HEADER_Y + 40.0;
 /// Two clicks on one file inside this window count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(300);
 
@@ -93,8 +93,14 @@ impl FileTree {
     /// Which row a point falls on. Local is offset by `ROW_HALF` so the
     /// drawn band maps to `[0, ROW_HEIGHT)`.
     fn row_index(&self, rect: Rect, position: (f32, f32)) -> Option<usize> {
+        if position.1 < rect.y + CONTENT_TOP - ROW_HALF {
+            return None;
+        }
         let local = position.1 - rect.y - CONTENT_TOP + self.scroll;
-        (local >= -ROW_HALF).then(|| ((local + ROW_HALF) / ROW_HEIGHT) as usize)
+        let index = (local >= -ROW_HALF).then(|| ((local + ROW_HALF) / ROW_HEIGHT) as usize)?;
+        // The pinned header hides a partially scrolled row. Hidden text
+        // must not remain clickable in the gap below the header.
+        (index as f32 * ROW_HEIGHT >= self.scroll).then_some(index)
     }
 
     fn row_path(&self, rect: Rect, position: (f32, f32)) -> Option<PathBuf> {
@@ -147,21 +153,16 @@ impl FileTree {
 }
 
 impl Component for FileTree {
-    fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        let style = TextStyle::serif(14.5, theme::ink());
-        let widest = self.vault.as_ref().map_or(0.0, |v| {
-            v.borrow()
-                .visible()
-                .iter()
-                .map(|row| theme::width(layer, row.name, &style))
-                .fold(0.0, f32::max)
-        });
+    fn measure(&mut self, _: &Layer) -> (f32, f32) {
         // A truncated filename is still a usable tree; the insets are not.
-        ((widest * 0.55).max(90.0) + 96.0, 200.0)
+        (186.0, 200.0)
     }
 
     fn sync(&mut self, context: &Context) {
         let rect = context.self_rect;
+        let max = (self.content_height() - rect.height).max(0.0);
+        let scroll = self.scroll.clamp(0.0, max);
+        self.dirty.write(&mut self.scroll, scroll);
         let over = context.hovering(rect);
         let next = over
             .then(|| self.row_path(rect, context.mouse.position))
@@ -240,16 +241,16 @@ impl Component for FileTree {
         let Some(vault_ref) = &self.vault else {
             theme::draw(
                 layer,
-                "No vault loaded",
+                "Choose a home for your notes",
                 (rect.x + 18.0, rect.y + 48.0),
-                &TextStyle::serif(14.5, theme::ink()),
+                &TextStyle::sans(12.5, theme::ink()),
                 theme::LEFT,
             );
             theme::draw(
                 layer,
-                "run with --onboard to choose one",
+                "Open a vault from the command palette",
                 (rect.x + 18.0, rect.y + 78.0),
-                &TextStyle::mono(10.5, theme::comment()),
+                &TextStyle::sans(10.5, theme::comment()),
                 theme::LEFT,
             );
             return;
@@ -271,7 +272,7 @@ impl Component for FileTree {
                 layer,
                 name,
                 (rect.x + 36.0, rect.y + HEADER_Y),
-                &TextStyle::mono(10.0, theme::comment()).tracked(0.18),
+                &TextStyle::sans(12.0, theme::dim()).bold(),
                 theme::LEFT,
             );
             theme::rule(
@@ -283,14 +284,26 @@ impl Component for FileTree {
             );
         }
 
-        let name_style = TextStyle::serif(14.5, theme::dim());
+        let name_style = TextStyle::sans(12.5, theme::dim());
         for (index, row) in vault.visible().iter().enumerate() {
             let y = rect.y + CONTENT_TOP - self.scroll + index as f32 * ROW_HEIGHT;
-            let band = Rect::new(rect.x, y - ROW_HALF, rect.width - 1.0, ROW_HEIGHT);
+            let band = Rect::new(
+                rect.x + 8.0,
+                y - ROW_HALF + 2.0,
+                rect.width - 16.0,
+                ROW_HEIGHT - 4.0,
+            );
+            if y - ROW_HALF < rect.y + CONTENT_TOP - ROW_HALF || y - ROW_HALF >= rect.bottom() {
+                continue;
+            }
             if self.debug_rows {
                 // The exact band `sync` hit-tests, so a misaligned hit is
                 // visible instead of mysterious.
-                theme::outline(layer, band, theme::warning());
+                theme::outline(
+                    layer,
+                    Rect::new(rect.x, y - ROW_HALF, rect.width, ROW_HEIGHT),
+                    theme::warning(),
+                );
             }
             let selected = selected.as_deref() == Some(row.path);
             if selected {
@@ -298,7 +311,7 @@ impl Component for FileTree {
                     band.position(),
                     band.size(),
                     theme::selection(),
-                    Rounding::NONE,
+                    Rounding::uniform(7.0),
                 );
             }
             // Selection takes priority over the hover surface: a clicked
@@ -324,7 +337,7 @@ impl Component for FileTree {
             let (name, icon_color) = if selected {
                 (name_style.clone().color(theme::ink()), theme::accent())
             } else {
-                (name_style.clone(), theme::non_text())
+                (name_style.clone(), theme::faint())
             };
             theme::icon(
                 layer,
@@ -338,7 +351,8 @@ impl Component for FileTree {
                 icon_color,
                 1.8,
             );
-            theme::draw(layer, row.name, (chevron_x + 36.0, y), &name, theme::LEFT);
+            let label = theme::elide(layer, row.name, rect.right() - chevron_x - 48.0, &name);
+            theme::draw(layer, &label, (chevron_x + 36.0, y), &name, theme::LEFT);
         }
 
         if self.divider_hover > 0.0 {

@@ -58,30 +58,43 @@ const TITLE_X: f32 = 34.0;
 /// when it would overflow the right edge, so a menu opened near a corner
 /// stays fully on screen — same rule as the slash menu's card.
 pub fn card_anchored(viewport: Rect, anchor: (f32, f32), rows: usize) -> Rect {
-    let height = PAD_Y * 2.0 + rows as f32 * ROW_HEIGHT;
-    let x = if anchor.0 + CARD_W > viewport.right() {
-        viewport.right() - CARD_W
-    } else {
-        anchor.0
-    }
-    .clamp(viewport.x, viewport.right() - CARD_W);
+    let available_rows = ((viewport.height - PAD_Y * 2.0) / ROW_HEIGHT)
+        .floor()
+        .max(1.0) as usize;
+    let available_columns = (viewport.width / CARD_W).floor().max(1.0) as usize;
+    let columns = rows.div_ceil(available_rows).clamp(1, available_columns);
+    let height = (PAD_Y * 2.0 + rows.div_ceil(columns) as f32 * ROW_HEIGHT).min(viewport.height);
+    let width = (CARD_W * columns as f32).min(viewport.width);
+    let x = anchor.0.clamp(viewport.x, viewport.right() - width);
     let y = if anchor.1 + height > viewport.bottom() {
         anchor.1 - height
     } else {
         anchor.1
     }
     .clamp(viewport.y, viewport.bottom() - height);
-    Rect::new(x, y, CARD_W, height)
+    Rect::new(x, y, width, height)
 }
 
-/// The row `point` is over, if any. The component owns this so the
-/// hit-test and the drawing cannot drift apart.
+/// Shared geometry for drawing, hover, keyboard selection and hit-testing.
+fn item_rect(card: Rect, rows: usize, index: usize) -> Rect {
+    // The entrance animation scales the card by at most three percent.
+    let columns = (card.width / CARD_W).round().max(1.0) as usize;
+    let per_column = rows.div_ceil(columns).max(1);
+    let width = card.width / columns as f32;
+    let height = ((card.height - PAD_Y * 2.0) / per_column as f32).max(0.0);
+    Rect::new(
+        card.x + (index / per_column) as f32 * width,
+        card.y + PAD_Y + (index % per_column) as f32 * height,
+        width,
+        height,
+    )
+}
+
 pub fn row_at(card: Rect, rows: usize, point: (f32, f32)) -> Option<usize> {
-    if !card.contains(point) || point.1 < card.y + PAD_Y {
+    if !card.contains(point) {
         return None;
     }
-    let index = ((point.1 - card.y - PAD_Y) / ROW_HEIGHT) as usize;
-    (index < rows).then_some(index)
+    (0..rows).find(|&index| item_rect(card, rows, index).contains(point))
 }
 
 pub struct ContextMenu {
@@ -148,10 +161,7 @@ impl ContextMenu {
             started: true,
             dirty: Dirty::new(),
         };
-        // The pill is NOT parked here: card placement needs the REAL
-        // viewport, and `card_anchored(Rect::default(), ..)` panics its own
-        // clamp (zero-width viewport ⇒ clamp max −CARD_W). A ghost's first
-        // `sync` carries the region rect and parks it.
+        // The pill is parked when sync supplies the real viewport.
         ghost
     }
 
@@ -234,12 +244,12 @@ impl Component for ContextMenu {
             // freeze; a ghost's slide never advances.
             if !self.started && !self.entries.is_empty() {
                 let card = card_anchored(context.self_rect, self.anchor, self.entries.len());
-                let y = card.y + PAD_Y + self.selected as f32 * ROW_HEIGHT;
+                let row = item_rect(card, self.entries.len(), self.selected);
                 self.slide.park(Rect::new(
-                    card.x + 4.0,
-                    y + 2.0,
-                    card.width - 8.0,
-                    ROW_HEIGHT - 4.0,
+                    row.x + 4.0,
+                    row.y + 2.0,
+                    (row.width - 8.0).max(0.0),
+                    (row.height - 4.0).max(0.0),
                 ));
                 self.started = true;
                 self.dirty.set();
@@ -268,8 +278,13 @@ impl Component for ContextMenu {
                 }
             }
             if let Some(row) = self.pill_target() {
-                let y = card.y + PAD_Y + row as f32 * ROW_HEIGHT;
-                let rect = Rect::new(card.x + 4.0, y + 2.0, card.width - 8.0, ROW_HEIGHT - 4.0);
+                let row = item_rect(card, self.entries.len(), row);
+                let rect = Rect::new(
+                    row.x + 4.0,
+                    row.y + 2.0,
+                    (row.width - 8.0).max(0.0),
+                    (row.height - 4.0).max(0.0),
+                );
                 if !self.started {
                     self.slide.park(rect);
                     self.started = true;
@@ -329,7 +344,7 @@ impl Component for ContextMenu {
             theme::fade(theme::non_text(), ea),
         );
 
-        let title_style = TextStyle::serif(14.5, theme::fade(theme::ink(), ea));
+        let title_style = TextStyle::sans(13.0, theme::fade(theme::ink(), ea));
         let hint_style = TextStyle::mono(10.0, theme::fade(theme::faint(), ea));
 
         // The slide pill rides under the selected/hovered row — one
@@ -345,13 +360,19 @@ impl Component for ContextMenu {
         }
 
         for (index, entry) in self.entries.iter().enumerate() {
-            let row = Rect::new(
-                card.x,
-                card.y + PAD_Y + index as f32 * ROW_HEIGHT,
-                card.width,
-                ROW_HEIGHT,
-            );
+            let row = item_rect(card, self.entries.len(), index);
             let middle = row.y + row.height / 2.0;
+            if entry.group == "Code color"
+                && let Some(hue) = crate::document::math_style::MathHue::from_keyword(
+                    &entry.title.to_ascii_lowercase(),
+                )
+            {
+                layer.draw_circle(
+                    (row.right() - 20.0, middle),
+                    5.0,
+                    theme::fade(theme::code_ink(crate::document::code::Ink::Manual(hue)), ea),
+                );
+            }
             if self.checked.get(index).copied().unwrap_or(false) {
                 theme::icon(
                     layer,
@@ -385,6 +406,29 @@ impl Component for ContextMenu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_menus_fit_short_windows_and_every_cell_is_clickable() {
+        for viewport in [
+            Rect::new(0.0, 0.0, 600.0, 240.0),
+            Rect::new(0.0, 0.0, 300.0, 300.0),
+        ] {
+            let card = card_anchored(viewport, (290.0, 220.0), 13);
+            assert!(card.right() <= viewport.right());
+            assert!(card.bottom() <= viewport.bottom());
+            for index in 0..13 {
+                let row = item_rect(card, 13, index);
+                assert_eq!(
+                    row_at(
+                        card,
+                        13,
+                        (row.x + row.width / 2.0, row.y + row.height / 2.0)
+                    ),
+                    Some(index)
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_menu_near_the_bottom_flips_up() {

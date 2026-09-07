@@ -13,7 +13,7 @@
 use std::ops::Range;
 
 use crate::document::Block;
-use crate::document::layout::DocLayout;
+use crate::document::layout::{DocLayout, VisLine};
 
 use super::geometry::PageGeometry;
 
@@ -36,111 +36,128 @@ pub struct Page {
 
 /// Cut `layout` into pages that fit `geometry`.
 ///
-/// Two rules today, and both are about height:
-///
-/// 1. A block goes on the current page if it fits, and starts a new one if
-///    it doesn't.
-/// 2. A block too tall for any page splits between its visual lines.
+/// The document is one column of visual lines, and the only question this
+/// asks is where that column may be cut. Between two adjacent lines there
+/// is either a *break opportunity* or there is not ([`breakable`]); the run
+/// of lines between two opportunities is a chunk, and a chunk lands whole
+/// on one page or starts the next. Every keep-rule in `PDF.md` §5 is a
+/// statement about where an opportunity is missing, so all four live in one
+/// predicate rather than in four special cases here.
 ///
 /// The gap between blocks is swallowed at a break, so a page never opens
-/// with leading whitespace. The rules that keep display math, code blocks
-/// and headings from being separated from what they belong to arrive with
-/// those elements — see `PDF.md` §5.
+/// with leading whitespace.
 ///
 /// Folded blocks are not consulted: export lays out its own `DocLayout`
 /// from a fold-cleared document, so `BlockLayout::hidden` is always `None`
 /// here and a collapsed section paginates like any other.
 pub fn paginate(layout: &DocLayout, geometry: &PageGeometry) -> Vec<Page> {
     let height = geometry.content_height;
+    let lines = self::lines(layout);
     let mut pages = vec![Page::default()];
-    // Where the current page's top sits in document coordinates. A block
-    // lands at `block.y - page_top`.
+    // Where the current page's top sits in document coordinates. A line
+    // lands at `line.y - page_top`.
     let mut page_top = 0.0;
 
-    for (index, block) in layout.blocks.iter().enumerate() {
-        let mut line = 0;
-        while line < block.lines.len() {
-            // The top of the first line still to place — the block's own top
-            // only until a split moves it — and the bottom of the last.
-            let start_y = block.lines[line].y;
-            let bottom = block
-                .lines
-                .last()
-                .map_or(start_y, |last| last.y + last.height);
-
-            if bottom - page_top <= height {
-                pages
-                    .last_mut()
-                    .expect("a page always exists")
-                    .pieces
-                    .push(Piece {
-                        block: index,
-                        lines: line..block.lines.len(),
-                        y: start_y - page_top,
-                    });
-                break;
-            }
-
-            // Doesn't fit whole. How many of its lines do? Never all of
-            // them: the last line's bottom is the block's, which is what
-            // just failed to fit.
-            let mut fits = if atomic(&layout.source[index]) {
-                // A block that must not be split takes none of this page
-                // and all of the next. Notation broken across a sheet is
-                // not a smaller equation, it is two wrong ones.
-                0
-            } else {
-                block.lines[line..]
-                    .iter()
-                    .take_while(|l| l.y + l.height - page_top <= height)
-                    .count()
-            };
-
-            // A line taller than an entire page fits nowhere, and breaking
-            // to a fresh one would come straight back here — the export
-            // would never finish. Once this line already has a page to
-            // itself, it takes it and overflows the bottom margin: one
-            // overset line, rather than a hang.
-            if fits == 0 && page_top >= start_y {
-                fits = 1;
-            }
-
-            if fits > 0 {
-                pages
-                    .last_mut()
-                    .expect("a page always exists")
-                    .pieces
-                    .push(Piece {
-                        block: index,
-                        lines: line..line + fits,
-                        y: start_y - page_top,
-                    });
-                line += fits;
-            }
-
-            // Break. The next page opens flush at the next line's top — the
-            // gap that would have preceded it is what a page break replaces.
-            if line < block.lines.len() {
-                page_top = block.lines[line].y;
-                pages.push(Page::default());
-            }
+    for (index, &at) in lines.iter().enumerate() {
+        let top = line(layout, at).y;
+        // Break before this line only where a break is allowed — which is
+        // to say only when it opens a chunk, since `demand` measures from
+        // here to the next opportunity and a mid-chunk line's demand was
+        // already paid for by the line that opened it.
+        //
+        // The second half of the test is the hang guard: a chunk taller
+        // than a whole sheet fits nowhere, and breaking to a fresh page
+        // would come straight back here. Once it has a page to itself it
+        // takes it, and `demand` drops to one line so the rest of it packs
+        // line by line rather than running off the bottom of the sheet.
+        if demand(layout, &lines, index, height) - page_top > height && page_top < top {
+            page_top = top;
+            pages.push(Page::default());
         }
+
+        let page = pages.last_mut().expect("a page always exists");
+        place(page, layout, at, page_top);
     }
     pages
 }
 
-/// Whether a block moves to the next page whole rather than splitting.
+/// How far down the document must fit on this page for the line at `index`
+/// to start here: the bottom of its chunk, which is everything up to the
+/// next place a break is allowed.
 ///
-/// Display math only, for now. A fenced code block wants the same rule but
-/// is a *run* of `CodeLine` blocks rather than one block, so it needs the
-/// run found first — that lands with the code row of `PDF.md` §6.
+/// A chunk taller than the whole sheet is the exception, and asks only for
+/// its own first line. Nothing can keep it together, and a chunk that
+/// insisted anyway would take one page and overflow it — one lost equation
+/// against one that prints in two halves.
+fn demand(layout: &DocLayout, lines: &[(usize, usize)], index: usize, height: f32) -> f32 {
+    let mut end = index + 1;
+    while end < lines.len() && !breakable(&layout.source, lines[end - 1], lines[end]) {
+        end += 1;
+    }
+    let first = line(layout, lines[index]);
+    let last = line(layout, lines[end - 1]);
+    if last.y + last.height - first.y <= height {
+        last.y + last.height
+    } else {
+        first.y + first.height
+    }
+}
+
+/// Every visual line in the document, in order, as `(block, line)`.
+fn lines(layout: &DocLayout) -> Vec<(usize, usize)> {
+    layout
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(block, laid)| (0..laid.lines.len()).map(move |line| (block, line)))
+        .collect()
+}
+
+fn line(layout: &DocLayout, at: (usize, usize)) -> &VisLine {
+    &layout.blocks[at.0].lines[at.1]
+}
+
+/// Whether a page may break between two adjacent lines — `PDF.md` §5's
+/// keep-rules, all four of them, said once.
+fn breakable(source: &[Block], previous: (usize, usize), next: (usize, usize)) -> bool {
+    if previous.0 == next.0 {
+        // Inside one block, only prose splits. Notation broken across a
+        // sheet is not a smaller equation but two wrong ones; a fence cut
+        // in half loses the slab that says it is one; and a heading split
+        // across a break ends a page, which is what rule 4 forbids.
+        return matches!(
+            source[previous.0],
+            Block::Paragraph(_) | Block::ListItem { .. }
+        );
+    }
+    // Between blocks: a heading keeps with whatever follows it, and a
+    // fenced block's continuation lines keep with the line that opened it —
+    // a fence is a *run* of `CodeLine` blocks rather than one block, and
+    // this is where the run is found.
+    !source[previous.0].is_heading()
+        && !matches!(source[next.0], Block::CodeLine { first: false, .. })
+}
+
+/// Put one line on `page`, extending the piece it continues rather than
+/// starting a second one.
 ///
-/// The guard that keeps this from hanging is the one already in `paginate`:
-/// a block too tall for any page takes the page it is on and overflows,
-/// atomic or not, because the alternative is asking for a fresh page
-/// forever.
-fn atomic(block: &Block) -> bool {
-    matches!(block, Block::Math { .. })
+/// A block's lines on one page are one piece, which is what lets a painter
+/// draw a slab under all of them at once instead of notching a rounded
+/// corner at every line join.
+fn place(page: &mut Page, layout: &DocLayout, at: (usize, usize), page_top: f32) {
+    let (block, row) = at;
+    if let Some(piece) = page.pieces.last_mut()
+        && piece.block == block
+        && piece.lines.end == row
+    {
+        piece.lines.end = row + 1;
+        return;
+    }
+    page.pieces.push(Piece {
+        block,
+        lines: row..row + 1,
+        y: line(layout, at).y - page_top,
+    });
 }
 
 #[cfg(test)]
@@ -173,6 +190,7 @@ mod tests {
             blocks,
             height: y,
             scale: 1.0,
+            code_colors: vec![Vec::new(); heights.len()],
             source: heights
                 .iter()
                 .map(|_| Block::Paragraph(Vec::new()))
@@ -204,6 +222,7 @@ mod tests {
             height: total,
             scale: 1.0,
             source: vec![Block::Paragraph(Vec::new())],
+            code_colors: vec![Vec::new()],
             anchors: Vec::new(),
             equation_numbers: HashMap::new(),
         }
@@ -213,6 +232,94 @@ mod tests {
         let mut geometry = PageGeometry::plain(super::super::geometry::Paper::A4);
         geometry.content_height = height;
         geometry
+    }
+
+    /// [`stacked`] with each block's kind said out loud: one 30px line
+    /// apiece, which is all the keep-rules read.
+    fn of(source: Vec<Block>) -> DocLayout {
+        let mut layout = stacked(&vec![30.0; source.len()]);
+        layout.source = source;
+        layout
+    }
+
+    fn para() -> Block {
+        Block::Paragraph(Vec::new())
+    }
+
+    fn heading() -> Block {
+        Block::Heading {
+            level: 1,
+            content: Vec::new(),
+            folded: false,
+        }
+    }
+
+    fn code(first: bool) -> Block {
+        Block::CodeLine {
+            content: Vec::new(),
+            first,
+            lang: None,
+        }
+    }
+
+    #[test]
+    fn a_fenced_block_moves_to_the_next_page_whole() {
+        // A paragraph, then a three-line fence, with room for three lines
+        // on the sheet: two of the fence would fit, and half a slab is not
+        // a code block.
+        let layout = of(vec![para(), code(true), code(false), code(false)]);
+        let pages = paginate(&layout, &geometry(100.0));
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].pieces.len(), 1, "only the paragraph stays behind");
+        assert_eq!(pages[1].pieces.len(), 3, "the fence travels whole");
+    }
+
+    #[test]
+    fn a_fence_taller_than_a_page_splits_rather_than_running_off_it() {
+        // Nothing can keep a five-line fence together on a three-line
+        // sheet. It packs line by line instead: two halves of a slab beat
+        // two lines drawn past the bottom edge of the paper.
+        let layout = of(vec![
+            code(true),
+            code(false),
+            code(false),
+            code(false),
+            code(false),
+        ]);
+        let pages = paginate(&layout, &geometry(100.0));
+        let placed: Vec<usize> = pages
+            .iter()
+            .flat_map(|page| page.pieces.iter())
+            .map(|piece| piece.block)
+            .collect();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(placed, vec![0, 1, 2, 3, 4], "no line of it is lost");
+    }
+
+    #[test]
+    fn a_heading_never_ends_a_page() {
+        // Two paragraphs, a heading, then its body, with room for three
+        // lines: the heading fits at the bottom and the first line under it
+        // does not, so both move.
+        let layout = of(vec![para(), para(), heading(), para()]);
+        let pages = paginate(&layout, &geometry(100.0));
+        assert_eq!(pages.len(), 2);
+        assert_eq!(
+            pages[0].pieces.len(),
+            2,
+            "the heading travels with its body"
+        );
+        assert_eq!(pages[1].pieces.len(), 2);
+    }
+
+    #[test]
+    fn a_heading_with_nothing_after_it_asks_for_nothing_more() {
+        // Keep-with-next has nothing to keep the last block with, and must
+        // not read past the end of the document looking for it.
+        let layout = of(vec![para(), para(), heading()]);
+        let pages = paginate(&layout, &geometry(100.0));
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].pieces.len(), 3);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::components::editor::{Editor, Metrics};
 use crate::document::layout::DocLayout;
 use crate::document::{Caret, Style};
 use crate::layout::Rect;
-use crate::renderer::{Layer, Rounding};
+use crate::renderer::Layer;
 use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty};
 
@@ -60,7 +60,7 @@ const MARKER_SIZE: f32 = 10.0;
 /// [`layout::anchor_style`](crate::document::layout::anchor_style), which is
 /// the other half of this pair.
 pub fn marker_style() -> TextStyle {
-    TextStyle::serif(MARKER_SIZE, theme::accent())
+    TextStyle::sans(MARKER_SIZE, theme::accent())
 }
 
 /// The editor metrics a note draws with: the margin's own insets and measure,
@@ -181,20 +181,6 @@ impl Component for SidenoteMargin {
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(
-            rect.position(),
-            rect.size(),
-            theme::background(),
-            Rounding::NONE,
-        );
-        theme::vertical_rule(
-            layer,
-            (rect.x, rect.y),
-            rect.height,
-            1.0,
-            theme::selection(),
-        );
-
         // Document coordinates become screen coordinates the same way the
         // editor does: content top, minus the shared scroll.
         let top = rect.y + self.top - self.scroll;

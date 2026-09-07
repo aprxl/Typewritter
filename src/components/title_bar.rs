@@ -1,4 +1,4 @@
-//! App identity and the vault search affordance.
+//! Workspace toolbar. Every control owns the geometry used by input routing.
 
 use super::theme_switch;
 use crate::layout::Rect;
@@ -6,124 +6,88 @@ use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle, icons};
 use crate::ui::{Component, Context, Dirty, Hover};
 
-pub const HEIGHT: f32 = 48.0;
+pub const HEIGHT: f32 = 60.0;
 
 pub struct TitleBar {
-    title: String,
-    kind: String,
-    search: String,
-    finder_open: bool,
+    query: Option<String>,
     caret_on: bool,
-    shortcut: String,
-    /// Filled in by `draw`, hit-tested by `sync` on the next frame.
-    search_rect: Rect,
-    hover: Hover,
-    /// The palette switch's own hover, and whether a swap is still running.
-    /// The switch has no state beyond these two — everything else it draws
-    /// it reads straight off the theme server.
+    search_hover: Hover,
+    sidebar_hover: Hover,
+    focus_hover: Hover,
+    focus_mode: bool,
     switch_hover: Hover,
-    theme_locked: bool,
+    locked: bool,
     dirty: Dirty,
 }
 
+pub fn sidebar_rect(bar: Rect) -> Rect {
+    Rect::new(bar.x + 188.0, bar.y + 13.0, 34.0, 34.0)
+}
+
+pub fn focus_rect(bar: Rect) -> Rect {
+    Rect::new(
+        theme_switch::switch_rect(bar).x - 94.0,
+        bar.y + 13.0,
+        80.0,
+        34.0,
+    )
+}
+
+pub fn search_box_rect(bar: Rect) -> Rect {
+    let left = sidebar_rect(bar).right() + 24.0;
+    let right = focus_rect(bar).x - 24.0;
+    let width = (right - left).clamp(0.0, 340.0);
+    Rect::new(
+        (bar.x + (bar.width - width) / 2.0).clamp(left, right.max(left) - width),
+        bar.y + 12.0,
+        width,
+        36.0,
+    )
+}
+
 impl TitleBar {
-    pub fn new(title: &str, kind: &str, finder_query: Option<String>) -> Self {
+    pub fn new(query: Option<String>) -> Self {
         Self {
-            title: title.into(),
-            kind: kind.into(),
-            finder_open: finder_query.is_some(),
-            search: finder_query.unwrap_or_default(),
+            query,
             caret_on: true,
-            shortcut: "⌘ /".into(),
-            search_rect: Rect::default(),
-            hover: Hover::new(),
+            search_hover: Hover::new(),
+            sidebar_hover: Hover::new(),
+            focus_hover: Hover::new(),
+            focus_mode: false,
             switch_hover: Hover::new(),
-            theme_locked: false,
+            locked: false,
             dirty: Dirty::new(),
         }
     }
 }
 
-fn compact_text<F>(text: &str, max_width: f32, mut width: F) -> String
-where
-    F: FnMut(&str) -> f32,
-{
-    if max_width <= 0.0 {
-        return String::new();
-    }
-    if width(text) <= max_width {
-        return text.into();
-    }
-
-    let marker = "...";
-    if width(marker) <= max_width {
-        let mut suffix = String::new();
-        for character in text.chars().rev() {
-            let candidate = format!("{marker}{character}{suffix}");
-            if width(&candidate) > max_width {
-                break;
-            }
-            suffix.insert(0, character);
-        }
-        return format!("{marker}{suffix}");
-    }
-
-    let mut suffix = String::new();
-    for character in text.chars().rev() {
-        let candidate = format!("{character}{suffix}");
-        if width(&candidate) > max_width {
-            break;
-        }
-        suffix.insert(0, character);
-    }
-    suffix
-}
-
-/// Search-box geometry shared by drawing and shell-level click handling.
-pub fn search_box_rect(layer: &Layer, rect: Rect) -> Rect {
-    let search_style = TextStyle::serif(12.5, theme::comment());
-    let shortcut_style = TextStyle::mono(10.0, theme::faint()).tracked(0.1);
-    let box_width = theme::width(layer, "search the vault", &search_style)
-        + theme::width(layer, "⌘ /", &shortcut_style)
-        + 55.0;
-    // The palette switch owns the right edge; search is laid out backwards
-    // from its left side rather than from the bar's.
-    Rect::new(
-        theme_switch::switch_rect(rect).x - theme_switch::GAP - box_width,
-        rect.y + (rect.height - 2.0) / 2.0 - 13.0,
-        box_width,
-        26.0,
-    )
-}
-
 impl Component for TitleBar {
-    fn measure(&mut self, layer: &Layer) -> (f32, f32) {
-        let title = theme::width(layer, &self.title, &TextStyle::serif(17.0, theme::ink()));
-        let search = theme::width(
-            layer,
-            "search the vault",
-            &TextStyle::serif(12.5, theme::comment()),
-        );
-        (title + search + 190.0, HEIGHT)
+    fn measure(&mut self, _: &Layer) -> (f32, f32) {
+        (620.0, HEIGHT)
     }
 
     fn sync(&mut self, context: &Context) {
-        let over = context.hovering(self.search_rect);
-        let mut dirty = self.hover.update(over, context.animation_dt);
-        // The switch's rect is derived from the region's own rect, not
-        // measured during a draw, so it is right on the first frame — and a
-        // locked switch reads as un-hovered however the pointer moves.
-        let switch = theme_switch::switch_rect(context.self_rect);
-        let over_switch = !context.theme_locked && context.hovering(switch);
-        dirty |= self.switch_hover.update(over_switch, context.animation_dt);
-        dirty |= self.theme_locked != context.theme_locked;
-        self.theme_locked = context.theme_locked;
-        if self.finder_open {
-            let before = self.caret_on;
-            self.caret_on = context.caret_on;
-            dirty |= before != self.caret_on;
+        let bar = context.self_rect;
+        let search = search_box_rect(bar);
+        let mut changed = self
+            .search_hover
+            .update(context.hovering(search), context.animation_dt);
+        changed |= self
+            .sidebar_hover
+            .update(context.hovering(sidebar_rect(bar)), context.animation_dt);
+        changed |= self
+            .focus_hover
+            .update(context.hovering(focus_rect(bar)), context.animation_dt);
+        changed |= self.switch_hover.update(
+            !context.theme_locked && context.hovering(theme_switch::switch_rect(bar)),
+            context.animation_dt,
+        );
+        self.dirty.write(&mut self.locked, context.theme_locked);
+        self.dirty.write(&mut self.focus_mode, context.focus_mode);
+        if self.query.is_some() {
+            self.dirty.write(&mut self.caret_on, context.caret_on);
         }
-        if dirty {
+        if changed {
             self.dirty.set();
         }
     }
@@ -131,82 +95,56 @@ impl Component for TitleBar {
     fn is_dirty(&self) -> bool {
         self.dirty.get()
     }
-
     fn clear_dirty(&mut self) {
         self.dirty.clear();
     }
-
     fn is_animating(&self) -> bool {
-        self.hover.is_animating() || self.switch_hover.is_animating()
+        self.search_hover.is_animating()
+            || self.sidebar_hover.is_animating()
+            || self.focus_hover.is_animating()
+            || self.switch_hover.is_animating()
     }
 
-    fn draw(&mut self, layer: &Layer, rect: Rect) {
-        layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
+    fn draw(&mut self, layer: &Layer, bar: Rect) {
+        theme::surface(layer, bar, theme::chrome(), 0.0);
         theme::rule(
             layer,
-            (rect.x, rect.bottom() - 2.0),
-            rect.width,
-            2.0,
+            (bar.x, bar.bottom() - 1.0),
+            bar.width,
+            1.0,
             theme::border(),
         );
-        let middle = rect.y + (rect.height - 2.0) / 2.0;
-
-        // The mark: a filled square with the wordmark's initial knocked out.
-        layer.draw_rectangle(
-            (rect.x + 18.0, middle - 12.0),
-            (24.0, 24.0),
-            theme::accent(),
-            Rounding::NONE,
-        );
+        let middle = bar.y + bar.height / 2.0;
+        theme::app_mark(layer, Rect::new(bar.x + 20.0, middle - 15.0, 30.0, 30.0));
         theme::draw(
             layer,
-            "T",
-            (rect.x + 30.0, middle),
-            &TextStyle::mono(14.0, theme::background()).bold(),
-            theme::CENTER,
-        );
-
-        let title_style = TextStyle::serif(17.0, theme::ink());
-        theme::draw(
-            layer,
-            &self.title,
-            (rect.x + 54.0, middle),
-            &title_style,
-            theme::LEFT,
-        );
-        let mut x = rect.x + 54.0 + theme::width(layer, &self.title, &title_style) + 9.0;
-        theme::vertical_rule(layer, (x, middle - 6.0), 12.0, 1.0, theme::border());
-        x += 10.0;
-        theme::draw(
-            layer,
-            &self.kind,
-            (x, middle),
-            &TextStyle::mono(9.5, theme::comment()).tracked(0.2),
+            "Typewritter",
+            (bar.x + 61.0, middle),
+            &TextStyle::sans(16.0, theme::ink()).bold().tracked(-0.02),
             theme::LEFT,
         );
 
-        // Search sits against the right edge, so it is laid out backwards
-        // from there and simply runs off if the window is too narrow.
-        let shortcut_style = TextStyle::mono(10.0, theme::faint()).tracked(0.1);
-        let search_style = TextStyle::serif(
-            12.5,
-            if self.finder_open {
-                theme::ink()
-            } else {
-                theme::comment()
-            },
-        );
-        self.search_rect = search_box_rect(layer, rect);
-        let box_left = self.search_rect.x;
-        let box_right = self.search_rect.right();
-        theme::hover_fill(layer, self.search_rect, self.hover.value());
-        theme::outline(
+        let sidebar = sidebar_rect(bar);
+        theme::hover_fill(layer, sidebar, self.sidebar_hover.value());
+        theme::icon(
             layer,
-            self.search_rect,
-            if self.finder_open {
+            icons::SIDEBAR,
+            (sidebar.x + 8.0, middle - 9.0),
+            18.0,
+            theme::dim(),
+            1.6,
+        );
+
+        let search = search_box_rect(bar);
+        theme::surface(layer, search, theme::background(), 9.0);
+        theme::hover_fill(layer, search, self.search_hover.value());
+        theme::rounded_outline(
+            layer,
+            search.inset(0.5),
+            8.5,
+            1.0,
+            if self.query.is_some() {
                 theme::accent()
-            } else if self.hover.value() > 0.0 {
-                theme::fade(theme::accent(), 0.25 + self.hover.value() * 0.75)
             } else {
                 theme::border()
             },
@@ -214,52 +152,80 @@ impl Component for TitleBar {
         theme::icon(
             layer,
             icons::SEARCH,
-            (box_left + 9.0, middle - 6.5),
-            13.0,
-            theme::comment(),
-            1.8,
+            (search.x + 12.0, middle - 7.0),
+            14.0,
+            theme::faint(),
+            1.7,
         );
-        let input_right = box_right - 9.0;
-        let displayed = if self.finder_open {
-            compact_text(&self.search, input_right - (box_left + 30.0), |text| {
-                theme::width(layer, text, &search_style)
-            })
-        } else {
-            "search the vault".into()
-        };
+        let style = TextStyle::sans(
+            12.5,
+            if self.query.is_some() {
+                theme::ink()
+            } else {
+                theme::faint()
+            },
+        );
+        let label = theme::elide(
+            layer,
+            self.query.as_deref().unwrap_or("Search notes"),
+            search.width - 76.0,
+            &style,
+        );
         theme::draw(
             layer,
-            &displayed,
-            (box_left + 30.0, middle),
-            &search_style,
+            &label,
+            (search.x + 36.0, middle),
+            &style,
             theme::LEFT,
         );
-        if self.finder_open {
-            if self.caret_on {
-                let x = (box_left + 30.0 + theme::width(layer, &displayed, &search_style))
-                    .min(input_right - 2.0);
-                layer.draw_rectangle(
-                    (x, middle - 8.0),
-                    (2.0, 16.0),
-                    theme::accent(),
-                    Rounding::NONE,
-                );
-            }
-        } else {
-            theme::draw(
-                layer,
-                &self.shortcut,
-                (box_right - 9.0, middle),
-                &shortcut_style,
-                theme::RIGHT,
+        if self.query.is_some() && self.caret_on {
+            layer.draw_rectangle(
+                (
+                    search.x + 36.0 + theme::width(layer, &label, &style),
+                    middle - 8.0,
+                ),
+                (1.5, 16.0),
+                theme::accent(),
+                Rounding::uniform(0.75),
             );
         }
 
+        let focus = focus_rect(bar);
+        if self.focus_mode {
+            theme::surface(layer, focus, theme::selection(), 8.0);
+        }
+        theme::hover_fill(layer, focus, self.focus_hover.value());
+        theme::icon(
+            layer,
+            icons::FOCUS,
+            (focus.x + 8.0, middle - 7.0),
+            14.0,
+            if self.focus_mode {
+                theme::accent()
+            } else {
+                theme::dim()
+            },
+            1.6,
+        );
+        theme::draw(
+            layer,
+            "Focus",
+            (focus.x + 30.0, middle),
+            &TextStyle::sans(
+                12.0,
+                if self.focus_mode {
+                    theme::accent()
+                } else {
+                    theme::dim()
+                },
+            ),
+            theme::LEFT,
+        );
         theme_switch::draw(
             layer,
-            theme_switch::switch_rect(rect),
+            theme_switch::switch_rect(bar),
             self.switch_hover.value(),
-            self.theme_locked,
+            self.locked,
         );
     }
 }

@@ -8,6 +8,7 @@
 
 use crate::components::editor::{MEASURE, RIGHT_MARGIN};
 use crate::components::sidenotes;
+use crate::layout::Rect;
 
 /// A sheet, in points. Portrait; a landscape variant is `flipped`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -128,11 +129,64 @@ impl PageGeometry {
     pub fn length(&self, px: f32) -> f32 {
         px * self.scale
     }
+
+    /// The whole sheet, in the content column's own pixels — [`point`]'s
+    /// inverse, applied to the paper's corners.
+    ///
+    /// It starts negative on both axes and runs past the column on all four
+    /// sides, because the column is inset in the paper. That is exactly what
+    /// makes it usable: a painter that only ever works in column pixels can
+    /// cover the sheet without being told what a point is.
+    ///
+    /// [`point`]: PageGeometry::point
+    pub fn sheet(&self) -> Rect {
+        Rect::new(
+            -self.origin.0 / self.scale,
+            -self.origin.1 / self.scale,
+            self.paper.width / self.scale,
+            self.paper.height / self.scale,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sheet` is `point`'s inverse, so the rect it hands back has to map
+    /// straight onto the paper's own corners — that is the whole claim, and
+    /// it is the one a ground painted from it depends on.
+    #[test]
+    fn the_sheet_in_pixels_maps_back_onto_the_paper() {
+        for geometry in [
+            PageGeometry::plain(Paper::A4),
+            PageGeometry::noted(Paper::A4),
+            PageGeometry::plain(Paper::A4.flipped()),
+        ] {
+            let sheet = geometry.sheet();
+            let top_left = geometry.point(sheet.position());
+            let bottom_right = geometry.point((sheet.right(), sheet.bottom()));
+            assert!(
+                top_left.0.abs() < 0.01 && top_left.1.abs() < 0.01,
+                "{top_left:?}"
+            );
+            assert!(
+                (bottom_right.0 - geometry.paper.width).abs() < 0.01
+                    && (bottom_right.1 - geometry.paper.height).abs() < 0.01,
+                "{bottom_right:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sheet_starts_left_of_and_above_the_column() {
+        // The column is inset in the paper, so covering the sheet means
+        // drawing outside the column on every side.
+        let geometry = PageGeometry::plain(Paper::A4);
+        let sheet = geometry.sheet();
+        assert!(sheet.x < 0.0 && sheet.y < 0.0, "{sheet:?}");
+        assert!(sheet.right() > geometry.content_width, "{sheet:?}");
+    }
 
     #[test]
     fn the_column_is_centred_on_the_sheet() {

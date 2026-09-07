@@ -16,6 +16,7 @@ use super::Shell;
 use crate::components::dialog::Prompt;
 use crate::components::palette;
 use crate::document::math::{AccentKind, BigOp, SymbolRole};
+use crate::document::math_style::{HighlightShape, MathHue};
 use crate::document::{BadgeColor, ListMarker};
 use crate::input::Input;
 
@@ -77,6 +78,34 @@ pub struct Command {
     pub run: fn(&mut Shell),
 }
 
+/// One command per hue and per highlight shape. `Command::run` is a plain
+/// function pointer rather than a closure, so each needs a body of its own;
+/// the title comes from the same `label()` the menu reads, so a rename
+/// cannot leave the two spellings disagreeing.
+macro_rules! hue_command {
+    ($id:literal, $hue:ident) => {
+        Command {
+            id: $id,
+            title: MathHue::$hue.label(),
+            group: "Colour",
+            chord: None,
+            run: |shell| shell.context_set_math_hue(MathHue::$hue),
+        }
+    };
+}
+
+macro_rules! shape_command {
+    ($id:literal, $shape:ident) => {
+        Command {
+            id: $id,
+            title: HighlightShape::$shape.label(),
+            group: "Highlight",
+            chord: None,
+            run: |shell| shell.context_set_math_shape(HighlightShape::$shape),
+        }
+    };
+}
+
 const CTRL: ModifiersState = ModifiersState::CONTROL;
 const CTRL_SHIFT: ModifiersState = ModifiersState::CONTROL.union(ModifiersState::SHIFT);
 
@@ -120,14 +149,13 @@ pub const COMMANDS: &[Command] = &[
             key: KeyCode::KeyS,
         }),
         // Saving clears the dirty flags; the revision bump that follows is
-        // what the views rebuild from.
-        run: |shell| {
-            let _ = shell.docs.borrow_mut().save_active();
-        },
+        // what the views rebuild from. Failures remain visible in the status
+        // line while the tab stays open for retry.
+        run: |shell| shell.save_active(),
     },
     Command {
         id: "file.open",
-        title: "Open File",
+        title: "Open file",
         group: "File",
         chord: None,
         run: |shell| shell.open_finder(),
@@ -149,7 +177,16 @@ pub const COMMANDS: &[Command] = &[
             mods: CTRL,
             key: KeyCode::KeyW,
         }),
-        run: |shell| shell.docs.borrow_mut().close_active(),
+        run: |shell| shell.close_active(),
+    },
+    Command {
+        id: "file.discard",
+        title: "Discard changes and close note",
+        group: "File",
+        // Deliberately palette-only: discarding is destructive and should
+        // never be a one-chord accident.
+        chord: None,
+        run: |shell| shell.discard_active(),
     },
     Command {
         id: "file.delete",
@@ -201,25 +238,36 @@ pub const COMMANDS: &[Command] = &[
         }),
         run: |shell| shell.open_picker(),
     },
-    // Ctrl+1..4 used to toggle the four regions. Those chords now pick a
-    // row in the finder (Ctrl+1..5), the only thing those keys do; the
-    // toggles themselves were reachable only from here and went with them.
     Command {
-        id: "view.capture",
-        title: "Capture mode",
+        id: "view.sidebar",
+        title: "Toggle sidebar",
+        group: "View",
+        chord: None,
+        run: Shell::toggle_sidebar,
+    },
+    Command {
+        id: "view.theme",
+        title: "Switch appearance",
+        group: "View",
+        chord: None,
+        run: |shell| {
+            let bar = shell.layout.rect(shell.regions[shell.title_region].node());
+            let switch = crate::components::theme_switch::switch_rect(bar);
+            shell.request_theme_swap((
+                switch.x + switch.width / 2.0,
+                switch.y + switch.height / 2.0,
+            ));
+        },
+    },
+    Command {
+        id: "view.focus",
+        title: "Toggle focus mode",
         group: "View",
         chord: Some(Chord {
             mods: CTRL_SHIFT,
             key: KeyCode::KeyC,
         }),
-        // Spec §3.2: one key to bare text and back — open if any panel is
-        // closed, close all of them if every panel is already open.
-        run: |shell| {
-            let any_open = shell.panels().iter().any(|p| p.open);
-            for panel in shell.panels_mut() {
-                panel.set_open(!any_open);
-            }
-        },
+        run: Shell::toggle_focus,
     },
     Command {
         id: "view.stats",
@@ -467,6 +515,182 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.context_set_heading(None),
     },
     Command {
+        id: "context.code.c",
+        title: "C",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::C), false),
+    },
+    Command {
+        id: "context.code.cpp",
+        title: "C++",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::Cpp), false),
+    },
+    Command {
+        id: "context.code.rust",
+        title: "Rust",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::Rust), false),
+    },
+    Command {
+        id: "context.code.lua",
+        title: "Lua",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::Lua), false),
+    },
+    Command {
+        id: "context.code.python",
+        title: "Python",
+        group: "Language",
+        chord: None,
+        run: |shell| {
+            shell.context_code_options(Some(crate::document::code::Language::Python), false)
+        },
+    },
+    Command {
+        id: "context.code.javascript",
+        title: "JavaScript",
+        group: "Language",
+        chord: None,
+        run: |shell| {
+            shell.context_code_options(Some(crate::document::code::Language::JavaScript), false)
+        },
+    },
+    Command {
+        id: "context.code.typescript",
+        title: "TypeScript",
+        group: "Language",
+        chord: None,
+        run: |shell| {
+            shell.context_code_options(Some(crate::document::code::Language::TypeScript), false)
+        },
+    },
+    Command {
+        id: "context.code.java",
+        title: "Java",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::Java), false),
+    },
+    Command {
+        id: "context.code.csharp",
+        title: "C#",
+        group: "Language",
+        chord: None,
+        run: |shell| {
+            shell.context_code_options(Some(crate::document::code::Language::CSharp), false)
+        },
+    },
+    Command {
+        id: "context.code.go",
+        title: "Go",
+        group: "Language",
+        chord: None,
+        run: |shell| shell.context_code_options(Some(crate::document::code::Language::Go), false),
+    },
+    Command {
+        id: "context.code.settings",
+        title: "Language and mode…",
+        group: "Highlighting",
+        chord: None,
+        run: |shell| shell.context_code_settings(),
+    },
+    Command {
+        id: "context.code.plain",
+        title: "Plain code",
+        group: "Highlighting",
+        chord: None,
+        run: |shell| shell.context_code_options(None, false),
+    },
+    Command {
+        id: "context.code.manual",
+        title: "DIY colors",
+        group: "Highlighting",
+        chord: None,
+        run: |shell| shell.context_code_options(None, true),
+    },
+    Command {
+        id: "context.code.color.rose",
+        title: "Rose",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Rose)),
+    },
+    Command {
+        id: "context.code.color.coral",
+        title: "Coral",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Coral)),
+    },
+    Command {
+        id: "context.code.color.amber",
+        title: "Amber",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Amber)),
+    },
+    Command {
+        id: "context.code.color.olive",
+        title: "Olive",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Olive)),
+    },
+    Command {
+        id: "context.code.color.green",
+        title: "Green",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Green)),
+    },
+    Command {
+        id: "context.code.color.teal",
+        title: "Teal",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Teal)),
+    },
+    Command {
+        id: "context.code.color.sky",
+        title: "Sky",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Sky)),
+    },
+    Command {
+        id: "context.code.color.indigo",
+        title: "Indigo",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Indigo)),
+    },
+    Command {
+        id: "context.code.color.violet",
+        title: "Violet",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Violet)),
+    },
+    Command {
+        id: "context.code.color.magenta",
+        title: "Magenta",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(Some(MathHue::Magenta)),
+    },
+    Command {
+        id: "context.code.color.clear",
+        title: "Clear color",
+        group: "Code color",
+        chord: None,
+        run: |shell| shell.context_code_color(None),
+    },
+    Command {
         id: "context.badge.orange",
         title: "Orange",
         group: "Color",
@@ -514,6 +738,26 @@ pub const COMMANDS: &[Command] = &[
         group: "Role",
         chord: None,
         run: |shell| shell.context_set_math_role(SymbolRole::Function),
+    },
+    hue_command!("context.hue.rose", Rose),
+    hue_command!("context.hue.coral", Coral),
+    hue_command!("context.hue.amber", Amber),
+    hue_command!("context.hue.olive", Olive),
+    hue_command!("context.hue.green", Green),
+    hue_command!("context.hue.teal", Teal),
+    hue_command!("context.hue.sky", Sky),
+    hue_command!("context.hue.indigo", Indigo),
+    hue_command!("context.hue.violet", Violet),
+    hue_command!("context.hue.magenta", Magenta),
+    shape_command!("context.shape.fill", Fill),
+    shape_command!("context.shape.outline", Outline),
+    shape_command!("context.shape.both", Both),
+    Command {
+        id: "context.symbol.automatic",
+        title: "Back to automatic",
+        group: "Symbol",
+        chord: None,
+        run: |shell| shell.context_reset_math_style(),
     },
     Command {
         id: "context.variant.plain",
@@ -768,15 +1012,84 @@ pub const BADGE_MENU: &[&str] = &[
     "context.badge",
 ];
 
-pub const INLINE_CODE_MENU: &[&str] = &["context.inline_code", "context.badge"];
+pub const INLINE_CODE_MENU: &[&str] = &[
+    "context.code.plain",
+    "context.code.manual",
+    "context.code.c",
+    "context.code.cpp",
+    "context.code.rust",
+    "context.code.lua",
+    "context.code.python",
+    "context.code.javascript",
+    "context.code.typescript",
+    "context.code.java",
+    "context.code.csharp",
+    "context.code.go",
+    "context.inline_code",
+];
 
-pub const CODE_BLOCK_MENU: &[&str] = &["context.body"];
+pub const CODE_BLOCK_MENU: &[&str] = &[
+    "context.code.plain",
+    "context.code.manual",
+    "context.code.c",
+    "context.code.cpp",
+    "context.code.rust",
+    "context.code.lua",
+    "context.code.python",
+    "context.code.javascript",
+    "context.code.typescript",
+    "context.code.java",
+    "context.code.csharp",
+    "context.code.go",
+    "context.body",
+];
+pub const CODE_COLOR_MENU: &[&str] = &[
+    "context.code.color.rose",
+    "context.code.color.coral",
+    "context.code.color.amber",
+    "context.code.color.olive",
+    "context.code.color.green",
+    "context.code.color.teal",
+    "context.code.color.sky",
+    "context.code.color.indigo",
+    "context.code.color.violet",
+    "context.code.color.magenta",
+    "context.code.color.clear",
+    "context.code.settings",
+];
 
 pub const SYMBOL_ROLE_MENU: &[&str] = &[
     "context.symbol.variable",
     "context.symbol.constant",
     "context.symbol.function",
 ];
+
+/// The ten identity hues, in wheel order — the same order `MathHue::ALL`
+/// lists them, so the swatch grid reads as a colour wheel rather than an
+/// alphabetised list.
+pub const SYMBOL_HUE_MENU: &[&str] = &[
+    "context.hue.rose",
+    "context.hue.coral",
+    "context.hue.amber",
+    "context.hue.olive",
+    "context.hue.green",
+    "context.hue.teal",
+    "context.hue.sky",
+    "context.hue.indigo",
+    "context.hue.violet",
+    "context.hue.magenta",
+];
+
+pub const SYMBOL_SHAPE_MENU: &[&str] = &[
+    "context.shape.fill",
+    "context.shape.outline",
+    "context.shape.both",
+];
+
+/// Putting a symbol back on the hue its letter falls on and the shape its
+/// role asks for. One row, because a reader who has customised nothing
+/// should still be able to see what automatic looks like.
+pub const SYMBOL_AUTOMATIC_MENU: &[&str] = &["context.symbol.automatic"];
 
 pub const GROUP_MENU: &[&str] = &[
     "context.group.parentheses",
@@ -863,7 +1176,7 @@ mod tests {
         assert_eq!(
             COMMANDS
                 .iter()
-                .find(|c| c.id == "view.capture")
+                .find(|c| c.id == "view.focus")
                 .unwrap()
                 .chord
                 .unwrap()

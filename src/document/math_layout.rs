@@ -11,6 +11,7 @@
 use crate::document::math::{
     AccentKind, BigOp, MathCursor, MathList, MathNode, NodeAddress, Slot, Step, SymbolRole,
 };
+use crate::document::math_style::{self, SymbolStyle};
 use crate::theme::{self, TextStyle};
 
 /// Math base size at script level 0. Matches body text so an inline expression
@@ -53,6 +54,14 @@ pub const ACCENT_GAP: f32 = 0.10;
 /// Space inside the rounded background of a variable at level zero.
 pub const VARIABLE_PAD_X: f32 = 3.0;
 pub const VARIABLE_PAD_Y: f32 = 2.0;
+/// The gap that separates a numeral's digit groups, as a fraction of the
+/// current math size. A thin space rather than a full one: `1 000` has to
+/// read as one number that is easy to count, not as two.
+pub const DIGIT_GROUP_SPACE: f32 = 3.0 / 18.0;
+/// How many digits a run needs before it is grouped at all. Four, so `1000`
+/// is set `1 000` — the threshold the reader asked for, and the one every
+/// three-digit number falls safely under.
+pub const DIGIT_GROUP_MIN: usize = 4;
 /// Optical overlap between adjacent integral-family signs at level zero, so
 /// `∫∫` nests the way a double integral is set. About a sixth of the sign's
 /// width — the condensed glyph is narrower than a normal operator, so the
@@ -73,6 +82,13 @@ pub const INTEGRAL_CONDENSE: f32 = 0.6;
 /// the lower limit. Lifting it re-centres the ink on the math axis. Tune by
 /// eye, alongside [`INTEGRAL_CONDENSE`].
 pub const INTEGRAL_RISE: f32 = 0.15;
+/// JuliaMono's summation sign is broad enough at display size that its
+/// diagonals read heavier than the surrounding notation. Narrowing the
+/// outline gives it the same optical weight as the integral family.
+pub const SUM_CONDENSE: f32 = 0.76;
+/// The summation glyph is bottom-biased in its cell. Lift its ink onto the
+/// math axis without moving the limits that are centred around its box.
+pub const SUM_RISE: f32 = 0.08;
 /// TeX's automatic inter-atom spacing, as fractions of the current math size
 /// (an em, where `1mu = 1/18 em`). Thin sits after punctuation, medium braces
 /// a binary operator, thick braces a relation. [`layout_inner`] reads them
@@ -92,8 +108,11 @@ pub struct MathBox {
     pub ascent: f32,
     /// Depth below this box's anchor line.
     pub descent: f32,
-    /// Draw a rounded semantic-role background behind this whole box.
-    pub highlight: Option<SymbolRole>,
+    /// Draw a semantic highlight around this whole box — the hue that says
+    /// which symbol it is and the shape that says what role it plays.
+    /// Resolved here rather than at paint time so a `MathBox` is two bytes
+    /// heavier instead of one `String` per symbol heavier.
+    pub highlight: Option<SymbolStyle>,
     pub kind: BoxKind,
 }
 
@@ -124,11 +143,26 @@ pub enum MathPrimitive {
     Stroke {
         path: String,
         thickness: f32,
+        ink: MathInk,
     },
     Dots {
         centers: Vec<(f32, f32)>,
         radius: f32,
     },
+}
+
+/// Which ink a glyph is set in. Not a colour — the palette owns those —
+/// but the kind of thing the glyph is, which is what chooses one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MathInk {
+    /// A name: the thing an expression is about. Set in the document's ink.
+    #[default]
+    Term,
+    /// A numeral.
+    Number,
+    /// An operator, relation, or punctuation mark — the grammar that joins
+    /// terms rather than one of the terms.
+    Operator,
 }
 
 /// Visual shape and children of a [`MathBox`].
@@ -137,6 +171,8 @@ pub enum BoxKind {
     Glyph {
         text: String,
         size: f32,
+        /// Which of the notation inks sets this glyph.
+        ink: MathInk,
         /// Horizontal offset from the box edge to the glyph itself.
         offset_x: f32,
         /// Vertical offset of the glyph's centre from the box's anchor line,
@@ -189,6 +225,11 @@ fn layout_inner(
     let classes: Vec<AtomClass> = list.iter().map(atom_class).collect();
     let spaced: Vec<AtomClass> = (0..list.len()).map(|i| demote(&classes, i)).collect();
 
+    // Digit groups ride the same advance as TeX's inter-atom spacing rather
+    // than a node of their own: a separator that existed in the tree would
+    // be a place the caret could stop and the backspace key could delete.
+    let groups = digit_group_gaps(list);
+
     let mut children = Vec::with_capacity(list.len());
     let mut x = 0.0;
     for (index, node) in list.iter().enumerate() {
@@ -196,7 +237,8 @@ fn layout_inner(
             x -= INTEGRAL_OVERLAP * scale(level, document_scale);
         }
         if index > 0 {
-            x += space_between(spaced[index - 1], spaced[index]) * size(level, document_scale);
+            x += (space_between(spaced[index - 1], spaced[index]) + groups[index])
+                * size(level, document_scale);
         }
         let child = layout_node(node, level, document_scale, measure, semantic_highlights);
         children.push((x, 0.0, child));
@@ -311,6 +353,97 @@ fn space_between(prev: AtomClass, next: AtomClass) -> f32 {
     }
 }
 
+/// The extra advance before each atom that separates a numeral's digit
+/// groups: `gaps[i]` is the space owed *before* `list[i]`, in ems.
+///
+/// Grouping is per literal, not per digit run, so a decimal point does not
+/// split one number into two: `1234.56789` is grouped from the point in
+/// both directions, which is what ISO 31-0 asks for and what makes a long
+/// mantissa countable.
+fn digit_group_gaps(list: &MathList) -> Vec<f32> {
+    let mut gaps = vec![0.0; list.len()];
+    let mut index = 0;
+    while index < list.len() {
+        if !is_digit(list, index) {
+            index += 1;
+            continue;
+        }
+        let integer_start = index;
+        let mut integer_end = index;
+        while is_digit(list, integer_end) {
+            integer_end += 1;
+        }
+        index = integer_end;
+        // A point only belongs to this literal if a digit follows it —
+        // otherwise it is the end of a sentence that happens to touch a
+        // number, and the digits after nothing are somebody else's.
+        if is_point(list, integer_end) && is_digit(list, integer_end + 1) {
+            let mut fraction_end = integer_end + 1;
+            while is_digit(list, fraction_end) {
+                fraction_end += 1;
+            }
+            mark_groups(&mut gaps, integer_end + 1, fraction_end, false);
+            index = fraction_end;
+        }
+        mark_groups(&mut gaps, integer_start, integer_end, true);
+    }
+    gaps
+}
+
+/// Marks a group boundary every three digits across `start..end`, counting
+/// from the decimal point — the right edge of an integer part, the left
+/// edge of a fractional one. Runs shorter than [`DIGIT_GROUP_MIN`] are left
+/// alone; `1 00` would be worse than `100`.
+fn mark_groups(gaps: &mut [f32], start: usize, end: usize, from_right: bool) {
+    if end - start < DIGIT_GROUP_MIN {
+        return;
+    }
+    for (position, gap) in gaps.iter_mut().enumerate().take(end).skip(start + 1) {
+        let from_point = if from_right {
+            end - position
+        } else {
+            position - start
+        };
+        if from_point % 3 == 0 {
+            *gap = DIGIT_GROUP_SPACE;
+        }
+    }
+}
+
+fn is_digit(list: &MathList, index: usize) -> bool {
+    matches!(list.get(index), Some(MathNode::Sym(c)) if c.is_ascii_digit())
+}
+
+fn is_point(list: &MathList, index: usize) -> bool {
+    matches!(list.get(index), Some(MathNode::Sym('.')))
+}
+
+/// Which ink sets `ch`. Read from the atom class the spacing rules already
+/// computed, so an operator cannot be spaced as one and inked as something
+/// else. A *unary* sign is still an operator here even though [`demote`]
+/// strips its spacing — how it is inked is about what it is, not where it
+/// happens to sit.
+fn char_ink(ch: char) -> MathInk {
+    if ch.is_ascii_digit() {
+        return MathInk::Number;
+    }
+    // Self-paired bars cannot have separate Open/Close atom classes, and a
+    // pasted large-operator glyph remains an ordinary atom for spacing. Both
+    // are still grammar when choosing ink.
+    if matches!(ch, '|' | '‖' | '∫' | '∮' | '∑' | '∏') {
+        return MathInk::Operator;
+    }
+    match char_class(ch) {
+        AtomClass::Bin | AtomClass::Rel | AtomClass::Punct | AtomClass::Open | AtomClass::Close => {
+            MathInk::Operator
+        }
+        AtomClass::Ord => MathInk::Term,
+    }
+}
+
+/// One typed character. A bare letter is a variable nobody has said
+/// anything else about, so it is styled as one — under its own identity,
+/// which is the letter itself.
 fn glyph(
     ch: char,
     level: usize,
@@ -318,13 +451,10 @@ fn glyph(
     measure: &dyn Fn(&str, &TextStyle) -> f32,
     semantic_highlights: bool,
 ) -> MathBox {
-    glyph_with_highlight(
-        ch,
-        level,
-        document_scale,
-        measure,
-        (semantic_highlights && ch.is_alphabetic()).then_some(SymbolRole::Variable),
-    )
+    let mut buffer = [0u8; 4];
+    let highlight = (semantic_highlights && ch.is_alphabetic())
+        .then(|| math_style::resolve(SymbolRole::Variable, ch.encode_utf8(&mut buffer)));
+    glyph_with_highlight(ch, level, document_scale, measure, highlight)
 }
 
 fn glyph_with_highlight(
@@ -332,7 +462,7 @@ fn glyph_with_highlight(
     level: usize,
     document_scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
-    highlight: Option<SymbolRole>,
+    highlight: Option<SymbolStyle>,
 ) -> MathBox {
     let size = size(level, document_scale);
     let text = ch.to_string();
@@ -355,6 +485,7 @@ fn glyph_with_highlight(
         kind: BoxKind::Glyph {
             text,
             size,
+            ink: char_ink(ch),
             offset_x: pad_x,
             offset_y: 0.0,
             condense: 1.0,
@@ -408,10 +539,11 @@ fn layout_node(
 ) -> MathBox {
     match node {
         MathNode::Sym(ch) => glyph(*ch, level, document_scale, measure, semantic_highlights),
-        MathNode::Resolved { role, body, .. } => {
+        MathNode::Resolved { id, role, body, .. } => {
             let body = layout_inner(body, level, document_scale, measure, false);
             if semantic_highlights {
-                padded_highlight(body, level, document_scale, *role)
+                let style = math_style::resolve(*role, id);
+                padded_highlight(body, level, document_scale, style)
             } else {
                 body
             }
@@ -484,6 +616,7 @@ fn text_glyph(
     size: f32,
     condense: f32,
     rise: f32,
+    ink: MathInk,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> MathBox {
     let half = size * 0.5;
@@ -496,6 +629,7 @@ fn text_glyph(
         kind: BoxKind::Glyph {
             text: text.to_owned(),
             size,
+            ink,
             offset_x: 0.0,
             offset_y: size * rise,
             condense,
@@ -522,6 +656,7 @@ fn big_op(
             size(level, document_scale) * BIGOP_SCALE,
             INTEGRAL_CONDENSE,
             INTEGRAL_RISE,
+            MathInk::Operator,
             measure,
         ),
         BigOp::ContourIntegral => text_glyph(
@@ -529,13 +664,15 @@ fn big_op(
             size(level, document_scale) * BIGOP_SCALE,
             INTEGRAL_CONDENSE,
             INTEGRAL_RISE,
+            MathInk::Operator,
             measure,
         ),
         BigOp::Sum => text_glyph(
             "∑",
             size(level, document_scale) * BIGOP_SCALE,
-            1.0,
-            0.0,
+            SUM_CONDENSE,
+            SUM_RISE,
+            MathInk::Operator,
             measure,
         ),
         BigOp::Prod => text_glyph(
@@ -543,9 +680,17 @@ fn big_op(
             size(level, document_scale) * BIGOP_SCALE,
             1.0,
             0.0,
+            MathInk::Operator,
             measure,
         ),
-        BigOp::Limit => text_glyph("lim", size(level, document_scale), 1.0, 0.0, measure),
+        BigOp::Limit => text_glyph(
+            "lim",
+            size(level, document_scale),
+            1.0,
+            0.0,
+            MathInk::Operator,
+            measure,
+        ),
     };
     let operand_level = (level + 1).min(2);
     let hide_empty_limits = matches!(kind, BigOp::Integral | BigOp::ContourIntegral);
@@ -611,13 +756,24 @@ fn stretchy_size(body: &MathBox, level: usize, document_scale: f32) -> f32 {
 /// operator are drawn at the same height but not at the same weight. Every
 /// caller already has the scaled stroke it drew the path with, so taking it
 /// here also stops the two from being computed twice and drifting.
-fn stroked_box(width: f32, ascent: f32, descent: f32, path: String, thickness: f32) -> MathBox {
+fn stroked_box(
+    width: f32,
+    ascent: f32,
+    descent: f32,
+    path: String,
+    thickness: f32,
+    ink: MathInk,
+) -> MathBox {
     MathBox {
         width,
         ascent,
         descent,
         highlight: None,
-        kind: BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }),
+        kind: BoxKind::Primitive(MathPrimitive::Stroke {
+            path,
+            thickness,
+            ink,
+        }),
     }
 }
 
@@ -654,7 +810,14 @@ fn delimiter(ch: char, height: f32, level: usize, document_scale: f32) -> MathBo
         '⟩' => format!("M 0 {top} L {} 0 L 0 {bottom}", width - stroke * 0.5,),
         _ => format!("M {} {top} V {bottom}", width * 0.5),
     };
-    stroked_box(width, height * 0.5, height * 0.5, path, stroke)
+    stroked_box(
+        width,
+        height * 0.5,
+        height * 0.5,
+        path,
+        stroke,
+        MathInk::Operator,
+    )
 }
 
 fn group(
@@ -718,6 +881,7 @@ fn radical(
         valley + stroke * 0.5,
         path,
         stroke,
+        MathInk::Term,
     );
     let mut children = (0..2).map(|_| None).collect::<Vec<_>>();
     children[0] = Some((0.0, 0.0, sign));
@@ -758,6 +922,7 @@ fn accent(
                     y + head * 0.7,
                 ),
                 thickness: stroke,
+                ink: MathInk::Term,
             }
         }
         AccentKind::Bar | AccentKind::Hat => {
@@ -782,6 +947,7 @@ fn accent(
             MathPrimitive::Stroke {
                 path,
                 thickness: stroke,
+                ink: MathInk::Term,
             }
         }
         AccentKind::Dot | AccentKind::DoubleDot | AccentKind::TripleDot => {
@@ -834,7 +1000,7 @@ fn padded_highlight(
     mut box_: MathBox,
     level: usize,
     document_scale: f32,
-    role: SymbolRole,
+    style: SymbolStyle,
 ) -> MathBox {
     clear_highlights(&mut box_);
     let pad_x = VARIABLE_PAD_X * scale(level, document_scale);
@@ -847,7 +1013,7 @@ fn padded_highlight(
     box_.width += pad_x * 2.0;
     box_.ascent += pad_y;
     box_.descent += pad_y;
-    box_.highlight = Some(role);
+    box_.highlight = Some(style);
     box_
 }
 
@@ -862,11 +1028,20 @@ fn script(
     let slots = node.slots();
     let mut children = (0..slots.len()).map(|_| None).collect::<Vec<_>>();
     let mut base_width = 0.0;
-    let base_role = semantic_highlights
+    // A script over a lone symbol highlights as one atom -- a squared `x` is
+    // a thing, not an `x` wearing a decoration -- so the base's own identity
+    // styles the whole box and the base is laid out without a second one.
+    let base_style = semantic_highlights
         .then(|| match node {
             MathNode::Script { base, .. } => match base.as_slice() {
-                [MathNode::Sym(ch)] if ch.is_alphabetic() => Some(SymbolRole::Variable),
-                [MathNode::Resolved { role, .. }] => Some(*role),
+                [MathNode::Sym(ch)] if ch.is_alphabetic() => {
+                    let mut buffer = [0u8; 4];
+                    Some(math_style::resolve(
+                        SymbolRole::Variable,
+                        ch.encode_utf8(&mut buffer),
+                    ))
+                }
+                [MathNode::Resolved { id, role, .. }] => Some(math_style::resolve(*role, id)),
                 _ => None,
             },
             _ => None,
@@ -884,7 +1059,7 @@ fn script(
             },
             document_scale,
             measure,
-            semantic_highlights && base_role.is_none(),
+            semantic_highlights && base_style.is_none(),
         );
         let (x, y) = match slot {
             Slot::Base => {
@@ -915,8 +1090,8 @@ fn script(
             .map(|child| child.expect("every script slot must be laid out"))
             .collect(),
     );
-    if let Some(role) = base_role {
-        padded_highlight(box_, level, document_scale, role)
+    if let Some(style) = base_style {
+        padded_highlight(box_, level, document_scale, style)
     } else {
         box_
     }
@@ -1590,6 +1765,150 @@ mod tests {
         }
     }
 
+    /// The x offset of every child in a laid-out list, which is where digit
+    /// grouping shows up: a group boundary is an advance, not a node.
+    fn offsets(box_: &MathBox) -> Vec<f32> {
+        let BoxKind::Row { children } = &box_.kind else {
+            panic!("list must produce row");
+        };
+        children.iter().map(|(x, _, _)| *x).collect()
+    }
+
+    /// The gap left before each child beyond the width of the one before it.
+    fn gaps(box_: &MathBox) -> Vec<f32> {
+        let BoxKind::Row { children } = &box_.kind else {
+            panic!("list must produce row");
+        };
+        let offsets = offsets(box_);
+        offsets
+            .iter()
+            .enumerate()
+            .map(|(index, x)| match index.checked_sub(1) {
+                None => 0.0,
+                Some(previous) => x - offsets[previous] - children[previous].2.width,
+            })
+            .collect()
+    }
+
+    /// Which children a group gap was inserted before. Thresholded rather
+    /// than compared against zero: the offsets are an f32 accumulation, so
+    /// a child with no gap before it lands within an ulp of its neighbour's
+    /// right edge rather than exactly on it.
+    fn grouped_at(box_: &MathBox) -> Vec<usize> {
+        let group = BASE_SIZE * DIGIT_GROUP_SPACE;
+        gaps(box_)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, gap)| *gap > group * 0.5)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn ink_at(box_: &MathBox, index: usize) -> MathInk {
+        let BoxKind::Row { children } = &box_.kind else {
+            panic!("list must produce row");
+        };
+        match &children[index].2.kind {
+            BoxKind::Glyph { ink, .. } => *ink,
+            other => panic!("child {index} is not a glyph: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_long_numeral_is_grouped_in_threes_from_the_right() {
+        assert_eq!(grouped_at(&layout(&symbols("1000"), 0, &fake_measure)), [1]);
+        assert_eq!(
+            grouped_at(&layout(&symbols("10000"), 0, &fake_measure)),
+            [2]
+        );
+        assert_eq!(
+            grouped_at(&layout(&symbols("1234567"), 0, &fake_measure)),
+            [1, 4]
+        );
+    }
+
+    /// `1 00` would be worse than `100`, so grouping starts at four digits.
+    #[test]
+    fn a_short_numeral_is_left_alone() {
+        for short in ["1", "12", "123"] {
+            assert!(grouped_at(&layout(&symbols(short), 0, &fake_measure)).is_empty());
+        }
+    }
+
+    /// ISO 31-0: a decimal point is the origin, and the fractional part is
+    /// grouped away from it in the other direction.
+    #[test]
+    fn a_decimal_groups_outward_from_its_point() {
+        // 3.14159 -> 3.141 59; the one-digit integer part is left alone.
+        assert_eq!(
+            grouped_at(&layout(&symbols("3.14159"), 0, &fake_measure)),
+            [5]
+        );
+        // 12345.6789 -> 12 345.678 9
+        assert_eq!(
+            grouped_at(&layout(&symbols("12345.6789"), 0, &fake_measure)),
+            [2, 9]
+        );
+    }
+
+    /// A point with no digits after it belongs to the sentence, not to the
+    /// number, so it must not join two runs into one literal.
+    #[test]
+    fn a_trailing_point_does_not_join_two_numbers() {
+        assert_eq!(
+            grouped_at(&layout(&symbols("1234.x5678"), 0, &fake_measure)),
+            [1, 7]
+        );
+    }
+
+    /// The separator is an advance, never a node: the caret still steps
+    /// through exactly four digits, and lands on the group boundary.
+    #[test]
+    fn a_group_boundary_is_spacing_rather_than_a_node() {
+        let list = symbols("1000");
+        let box_ = layout(&list, 0, &fake_measure);
+        let BoxKind::Row { children } = &box_.kind else {
+            panic!("list must produce row");
+        };
+        assert_eq!(children.len(), 4, "grouping adds no atoms");
+
+        let cursor = MathCursor {
+            path: Vec::new(),
+            index: 1,
+        };
+        let (x, ..) = cursor_pos(&list, &cursor, 0, &fake_measure);
+        assert_eq!(x, offsets(&box_)[1], "the caret follows the gap");
+    }
+
+    #[test]
+    fn numerals_operators_and_terms_take_three_different_inks() {
+        let box_ = layout(&symbols("2+x"), 0, &fake_measure);
+        assert_eq!(ink_at(&box_, 0), MathInk::Number);
+        assert_eq!(ink_at(&box_, 1), MathInk::Operator);
+        assert_eq!(ink_at(&box_, 2), MathInk::Term);
+    }
+
+    /// Relations, punctuation, and delimiters are all structural grammar.
+    #[test]
+    fn relations_punctuation_and_delimiters_are_quiet() {
+        let box_ = layout(&symbols("=,(|∑"), 0, &fake_measure);
+        assert_eq!(ink_at(&box_, 0), MathInk::Operator);
+        assert_eq!(ink_at(&box_, 1), MathInk::Operator);
+        assert_eq!(ink_at(&box_, 2), MathInk::Operator);
+        assert_eq!(ink_at(&box_, 3), MathInk::Operator);
+        assert_eq!(ink_at(&box_, 4), MathInk::Operator);
+    }
+
+    /// TeX demotes a leading `-` to an ordinary atom so it gets no spacing.
+    /// That is about where it sits; it is still an operator, and inking it
+    /// as a term would make `-x` and a variable named minus look alike.
+    #[test]
+    fn a_unary_sign_is_still_inked_as_an_operator() {
+        let box_ = layout(&symbols("-x"), 0, &fake_measure);
+        assert_eq!(ink_at(&box_, 0), MathInk::Operator);
+        assert!(gaps(&layout(&symbols("-x"), 0, &fake_measure))[1] < 0.5);
+    }
+
     fn highlight_count(box_: &MathBox) -> usize {
         usize::from(box_.highlight.is_some())
             + match &box_.kind {
@@ -2161,10 +2480,16 @@ mod tests {
         ] {
             let box_ = delimiter(ch, BASE_SIZE, 0, 1.0);
             assert_eq!(box_.width, BASE_SIZE * factor);
-            let BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }) = box_.kind else {
+            let BoxKind::Primitive(MathPrimitive::Stroke {
+                path,
+                thickness,
+                ink,
+            }) = box_.kind
+            else {
                 panic!("delimiter must be stroked geometry");
             };
             assert_eq!(thickness, SHAPE_STROKE);
+            assert_eq!(ink, MathInk::Operator);
             assert_eq!(path.matches('M').count(), path_parts.0);
             assert_eq!(path.matches('L').count(), path_parts.1);
         }
@@ -2182,10 +2507,16 @@ mod tests {
         };
         let sign = &radical[0];
         let body = &radical[1];
-        let BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }) = &sign.2.kind else {
+        let BoxKind::Primitive(MathPrimitive::Stroke {
+            path,
+            thickness,
+            ink,
+        }) = &sign.2.kind
+        else {
             panic!("radical must be one connected stroke");
         };
         assert_eq!(*thickness, SHAPE_STROKE);
+        assert_eq!(*ink, MathInk::Term);
         assert_eq!(path.matches('M').count(), 1);
         assert_eq!(sign.2.width, body.0 + body.2.width);
         assert!(sign.2.ascent > body.2.ascent);
@@ -2227,11 +2558,16 @@ mod tests {
             let BoxKind::Row { children: accent } = &children[0].2.kind else {
                 panic!("accent must produce row");
             };
-            let BoxKind::Primitive(MathPrimitive::Stroke { path, thickness }) = &accent[0].2.kind
+            let BoxKind::Primitive(MathPrimitive::Stroke {
+                path,
+                thickness,
+                ink,
+            }) = &accent[0].2.kind
             else {
                 panic!("accent must be stroked geometry");
             };
             assert_eq!(*thickness, SHAPE_STROKE);
+            assert_eq!(*ink, MathInk::Term);
             assert_eq!(path.matches('L').count(), line_count);
             if kind == AccentKind::Bar {
                 assert!(path.contains(" H "));
@@ -2254,14 +2590,25 @@ mod tests {
         let BoxKind::Row { children } = box_.kind else {
             panic!("list must produce row");
         };
-        assert_eq!(children[0].2.highlight, Some(SymbolRole::Variable));
-        assert_eq!(children[1].2.highlight, Some(SymbolRole::Variable));
-        assert_eq!(children[2].2.highlight, Some(SymbolRole::Variable));
-        assert_eq!(children[3].2.highlight, None);
+        assert_eq!(
+            children[0].2.highlight,
+            Some(math_style::automatic(SymbolRole::Variable, "x"))
+        );
+        assert_eq!(
+            children[1].2.highlight,
+            Some(math_style::automatic(SymbolRole::Variable, "\u{03b1}"))
+        );
+        assert_eq!(
+            children[2].2.highlight,
+            Some(math_style::automatic(SymbolRole::Variable, "\u{0416}"))
+        );
+        assert_eq!(children[3].2.highlight, None, "a digit is not a name");
         assert_eq!(children[0].2.width, BASE_SIZE * 0.5 + VARIABLE_PAD_X * 2.0);
         assert_eq!(children[0].2.ascent, BASE_SIZE * 0.5 + VARIABLE_PAD_Y);
         assert_eq!(children[1].0, children[0].2.width);
-        assert_ne!(theme::variable(), theme::alt());
+        // Each letter is its own colour, which is what identity-carries-hue
+        // buys: `x` and an alpha must not read as the same term.
+        assert_ne!(children[0].2.highlight, children[1].2.highlight);
     }
 
     #[test]
@@ -2275,7 +2622,10 @@ mod tests {
             panic!("list must produce row");
         };
         let script = &children[0].2;
-        assert_eq!(script.highlight, Some(SymbolRole::Variable));
+        assert_eq!(
+            script.highlight,
+            Some(math_style::automatic(SymbolRole::Variable, "x"))
+        );
         assert!(script.descent > BASE_SIZE * 0.5);
         assert!(script.width > BASE_SIZE * 0.5);
         assert_eq!(highlight_count(script), 1);
@@ -2297,7 +2647,10 @@ mod tests {
                 panic!("list must produce row");
             };
             let symbol = &children[0].2;
-            assert_eq!(symbol.highlight, Some(role));
+            assert_eq!(
+                symbol.highlight,
+                Some(math_style::automatic(role, "test.symbol"))
+            );
             assert_eq!(highlight_count(symbol), 1);
             assert_eq!(symbol.width, BASE_SIZE * 0.5 + VARIABLE_PAD_X * 2.0);
         }
@@ -2318,7 +2671,10 @@ mod tests {
             panic!("list must produce row");
         };
         let symbol = &children[0].2;
-        assert_eq!(symbol.highlight, Some(SymbolRole::Constant));
+        assert_eq!(
+            symbol.highlight,
+            Some(math_style::automatic(SymbolRole::Constant, "test.symbol"))
+        );
         assert_eq!(highlight_count(symbol), 1);
     }
 
@@ -2391,7 +2747,8 @@ mod tests {
             );
         }
 
-        // ∑/∏/lim stay on the anchor; only the integral family is raised.
+        // The sum receives its own optical width and rise just like the
+        // integral family, while product and lim stay on the anchor.
         let sum = layout(
             &vec![big_op(BigOp::Sum, Vec::new(), Vec::new())],
             0,
@@ -2403,10 +2760,37 @@ mod tests {
         let BoxKind::Row { children: operator } = &children[0].2.kind else {
             panic!("operator must produce row");
         };
-        let BoxKind::Glyph { offset_y, .. } = &operator[0].2.kind else {
+        let BoxKind::Glyph {
+            offset_y,
+            condense,
+            ink,
+            ..
+        } = &operator[0].2.kind
+        else {
             panic!("the sum must be a glyph");
         };
-        assert!((offset_y - 0.0).abs() < 0.0001, "∑ must sit on the anchor");
+        assert!((*condense - SUM_CONDENSE).abs() < 0.0001);
+        assert!((*offset_y - BASE_SIZE * BIGOP_SCALE * SUM_RISE).abs() < 0.0001);
+        assert_eq!(*ink, MathInk::Operator);
+
+        for kind in [BigOp::Prod, BigOp::Limit] {
+            let box_ = layout(
+                &vec![big_op(kind, Vec::new(), Vec::new())],
+                0,
+                &fake_measure,
+            );
+            let BoxKind::Row { children } = &box_.kind else {
+                panic!("list must produce row");
+            };
+            let BoxKind::Row { children: operator } = &children[0].2.kind else {
+                panic!("operator must produce row");
+            };
+            let BoxKind::Glyph { offset_y, ink, .. } = operator[0].2.kind else {
+                panic!("large operator must be a glyph");
+            };
+            assert_eq!(offset_y, 0.0);
+            assert_eq!(ink, MathInk::Operator);
+        }
     }
 
     #[test]

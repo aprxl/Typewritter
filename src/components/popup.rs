@@ -32,17 +32,17 @@ use crate::theme;
 /// Corner radius of every floating card — a popup reads as modern when its
 /// shoulders are soft rather than square. One number across all popups, so
 /// two cards on screen never disagree about how round they are.
-pub const CARD_RADIUS: f32 = 9.0;
+pub const CARD_RADIUS: f32 = 14.0;
 
 /// How far the shadow slab spreads past the resting card on every side,
 /// before its blur. Generous on purpose: the halo must fade to nothing
 /// before the slab's own edge arrives, or the blur prints that edge as a
 /// visible ring — a shadow with a border reads as a second card.
-pub const SHADOW_SPREAD: f32 = 10.0;
+pub const SHADOW_SPREAD: f32 = 4.0;
 
 /// The blur radius the shell sets on the shadow layer at creation and
 /// never touches again — see `Shell::new`.
-pub const SHADOW_BLUR_RADIUS: f32 = 14.0;
+pub const SHADOW_BLUR_RADIUS: f32 = 20.0;
 
 /// How long an anchored menu's entrance spring takes to settle, and its
 /// curve: a quick rise with a small overshoot and a long tail — past 200ms
@@ -50,7 +50,7 @@ pub const SHADOW_BLUR_RADIUS: f32 = 14.0;
 /// `CubicBezier`'s y is unclamped, which is exactly what an overshoot needs.
 ///
 /// Modals do not use this curve; see [`MODAL_FADE_DURATION`].
-pub const MENU_SLIDE_DURATION: Duration = Duration::from_millis(220);
+pub const MENU_SLIDE_DURATION: Duration = Duration::from_millis(170);
 pub const MENU_SLIDE_EASING: Easing = Easing::CubicBezier(0.3, 1.25, 0.5, 1.0);
 
 /// How long a large modal takes to fade up. No overshoot: a palette-sized
@@ -160,7 +160,7 @@ pub fn slide_target(touched: Option<usize>, len: usize) -> Option<usize> {
     touched.map(|h| h.min(len - 1))
 }
 
-/// A floating card grown out of `anchor`: scaled from 88% up to full size
+/// A floating card grown out of `anchor`: scaled from 97% up to full size
 /// around the point it serves while sliding down a few pixels into place —
 /// the card grows out of what was clicked and settles downward, gravity
 /// agreeing with the direction it opens in. Clamped, so an overshooting
@@ -170,8 +170,8 @@ pub fn slide_target(touched: Option<usize>, len: usize) -> Option<usize> {
 /// so the two can never disagree about where the floating surface sits.
 pub fn revealed_card(card: Rect, anchor: (f32, f32), e: f32) -> Rect {
     let e = e.clamp(0.0, 1.0);
-    let scale = 0.88 + 0.12 * e;
-    let travel = (1.0 - e) * -7.0; // starts 7px above, slides down into place
+    let scale = 0.97 + 0.03 * e;
+    let travel = (1.0 - e) * -5.0; // starts 5px above, slides down into place
     let cx = anchor.0;
     let cy = anchor.1;
     let x = cx + (card.x - cx) * scale;

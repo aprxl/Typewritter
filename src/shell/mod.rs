@@ -1,11 +1,9 @@
 //! The shell: the layout tree, the regions that fill it, and the frame loop
 //! that drives both.
 //!
-//! This is `design/Main View.dc.html`, rebuilt against the real renderer.
-//! The left tree reads the actual vault on disk (see [`crate::vault`]) and
-//! the centre column is a working buffer: files open into tabs (a click
-//! previews, a double-click pins), the text is editable, and `Ctrl+S` saves.
-//! Still mock: the sidenote margin, which belongs to document anchors.
+//! The native Studio workspace: vault navigation, editable document tabs,
+//! and sidenotes attached to document anchors. See `docs/STUDIO.md` for the
+//! visual direction and the boundaries of the experiment.
 //!
 //! Everything visible is a [`Component`] in its own [`Region`], so each part
 //! measures itself, redraws only when it changes, and is scissored to its
@@ -22,6 +20,7 @@
 //! [`Region::set_component`] is for.
 
 mod commands;
+mod focus;
 mod input;
 mod panel;
 mod stepped;
@@ -34,14 +33,15 @@ use winit::event::MouseButton;
 
 use crate::animation::{Animation, Easing};
 use crate::components::dialog::Prompt;
+use crate::components::document_surface::{self, DocumentSurface};
 use crate::components::sidenotes::Note;
 use crate::components::tab_strip::TabView;
 use crate::components::topics::Entry;
 use crate::components::{
     Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileTree, Finder, FormatBar, MathMenu,
-    Onboarding, Palette, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar, Topics,
-    breadcrumb, editor, file_tree, format_bar, sidenotes, status_line, tab_strip, title_bar,
-    topics,
+    Onboarding, Palette, Scrollbar, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar,
+    Topics, breadcrumb, editor, file_tree, format_bar, scrollbar, sidenotes, status_line,
+    tab_strip, title_bar, topics,
 };
 use crate::config::Config;
 use crate::document::Caret;
@@ -49,6 +49,7 @@ use crate::document::Focus;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind, layout_blocks};
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_conversion;
+use crate::document::math_style;
 use crate::document::outline;
 use crate::export;
 use crate::frame::FrameScheduler;
@@ -56,8 +57,8 @@ use crate::input::Input;
 use crate::layout::{Layout, NodeId, Rect, Size, Style};
 use crate::renderer::{Layer, LayerInvalidation, Renderer, ShaderEffect};
 use crate::tabs::Tabs;
-use crate::theme::{self, TextStyle};
-use crate::ui::{Component, Context, Hover, Mouse, Region};
+use crate::theme::{self, TextStyle, Theme};
+use crate::ui::{Component, Context, Glide, Hover, Mouse, Region};
 use crate::vault::Vault;
 use crate::vim::{Edit, Operator, OperatorTarget, Vim, VimMode, VisualMode};
 
@@ -78,10 +79,89 @@ struct PaletteState {
 /// full ranked list (`search::search`), so picking row *n* is a direct
 /// index and `Ctrl+1..5` needs no re-filter.
 struct FinderState {
+    index: crate::search::SearchIndex,
     rows: Vec<crate::search::Row>,
     query: String,
     selected: usize,
 }
+
+/// How long the page takes to settle once the wheel stops, and the curve
+/// it settles on. Short on purpose: past about a fifth of a second a smooth
+/// scroll stops reading as momentum and starts reading as lag. `EaseOut`
+/// because a scroll begins with the reader's hand and ends on its own.
+const SCROLL_GLIDE: Duration = Duration::from_millis(150);
+const SCROLL_EASING: Easing = Easing::EaseOut;
+
+/// How far one wheel notch takes the page, in lines — the desktop default.
+/// A notch used to move exactly one line, which was already a little mean
+/// and under a glide reads as a stutter rather than as a scroll.
+const SCROLL_LINES: f32 = 3.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ViewUpdate {
+    tabs: bool,
+    breadcrumb: bool,
+    topics: bool,
+    editor: bool,
+    status: bool,
+    sidenotes: bool,
+    follow_caret: bool,
+}
+
+impl ViewUpdate {
+    /// Redraw every region. Deliberately *not* a caret chase: a rebuild is
+    /// about what is on screen, not about where the caret is, and most of
+    /// the things that ask for one — a popup opening, a save, a repaint
+    /// after the palette moved — leave the caret exactly where it was. Only
+    /// the callers that really moved the camera set `follow_caret`.
+    const ALL: Self = Self {
+        tabs: true,
+        breadcrumb: true,
+        topics: true,
+        editor: true,
+        status: true,
+        sidenotes: true,
+        follow_caret: false,
+    };
+
+    const NONE: Self = Self {
+        tabs: false,
+        breadcrumb: false,
+        topics: false,
+        editor: false,
+        status: false,
+        sidenotes: false,
+        follow_caret: false,
+    };
+}
+
+/// The two servers a laid-out document depends on: the palette, whose
+/// colours are baked into the `TextStyle`s that were measured, and symbol
+/// styling, which math layout resolves into every highlight as it measures.
+/// Either one moving invalidates a cached layout.
+type PaintRevision = (u64, u64);
+
+fn paint_revision() -> PaintRevision {
+    (theme::revision(), math_style::revision())
+}
+
+type LayoutCache = (
+    u64,
+    Option<usize>,
+    Option<std::path::PathBuf>,
+    PaintRevision,
+    f32,
+    Rc<DocLayout>,
+);
+type StackedNote = (String, String, f32, Rc<DocLayout>);
+type StackedNoteCache = (
+    u64,
+    Option<usize>,
+    Option<std::path::PathBuf>,
+    PaintRevision,
+    f32,
+    Vec<StackedNote>,
+);
 
 /// The slash menu's live query text, selection index, and anchor point
 /// while it's open — the shell owns these (it's the one taking
@@ -157,9 +237,11 @@ enum MenuDismiss {
         /// Which row the pill had parked on.
         pointer_row: Option<usize>,
     },
-    /// The right-click context menu: rows and live checkmarks as they stood.
+    /// The right-click context menu: whichever face it was wearing, as it
+    /// stood. One variant rather than two because it is one surface — same
+    /// region, same reveal clock, same anchor — showing one of two things.
     Context {
-        state: crate::components::context_menu::Snapshot,
+        state: ContextGhost,
         anchor: (f32, f32),
         pill_row: usize,
     },
@@ -171,11 +253,29 @@ enum MenuDismiss {
     },
 }
 
+/// What a closing context menu was showing: a list of commands, or the
+/// symbol inspector.
+enum ContextGhost {
+    Commands(crate::components::context_menu::Snapshot),
+    Symbol(crate::components::symbol_menu::Snapshot),
+}
+
+impl ContextGhost {
+    /// A menu that offered nothing has no ghost worth showing.
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Commands(snapshot) => snapshot.entries.is_empty(),
+            Self::Symbol(snapshot) => snapshot.sections.is_empty(),
+        }
+    }
+}
+
 /// The in-math completion card while it is showing: the precise tree query,
-/// selected row, and anchor point. It has no open/closed state of its own.
+/// selected row, visible interpretations, and anchor point.
 struct MathMenuState {
     query: math_conversion::Query,
     selected: usize,
+    first_visible: usize,
     anchor: (f32, f32),
 }
 
@@ -274,6 +374,26 @@ pub struct Shell {
     topics: Panel,
     status: Panel,
     text_column: NodeId,
+    /// The document sheet: the text column, the sidenote margin beside it,
+    /// and the scroll strip. What the wheel scrolls, so that the pointer
+    /// drifting onto a margin note does not stop the page.
+    canvas: NodeId,
+    /// The strip the scroll thumb lives in, to the right of the sidenote
+    /// margin and inside the document sheet. Hidden when there is nothing
+    /// to scroll it with — no file, or Focus mode, which is chromeless by
+    /// definition.
+    scroll_column: NodeId,
+    /// What the scrollbar draws, shared with its component so the page can
+    /// move without rebuilding it. See [`scrollbar`].
+    scroll_span: Rc<Cell<scrollbar::Span>>,
+    /// The page's scroll offset, and the authority on it: `Tabs::editor_scroll`
+    /// is where this frame's value is *published*, for everything that
+    /// paints and hit-tests against it.
+    scroll: Glide,
+    /// How far below the thumb's top the pointer took hold of it, while a
+    /// drag is running. Held rather than recomputed so the thumb stays under
+    /// the finger instead of jumping its centre there on the first move.
+    scroll_grab: Option<f32>,
     /// `None` until a vault is chosen (first run / `--onboard`).
     config: Option<Config>,
     vault: Option<Rc<RefCell<Vault>>>,
@@ -304,6 +424,7 @@ pub struct Shell {
     brush_inside: Vec<ContextHit>,
     brush_point: Option<(f32, f32)>,
     brush_revision: u64,
+    brush_document_revision: u64,
     last_brush_revision: u64,
     /// The in-math completion card while it is showing.
     math_menu: Option<MathMenuState>,
@@ -331,8 +452,6 @@ pub struct Shell {
     math_menu_region: usize,
     /// Blinks the caret in the editor and the name prompt.
     caret: Stepped,
-    /// Fades the writing indicator.
-    pulse: Stepped,
     /// The entrance-reveal clock for whichever popup is opening — a menu
     /// grows out of its anchor as this weight climbs, a modal fades up with
     /// it (the curves live in the drawing: `popup::MENU_SLIDE_EASING`,
@@ -375,8 +494,15 @@ pub struct Shell {
     redraws: (usize, usize),
     /// The open dialog, if any. While it is set it owns the keyboard.
     dialog: Option<Prompt>,
+    /// Last persistence error, shown in the status line while the document
+    /// remains open for retry.
+    save_error: Option<String>,
     /// Last [`Tabs::revision`] the views were rebuilt from.
     last_revision: u64,
+    last_layout_revision: u64,
+    last_active_index: Option<usize>,
+    last_active_path: Option<std::path::PathBuf>,
+    last_editor_scroll: f32,
     /// Last vim mode the views were rebuilt from — mode changes (Escape
     /// out of Insert, with nothing else touched) don't move `Tabs::revision`
     /// on their own, but the status badge and the editor's caret shape both
@@ -394,10 +520,16 @@ pub struct Shell {
     /// key: moving focus into a note must follow the note, even when the
     /// caret value happens not to move.
     followed: (usize, Focus, Caret),
-    /// The laid-out active document, keyed by `(revision, content width)`.
+    /// The laid-out active document, keyed by content revision, active tab,
+    /// theme revision, and content width. Caret/focus/scroll changes do not
+    /// invalidate this expensive document layout.
     /// Rebuilt in `rebuild_views`; the editor and the shell's own caret
     /// math (click, j/k) read the same `Rc`.
-    doc_layout: Option<(u64, f32, Rc<DocLayout>)>,
+    doc_layout: Option<LayoutCache>,
+    /// Cached margin layouts and stack placement for the same document view.
+    /// The cache is shared by caret following and the margin component so a
+    /// note-focused rebuild cannot lay out every note twice.
+    stacked_note_layout: Option<StackedNoteCache>,
     /// The goal x (pixels) vertical motion aims at — the vim `goal_col`,
     /// now in pixels. Some until a non-vertical caret change clears it.
     goal_x: Option<f32>,
@@ -411,9 +543,11 @@ pub struct Shell {
     repeat: Option<RepeatOp>,
     insert_repeat: Vec<InsertEvent>,
     insert_prefix: Option<RepeatOp>,
-    /// The text region's width views were last rebuilt from. A panel toggle
-    /// resizes it without moving `Tabs::revision`, and the wrap must follow.
-    last_width: f32,
+    /// Geometry affects wrapping and the focus camera even without an edit.
+    last_editor_rect: Rect,
+    focus_panels: Option<[bool; 4]>,
+    focus_fade: Hover,
+    last_focus_mode: bool,
     /// The blurred layer above the editor, carrying highlight glow. Held
     /// here because `rebuild_views` swaps the editor component out and the
     /// layer has to outlive that.
@@ -459,10 +593,17 @@ impl Shell {
         // The sidenote margin lives inside the canvas, which is what makes
         // it part of the document rather than a fourth panel.
         let tree = layout.add_child(body, Style::fixed(file_tree::WIDTH));
-        let canvas = layout.add_child(body, Style::flex(1.0).row());
+        let canvas_outer = layout.add_child(body, Style::flex(1.0).row());
+        layout.add_child(canvas_outer, Style::fixed(document_surface::GAP));
+        let canvas_slot = layout.add_child(canvas_outer, Style::flex(1.0));
+        layout.add_child(canvas_outer, Style::fixed(document_surface::GAP));
+        layout.add_child(canvas_slot, Style::fixed(document_surface::GAP));
+        let canvas = layout.add_child(canvas_slot, Style::flex(1.0).row());
+        layout.add_child(canvas_slot, Style::fixed(document_surface::GAP));
         let topics = layout.add_child(body, Style::fixed(topics::WIDTH));
         let text_column = layout.add_child(canvas, Style::flex(1.0));
         let sidenotes = layout.add_child(canvas, Style::fixed(sidenotes::WIDTH));
+        let scroll_column = layout.add_child(canvas, Style::fixed(scrollbar::WIDTH));
 
         // One layer each, created bottom-to-top.
         let region = |renderer: &mut Renderer, node, component: Box<dyn Component>| {
@@ -474,11 +615,7 @@ impl Shell {
         };
         let mut regions = vec![
             region(renderer, Layout::ROOT, Box::new(Backdrop)),
-            region(
-                renderer,
-                title,
-                Box::new(TitleBar::new("Typewritter", "LECTURE CAPTURE", None)),
-            ),
+            region(renderer, title, Box::new(TitleBar::new(None))),
             region(
                 renderer,
                 tabs,
@@ -498,6 +635,7 @@ impl Shell {
                     tree_menu_request.clone(),
                 )),
             ),
+            region(renderer, canvas, Box::new(DocumentSurface)),
             region(renderer, text_column, Box::new(Editor::placeholder())),
         ];
 
@@ -514,11 +652,17 @@ impl Shell {
             radius: editor::GLOW_RADIUS,
         }));
 
+        let scroll_span = Rc::new(Cell::new(scrollbar::Span::default()));
         regions.extend([
             region(
                 renderer,
                 sidenotes,
                 Box::new(SidenoteMargin::new(Vec::new(), editor::TOP, 0.0)),
+            ),
+            region(
+                renderer,
+                scroll_column,
+                Box::new(Scrollbar::new(scroll_span.clone())),
             ),
             region(renderer, topics, Box::new(Topics::new(Vec::new(), 0))),
             region(
@@ -530,7 +674,7 @@ impl Shell {
                     "no file open".into(),
                     String::new(),
                     String::new(),
-                    true,
+                    false,
                     String::new(),
                 )),
             ),
@@ -622,6 +766,11 @@ impl Shell {
             topics: Panel::new(topics, topics::WIDTH),
             status: Panel::new(status, status_line::HEIGHT),
             text_column,
+            canvas,
+            scroll_column,
+            scroll_span,
+            scroll: Glide::new(SCROLL_GLIDE, SCROLL_EASING),
+            scroll_grab: None,
             config,
             vault,
             docs,
@@ -639,6 +788,7 @@ impl Shell {
             brush_inside: Vec::new(),
             brush_point: None,
             brush_revision: 0,
+            brush_document_revision: 0,
             last_brush_revision: 0,
             math_menu: None,
             math_dismissed: None,
@@ -659,12 +809,8 @@ impl Shell {
             menu_region,
             format_region,
             math_menu_region,
-            // Two steps, because a caret is on or off: every frame between
-            // two flips repaints the same pixels. The writing indicator is
-            // a fade, but `Topics` already rounds it to sixteenths, so
-            // sixteen steps is every value that reaches the screen.
+            // Two steps: the caret should wake the renderer only when it flips.
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
-            pulse: Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16).ping_pong(),
             popup_reveal: Animation::new(
                 crate::components::popup::MENU_SLIDE_DURATION,
                 crate::components::popup::MENU_SLIDE_EASING,
@@ -672,7 +818,7 @@ impl Shell {
             wake_at: None,
             autosave_last_attempt: Instant::now(),
             autosave_revision: 0,
-            show_stats: true,
+            show_stats: false,
             debug_rows: false,
             dragging: None,
             divider_hot: false,
@@ -680,7 +826,12 @@ impl Shell {
             layouts: 0,
             redraws: (0, 0),
             dialog: None,
+            save_error: None,
             last_revision: 0,
+            last_layout_revision: 0,
+            last_active_index: None,
+            last_active_path: None,
+            last_editor_scroll: 0.0,
             last_mode: VimMode::Normal,
             last_visual_state: (None, None, None, false),
             followed: (
@@ -694,6 +845,7 @@ impl Shell {
                 },
             ),
             doc_layout: None,
+            stacked_note_layout: None,
             goal_x: None,
             visual_anchor: None,
             visual_override: None,
@@ -704,7 +856,10 @@ impl Shell {
             repeat: None,
             insert_repeat: Vec::new(),
             insert_prefix: None,
-            last_width: 0.0,
+            last_editor_rect: Rect::default(),
+            focus_panels: None,
+            focus_fade: Hover::new(),
+            last_focus_mode: false,
             glow,
             popup_shadow,
             last_shadow_owner: None,
@@ -730,6 +885,12 @@ impl Shell {
         let dt = FrameScheduler::animation_delta(frametime);
 
         self.handle_input(input, viewport);
+        // Straight after the input that aimed it, and before the regions
+        // sync: the scrollbar reads the span this publishes. It takes no
+        // frame delta — the glide keeps its own clock, because this frame's
+        // delta may be an idle gap that its target did not live through.
+        let scrolling = self.drive_scroll();
+        self.reveal_focused_note();
         self.autosave();
         self.sync_math_menu();
         self.export_yank();
@@ -739,14 +900,12 @@ impl Shell {
         // same frame or the window would spend one frame in the old colours
         // underneath a still image of the old colours.
         let mut animating = self.sync_theme_swap(renderer, viewport, dt);
+        animating |= scrolling;
         self.sync_theme();
 
-        // The two stepped ones report a *step change*, not "still running",
-        // so they fall silent between steps and the loop can sleep. They
-        // keep their own wall clock; `dt` is clamped, and clamped time
-        // cannot drive something that sleeps longer than the clamp.
+        // The caret reports a step change and keeps its own wall clock,
+        // so the loop can sleep between visible changes.
         animating |= self.caret.advance();
-        animating |= self.pulse.advance();
         if self.any_overlay_open() || self.popup_reveal.is_playing() {
             animating |= self.popup_reveal.advance(dt);
         }
@@ -769,7 +928,7 @@ impl Shell {
             }
             animating = true;
         }
-        let animation_wake = Instant::now() + self.caret.wake_in().min(self.pulse.wake_in());
+        let animation_wake = Instant::now() + self.caret.wake_in();
         // A pending autosave is a deadline too: it must wake the loop from
         // its sleep even though no animation is asking for a frame. Without
         // this the save fires while typing and then never while idle.
@@ -779,6 +938,8 @@ impl Shell {
         );
         animating |= self.divider_hover.update(self.divider_hot, dt);
         animating |= self.divider_hover.is_animating();
+        animating |= self.focus_fade.update(self.focus_mode(), dt);
+        animating |= self.focus_fade.is_animating();
         for panel in self.panels_mut() {
             animating |= panel.animation.advance(dt);
         }
@@ -786,8 +947,13 @@ impl Shell {
         // Push the animated extents into the tree. Below half a pixel the
         // panel is hidden outright.
         let extents = self.panels().map(|p| (p.node, p.current()));
+        let has_margin = self
+            .docs
+            .borrow()
+            .active()
+            .is_some_and(|tab| !tab.document.notes.is_empty());
         for (node, extent) in extents {
-            let visible = extent >= 0.5;
+            let visible = extent >= 0.5 && (node != self.sidenotes.node || has_margin);
             self.layout.set_style(node, |s| {
                 s.size = Size::Fixed(extent);
                 s.visible = visible;
@@ -820,8 +986,9 @@ impl Shell {
             divider_hot: self.divider_hot || self.dragging == Some(Divider::Tree),
             // Step-end, not a fade: a caret that fades looks like a bug.
             caret_on: self.caret.is_on(),
-            pulse: self.pulse.weight(),
             show_stats: self.show_stats,
+            focus_mode: self.focus_mode(),
+            focus_amount: self.focus_fade.value(),
             mouse: Mouse {
                 position: input.mouse_position(),
                 left_pressed: input.is_mouse_pressed(MouseButton::Left),
@@ -848,6 +1015,11 @@ impl Shell {
             // A component hit-tests against its own rect; the shell is the
             // only one that knows where that rect is, so it hands it over.
             context.self_rect = self.layout.rect(region.node());
+            if !self.layout.style(region.node()).visible {
+                context.self_rect = Rect::default();
+                context.mouse = Mouse::default();
+                context.scroll_y = 0.0;
+            }
             context.owns_shadow = Some(index) == shadow_owner;
             region.sync(&context);
             animating |= region.is_animating();
@@ -864,13 +1036,54 @@ impl Shell {
             .fold(0, |n, region| n + region.update(&self.layout) as usize);
         self.redraws = (redrawn, self.regions.len());
 
+        // Component events (notably a tab-strip close click) can fail to
+        // persist without changing the document revision. Promote that
+        // error into the shell-owned status message before deciding which
+        // snapshots need rebuilding.
+        let persistence_error = self.docs.borrow_mut().take_error();
+        let error_changed = persistence_error.is_some();
+        if let Some(error) = persistence_error {
+            self.save_error = Some(error);
+        }
+
         // Whatever changed this frame — typing, a click that opened a file,
         // a tab closed, Escape out of Insert with nothing else touched —
         // lands in the views as one rebuild. Runs after the draw pass, so
         // the fresh components paint on the next frame. A panel toggle
         // resizes the text column without moving `Tabs::revision`, but the
         // wrap depends on that width, so it rebuilds too.
-        let revision = self.docs.borrow().revision();
+        let (revision, layout_revision, active_index, active_path, editor_scroll) = {
+            let docs = self.docs.borrow();
+            (
+                docs.revision(),
+                docs.layout_revision(),
+                docs.active_index(),
+                docs.active().map(|tab| tab.path().to_path_buf()),
+                docs.editor_scroll,
+            )
+        };
+        let revision_changed = revision != self.last_revision;
+        let layout_changed = layout_revision != self.last_layout_revision;
+        let active_changed =
+            active_index != self.last_active_index || active_path != self.last_active_path;
+        let scroll_changed = editor_scroll != self.last_editor_scroll;
+        let caret_changed = {
+            let docs = self.docs.borrow();
+            let key = (
+                docs.active_index().unwrap_or(usize::MAX),
+                docs.active().map_or(Focus::Body, |tab| tab.document.focus),
+                docs.active().map_or(
+                    Caret {
+                        block: 0,
+                        inline: 0,
+                        offset: 0,
+                        style: crate::document::Style::PLAIN,
+                    },
+                    |tab| tab.document.caret,
+                ),
+            );
+            key != self.followed
+        };
         let mode = self.vim.current_mode();
         let visual_state = (
             self.vim.visual_mode(),
@@ -878,25 +1091,64 @@ impl Shell {
             self.visual_override,
             self.visual_line_mode,
         );
-        let width = self.layout.rect(self.text_column).width;
+        let editor_rect = self.layout.rect(self.text_column);
+        let geometry_changed = editor_rect != self.last_editor_rect;
+        let focus_changed = self.focus_mode() != self.last_focus_mode;
         let search = self
             .search
             .as_ref()
             .map(|state| (state.query.clone(), state.forward));
-        if revision != self.last_revision
-            || mode != self.last_mode
-            || visual_state != self.last_visual_state
-            || width != self.last_width
-            || search != self.rendered_search
-            || self.brush_revision != self.last_brush_revision
+        let mode_changed = mode != self.last_mode;
+        let visual_changed = visual_state != self.last_visual_state;
+        let search_changed = search != self.rendered_search;
+        let brush_changed = self.brush_revision != self.last_brush_revision;
+        if revision_changed
+            || mode_changed
+            || visual_changed
+            || geometry_changed
+            || focus_changed
+            || search_changed
+            || brush_changed
+            || error_changed
         {
             self.last_revision = revision;
             self.last_mode = mode;
             self.last_visual_state = visual_state;
-            self.last_width = width;
+            self.last_editor_rect = editor_rect;
+            self.last_focus_mode = self.focus_mode();
             self.rendered_search = search;
             self.last_brush_revision = self.brush_revision;
-            self.rebuild_views();
+            let mut update = ViewUpdate::NONE;
+            if layout_changed || active_changed || geometry_changed || focus_changed {
+                update = ViewUpdate::ALL;
+                // Reflows and camera changes: a resize or a panel toggle
+                // re-wraps the text under the reader, switching tabs lands
+                // on a document whose caret is elsewhere, and Focus mode is
+                // a camera by definition. An edit is not on this list —
+                // typing moves the caret, which follows on its own below,
+                // while folding does not and must keep the reader's place.
+                update.follow_caret = active_changed || geometry_changed || focus_changed;
+            } else {
+                update.breadcrumb = caret_changed;
+                update.topics = caret_changed;
+                update.editor = caret_changed || scroll_changed;
+                update.sidenotes = caret_changed || scroll_changed;
+                update.follow_caret = caret_changed;
+                update.editor |= mode_changed || visual_changed || brush_changed;
+                update.status = mode_changed || search_changed;
+                update.status |= error_changed;
+                // Saves and other model changes can alter tab badges without
+                // touching layout, caret, or mode state.
+                if update == ViewUpdate::NONE {
+                    update.tabs = true;
+                    update.status = true;
+                }
+            }
+            self.last_layout_revision = layout_revision;
+            self.last_active_index = active_index;
+            self.last_active_path = active_path;
+            self.last_editor_scroll = editor_scroll;
+            self.rebuild_views_with(update);
         }
         animating
     }
@@ -983,7 +1235,13 @@ impl Shell {
         let now = Instant::now();
         if autosave_due(self.autosave_last_attempt, now, dirty) {
             let failed = self.docs.borrow_mut().save_all();
-            for (path, error) in failed {
+            self.save_error = failed.first().map(|(path, error)| {
+                format!(
+                    "save failed for {}: {error} (Ctrl+S to retry; Discard changes to close)",
+                    path.display()
+                )
+            });
+            for (path, error) in &failed {
                 eprintln!("autosave failed for {}: {error}", path.display());
             }
             self.autosave_last_attempt = now;
@@ -999,13 +1257,34 @@ impl Shell {
         Some(self.autosave_last_attempt + AUTOSAVE_IDLE)
     }
 
+    /// Opens the export card.
+    ///
+    /// The palette is the one thing an export decides for itself, and the
+    /// card is where it is decided. It is asked *before* the file dialog
+    /// rather than after, because the file dialog is a native modal and a
+    /// question behind one is a question nobody answers.
+    ///
+    /// The switch starts off whatever the reader is editing in: printing a
+    /// dark page is a choice almost nobody makes on purpose (`PDF.md` §2),
+    /// so reading in the dark must not quietly become printing in it.
+    fn export_pdf(&mut self) {
+        if self.docs.borrow().active().is_none() {
+            return;
+        }
+        self.open_dialog(Prompt::ExportPdf { dark: false });
+    }
+
     /// Renders the active note to a PDF the reader picks a place for.
     ///
     /// Measuring and shaping go through the text region's own layer, which
     /// is what makes the page break its lines exactly where the editor does
     /// — see `PDF.md` §4. That makes this synchronous and main-thread, which
     /// is fine: it is an export, not a keystroke.
-    fn export_pdf(&mut self) {
+    ///
+    /// `theme` is the page's, not the reader's: `export::render` swaps it in
+    /// around the whole layout and paint pass and puts the reader's back
+    /// afterwards, so the editor keeps the palette it had.
+    fn run_export(&mut self, theme: Theme) {
         let (document, name) = {
             let docs = self.docs.borrow();
             let Some(tab) = docs.active() else {
@@ -1022,19 +1301,30 @@ impl Shell {
             return;
         };
         let layer = self.regions[self.text_region].layer();
-        if let Err(error) = export::export_pdf(&document, layer, &path, export::Options::default())
-        {
+        let options = export::Options {
+            theme,
+            ..export::Options::default()
+        };
+        if let Err(error) = export::export_pdf(&document, layer, &path, options) {
             eprintln!("PDF export failed for {}: {error}", path.display());
         }
     }
 
-    /// Writes every dirty tab now, for the window-close path. Failures are
-    /// logged to stderr and swallowed — the window must always close, and
-    /// there is nothing left to retry once the loop has exited.
-    pub fn save_all(&mut self) {
-        for (path, error) in self.docs.borrow_mut().save_all() {
+    /// Writes every dirty tab now for the window-close path. Returns `false`
+    /// when any save failed; the caller keeps the window alive so the error
+    /// remains visible and the user can retry.
+    pub fn save_all(&mut self) -> bool {
+        let failed = self.docs.borrow_mut().save_all();
+        self.save_error = failed.first().map(|(path, error)| {
+            format!(
+                "save failed for {}: {error} (Ctrl+S to retry; Discard changes to close)",
+                path.display()
+            )
+        });
+        for (path, error) in &failed {
             eprintln!("save failed for {}: {error}", path.display());
         }
+        failed.is_empty()
     }
 
     /// Attaches a layer to each overlay that is open and drops the layer of
@@ -1183,10 +1473,16 @@ impl Shell {
     /// [`TextStyle`]: crate::theme::TextStyle
     /// [`ThemeServer::take_change`]: crate::theme::ThemeServer::take_change
     fn sync_theme(&mut self) {
-        if !theme::take_change() {
+        // Both flags are taken every frame, never short-circuited: leaving
+        // one armed would replay this whole invalidation on the next frame
+        // for a change that has already landed.
+        let palette = theme::take_change();
+        let symbols = math_style::take_change();
+        if !palette && !symbols {
             return;
         }
         self.doc_layout = None;
+        self.stacked_note_layout = None;
         self.rebuild_views();
         for region in &mut self.regions {
             region.poke();
@@ -1216,7 +1512,7 @@ impl Shell {
             (Divider::Topics, &self.topics, true),
         ] {
             let rect = self.layout.rect(panel.node);
-            if !panel.open || rect.width < 1.0 {
+            if !panel.open || !self.layout.style(panel.node).visible || rect.width < 1.0 {
                 continue;
             }
             let edge = if from_right { rect.x } else { rect.right() };
@@ -1244,10 +1540,25 @@ impl Shell {
     /// The active document laid out at the given width, cached by
     /// `(revision, width)`. The measure source is the editor region's own
     /// layer, so what is measured here is exactly what the editor draws.
+    ///
+    /// Two revisions ride the key rather than one. Math layout resolves each
+    /// symbol's highlight as it measures, so recolouring a symbol invalidates
+    /// laid-out boxes exactly the way swapping the palette does.
     fn current_layout(&mut self, width: f32) -> Rc<DocLayout> {
-        let revision = self.docs.borrow().revision();
-        if let Some((r, w, layout)) = &self.doc_layout
+        let (revision, active, path, theme_revision) = {
+            let docs = self.docs.borrow();
+            (
+                docs.layout_revision(),
+                docs.active_index(),
+                docs.active().map(|tab| tab.path().to_path_buf()),
+                paint_revision(),
+            )
+        };
+        if let Some((r, a, p, t, w, layout)) = &self.doc_layout
             && *r == revision
+            && *a == active
+            && *p == path
+            && *t == theme_revision
             && *w == width
         {
             return layout.clone();
@@ -1266,24 +1577,53 @@ impl Shell {
                     height: 0.0,
                     scale: 1.0,
                     source: Vec::new(),
+                    code_colors: Vec::new(),
                     anchors: Vec::new(),
                     equation_numbers: std::collections::HashMap::new(),
                 },
             }
         };
         let layout = Rc::new(layout);
-        self.doc_layout = Some((revision, width, layout.clone()));
+        self.doc_layout = Some((
+            revision,
+            active,
+            path,
+            theme_revision,
+            width,
+            layout.clone(),
+        ));
         layout
     }
 
-    /// How far the editor can scroll — the layout's total height, which the
-    /// old line-counting estimate could not see.
-    fn editor_max_scroll(&mut self) -> f32 {
-        let rect = self.layout.rect(self.text_column);
-        match &self.doc_layout {
-            Some((_, _, layout)) => editor::max_scroll(layout.height, rect.height - editor::TOP),
-            None => 0.0,
-        }
+    /// Advances the page's scroll by one frame and publishes it: the offset
+    /// everything paints and hit-tests against, and the span the scrollbar
+    /// draws. Reports whether the page moved.
+    ///
+    /// The target is re-clamped here rather than only where it is aimed,
+    /// because the bounds move on their own — a section folded away, a
+    /// resize that re-wraps the text — and a target left past the new
+    /// ceiling would strand the reader below the last line.
+    fn drive_scroll(&mut self) -> bool {
+        let (min, max) = self.editor_scroll_bounds();
+        self.scroll.aim(self.scroll.target().clamp(min, max));
+        let moved = self.scroll.advance();
+        self.docs
+            .borrow_mut()
+            .set_editor_scroll(self.scroll.value());
+
+        // Nothing to scroll, nothing open to scroll, or Focus mode, which
+        // is chromeless by definition: the strip gives its width back.
+        let has_tab = self.docs.borrow().active().is_some();
+        let shown = max > min && has_tab && !self.focus_mode();
+        self.layout
+            .set_style(self.scroll_column, |s| s.visible = shown);
+        self.scroll_span.set(scrollbar::Span {
+            scroll: self.scroll.value(),
+            range: (min, max),
+            view: (self.layout.rect(self.text_column).height - editor::TOP).max(0.0),
+            held: self.scroll_grab.is_some(),
+        });
+        moved
     }
 
     /// Brings the caret's visual line into the editor's visible band, if
@@ -1302,7 +1642,7 @@ impl Shell {
                 let Some(layout) = self
                     .doc_layout
                     .as_ref()
-                    .map(|(_, _, layout)| layout.clone())
+                    .map(|(_, _, _, _, _, layout)| layout.clone())
                 else {
                     return;
                 };
@@ -1312,17 +1652,24 @@ impl Shell {
                 layout.caret_band(tab.document.caret)
             }
         };
-        let scroll = self.docs.borrow().editor_scroll;
-        let max = self.editor_max_scroll();
-        let scroll = editor::follow_scroll(
-            scroll,
-            band.0,
-            band.1,
-            rect.y + editor::TOP,
-            rect.bottom(),
-            max,
-        );
-        self.docs.borrow_mut().set_editor_scroll(scroll);
+        // Measured from where the page is *heading*, not from where it is:
+        // following a caret against a scroll still in flight would answer
+        // for a viewport that is already on its way somewhere else.
+        let scroll = self.scroll.target();
+        let scroll = if self.focus_mode() {
+            editor::focus_scroll(band, rect, self.layout.rect(Layout::ROOT))
+        } else {
+            let (_, max) = self.editor_scroll_bounds();
+            editor::follow_scroll(
+                scroll,
+                band.0,
+                band.1,
+                rect.y + editor::TOP,
+                rect.bottom(),
+                max,
+            )
+        };
+        self.scroll.aim(scroll);
     }
 
     /// The focused note's placed band in document coordinates — `(top,
@@ -1346,7 +1693,7 @@ impl Shell {
     fn editor_point(&self, rect: Rect, mouse: (f32, f32)) -> Option<(f32, f32)> {
         let docs = self.docs.borrow();
         docs.active()?;
-        let local_x = (mouse.0 - (rect.x + editor::INSET)).max(0.0);
+        let local_x = (mouse.0 - (Editor::content_x(rect))).max(0.0);
         let local_y = mouse.1 - rect.y - editor::TOP + docs.editor_scroll;
         if local_y < 0.0 {
             return None;
@@ -1496,8 +1843,26 @@ impl Shell {
     /// place rather than sliding. Shared by `sidenote_notes` and the margin's
     /// click handler, so a click can never land on a note the view drew at a
     /// different y.
-    fn stacked_notes(&mut self) -> Vec<(String, String, f32, Rc<DocLayout>)> {
+    fn stacked_notes(&mut self) -> Vec<StackedNote> {
         let width = Editor::content_width(self.layout.rect(self.text_column));
+        let (revision, active, path, theme_revision) = {
+            let docs = self.docs.borrow();
+            (
+                docs.layout_revision(),
+                docs.active_index(),
+                docs.active().map(|tab| tab.path().to_path_buf()),
+                paint_revision(),
+            )
+        };
+        if let Some((r, a, p, t, w, notes)) = &self.stacked_note_layout
+            && *r == revision
+            && *a == active
+            && *p == path
+            && *t == theme_revision
+            && *w == width
+        {
+            return notes.clone();
+        }
         let layout = self.current_layout(width);
 
         // Resolve every borrow into a plain local first: a `Ref` from
@@ -1544,12 +1909,15 @@ impl Shell {
         let wanted: Vec<(f32, f32)> = laid.iter().map(|(layout, y)| (*y, layout.height)).collect();
         let ys = sidenotes::stack(&wanted, sidenotes::GAP);
 
-        anchored
+        let notes: Vec<_> = anchored
             .into_iter()
             .zip(laid)
             .zip(ys)
             .map(|(((label, number, _), (layout, _)), y)| (label, number, y, layout))
-            .collect()
+            .collect();
+        self.stacked_note_layout =
+            Some((revision, active, path, theme_revision, width, notes.clone()));
+        notes
     }
 
     /// The margin's notes as components. The focused note — the one whose
@@ -1587,8 +1955,13 @@ impl Shell {
 
     /// Rebuilds the view regions (tab strip, breadcrumb, editor, status
     /// line) from a live snapshot. Called when [`Tabs::revision`] moves, and
-    /// after the picker swaps the vault.
+    /// after the picker swaps the vault. It repaints; it does not move the
+    /// page — see [`ViewUpdate::ALL`].
     fn rebuild_views(&mut self) {
+        self.rebuild_views_with(ViewUpdate::ALL);
+    }
+
+    fn rebuild_views_with(&mut self, update: ViewUpdate) {
         // The fresh layout first: `ensure_caret_visible` below reads it.
         let width = Editor::content_width(self.layout.rect(self.text_column));
         let _ = self.current_layout(width);
@@ -1612,50 +1985,63 @@ impl Shell {
                 ),
             )
         };
-        if caret_key != self.followed {
+        if update.follow_caret || caret_key != self.followed {
+            // A different document under the same offset is not travel:
+            // gliding would smear one page's scroll across another's
+            // content, which reads as the wrong file scrolling.
+            let switched = caret_key.0 != self.followed.0;
             self.followed = caret_key;
             self.ensure_caret_visible();
+            if switched {
+                self.scroll.settle(self.scroll.target());
+            }
             // A caret being moved or typed at should read as steady, not
             // strobing — restarting snaps the blink to weight 0, which
             // `Context::caret_on` reads as solid-on, for a full half-cycle.
             self.caret.restart();
         }
 
-        let (tabs, active) = {
-            let docs = self.docs.borrow();
-            let tabs = docs
-                .tabs
+        if update.tabs {
+            let (tabs, active) = {
+                let docs = self.docs.borrow();
+                let tabs = docs
+                    .tabs
+                    .iter()
+                    .map(|tab| TabView {
+                        name: tab.name().to_string(),
+                        preview: tab.preview,
+                        unsaved: tab.document.is_dirty(),
+                    })
+                    .collect();
+                (tabs, docs.active_index())
+            };
+            self.regions[self.tab_region].set_component(Box::new(TabStrip::new(
+                self.docs.clone(),
+                tabs,
+                active,
+            )));
+        }
+
+        if update.breadcrumb {
+            let crumb = self.crumb();
+            self.regions[self.breadcrumb_region].set_component(Box::new(Breadcrumb::new(crumb)));
+        }
+
+        if update.topics {
+            let caret_block = {
+                let docs = self.docs.borrow();
+                docs.active()
+                    .map(|tab| tab.document.caret.block)
+                    .unwrap_or(0)
+            };
+            let nodes = self.outline();
+            let active = outline::active(&nodes, caret_block).unwrap_or(0);
+            let entries = nodes
                 .iter()
-                .map(|tab| TabView {
-                    name: tab.name().to_string(),
-                    preview: tab.preview,
-                    unsaved: tab.document.is_dirty(),
-                })
+                .map(|node| Entry::new(&node.number, &node.text, node.depth))
                 .collect();
-            (tabs, docs.active_index())
-        };
-        self.regions[self.tab_region].set_component(Box::new(TabStrip::new(
-            self.docs.clone(),
-            tabs,
-            active,
-        )));
-
-        let crumb = self.crumb();
-        self.regions[self.breadcrumb_region].set_component(Box::new(Breadcrumb::new(crumb)));
-
-        let caret_block = {
-            let docs = self.docs.borrow();
-            docs.active()
-                .map(|tab| tab.document.caret.block)
-                .unwrap_or(0)
-        };
-        let nodes = self.outline();
-        let active = outline::active(&nodes, caret_block).unwrap_or(0);
-        let entries = nodes
-            .iter()
-            .map(|node| Entry::new(&node.number, &node.text, node.depth))
-            .collect();
-        self.regions[self.topics_region].set_component(Box::new(Topics::new(entries, active)));
+            self.regions[self.topics_region].set_component(Box::new(Topics::new(entries, active)));
+        }
 
         // The badge and the caret shape both read peripherally, so both get
         // a colour/shape pair rather than just a label.
@@ -1679,84 +2065,96 @@ impl Shell {
             context_line
         };
 
-        let (editor, status) = {
-            // The layout cache is fresh from the top of this function; grab
-            // the shared `Rc` before borrowing the tabs.
-            let width = Editor::content_width(self.layout.rect(self.text_column));
-            let layout = self.current_layout(width);
-            let scroll = self.docs.borrow().editor_scroll;
-            let mut docs = self.docs.borrow_mut();
-            match docs.active_mut() {
-                Some(tab) => {
-                    let caret = tab.document.caret;
-                    // The page draws the caret only while the body is focused;
-                    // when a note is focused the caret is note-relative and the
-                    // focused note's editor draws it instead.
-                    let page_caret = match tab.document.focus {
-                        Focus::Body => Some(caret),
-                        Focus::Note(_) => None,
-                    };
-                    let math_path = if tab.document.math.is_some() {
-                        let mut path = vec!["math"];
-                        path.extend(tab.document.math_path_names());
-                        path.join(" › ")
-                    } else {
-                        String::new()
-                    };
-                    let math = tab.document.math.clone();
-                    (
-                        Editor::new(
-                            layout,
-                            page_caret,
-                            scroll,
-                            block_caret,
-                            caret.style,
-                            editor::Metrics::PAGE,
-                        )
-                        .with_math(math)
-                        .with_math_selection(math_selection)
-                        .with_context_selections(self.brush_selected.clone(), self.brush_point)
-                        .with_selection(selection, line_selection),
-                        StatusLine::new(
-                            mode_label,
-                            mode_color,
-                            tab.name().to_string(),
+        if update.editor || update.status {
+            let (editor, status) = {
+                // The layout cache is fresh from the top of this function; grab
+                // the shared `Rc` before borrowing the tabs.
+                let width = Editor::content_width(self.layout.rect(self.text_column));
+                let layout = self.current_layout(width);
+                let scroll = self.docs.borrow().editor_scroll;
+                let mut docs = self.docs.borrow_mut();
+                match docs.active_mut() {
+                    Some(tab) => {
+                        let caret = tab.document.caret;
+                        // The page draws the caret only while the body is focused;
+                        // when a note is focused the caret is note-relative and the
+                        // focused note's editor draws it instead.
+                        let page_caret = match tab.document.focus {
+                            Focus::Body => Some(caret),
+                            Focus::Note(_) => None,
+                        };
+                        let math_path = if tab.document.math.is_some() {
+                            let mut path = vec!["math"];
+                            path.extend(tab.document.math_path_names());
+                            path.join(" › ")
+                        } else {
+                            String::new()
+                        };
+                        let math = tab.document.math.clone();
+                        let saved = self.save_error.clone().unwrap_or_else(|| {
                             if tab.document.is_dirty() {
                                 "unsaved changes".into()
                             } else {
                                 "saved".into()
-                            },
-                            format!("{} words", tab.document.word_count()),
-                            self.show_stats,
-                            command.clone(),
+                            }
+                        });
+                        (
+                            Editor::new(
+                                layout,
+                                page_caret,
+                                scroll,
+                                block_caret,
+                                caret.style,
+                                editor::Metrics::PAGE,
+                            )
+                            .with_math(math)
+                            .with_math_selection(math_selection)
+                            .with_context_selections(self.brush_selected.clone(), self.brush_point)
+                            .with_selection(selection, line_selection),
+                            StatusLine::new(
+                                mode_label,
+                                mode_color,
+                                tab.name().to_string(),
+                                saved,
+                                format!("{} words", tab.document.word_count()),
+                                self.show_stats,
+                                command.clone(),
+                            )
+                            .with_math_path(math_path),
                         )
-                        .with_math_path(math_path),
-                    )
-                }
-                None => (
-                    Editor::placeholder(),
-                    StatusLine::new(
-                        mode_label,
-                        mode_color,
-                        "no file open".into(),
-                        String::new(),
-                        String::new(),
-                        self.show_stats,
-                        command,
+                    }
+                    None => (
+                        Editor::placeholder(),
+                        StatusLine::new(
+                            mode_label,
+                            mode_color,
+                            "no file open".into(),
+                            String::new(),
+                            String::new(),
+                            self.show_stats,
+                            command,
+                        ),
                     ),
-                ),
+                }
+            };
+            if update.editor {
+                self.regions[self.text_region]
+                    .set_component(Box::new(editor.with_glow(self.glow.clone())));
             }
-        };
-        self.regions[self.text_region].set_component(Box::new(editor.with_glow(self.glow.clone())));
-        self.regions[self.status_region].set_component(Box::new(status));
+            if update.status {
+                self.regions[self.status_region].set_component(Box::new(status));
+            }
+        }
 
-        let sidenote_notes = self.sidenote_notes();
-        let scroll = self.docs.borrow().editor_scroll;
-        self.regions[self.sidenote_region].set_component(Box::new(SidenoteMargin::new(
-            sidenote_notes,
-            editor::TOP,
-            scroll,
-        )));
+        if update.sidenotes {
+            let sidenote_notes = self.sidenote_notes();
+            let scroll = self.docs.borrow().editor_scroll;
+            self.regions[self.sidenote_region].set_component(Box::new(SidenoteMargin::new(
+                sidenote_notes,
+                editor::TOP,
+                scroll,
+            )));
+        }
     }
 }
 
@@ -1830,9 +2228,24 @@ fn dragged_width(rect: Rect, mouse_x: f32, from_right: bool) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AUTOSAVE_IDLE, autosave_due, dragged_width, grab_zone};
+    use super::{AUTOSAVE_IDLE, ViewUpdate, autosave_due, dragged_width, grab_zone};
     use crate::layout::Rect;
     use std::time::{Duration, Instant};
+
+    /// A popup opening, a save, a repaint after the palette moved: all of
+    /// them ask for a full rebuild, and none of them touched the caret. If
+    /// a rebuild chased the caret, the reader who had scrolled away from it
+    /// would be thrown back to it the moment a menu appeared.
+    #[test]
+    fn a_full_rebuild_redraws_everything_without_moving_the_page() {
+        let all = ViewUpdate::ALL;
+        assert!(all.tabs && all.breadcrumb && all.topics);
+        assert!(all.editor && all.status && all.sidenotes);
+        assert!(
+            !all.follow_caret,
+            "a rebuild repaints; only a moved camera follows the caret"
+        );
+    }
 
     #[test]
     fn an_edit_restarts_the_idle_clock() {

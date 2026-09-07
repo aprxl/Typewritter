@@ -12,7 +12,7 @@
 pub struct FontParameters {
     /// Font size in physical pixels.
     pub size: f32,
-    /// Faux-bold strength: swash `embolden` outline expansion. `0.0` is
+    /// Faux-bold strength: filled outline plus a centered stroke. `0.0` is
     /// normal weight; larger values are progressively bolder. Continuous,
     /// not a discrete set of weight steps.
     pub weight: f32,

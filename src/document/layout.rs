@@ -22,8 +22,8 @@ use crate::theme::{self, TextStyle};
 
 /// Visual line heights, in logical pixels.
 pub const LINE_BODY: f32 = 30.0;
-pub const LINE_H1: f32 = 42.0;
-pub const LINE_H2: f32 = 36.0;
+pub const LINE_H1: f32 = 50.0;
+pub const LINE_H2: f32 = 38.0;
 pub const LINE_H3: f32 = 32.0;
 pub const LINE_H4: f32 = 30.0;
 /// The band a rule occupies. Deliberately shorter than a body line: a rule
@@ -47,9 +47,9 @@ pub const GAP_PARAGRAPH: f32 = 14.0;
 /// top of [`MATH_PAD`], which is the breathing room *inside* the block.
 pub const GAP_MATH: f32 = 24.0;
 /// Space *above* a heading (the first block gets none).
-pub const GAP_HEADING: f32 = 26.0;
+pub const GAP_HEADING: f32 = 30.0;
 /// Space below a heading.
-pub const GAP_AFTER_HEADING: f32 = 8.0;
+pub const GAP_AFTER_HEADING: f32 = 12.0;
 /// Space below a rule — tighter than a paragraph's, for the same reason.
 pub const GAP_DIVIDER: f32 = 8.0;
 /// Space below a list item that has another item right after it — tighter
@@ -193,6 +193,7 @@ pub struct DocLayout {
     /// A snapshot of the source blocks, so the editor can index a visual
     /// block back to its kind and runs without holding the live document.
     pub source: Vec<Block>,
+    pub code_colors: Vec<Vec<Option<super::code::Ink>>>,
     /// Each sidenote anchor, in document order, with its derived number and
     /// the y of the line it sits on. Nothing stores these — like the heading
     /// outline, they are derived from position so a number can never
@@ -224,6 +225,7 @@ pub enum RangeKind {
     Badge,
     InlineCode,
     CodeBlock,
+    CodeWord,
 }
 
 /// The font a run renders with. Body is serif 17.5; headings are serif at
@@ -245,18 +247,18 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
         .tracked(0.1);
     }
     let mut base = match kind {
-        Block::Heading { level, .. } => TextStyle::serif(
+        Block::Heading { level, .. } => TextStyle::sans(
             match level {
-                1 => 24.0,
-                2 => 21.0,
-                3 => 18.5,
+                1 => 30.0,
+                2 => 23.0,
+                3 => 19.0,
                 _ => 17.5,
             } * scale,
             theme::ink(),
         )
         .bold(),
         Block::Paragraph(_) | Block::Divider(_) | Block::Math { .. } => {
-            TextStyle::serif(17.5 * scale, theme::ink())
+            TextStyle::sans(17.5 * scale, theme::ink())
         }
         // A done task's text is dimmed: the drawn strike through it says
         // "done", the muted ink says "past tense". Together they quiet the
@@ -264,8 +266,8 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
         Block::ListItem {
             marker: ListMarker::Task { done: true },
             ..
-        } => TextStyle::serif(17.5 * scale, theme::dim()),
-        Block::ListItem { .. } => TextStyle::serif(17.5 * scale, theme::ink()),
+        } => TextStyle::sans(17.5 * scale, theme::dim()),
+        Block::ListItem { .. } => TextStyle::sans(17.5 * scale, theme::ink()),
         Block::CodeLine { .. } => TextStyle::mono(17.5 * scale, theme::ink()),
     };
     if style.bold {
@@ -281,7 +283,7 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
 /// auto-number and the colour is the accent, so an anchor reads as "this
 /// opens something" rather than as a word in the sentence.
 pub fn anchor_style() -> TextStyle {
-    TextStyle::serif(ANCHOR_SIZE, theme::accent())
+    TextStyle::sans(ANCHOR_SIZE, theme::accent())
 }
 
 /// The ink an inline equation reference draws with. Resolved, it takes the
@@ -291,7 +293,7 @@ pub fn anchor_style() -> TextStyle {
 /// a number.
 pub fn eq_ref_style(display: &str, scale: f32) -> TextStyle {
     if display.starts_with('(') {
-        TextStyle::serif(17.5 * scale, theme::accent())
+        TextStyle::sans(17.5 * scale, theme::accent())
     } else {
         TextStyle::mono(theme::BADGE_SIZE * scale, theme::comment())
     }
@@ -749,6 +751,7 @@ pub fn layout_blocks(
     DocLayout {
         blocks: laid,
         source: blocks.to_vec(),
+        code_colors: super::code::colors(blocks),
         height: y,
         scale,
         anchors,
@@ -804,7 +807,32 @@ fn segment_text(run: &Inline, segment: &Segment) -> String {
         .collect()
 }
 
-/// The char index (block-flat) that a segment covers up to, exclusive.
+/// Bounds of the contiguous code span, independent of color-run boundaries.
+fn code_span_bounds(block: &Block, inline: usize) -> (usize, usize) {
+    if block.is_code() {
+        return (0, block_flat_len(block));
+    }
+    let runs = block.inlines();
+    let mut first = inline;
+    let mut last = inline + 1;
+    while first > 0 && runs[first - 1].style().code {
+        first -= 1;
+    }
+    while last < runs.len() && runs[last].style().code {
+        last += 1;
+    }
+    let start = runs[..first]
+        .iter()
+        .map(|run| run_text(run).chars().count())
+        .sum();
+    let end = runs[..last]
+        .iter()
+        .map(|run| run_text(run).chars().count())
+        .sum();
+    (start, end)
+}
+
+/// Character count of a block, counting opaque atoms as one.
 fn block_flat_len(block: &Block) -> usize {
     block
         .inlines()
@@ -1241,8 +1269,11 @@ impl DocLayout {
         let line = &layout_block.lines[line_idx];
         let block = &self.source[block_idx];
         let x = x - line.x;
+        if block.is_code() && block_flat_len(block) == 0 {
+            return Some(self.code_block_target(block_idx));
+        }
 
-        if block.is_code() {
+        if block.is_code() && !block.inlines()[0].style().syntax.manual {
             let mut first = block_idx;
             while first > 0
                 && matches!(
@@ -1309,7 +1340,7 @@ impl DocLayout {
                         kind: RangeKind::Badge,
                     });
                 }
-                if segment.style.code {
+                if segment.style.code && !segment.style.syntax.manual {
                     return Some(ContextHit::Range {
                         range: whole_run,
                         kind: RangeKind::InlineCode,
@@ -1329,7 +1360,20 @@ impl DocLayout {
                     .chars()
                     .nth(within_segment)
                     .expect("segment length matches segment text");
-                if !ch.is_alphanumeric() && ch != '_' {
+                if ch.is_whitespace() && segment.style.code && segment.style.syntax.manual {
+                    return Some(if block.is_code() {
+                        self.code_block_target(block_idx)
+                    } else {
+                        ContextHit::Range {
+                            range: whole_run,
+                            kind: RangeKind::InlineCode,
+                        }
+                    });
+                }
+                if !ch.is_alphanumeric()
+                    && ch != '_'
+                    && !(segment.style.code && segment.style.syntax.manual && !ch.is_whitespace())
+                {
                     return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
                 }
                 let chars: Vec<char> = block
@@ -1337,12 +1381,23 @@ impl DocLayout {
                     .iter()
                     .flat_map(|run| run_text(run).chars())
                     .collect();
+                let (lower, upper) = if segment.style.code {
+                    code_span_bounds(block, segment.inline)
+                } else {
+                    (0, chars.len())
+                };
                 let mut start = clicked;
-                while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+                while (ch.is_alphanumeric() || ch == '_')
+                    && start > lower
+                    && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_')
+                {
                     start -= 1;
                 }
                 let mut end = clicked + 1;
-                while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                while (ch.is_alphanumeric() || ch == '_')
+                    && end < upper
+                    && (chars[end].is_alphanumeric() || chars[end] == '_')
+                {
                     end += 1;
                 }
                 return Some(ContextHit::Range {
@@ -1356,7 +1411,11 @@ impl DocLayout {
                             offset: end,
                         },
                     ),
-                    kind: RangeKind::Word,
+                    kind: if segment.style.code {
+                        RangeKind::CodeWord
+                    } else {
+                        RangeKind::Word
+                    },
                 });
             }
             advance_x += width;
@@ -1382,7 +1441,7 @@ impl DocLayout {
 
         for (block_idx, layout_block) in self.blocks.iter().enumerate() {
             let block = &self.source[block_idx];
-            if block.is_code() {
+            if block.is_code() && !block.inlines()[0].style().syntax.manual {
                 let target = self.code_block_target(block_idx);
                 for line in &layout_block.lines {
                     if circle_intersects_rect(
@@ -1491,7 +1550,7 @@ impl DocLayout {
                                     },
                                 );
                             }
-                        } else if segment.style.code {
+                        } else if segment.style.code && !segment.style.syntax.manual {
                             if circle_intersects_rect(
                                 point,
                                 radius,
@@ -1515,7 +1574,9 @@ impl DocLayout {
                                     &ch.to_string(),
                                     &text_style(block, segment.style, self.scale),
                                 );
-                                if (ch.is_alphanumeric() || ch == '_')
+                                if (ch.is_alphanumeric()
+                                    || ch == '_'
+                                    || (segment.style.code && !ch.is_whitespace()))
                                     && circle_intersects_rect(
                                         point,
                                         radius,
@@ -1526,15 +1587,22 @@ impl DocLayout {
                                     )
                                 {
                                     let clicked = run_start + segment.start + within_segment;
+                                    let (lower, upper) = if segment.style.code {
+                                        code_span_bounds(block, segment.inline)
+                                    } else {
+                                        (0, chars.len())
+                                    };
                                     let mut start = clicked;
-                                    while start > 0
+                                    while (ch.is_alphanumeric() || ch == '_')
+                                        && start > lower
                                         && (chars[start - 1].is_alphanumeric()
                                             || chars[start - 1] == '_')
                                     {
                                         start -= 1;
                                     }
                                     let mut end = clicked + 1;
-                                    while end < chars.len()
+                                    while (ch.is_alphanumeric() || ch == '_')
+                                        && end < upper
                                         && (chars[end].is_alphanumeric() || chars[end] == '_')
                                     {
                                         end += 1;
@@ -1552,7 +1620,11 @@ impl DocLayout {
                                                     offset: end,
                                                 },
                                             ),
-                                            kind: RangeKind::Word,
+                                            kind: if segment.style.code {
+                                                RangeKind::CodeWord
+                                            } else {
+                                                RangeKind::Word
+                                            },
                                         },
                                     );
                                 }
@@ -2598,7 +2670,7 @@ mod tests {
             fake_measure(text, style)
         };
         layout(&d, 300.0, &check);
-        assert_eq!(seen.get(), Some(24.0), "H1 text is measured at size 24");
+        assert_eq!(seen.get(), Some(30.0), "H1 text is measured at size 30");
         // The heading weight should be bold.
         let h1_style = text_style(&d.body()[0], Style::PLAIN, 1.0);
         assert!(h1_style.weight > 0.0, "headings are always bold");

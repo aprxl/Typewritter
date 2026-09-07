@@ -6,12 +6,13 @@
 //! colour past the frame it drew with it — [`set`] swaps the palette and
 //! every call site picks the new value up on its next read.
 //!
-//! Palettes are transcribed from `~/.dev/Guara/COLOR.md`; the role names are
-//! that document's, so a value here can be checked against it directly.
+//! Studio pairs chalk and mulberry surfaces with a warm coral focus accent.
+//! Inter is embedded, so UI and prose have the same metrics on every OS.
 
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
 use crate::document::BadgeColor;
+use crate::document::math_style::MathHue;
 use crate::layout::Rect;
 use crate::renderer::{
     Alignment, Color, Font, FontParameters, GradientDirection, HorizontalAlign, Layer, LineCap,
@@ -47,177 +48,137 @@ pub struct Theme {
     /// guessing from a luminance threshold.
     pub mode: Mode,
 
-    // -- Surfaces --
-    /// The page itself.
+    // Surfaces, from the document to the surrounding chrome and floating cards.
     pub background: Color,
-    /// Panels that sit behind the page (Guara's gutter): the tree, topics,
-    /// the title bar, the status line.
     pub panel: Color,
-    /// A card floating *over* the page — the palette, the dialogs, the
-    /// menus. The same value as `panel` in Guara, a lighter one in Noir,
-    /// where a card that dropped to the gutter's value would sink into the
-    /// window instead of lifting off the page.
     pub popup: Color,
-    /// Cursor line / alternate background — also the math slot fill.
     pub alt: Color,
-    /// Chrome / statusline. Lighter than `panel`: the tab strip and
-    /// breadcrumb.
     pub chrome: Color,
     pub selection: Color,
-    /// Behind code, inline and fenced. A clear step down from `background` —
-    /// the boundary of a code span has to read at a glance, since nothing
-    /// else marks it.
     pub code: Color,
-    /// Behind a display math block. A sibling of `code` rather than the same
-    /// tint: both are slabs of machinery on a page of prose, and telling one
-    /// from the other at a glance is the whole point of tinting them at all.
-    /// Cooler and greyer than code's warm tan, which is what separates them
-    /// without introducing a colour the palette does not already live in.
-    ///
-    /// Read it through [`math_surface`] — `math` alone is the notation font.
     pub math: Color,
     pub border: Color,
 
-    // -- Badges and highlights --
-    /// A badge's label and its outline share one colour, as in the design —
-    /// the box is a hairline, not a filled tag.
+    // Document annotations and mathematical roles.
     pub badge_ink: Color,
     pub badge_blue: Color,
     pub badge_green: Color,
     pub badge_purple: Color,
-    /// Underline highlight. Drawn as a bar *below* the text rather than a
-    /// wash behind it, so the glyphs keep the page's own contrast.
     pub highlight: Color,
-    /// Saturated role colours behind resolved mathematical symbols. They sit
-    /// outside the page's warm surface palette so semantic tokens stand out.
-    pub variable: Color,
-    pub constant: Color,
-    pub function: Color,
-    /// Quietest ink that is still ink: dates, hints, disabled glyphs.
-    pub faint: Color,
-    /// Non-text: separators inside a line of type, empty-slot outlines.
-    pub non_text: Color,
+    /// The ink a numeral is set in. Numbers are quantities, not names, and
+    /// reading one is a different act from reading a variable — so they get
+    /// an ink of their own rather than borrowing the prose's.
+    pub math_number: Color,
+    /// The ink an operator, relation, or piece of punctuation is set in.
+    /// Quieter than [`Self::ink`] on purpose: `+` and `=` are the grammar
+    /// of an expression, and grammar should not compete with the terms it
+    /// joins.
+    pub math_operator: Color,
+    /// The identity washes behind symbols, in [`MathHue::ALL`] order. Fills
+    /// only — an outline is derived from its fill by [`Theme::shade`], so a
+    /// border can never drift off the hue it belongs to.
+    pub math_hues: [Color; MathHue::ALL.len()],
 
-    // -- Foreground --
+    // Text and non-text hierarchy.
+    pub faint: Color,
+    pub non_text: Color,
     pub ink: Color,
     pub dim: Color,
     pub comment: Color,
 
-    // -- Semantic accents (Guara's syntax hues, reused as UI roles) --
-    /// Keyword orange: the one loud colour. Mode badge, active markers,
-    /// caret.
+    // Interaction and state.
     pub accent: Color,
-    /// Type orange, a shade deeper: structural annotations.
     pub structure: Color,
-    /// Function green: things that are healthy or live.
     pub live: Color,
-    /// Global teal — the deliberate cool outlier in a warm palette.
     pub cool: Color,
     pub warning: Color,
 }
 
 impl Theme {
-    /// Guara light. Kept whole and current, but nothing loads it yet — the
-    /// application starts on [`Theme::NOIR`], and choosing between them is
-    /// its own piece of work.
+    /// Studio Chalk: warm paper, lavender surroundings, coral gestures.
     pub const LIGHT: Self = Self {
         mode: Mode::Light,
-        background: Color::rgb(0xF8, 0xED, 0xD0),
-        panel: Color::rgb(0xF0, 0xE3, 0xBE),
-        // Guara draws a float on the gutter's colour; only Noir splits them.
-        popup: Color::rgb(0xF0, 0xE3, 0xBE),
-        alt: Color::rgb(0xEF, 0xE0, 0xA8),
-        chrome: Color::rgb(0xFA, 0xF1, 0xDB),
-        selection: Color::rgb(0xD2, 0xB2, 0x6E),
-        code: Color::rgb(0xD9, 0xC9, 0x9E),
-        math: Color::rgb(0xD5, 0xCD, 0xB4),
-        border: Color::rgb(0xDD, 0xD0, 0xA0),
-        // The design gives a badge the structural orange rather than an ink
-        // of its own; the two entries carrying one value is that, written out.
-        badge_ink: Color::rgb(0xA8, 0x4C, 0x00),
-        badge_blue: Color::rgb(0x1F, 0x70, 0xA0),
-        badge_green: Color::rgb(0x3E, 0x7D, 0x59),
-        badge_purple: Color::rgb(0x7B, 0x52, 0xA0),
-        highlight: Color::rgb(0xE0, 0xA8, 0x2C),
-        variable: Color::rgb(0x6E, 0x9A, 0xF5),
-        constant: Color::rgb(0xEE, 0x91, 0x45),
-        function: Color::rgb(0x65, 0xB8, 0x78),
-        faint: Color::rgb(0xA0, 0x91, 0x83),
-        non_text: Color::rgb(0xC4, 0xB7, 0x9E),
-        ink: Color::rgb(0x3C, 0x38, 0x36),
-        dim: Color::rgb(0x7C, 0x6F, 0x64),
-        comment: Color::rgb(0x92, 0x83, 0x74),
-        accent: Color::rgb(0xC2, 0x4F, 0x1A),
-        structure: Color::rgb(0xA8, 0x4C, 0x00),
-        live: Color::rgb(0x3E, 0x7D, 0x59),
-        cool: Color::rgb(0x0D, 0x66, 0x78),
-        warning: Color::rgb(0xB0, 0x7B, 0x18),
+        background: Color::rgb(0xFB, 0xF9, 0xF6),
+        panel: Color::rgb(0xEF, 0xEB, 0xF0),
+        popup: Color::rgb(0xFD, 0xFB, 0xF8),
+        alt: Color::rgb(0xF3, 0xEC, 0xEE),
+        chrome: Color::rgb(0xF5, 0xF1, 0xF3),
+        selection: Color::rgb(0xEE, 0xDB, 0xD9),
+        code: Color::rgb(0xEE, 0xE8, 0xEF),
+        math: Color::rgb(0xF0, 0xEA, 0xF2),
+        border: Color::rgb(0xDE, 0xD5, 0xE0),
+        badge_ink: Color::rgb(0xA6, 0x55, 0x32),
+        badge_blue: Color::rgb(0x4E, 0x6D, 0x9F),
+        badge_green: Color::rgb(0x35, 0x76, 0x6A),
+        badge_purple: Color::rgb(0x84, 0x5A, 0x9E),
+        highlight: Color::rgb(0xDB, 0xAA, 0x52),
+        math_number: Color::rgb(0x4A, 0x5C, 0x91),
+        math_operator: Color::rgb(0x7D, 0x6E, 0x85),
+        math_hues: [
+            Color::rgb(0xF5, 0xDC, 0xDD),
+            Color::rgb(0xF8, 0xDF, 0xCF),
+            Color::rgb(0xF3, 0xE6, 0xC6),
+            Color::rgb(0xE4, 0xEB, 0xC9),
+            Color::rgb(0xD3, 0xEA, 0xD8),
+            Color::rgb(0xCC, 0xE8, 0xE5),
+            Color::rgb(0xD5, 0xE4, 0xF1),
+            Color::rgb(0xDC, 0xDC, 0xF0),
+            Color::rgb(0xE7, 0xD9, 0xF0),
+            Color::rgb(0xF4, 0xD8, 0xE7),
+        ],
+        faint: Color::rgb(0x81, 0x71, 0x84),
+        non_text: Color::rgb(0xC1, 0xAF, 0xBF),
+        ink: Color::rgb(0x35, 0x2B, 0x3B),
+        dim: Color::rgb(0x6D, 0x5C, 0x72),
+        comment: Color::rgb(0x82, 0x71, 0x87),
+        accent: Color::rgb(0xB8, 0x4F, 0x48),
+        structure: Color::rgb(0x92, 0x64, 0x88),
+        live: Color::rgb(0x44, 0x81, 0x6C),
+        cool: Color::rgb(0x85, 0x61, 0x8D),
+        warning: Color::rgb(0xA7, 0x71, 0x31),
     };
 
-    /// Guara Noir, and what the application currently loads.
-    ///
-    /// Every entry the palette document names is transcribed from its NOIR
-    /// column. Five roles are the application's own — the code and math
-    /// slabs, the three math-symbol pills, the purple badge — and the
-    /// document's rule for those is stated at the top of it: *semantic hues
-    /// are constant across variants; only brightness and surface shift*.
-    /// Each is that, and nothing more inventive: the light entry's hue,
-    /// moved to the other side of the page. Each carries its working below.
-    pub const NOIR: Self = Self {
+    /// Studio Mulberry: plum-black surfaces and apricot light.
+    pub const DARK: Self = Self {
         mode: Mode::Dark,
-        background: Color::rgb(0x1B, 0x17, 0x14),
-        panel: Color::rgb(0x14, 0x11, 0x10),
-        popup: Color::rgb(0x22, 0x1D, 0x18),
-        alt: Color::rgb(0x3C, 0x38, 0x36),
-        // Noir gives chrome the gutter's value, so the title bar, the tab
-        // strip, and the side panels are one dark surround and the page is
-        // the lighter thing inside it. `border` is what separates them, and
-        // in Noir it is darker than either.
-        chrome: Color::rgb(0x14, 0x11, 0x10),
-        // The one entry with an alpha: Noir selects by laying a warm veil
-        // over the line rather than replacing its background, so a
-        // selection over a highlight still shows the highlight. The hex is
-        // the document's `#B7B09884` — its prose says ~72% next to an alpha
-        // byte that reads 52%, and the byte is the part that was shipped.
-        selection: Color::rgba(0xB7, 0xB0, 0x98, 0x84),
-        // Light drops the code slab a clear step *below* the page; Noir
-        // lifts it the same step above, at the same warm hue and the lower
-        // saturation a dark surface needs to read as the same tint. Lands
-        // in the register Noir's own washes use (diff-change is `#2E2A1A`).
-        code: Color::rgb(0x33, 0x2C, 0x22),
-        // Code's hue, greyed — the same separation the two carry in light,
-        // where math is code's tint with the tan taken out of it.
-        math: Color::rgb(0x2F, 0x2E, 0x2B),
-        border: Color::rgb(0x0D, 0x0B, 0x09),
-        badge_ink: Color::rgb(0xFF, 0x97, 0x42),
-        badge_blue: Color::rgb(0x13, 0x94, 0xAF),
-        badge_green: Color::rgb(0x58, 0xAF, 0x7D),
-        // The one badge with no role in the document. Light's violet, lifted
-        // to the same contrast against the page that it has against Guara's
-        // (4.9:1) — the hue is untouched at 271°.
-        badge_purple: Color::rgb(0xA2, 0x78, 0xC9),
-        // Noir's search highlight is a background wash; this is a bar drawn
-        // under the text, with a glow over it, so a wash's value would leave
-        // both invisible. It takes the gold Noir does carry — annotation.
-        highlight: Color::rgb(0xC2, 0x87, 0x1A),
-        // The three pills sit *behind* math glyphs, which are drawn in
-        // `ink` — so on a dark page they darken rather than brighten, or the
-        // cream glyph on top stops reading. Each keeps its light hue
-        // (cornflower 223°, orange 26°, green 135°) at the contrast light
-        // holds against its own ink, ~5:1.
-        variable: Color::rgb(0x47, 0x60, 0x9F),
-        constant: Color::rgb(0x8F, 0x4E, 0x1D),
-        function: Color::rgb(0x2E, 0x6B, 0x3D),
-        faint: Color::rgb(0x92, 0x83, 0x74),
-        non_text: Color::rgb(0x36, 0x2C, 0x26),
-        ink: Color::rgb(0xF0, 0xE4, 0xC2),
-        dim: Color::rgb(0xCC, 0xBB, 0x9E),
-        comment: Color::rgb(0x92, 0x83, 0x74),
-        accent: Color::rgb(0xC0, 0x5B, 0x2D),
-        structure: Color::rgb(0xFF, 0x97, 0x42),
-        live: Color::rgb(0x58, 0xAF, 0x7D),
-        cool: Color::rgb(0x13, 0x94, 0xAF),
-        warning: Color::rgb(0xB5, 0x76, 0x14),
+        background: Color::rgb(0x27, 0x21, 0x2C),
+        panel: Color::rgb(0x1C, 0x18, 0x21),
+        popup: Color::rgb(0x35, 0x2C, 0x3C),
+        alt: Color::rgb(0x32, 0x29, 0x37),
+        chrome: Color::rgb(0x23, 0x1D, 0x2A),
+        selection: Color::rgb(0x51, 0x37, 0x40),
+        code: Color::rgb(0x33, 0x2A, 0x3A),
+        math: Color::rgb(0x30, 0x29, 0x39),
+        border: Color::rgb(0x3D, 0x31, 0x44),
+        badge_ink: Color::rgb(0xEA, 0xB8, 0x82),
+        badge_blue: Color::rgb(0xAB, 0xC0, 0xDF),
+        badge_green: Color::rgb(0x97, 0xC8, 0xB4),
+        badge_purple: Color::rgb(0xCF, 0xAB, 0xD9),
+        highlight: Color::rgb(0xD5, 0xAB, 0x63),
+        math_number: Color::rgb(0xA6, 0xB4, 0xE4),
+        math_operator: Color::rgb(0xAC, 0x98, 0xB3),
+        math_hues: [
+            Color::rgb(0x52, 0x31, 0x38),
+            Color::rgb(0x57, 0x3A, 0x2F),
+            Color::rgb(0x50, 0x44, 0x2C),
+            Color::rgb(0x3F, 0x49, 0x30),
+            Color::rgb(0x2C, 0x4B, 0x3C),
+            Color::rgb(0x28, 0x49, 0x4B),
+            Color::rgb(0x32, 0x44, 0x58),
+            Color::rgb(0x3B, 0x3A, 0x5C),
+            Color::rgb(0x48, 0x35, 0x56),
+            Color::rgb(0x52, 0x30, 0x49),
+        ],
+        faint: Color::rgb(0xA1, 0x8B, 0xA5),
+        non_text: Color::rgb(0x66, 0x51, 0x6E),
+        ink: Color::rgb(0xF0, 0xE8, 0xEA),
+        dim: Color::rgb(0xC3, 0xB0, 0xC7),
+        comment: Color::rgb(0xA4, 0x8F, 0xA9),
+        accent: Color::rgb(0xF0, 0xA0, 0x88),
+        structure: Color::rgb(0xD5, 0xAB, 0xC6),
+        live: Color::rgb(0x98, 0xC7, 0xAE),
+        cool: Color::rgb(0xD2, 0xB0, 0xDC),
+        warning: Color::rgb(0xE7, 0xBD, 0x7B),
     };
 
     /// The built-in palette for `mode`. The pair the switch flips between,
@@ -225,8 +186,42 @@ impl Theme {
     pub const fn of(mode: Mode) -> Self {
         match mode {
             Mode::Light => Self::LIGHT,
-            Mode::Dark => Self::NOIR,
+            Mode::Dark => Self::DARK,
         }
+    }
+
+    /// The wash behind a symbol carrying `hue`.
+    pub fn math_fill(&self, hue: MathHue) -> Color {
+        self.math_hues[hue as usize].clone()
+    }
+
+    /// The border around a symbol carrying `hue`: its own fill, shaded.
+    pub fn math_edge(&self, hue: MathHue) -> Color {
+        let index = usize::from(self.mode == Mode::Dark);
+        self.shade(self.math_fill(hue), EDGE_STEP[index], EDGE_CHROMA[index])
+    }
+
+    /// The same colour, pushed `step` away from *this palette's* page and
+    /// `chroma` times as saturated: darker on a light appearance, lighter
+    /// on a dark one.
+    ///
+    /// Done in HSL rather than by mixing toward the ink, because mixing
+    /// drags every hue toward the ink's own — on the mulberry palette that
+    /// turns ten distinguishable borders into ten shades of plum-grey.
+    /// Rotating value and saturation leaves the hue exactly where it was,
+    /// which is the whole promise: a border is a shade of its fill, not a
+    /// second colour.
+    pub fn shade(&self, color: Color, step: f32, chroma: f32) -> Color {
+        let Color::Solid([r, g, b, a]) = color else {
+            return color;
+        };
+        let (hue, saturation, lightness) = to_hsl(r, g, b);
+        let lightness = match self.mode {
+            Mode::Light => lightness * (1.0 - step),
+            Mode::Dark => lightness + (1.0 - lightness) * step,
+        };
+        let (r, g, b) = from_hsl(hue, (saturation * chroma).min(1.0), lightness);
+        Color::rgba(r, g, b, a)
     }
 
     /// The ink a badge of `color` is drawn in — label and hairline box both.
@@ -242,7 +237,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::NOIR
+        Self::LIGHT
     }
 }
 
@@ -328,7 +323,7 @@ impl ThemeServer {
 
 impl Default for ThemeServer {
     fn default() -> Self {
-        Self::new(Theme::NOIR)
+        Self::new(Theme::LIGHT)
     }
 }
 
@@ -338,7 +333,7 @@ impl Default for ThemeServer {
 /// one down through the layout, the components, and the prose builders would
 /// put a `&Theme` in a few hundred signatures to say one thing that is true
 /// everywhere. It lives here instead, and is written only by [`set`].
-static SERVER: RwLock<ThemeServer> = RwLock::new(ThemeServer::new(Theme::NOIR));
+static SERVER: RwLock<ThemeServer> = RwLock::new(ThemeServer::new(Theme::LIGHT));
 
 /// Reads the live server. A poisoned lock still holds a perfectly good
 /// palette, so it is taken rather than panicked on: a stale colour for one
@@ -419,9 +414,8 @@ palette! {
     math_surface => math,
     border => border,
     highlight => highlight,
-    variable => variable,
-    constant => constant,
-    function => function,
+    math_number => math_number,
+    math_operator => math_operator,
     faint => faint,
     non_text => non_text,
     ink => ink,
@@ -440,16 +434,16 @@ pub fn badge_ink(color: BadgeColor) -> Color {
 }
 
 /// Faux-bold outline expansion, as a fraction of font size.
-const FAUX_BOLD_WEIGHT_RATIO: f32 = 0.025;
+const FAUX_BOLD_WEIGHT_RATIO: f32 = 0.018;
 
-/// Prose. Georgia is what the design specifies and what is installed.
-pub fn serif() -> Font {
-    Font::Named("Georgia".into())
+/// Inter is embedded in the app and reused by both screen and PDF shaping.
+pub fn sans() -> Font {
+    Font::Bytes(include_bytes!("../resources/fonts/InterVariable.ttf"))
 }
 
 /// Labels, numbers, and anything that wants to read as machinery.
 pub fn mono() -> Font {
-    Font::Named("Essential PragmataPro".into())
+    Font::Named("monospace".into())
 }
 
 /// Math. Stays separate from `mono` because the two answer different
@@ -461,6 +455,17 @@ pub fn mono() -> Font {
 /// as it is edited.
 pub fn math() -> Font {
     Font::Named("JuliaMono".into())
+}
+
+/// Surrounding text stays readable while the active line keeps full ink.
+pub fn focus_opacity(amount: f32) -> f32 {
+    // Alpha blends in linear light. Dark ink needs more coverage against
+    // chalk to look as readable as pale ink against mulberry.
+    let surrounding = match mode() {
+        Mode::Light => 0.58,
+        Mode::Dark => 0.28,
+    };
+    1.0 - (1.0 - surrounding) * amount.clamp(0.0, 1.0)
 }
 
 /// A font plus everything `draw_text` needs to reproduce one look.
@@ -481,9 +486,9 @@ pub struct TextStyle {
 }
 
 impl TextStyle {
-    pub fn serif(size: f32, color: Color) -> Self {
+    pub fn sans(size: f32, color: Color) -> Self {
         Self {
-            font: serif(),
+            font: sans(),
             size,
             color,
             weight: 0.0,
@@ -517,16 +522,13 @@ impl TextStyle {
         }
     }
 
-    /// Faux bold. Georgia ships as a single regular cut here, so weight is
-    /// synthesised; a light expansion reads as 600 rather than filling in
-    /// the counters at body sizes.
+    /// A light optical expansion, shared by screen and PDF glyph outlines.
     pub fn bold(mut self) -> Self {
         self.weight = self.size * FAUX_BOLD_WEIGHT_RATIO;
         self
     }
 
-    /// Faux italic: a 12° shear. Georgia ships no italic cut, so — like
-    /// faux bold — the slant is synthesized by the renderer.
+    /// A 12° italic shear, shared by screen and PDF glyph outlines.
     pub fn italic(mut self) -> Self {
         self.slant = 0.21;
         self
@@ -598,6 +600,25 @@ pub fn width(layer: &Layer, text: &str, style: &TextStyle) -> f32 {
         .0
 }
 
+/// Shared syntax and DIY ink palette, following the current appearance.
+pub fn code_ink(ink: crate::document::code::Ink) -> Color {
+    use crate::document::code::{Ink, capture};
+    match ink {
+        Ink::Manual(hue) => math_edge(hue),
+        Ink::Syntax(index) => match capture(index) {
+            "comment" => comment(),
+            "string" => math_edge(MathHue::Green),
+            "number" | "constant" => math_edge(MathHue::Amber),
+            "keyword" => math_edge(MathHue::Violet),
+            "type" | "constructor" => math_edge(MathHue::Teal),
+            "function" => math_edge(MathHue::Sky),
+            "property" | "attribute" | "tag" => math_edge(MathHue::Rose),
+            "operator" | "punctuation" => dim(),
+            _ => self::ink(),
+        },
+    }
+}
+
 /// The same colour at a different opacity. Non-solid colours are returned
 /// unchanged — there is no single alpha to set on a gradient.
 pub fn fade(color: Color, alpha: f32) -> Color {
@@ -635,6 +656,68 @@ pub fn mix(from: Color, to: Color, t: f32) -> Color {
         }
         _ => from,
     }
+}
+
+/// How far [`math_edge`] pushes a fill away from the page. Higher in the
+/// dark appearance because a border there is climbing out of a deep tint
+/// rather than down out of a pale one, and the same step reads as less.
+const EDGE_STEP: [f32; 2] = [0.50, 0.42];
+/// How far [`math_edge`] lifts a fill's saturation. A one-pixel line has
+/// almost no area to carry a hue with, so it is given a little more chroma
+/// than the wash it edges — but only a little. The pale hues start out
+/// light enough that a bigger lift sends amber and olive fluorescent, and a
+/// highlighter pen is not what a page of mathematics wants.
+const EDGE_CHROMA: [f32; 2] = [1.15, 1.25];
+
+/// The wash behind a symbol carrying `hue`.
+pub fn math_fill(hue: MathHue) -> Color {
+    server().theme().math_fill(hue)
+}
+
+/// The border around a symbol carrying `hue`: its own fill, shaded. Never a
+/// colour of its own — see [`Theme::shade`].
+pub fn math_edge(hue: MathHue) -> Color {
+    server().theme().math_edge(hue)
+}
+
+/// sRGB to HSL, hue in turns. Straight from the definition; the only care
+/// needed is a grey, whose hue is undefined and is reported as zero.
+fn to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) / 2.0;
+    let chroma = max - min;
+    if chroma <= f32::EPSILON {
+        return (0.0, 0.0, lightness);
+    }
+    let saturation = chroma / (1.0 - (2.0 * lightness - 1.0).abs());
+    let hue = if max == r {
+        ((g - b) / chroma).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / chroma + 2.0
+    } else {
+        (r - g) / chroma + 4.0
+    };
+    (hue / 6.0, saturation, lightness)
+}
+
+/// The inverse of [`to_hsl`].
+fn from_hsl(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let sector = hue.rem_euclid(1.0) * 6.0;
+    let second = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match sector as u32 {
+        0 => (chroma, second, 0.0),
+        1 => (second, chroma, 0.0),
+        2 => (0.0, chroma, second),
+        3 => (0.0, second, chroma),
+        4 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+    let base = lightness - chroma / 2.0;
+    let channel = |v: f32| ((v + base).clamp(0.0, 1.0) * 255.0).round() as u8;
+    (channel(r), channel(g), channel(b))
 }
 
 pub fn rule(layer: &Layer, at: (f32, f32), length: f32, thickness: f32, color: Color) {
@@ -683,10 +766,7 @@ pub fn outline(layer: &Layer, rect: Rect, color: Color) {
 /// reads as a smudge.
 pub fn shadow_ink() -> Color {
     match mode() {
-        // 0x80 (50%) by ear: scale_alpha finally lets this byte through
-        // (see the slab painter), and the halved values from before read as
-        // barely-there now that they are actually applied.
-        Mode::Light => Color::rgba(0x3C, 0x38, 0x36, 0x80),
+        Mode::Light => Color::rgba(0x35, 0x23, 0x3F, 0x30),
         Mode::Dark => Color::rgba(0x00, 0x00, 0x00, 0x80),
     }
 }
@@ -698,15 +778,13 @@ pub fn shadow_ink() -> Color {
 /// alpha carries it, so a gradient fades without per-pixel work.
 pub fn elevated_popup(e: f32) -> Color {
     let base = popup();
-    let lift = if mode() == Mode::Light { 6 } else { 9 };
+    let lift = if mode() == Mode::Light { 3 } else { 7 };
     let Color::Solid([r, g, b, _]) = base.clone() else {
         return fade(base, e);
     };
     let a = (e.clamp(0.0, 1.0) * 255.0) as u8;
-    // The lift is small enough that no palette channel can overflow —
-    // clippy knows it too, so there is deliberately no `.min(255)` here.
-    assert!(lift <= 15);
-    let up = |c: u8| c + lift;
+    // Near-white surfaces clamp their highlight instead of wrapping a channel.
+    let up = |c: u8| c.saturating_add(lift);
     Color::gradient(
         [up(r), up(g), up(b), a],
         [r, g, b, a],
@@ -733,7 +811,11 @@ pub fn rounded_outline(layer: &Layer, rect: Rect, radius: f32, width: f32, color
 /// edge — the exact shape [`rounded_outline`] strokes. The radius is
 /// clamped to half the shorter side, so degenerate rects come out as
 /// stadia rather than nonsense arcs.
-fn rounded_rect_path(rect: Rect, radius: f32) -> String {
+///
+/// Public because the document painters stroke the same shape through a
+/// [`Canvas`](crate::canvas::Canvas) rather than a [`Layer`], and two
+/// generators for one border would be two borders.
+pub fn rounded_rect_path(rect: Rect, radius: f32) -> String {
     let r = radius.max(0.0).min(rect.width / 2.0).min(rect.height / 2.0);
     let (x, y) = rect.position();
     let right = rect.right();
@@ -757,10 +839,93 @@ pub fn hover_fill(layer: &Layer, rect: Rect, weight: f32) {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            fade(selection(), 0.32 * weight),
-            Rounding::NONE,
+            fade(selection(), 0.55 * weight),
+            Rounding::uniform(7.0),
         );
     }
+}
+
+/// A softly lit surface. The gradient is geometry rendered by Atomos;
+/// no texture allocation or continuously running effect is needed.
+pub fn surface(layer: &Layer, rect: Rect, base: Color, radius: f32) {
+    let top = mix(
+        base.clone(),
+        ink(),
+        if mode() == Mode::Dark { 0.018 } else { 0.006 },
+    );
+    let (Color::Solid(top), Color::Solid(bottom)) = (top, base) else {
+        return;
+    };
+    layer.draw_rectangle(
+        rect.position(),
+        rect.size(),
+        Color::gradient(top, bottom, GradientDirection::Vertical),
+        Rounding::uniform(radius),
+    );
+}
+
+/// The app's handwritten tau, drawn as a native path at any scale.
+pub fn app_mark(layer: &Layer, rect: Rect) {
+    let top = [0xDA, 0x78, 0x5C, 0xFF];
+    let bottom = [0xAF, 0x50, 0x68, 0xFF];
+    layer.draw_rectangle(
+        rect.position(),
+        rect.size(),
+        Color::gradient(top, bottom, GradientDirection::Vertical),
+        Rounding::uniform(rect.width * 0.29),
+    );
+    icon(
+        layer,
+        icons::TAU_MARK,
+        (rect.x + rect.width * 0.2, rect.y + rect.height * 0.2),
+        rect.width * 0.6,
+        mark_ink(),
+        2.3,
+    );
+}
+
+pub fn mark_ink() -> Color {
+    Color::rgb(0xFF, 0xFF, 0xFF)
+}
+
+/// A keyboard hint with a restrained physical edge. Returns its width.
+pub fn keycap(layer: &Layer, label: &str, at: (f32, f32), alpha: f32) -> f32 {
+    let style = TextStyle::sans(11.0, fade(dim(), alpha));
+    let width = width(layer, label, &style) + 12.0;
+    let rect = Rect::new(at.0, at.1 - 10.0, width, 20.0);
+    layer.draw_rectangle(
+        rect.position(),
+        rect.size(),
+        fade(alt(), alpha),
+        Rounding::uniform(5.0),
+    );
+    rounded_outline(layer, rect.inset(0.5), 4.5, 1.0, fade(border(), alpha));
+    draw(layer, label, (at.0 + width / 2.0, at.1), &style, CENTER);
+    width
+}
+
+/// Ellipsize before shaping the final label so it stays inside its control.
+pub fn elide(layer: &Layer, text: &str, max_width: f32, style: &TextStyle) -> String {
+    if width(layer, text, style) <= max_width {
+        return text.into();
+    }
+    if width(layer, "…", style) > max_width {
+        return String::new();
+    }
+    let mut ends: Vec<_> = text.char_indices().map(|(i, _)| i).collect();
+    ends.push(text.len());
+    let mut low = 0;
+    let mut high = ends.len() - 1;
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let label = format!("{}…", &text[..ends[mid]]);
+        if width(layer, &label, style) <= max_width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    format!("{}…", &text[..ends[low]])
 }
 
 /// Draws one of the [`icons`] paths, `at` being its top-left corner.
@@ -826,6 +991,12 @@ pub fn polyline(layer: &Layer, points: &[(f32, f32)], color: Color, thickness: f
 /// Circles and rects from the source SVG are written out as arcs and
 /// closed subpaths: `draw_svg_icon` takes one path's `d`, not a document.
 pub mod icons {
+    pub const TAU_MARK: &str = "M4 7C6 5 8 6 11 6H20 M13 6L10.5 16C9.5 20 13.5 20 17 17";
+    pub const NOTE_MARK: &str =
+        "M7 3H16L20 7V21H7A3 3 0 0 1 4 18V6A3 3 0 0 1 7 3Z M8 3V21 M12 10H16 M12 14H16";
+    pub const SIDEBAR: &str =
+        "M4 4H20A1 1 0 0 1 21 5V19A1 1 0 0 1 20 20H4A1 1 0 0 1 3 19V5A1 1 0 0 1 4 4Z M9 4V20";
+    pub const FOCUS: &str = "M8 3H3V8 M16 3H21V8 M3 16V21H8 M21 16V21H16";
     pub const CHECK: &str = "M20 6L9 17l-5-5";
     pub const FILE: &str =
         "M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z M14 2L14 8L20 8";
@@ -837,6 +1008,7 @@ pub mod icons {
                               3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z";
     pub const CHEVRON_DOWN: &str = "M6 9L12 15L18 9";
     pub const CHEVRON_RIGHT: &str = "M9 18L15 12L9 6";
+    pub const CHEVRON_LEFT: &str = "M15 18L9 12L15 6";
     pub const SORT: &str = "M11 5h10M11 12h10M11 19h10M3 8l3-3 3 3M6 5v14";
     pub const CALENDAR: &str = "M3 4H21V22H3Z M16 2v4M8 2v4M3 10h18";
     pub const CLOCK: &str = "M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0 M12 7v5l3 2";
@@ -863,6 +1035,53 @@ pub mod icons {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `shade` is what makes a border "a shade of its fill" true rather
+    /// than aspirational: the hue must come out where it went in, and the
+    /// value must move away from the page — down on chalk, up on mulberry.
+    #[test]
+    fn a_shade_keeps_its_hue_and_moves_away_from_the_page() {
+        for (mode, brighter) in [(Mode::Light, false), (Mode::Dark, true)] {
+            let theme = Theme::of(mode);
+            for hue in MathHue::ALL {
+                let Color::Solid([r, g, b, _]) = theme.math_fill(hue) else {
+                    panic!("a hue is a solid colour");
+                };
+                let Color::Solid([sr, sg, sb, _]) = theme.math_edge(hue) else {
+                    panic!("a shade of a solid colour is solid");
+                };
+                let (fill_hue, _, fill_light) = to_hsl(r, g, b);
+                let (edge_hue, _, edge_light) = to_hsl(sr, sg, sb);
+
+                let turned = (fill_hue - edge_hue)
+                    .abs()
+                    .min(1.0 - (fill_hue - edge_hue).abs());
+                assert!(
+                    turned < 0.02,
+                    "{hue:?} in {mode:?} turned {turned} of a wheel"
+                );
+                assert_eq!(
+                    edge_light > fill_light,
+                    brighter,
+                    "{hue:?} in {mode:?} moved the wrong way"
+                );
+            }
+        }
+    }
+
+    /// Ten hues that a reader has to tell apart cannot be nine.
+    #[test]
+    fn every_hue_is_its_own_colour_in_both_appearances() {
+        for mode in [Mode::Light, Mode::Dark] {
+            let theme = Theme::of(mode);
+            for (index, hue) in theme.math_hues.iter().enumerate() {
+                assert!(
+                    !theme.math_hues[..index].contains(hue),
+                    "{mode:?} repeats a hue at {index}"
+                );
+            }
+        }
+    }
 
     /// `rounded_outline` strokes generated path data with `.expect` — a
     /// typo in the generator would panic at draw time, so the exact shape
@@ -941,9 +1160,9 @@ mod tests {
                 Theme::of(Theme::of(mode).mode.flipped())
             );
         }
-        assert_ne!(Theme::LIGHT, Theme::NOIR);
+        assert_ne!(Theme::LIGHT, Theme::DARK);
         assert_eq!(Theme::of(Mode::Light), Theme::LIGHT);
-        assert_eq!(Theme::of(Mode::Dark), Theme::NOIR);
+        assert_eq!(Theme::of(Mode::Dark), Theme::DARK);
     }
 
     /// The redraw request is a one-shot: the shell takes it, redraws every

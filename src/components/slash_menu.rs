@@ -30,7 +30,8 @@ pub const MAX_ROWS: usize = ((CARD_H - QUERY_H) / ROW_HEIGHT) as usize;
 
 /// The card's top-left corner sits at `anchor` by default. If it would
 /// overflow the viewport bottom, the card flips upward (bottom-left corner
-/// at anchor); if it would overflow the right edge, it shifts left.
+/// at anchor), then stays inside the viewport even when neither side of
+/// the caret has enough room. The same rectangle drives drawing and hits.
 pub fn card_anchored(viewport: Rect, anchor: (f32, f32)) -> Rect {
     let mut x = anchor.0;
     let mut y = anchor.1;
@@ -43,6 +44,8 @@ pub fn card_anchored(viewport: Rect, anchor: (f32, f32)) -> Rect {
         x = viewport.right() - CARD_W;
     }
 
+    x = x.clamp(viewport.x, (viewport.right() - CARD_W).max(viewport.x));
+    y = y.clamp(viewport.y, (viewport.bottom() - CARD_H).max(viewport.y));
     Rect::new(x, y, CARD_W, CARD_H)
 }
 
@@ -143,9 +146,8 @@ impl SlashMenu {
             started: false,
             dirty: Dirty::new(),
         };
-        // The pill is NOT parked here: `card_anchored(Rect::default(), ..)`
-        // panics its own clamp (zero-width viewport ⇒ clamp max −CARD_W).
-        // A ghost's first `sync` carries the region rect and parks it.
+        // A ghost's first `sync` carries the real viewport and parks the
+        // pill in the same place as the live card.
         ghost
     }
 
@@ -376,7 +378,7 @@ impl Component for SlashMenu {
                 layer,
                 "No matching command",
                 (card.x + card.width / 2.0, card.y + QUERY_H + 32.0),
-                &TextStyle::serif(13.5, theme::fade(theme::faint(), ea)),
+                &TextStyle::sans(13.5, theme::fade(theme::faint(), ea)),
                 theme::CENTER,
             );
         } else {
@@ -387,7 +389,7 @@ impl Component for SlashMenu {
 
 impl SlashMenu {
     fn draw_query(&self, layer: &Layer, card: Rect, ea: f32) {
-        let style = TextStyle::serif(16.0, theme::fade(theme::ink(), ea));
+        let style = TextStyle::sans(16.0, theme::fade(theme::ink(), ea));
         let middle = card.y + QUERY_H / 2.0;
         if self.query.is_empty() {
             theme::draw(
@@ -419,8 +421,8 @@ impl SlashMenu {
     }
 
     fn draw_rows(&self, layer: &Layer, card: Rect, ea: f32) {
-        let title_style = TextStyle::serif(15.0, theme::fade(theme::ink(), ea));
-        let group_style = TextStyle::serif(11.5, theme::fade(theme::comment(), ea));
+        let title_style = TextStyle::sans(13.0, theme::fade(theme::ink(), ea));
+        let group_style = TextStyle::sans(10.5, theme::fade(theme::comment(), ea));
         let hint_style = TextStyle::mono(10.5, theme::fade(theme::faint(), ea));
 
         // The slide pill rides UNDER the text of whichever visible row was
@@ -552,6 +554,33 @@ mod tests {
         let r = card_anchored(viewport, (750.0, 500.0));
         assert_eq!(r.x, 800.0 - CARD_W);
         assert_eq!(r.y, 500.0 - CARD_H);
+    }
+
+    #[test]
+    fn focus_anchor_fits_when_neither_side_has_room_for_the_card() {
+        let viewport = Rect::new(0.0, 0.0, 620.0, 484.0);
+        let card = card_anchored(viewport, (68.0, 250.0));
+        assert!(card.y >= viewport.y);
+        assert!(card.bottom() <= viewport.bottom());
+        // The query and all six rows must remain available after flipping.
+        for offset in 0..MAX_ROWS {
+            let point = (
+                card.x + 20.0,
+                card.y + QUERY_H + (offset as f32 + 0.5) * ROW_HEIGHT,
+            );
+            assert!(viewport.contains(point));
+            assert_eq!(row_at_impl(card, 0, point), Some(offset));
+        }
+    }
+
+    #[test]
+    fn offscreen_anchor_is_clamped_to_an_offset_viewport() {
+        let viewport = Rect::new(20.0, 30.0, 620.0, 484.0);
+        for anchor in [(-100.0, -100.0), (900.0, 900.0)] {
+            let card = card_anchored(viewport, anchor);
+            assert!(card.x >= viewport.x && card.right() <= viewport.right());
+            assert!(card.y >= viewport.y && card.bottom() <= viewport.bottom());
+        }
     }
 
     #[test]

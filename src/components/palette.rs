@@ -8,20 +8,20 @@
 use crate::layout::Rect;
 use crate::renderer::{Layer, Rounding};
 use crate::theme::{self, TextStyle};
-use crate::ui::{Component, Context, Dirty};
+use crate::ui::{Component, Context, Dirty, Hover};
 
-use super::popup::{Slide, paint_shadow_slab};
+use super::popup::paint_shadow_slab;
 
 const ROW_RADIUS: f32 = 6.0;
-const CARD_W: f32 = 560.0;
+const CARD_W: f32 = 600.0;
 /// Query line plus the rule beneath it.
-const QUERY_H: f32 = 56.0;
-const ROW_HEIGHT: f32 = 34.0;
+const QUERY_H: f32 = 64.0;
+const ROW_HEIGHT: f32 = 38.0;
 /// The "↑↓ select · Enter runs · Esc closes" line.
-const FOOTER_H: f32 = 34.0;
+const FOOTER_H: f32 = 44.0;
 /// Tall enough for about ten rows. `MAX_ROWS` is derived from this, not the
 /// other way round, so the two numbers cannot drift apart.
-const CARD_H: f32 = 430.0;
+const CARD_H: f32 = 456.0;
 const MAX_ROWS: usize = ((CARD_H - QUERY_H - FOOTER_H) / ROW_HEIGHT) as usize;
 
 /// One command as the palette shows it.
@@ -106,12 +106,26 @@ pub struct Palette {
     /// The blurred layer this card paints its shadow slab into.
     shadow: Option<Layer>,
     reveal: f32,
-    slide: Slide,
-    started: bool,
+    hovered: Option<usize>,
+    hover: Hover,
     dirty: Dirty,
 }
 
 impl Palette {
+    /// The command under the pointer, using the same rows as the painter.
+    pub fn row_at(&self, viewport: Rect, point: (f32, f32)) -> Option<usize> {
+        if !self.open {
+            return None;
+        }
+        (0..self
+            .visible
+            .len()
+            .saturating_sub(self.first_visible)
+            .min(MAX_ROWS))
+            .find(|&row| row_rect(card(viewport), row).contains(point))
+            .map(|row| self.first_visible + row)
+    }
+
     /// `selected` indexes into the *filtered* list.
     pub fn new(entries: Vec<Entry>, query: String, selected: usize) -> Self {
         let visible = filter(&entries, &query);
@@ -133,8 +147,8 @@ impl Palette {
             open: true,
             shadow: None,
             reveal: 0.0,
-            slide: Slide::new(),
-            started: false,
+            hovered: None,
+            hover: Hover::new(),
             dirty: Dirty::new(),
         }
     }
@@ -152,8 +166,8 @@ impl Palette {
             open: false,
             shadow: None,
             reveal: 1.0,
-            slide: Slide::new(),
-            started: false,
+            hovered: None,
+            hover: Hover::new(),
             dirty: Dirty::new(),
         }
     }
@@ -167,7 +181,7 @@ impl Palette {
     /// Paints the shadow slab from sync. A modal's halo fades in with the
     /// card; a closed palette clears the layer unconditionally so the last
     /// frame's halo always leaves with it.
-    fn paint_shadow(&mut self, owns: bool) {
+    fn paint_shadow(&mut self, owns: bool, viewport: Rect) {
         if !owns {
             return;
         }
@@ -178,7 +192,7 @@ impl Palette {
             paint_shadow_slab(&shadow, Rect::default(), -1.0);
             return;
         }
-        paint_shadow_slab(&shadow, card(Rect::default()), self.reveal);
+        paint_shadow_slab(&shadow, card(viewport), self.reveal);
     }
 }
 
@@ -197,28 +211,20 @@ impl Component for Palette {
             self.reveal = context.reveal;
             self.dirty.set();
         }
-        self.paint_shadow(context.owns_shadow);
+        self.paint_shadow(context.owns_shadow, context.self_rect);
         if self.open {
             self.dirty.write(&mut self.caret_on, context.caret_on);
-
-            // The pill follows the keyboard selection. The shell rebuilds
-            // this snapshot on every keystroke/move and `new` seeds the
-            // target from `selected`, so the pill parks once per snapshot
-            // and any selection change shows up as a fresh snapshot.
-            if !self.visible.is_empty() {
-                let row = self.selected.saturating_sub(self.first_visible);
-                let target = row_rect(card(Rect::default()), row);
-                if !self.started {
-                    self.slide.park(target);
-                    self.started = true;
-                } else if self.slide.slide_to(target) {
-                    self.dirty.set();
-                }
+            let hovered = context
+                .mouse
+                .in_window
+                .then(|| self.row_at(context.self_rect, context.mouse.position))
+                .flatten();
+            if self
+                .hover
+                .track(&mut self.hovered, hovered, context.animation_dt)
+            {
+                self.dirty.set();
             }
-        }
-        self.slide.advance(context.animation_dt);
-        if self.slide.advancing() {
-            self.dirty.set();
         }
     }
 
@@ -235,8 +241,7 @@ impl Component for Palette {
     }
 
     fn is_animating(&self) -> bool {
-        // Never report a never-advanced Slide on a closed snapshot.
-        self.open && (self.slide.advancing() || (self.reveal > 0.0 && self.reveal < 1.0))
+        self.open && (self.hover.is_animating() || (self.reveal > 0.0 && self.reveal < 1.0))
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
@@ -248,15 +253,15 @@ impl Component for Palette {
         layer.draw_rectangle(
             rect.position(),
             rect.size(),
-            theme::fade(theme::background(), 0.72 * ea),
+            theme::fade(theme::background(), 0.48 * ea),
             Rounding::NONE,
         );
 
         let resting = card(rect);
         // A modal does not scale or overshoot — a palette-sized surface
         // wobbling reads as lag. It just fades up (and the rounded surface
-        // rises 4px into place on the same curve).
-        let travel = (1.0 - ea) * -4.0;
+        // rises 8px into place on the same curve).
+        let travel = (1.0 - ea) * 8.0;
         let card = Rect::new(resting.x, resting.y + travel, resting.width, resting.height);
 
         layer.draw_rectangle(
@@ -287,18 +292,43 @@ impl Component for Palette {
                 layer,
                 "No matching command",
                 (card.x + card.width / 2.0, card.y + QUERY_H + 32.0),
-                &TextStyle::serif(13.5, theme::fade(theme::faint(), ea)),
+                &TextStyle::sans(13.5, theme::fade(theme::faint(), ea)),
                 theme::CENTER,
             );
         } else {
             self.draw_rows(layer, card, ea);
         }
 
+        theme::rule(
+            layer,
+            (card.x + 20.0, card.bottom() - FOOTER_H),
+            card.width - 40.0,
+            1.0,
+            theme::fade(theme::border(), ea),
+        );
+        let y = card.bottom() - FOOTER_H / 2.0;
         theme::draw(
             layer,
-            "\u{2191}\u{2193} select \u{b7} Enter runs \u{b7} Esc closes",
-            (card.x + 20.0, card.bottom() - FOOTER_H / 2.0),
-            &TextStyle::mono(10.0, theme::fade(theme::faint(), ea)),
+            "COMMANDS",
+            (card.x + 22.0, y),
+            &TextStyle::sans(9.0, theme::fade(theme::faint(), ea)).tracked(0.1),
+            theme::LEFT,
+        );
+        let x = card.right() - 245.0;
+        theme::keycap(layer, "↑ ↓", (x, y), ea);
+        theme::draw(
+            layer,
+            "Navigate",
+            (x + 41.0, y),
+            &TextStyle::sans(10.5, theme::fade(theme::faint(), ea)),
+            theme::LEFT,
+        );
+        theme::keycap(layer, "Enter", (x + 110.0, y), ea);
+        theme::draw(
+            layer,
+            "Run",
+            (x + 156.0, y),
+            &TextStyle::sans(10.5, theme::fade(theme::faint(), ea)),
             theme::LEFT,
         );
     }
@@ -317,88 +347,99 @@ fn row_rect(card: Rect, row: usize) -> Rect {
 
 impl Palette {
     fn draw_query(&self, layer: &Layer, card: Rect, ea: f32) {
-        let style = TextStyle::serif(16.0, theme::fade(theme::ink(), ea));
+        let style = TextStyle::sans(16.0, theme::fade(theme::ink(), ea));
         let middle = card.y + QUERY_H / 2.0;
-        if self.query.is_empty() {
-            theme::draw(
-                layer,
-                "Type a command",
-                (card.x + 20.0, middle),
-                &style.clone().color(theme::fade(theme::faint(), ea)),
-                theme::LEFT,
-            );
-        } else {
-            theme::draw(
-                layer,
-                &self.query,
-                (card.x + 20.0, middle),
-                &style,
-                theme::LEFT,
-            );
-        }
-
+        theme::icon(
+            layer,
+            theme::icons::SEARCH,
+            (card.x + 23.0, middle - 8.0),
+            16.0,
+            theme::fade(theme::accent(), ea),
+            1.6,
+        );
+        let query = theme::elide(layer, &self.query, card.width - 130.0, &style);
+        theme::draw(
+            layer,
+            if self.query.is_empty() {
+                "What would you like to do?"
+            } else {
+                &query
+            },
+            (card.x + 52.0, middle),
+            &style.clone().color(if self.query.is_empty() {
+                theme::fade(theme::faint(), ea)
+            } else {
+                style.color.clone()
+            }),
+            theme::LEFT,
+        );
+        theme::keycap(layer, "Esc", (card.right() - 54.0, middle), ea);
         if self.caret_on {
-            let x = card.x + 20.0 + theme::width(layer, &self.query, &style);
+            let x = card.x + 52.0 + theme::width(layer, &query, &style);
             layer.draw_rectangle(
                 (x, middle - 10.0),
-                (2.0, 20.0),
+                (1.5, 20.0),
                 theme::fade(theme::accent(), ea),
-                Rounding::NONE,
+                Rounding::uniform(0.75),
             );
         }
     }
 
     fn draw_rows(&self, layer: &Layer, card: Rect, ea: f32) {
-        let title_style = TextStyle::serif(15.0, theme::fade(theme::ink(), ea));
-        let group_style = TextStyle::serif(11.5, theme::fade(theme::comment(), ea));
-        let hint_style = TextStyle::mono(10.5, theme::fade(theme::faint(), ea));
-
-        // The slide pill rides under the selected row — arrow keys move it
-        // because each selection change rebuilds this snapshot with a new
-        // `selected`, and sync retargets from there.
-        if self.started && !self.visible.is_empty() {
-            let pill = row_rect(card, self.selected.saturating_sub(self.first_visible));
-            layer.draw_rectangle(
-                (pill.x + 4.0, pill.y + 2.0),
-                (pill.width - 8.0, pill.height - 4.0),
-                theme::fade(theme::selection(), ea),
-                Rounding::uniform(ROW_RADIUS),
-            );
-        }
-
-        let window = self.visible[self.first_visible..]
+        let title_style = TextStyle::sans(13.0, theme::fade(theme::ink(), ea));
+        let group_style = TextStyle::sans(10.5, theme::fade(theme::faint(), ea));
+        for (offset, &entry_index) in self.visible[self.first_visible..]
             .iter()
             .take(MAX_ROWS)
-            .enumerate();
-        for (offset, &entry_index) in window {
+            .enumerate()
+        {
             let entry = &self.entries[entry_index];
             let row = row_rect(card, offset);
             let middle = row.y + row.height / 2.0;
-
+            if self.first_visible + offset == self.selected {
+                layer.draw_rectangle(
+                    (row.x + 8.0, row.y + 2.0),
+                    (row.width - 16.0, row.height - 4.0),
+                    theme::fade(theme::selection(), ea),
+                    Rounding::uniform(ROW_RADIUS),
+                );
+            } else if self.hovered == Some(self.first_visible + offset) {
+                theme::hover_fill(layer, row.inset(4.0), self.hover.value() * ea);
+            }
+            let icon = match entry.group.as_str() {
+                "File" => theme::icons::FILE_LINES,
+                "View" => theme::icons::SIDEBAR,
+                "Vault" => theme::icons::FOLDER,
+                "Edit" => theme::icons::NOTE_MARK,
+                _ => theme::icons::TOPICS,
+            };
+            theme::icon(
+                layer,
+                icon,
+                (row.x + 22.0, middle - 7.0),
+                14.0,
+                theme::fade(theme::dim(), ea),
+                1.5,
+            );
+            let label = theme::elide(layer, &entry.title, row.width - 230.0, &title_style);
             theme::draw(
                 layer,
-                &entry.title,
-                (row.x + 20.0, middle),
+                &label,
+                (row.x + 50.0, middle),
                 &title_style,
                 theme::LEFT,
             );
-            let group_x = row.x + 20.0 + theme::width(layer, &entry.title, &title_style) + 8.0;
             theme::draw(
                 layer,
                 &entry.group,
-                (group_x, middle),
+                (row.right() - 150.0, middle),
                 &group_style,
-                theme::LEFT,
+                theme::RIGHT,
             );
-
             if !entry.hint.is_empty() {
-                theme::draw(
-                    layer,
-                    &entry.hint,
-                    (row.right() - 20.0, middle),
-                    &hint_style,
-                    theme::RIGHT,
-                );
+                let width =
+                    theme::width(layer, &entry.hint, &TextStyle::sans(11.0, theme::dim())) + 12.0;
+                theme::keycap(layer, &entry.hint, (row.right() - 20.0 - width, middle), ea);
             }
         }
     }
@@ -414,6 +455,28 @@ mod tests {
             group: group.into(),
             hint: String::new(),
         }
+    }
+
+    #[test]
+    fn clicking_a_scrolled_command_uses_its_filtered_index() {
+        let entries = (0..25)
+            .map(|i| entry(&format!("Command {i}"), "View"))
+            .collect();
+        let palette = Palette::new(entries, String::new(), 20);
+        let viewport = Rect::new(30.0, 50.0, 1280.0, 800.0);
+        let row = row_rect(card(viewport), MAX_ROWS - 1);
+        assert_eq!(
+            palette.row_at(viewport, (row.x + 20.0, row.y + 15.0)),
+            Some(20)
+        );
+        assert_eq!(
+            palette.row_at(viewport, (row.x + 20.0, card(viewport).y + 20.0)),
+            None
+        );
+        assert_eq!(
+            Palette::closed().row_at(viewport, (row.x + 20.0, row.y + 15.0)),
+            None
+        );
     }
 
     #[test]

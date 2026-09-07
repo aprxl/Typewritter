@@ -15,13 +15,15 @@ use super::commands;
 use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
 use crate::components::{
-    ContextMenu, Dialog, FileTree, Finder, FormatBar, MathMenu, Onboarding, Palette, SlashMenu,
-    Topics, context_menu, editor, file_tree, format_bar, math_menu, onboarding, sidenotes,
-    theme_switch, title_bar,
+    ContextMenu, Dialog, Editor, FileTree, Finder, FormatBar, MathMenu, Onboarding, Palette,
+    SlashMenu, SymbolMenu, TabStrip, Topics, context_menu, editor, file_tree, format_bar,
+    math_menu, onboarding, scrollbar, sidenotes, symbol_menu, theme_switch, title_bar,
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind};
 use crate::document::math::{self, AccentKind, BigOp, MathNode, NodeAddress, Slot, SymbolRole};
+use crate::document::math_style::{self, HighlightShape, MathHue};
+use crate::document::math_symbols;
 use crate::document::{
     BadgeColor, Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, Style, math_conversion,
     math_layout,
@@ -29,7 +31,7 @@ use crate::document::{
 use crate::input::Input;
 use crate::layout::Rect;
 use crate::tabs::Tabs;
-use crate::theme::{self, TextStyle};
+use crate::theme::{self, TextStyle, Theme};
 use crate::vault::Vault;
 use crate::vim::{
     Edit, ExtendedAction, Key, Mode, Motion, Operator, OperatorTarget, Vim, VimMode, VisualAction,
@@ -40,8 +42,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    ContextMenuState, MathMenuState, MenuDismiss, PaletteState, Shell, SlashMenuState,
-    WordFormatState,
+    ContextGhost, ContextMenuState, MathMenuState, MenuDismiss, PaletteState, Shell,
+    SlashMenuState, WordFormatState,
 };
 
 impl Shell {
@@ -118,6 +120,20 @@ impl Shell {
         // thousandth. A swap already running swallows the click — see
         // `ThemeSwap`.
         if input.is_mouse_pressed(MouseButton::Left) && input.is_cursor_in_window() {
+            let bar = self.layout.rect(self.regions[self.title_region].node());
+            let command_id = if title_bar::sidebar_rect(bar).contains(input.mouse_position()) {
+                Some("view.sidebar")
+            } else if title_bar::focus_rect(bar).contains(input.mouse_position()) {
+                Some("view.focus")
+            } else {
+                None
+            };
+            if let Some(command) =
+                command_id.and_then(|id| commands::COMMANDS.iter().find(|command| command.id == id))
+            {
+                (command.run)(self);
+                return;
+            }
             let switch =
                 theme_switch::switch_rect(self.layout.rect(self.regions[self.title_region].node()));
             if switch.contains(input.mouse_position()) {
@@ -131,14 +147,38 @@ impl Shell {
 
         if input.is_mouse_pressed(MouseButton::Left)
             && input.is_cursor_in_window()
-            && title_bar::search_box_rect(
-                self.regions[self.title_region].layer(),
-                self.layout.rect(self.regions[self.title_region].node()),
-            )
-            .contains(input.mouse_position())
+            && title_bar::search_box_rect(self.layout.rect(self.regions[self.title_region].node()))
+                .contains(input.mouse_position())
         {
             self.open_finder();
             return;
+        }
+
+        if input.is_mouse_pressed(MouseButton::Left) && input.is_cursor_in_window() {
+            let point = input.mouse_position();
+            let new_tab = self.regions[self.tab_region]
+                .component_as::<TabStrip>()
+                .is_some_and(|tabs| tabs.new_note_at(point));
+            let empty_action = if self.docs.borrow().active().is_none() {
+                crate::components::empty_state::buttons(self.layout.rect(self.text_column))
+                    .iter()
+                    .position(|rect| rect.contains(point))
+            } else {
+                None
+            };
+            if new_tab || empty_action == Some(0) {
+                if let Some(command) = commands::COMMANDS
+                    .iter()
+                    .find(|command| command.id == "file.new")
+                {
+                    (command.run)(self);
+                }
+                return;
+            }
+            if empty_action == Some(1) {
+                self.open_finder();
+                return;
+            }
         }
 
         // The topics panel jumps the caret to its heading — through the
@@ -207,6 +247,7 @@ impl Shell {
             note_at_caret(&tab.document, tab.document.caret)
         };
         if let Some(index) = index {
+            self.sidenotes.set_open(true);
             focus_note(&mut self.docs.borrow_mut(), index);
         }
     }
@@ -227,7 +268,7 @@ impl Shell {
             // text's own left edge. y keeps the page's scroll like clicks.
             let scroll = self.docs.borrow().editor_scroll;
             (
-                mouse.0 - (rect.x + editor::INSET),
+                mouse.0 - (Editor::content_x(rect)),
                 mouse.1 - rect.y - editor::TOP + scroll,
             )
         };
@@ -277,6 +318,7 @@ impl Shell {
         };
         let Some(index) = index else { return false };
         self.goal_x = None;
+        self.sidenotes.set_open(true);
         focus_note(&mut self.docs.borrow_mut(), index);
         true
     }
@@ -286,6 +328,9 @@ impl Shell {
     /// the note's own layout — never handed to a `body()`-resolving function,
     /// whose coordinates come from the page's layout and are wrong here.
     fn margin_note_at(&mut self, point: (f32, f32)) -> Option<(usize, Caret)> {
+        if !self.layout.style(self.sidenotes.node).visible {
+            return None;
+        }
         let rect = self.layout.rect(self.sidenotes.node);
         let (scroll, index_of) = {
             let docs = self.docs.borrow();
@@ -326,10 +371,44 @@ impl Shell {
     }
 
     fn handle_brush_input(&mut self, input: &Input) -> bool {
+        let revision = self.docs.borrow().revision();
+        if self.brush_document_revision != revision {
+            if reset_brush_selection(
+                &mut self.brush_selected,
+                &mut self.brush_inside,
+                &mut self.brush_point,
+            ) {
+                self.brush_revision = self.brush_revision.wrapping_add(1);
+            }
+            self.brush_document_revision = revision;
+        }
         if !(input.ctrl() && input.is_mouse_down(MouseButton::Left)) {
-            if self.brush_point.take().is_some() || !self.brush_inside.is_empty() {
+            let released = self.brush_point.take().is_some();
+            if released || !self.brush_inside.is_empty() {
                 self.brush_inside.clear();
                 self.brush_revision = self.brush_revision.wrapping_add(1);
+            }
+            if released
+                && let Some(target) = self
+                    .brush_selected
+                    .iter()
+                    .find(|hit| {
+                        matches!(
+                            hit,
+                            ContextHit::Range {
+                                kind: RangeKind::CodeWord,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+            {
+                self.open_context_target(
+                    commands::CODE_COLOR_MENU,
+                    input.mouse_position(),
+                    Some(target),
+                );
+                return true;
             }
             return false;
         }
@@ -407,12 +486,19 @@ impl Shell {
         let has_tab = self.docs.borrow().active().is_some();
         let in_math = self.docs.borrow().in_math();
 
-        if has_tab && over_editor && input.scroll_delta().1 != 0.0 {
-            let max = self.editor_max_scroll();
-            let scroll = self.docs.borrow().editor_scroll;
-            let next = (scroll - input.scroll_delta().1 * crate::document::layout::LINE_BODY)
-                .clamp(0.0, max);
-            self.docs.borrow_mut().set_editor_scroll(next);
+        // Anywhere over the sheet, not just over the text: a pointer that
+        // has drifted onto a margin note is still pointing at the document.
+        let over_canvas =
+            input.is_cursor_in_window() && self.layout.rect(self.canvas).contains(mouse);
+        if has_tab && over_canvas && input.scroll_delta().1 != 0.0 {
+            let (min, max) = self.editor_scroll_bounds();
+            // Aimed from where the page is heading, not from where it is:
+            // a second notch mid-glide must add its own distance rather
+            // than measure from a journey that has not finished.
+            let step =
+                input.scroll_delta().1 * super::SCROLL_LINES * crate::document::layout::LINE_BODY;
+            self.scroll
+                .aim((self.scroll.target() - step).clamp(min, max));
         }
 
         if has_tab && !in_math && !self.vim.command_active() {
@@ -444,6 +530,17 @@ impl Shell {
                 if self.click_anchor(rect, mouse) {
                     // The click focused a note; nothing else to do with it.
                 } else if let Some(target) = self.context_at(rect, mouse) {
+                    if matches!(
+                        target,
+                        ContextHit::Range {
+                            kind: RangeKind::CodeWord,
+                            ..
+                        }
+                    ) && !self.brush_selected.contains(&target)
+                    {
+                        self.brush_selected.clear();
+                        self.brush_revision = self.brush_revision.wrapping_add(1);
+                    }
                     if matches!(
                         target,
                         ContextHit::Range {
@@ -496,6 +593,7 @@ impl Shell {
         }
 
         self.divider_drag(input);
+        self.scrollbar_drag(input);
     }
 
     /// Arrow keys, Home, End. Vertical motion goes through the layout so it
@@ -1337,7 +1435,7 @@ impl Shell {
         );
     }
 
-    fn exit_visual(&mut self) {
+    pub(super) fn exit_visual(&mut self) {
         self.vim.set_mode(Mode::Normal);
         self.visual_anchor = None;
         self.visual_override = None;
@@ -1543,6 +1641,25 @@ impl Shell {
     }
 
     fn handle_palette_input(&mut self, input: &Input) {
+        if input.is_mouse_pressed(MouseButton::Left) && input.is_cursor_in_window() {
+            let viewport = self.layout.rect(crate::layout::Layout::ROOT);
+            let point = input.mouse_position();
+            let row = self.regions[self.palette_region]
+                .component_as::<Palette>()
+                .and_then(|palette| palette.row_at(viewport, point));
+            if let Some(row) = row {
+                if let Some(state) = &mut self.palette {
+                    state.selected = row;
+                }
+                self.run_selected_palette_command();
+                return;
+            }
+            if !palette::card(viewport).contains(point) {
+                self.close_palette();
+                return;
+            }
+        }
+
         if input.is_key_pressed(KeyCode::Escape) {
             self.close_palette();
             return;
@@ -1574,14 +1691,53 @@ impl Shell {
 
     // ---- file finder --------------------------------------------------
 
+    /// Closes the active tab only after a dirty document has been persisted.
+    /// A failed save leaves the tab and its undo history in place.
+    pub(super) fn close_active(&mut self) {
+        match self.docs.borrow_mut().try_close_active() {
+            Ok(_) => self.save_error = None,
+            Err(error) => {
+                self.save_error = Some(format!(
+                    "close failed: {error} (Ctrl+S to retry; Discard changes to close)"
+                ));
+                eprintln!("close failed: {error}");
+            }
+        }
+        self.rebuild_views();
+    }
+
+    pub(super) fn save_active(&mut self) {
+        match self.docs.borrow_mut().save_active() {
+            Ok(()) => self.save_error = None,
+            Err(error) => {
+                self.save_error = Some(format!("save failed: {error}"));
+                eprintln!("save failed: {error}");
+            }
+        }
+        self.rebuild_views();
+    }
+
+    /// Explicitly drops the active tab without attempting persistence. This
+    /// is the recovery route when a close/save error cannot be repaired.
+    pub(super) fn discard_active(&mut self) {
+        let index = self.docs.borrow().active_index();
+        if let Some(index) = index {
+            self.docs.borrow_mut().close(index);
+            self.save_error = None;
+            self.rebuild_views();
+        }
+    }
+
     pub(super) fn open_finder(&mut self) {
         let Some(vault) = &self.vault else {
             return;
         };
         self.popup_reveal.restart();
         let files = vault.borrow().files();
+        let index = crate::search::SearchIndex::build(&files);
         self.finder = Some(super::FinderState {
-            rows: crate::search::search(&files, ""),
+            rows: index.search(""),
+            index,
             query: String::new(),
             selected: 0,
         });
@@ -1594,28 +1750,19 @@ impl Shell {
     }
 
     /// Re-ranks the rows against the current query. The shell owns the
-    /// ranked list (the component only draws a snapshot), so every query
-    /// change re-runs `search::search` here — the vault is a few hundred
-    /// kilobytes, well inside the §11 search budget.
+    /// ranked list (the component only draws a snapshot); the index was built
+    /// when the finder opened, so this path is memory-only.
     fn rerank_finder(&mut self) {
         let Some(state) = self.finder.as_mut() else {
             return;
         };
-        let files = self.vault.as_ref().map(|v| v.borrow().files());
-        let Some(files) = files else {
-            return;
-        };
-        state.rows = crate::search::search(&files, &state.query);
+        state.rows = state.index.search(&state.query);
         state.selected = state.selected.min(state.rows.len().saturating_sub(1));
     }
 
     fn refresh_finder(&mut self) {
         let query = self.finder.as_ref().map(|state| state.query.clone());
-        self.regions[self.title_region].set_component(Box::new(title_bar::TitleBar::new(
-            "Typewritter",
-            "LECTURE CAPTURE",
-            query,
-        )));
+        self.regions[self.title_region].set_component(Box::new(title_bar::TitleBar::new(query)));
         let finder = match &self.finder {
             Some(state) => Finder::new(state.rows.clone(), state.query.clone(), state.selected),
             None => Finder::closed(),
@@ -1649,6 +1796,24 @@ impl Shell {
     }
 
     fn handle_finder_input(&mut self, input: &Input) {
+        if input.is_mouse_pressed(MouseButton::Left) && input.is_cursor_in_window() {
+            let viewport = self.layout.rect(crate::layout::Layout::ROOT);
+            let point = input.mouse_position();
+            let row = self.regions[self.finder_region]
+                .component_as::<Finder>()
+                .and_then(|finder| finder.row_at(viewport, point));
+            if let Some(row) = row {
+                if let Some(state) = &mut self.finder {
+                    state.selected = row;
+                }
+                self.open_selected_finder_file();
+                return;
+            }
+            if !crate::components::search::card(viewport).contains(point) {
+                self.close_finder();
+                return;
+            }
+        }
         if input.is_key_pressed(KeyCode::Escape) {
             self.close_finder();
             return;
@@ -1681,9 +1846,17 @@ impl Shell {
         {
             let mut docs = self.docs.borrow_mut();
             docs.open_preview(row.path());
+            if !docs.active().is_some_and(|tab| tab.path() == row.path()) {
+                return;
+            }
+            docs.tree_selected = Some(row.path().to_path_buf());
             if let Some((block, offset)) = row.position() {
                 docs.jump_to_flat(block, offset);
             }
+        }
+        if let Some(vault) = &self.vault {
+            vault.borrow_mut().reveal(row.path());
+            self.regions[self.tree_region].poke();
         }
         self.close_finder();
     }
@@ -1707,7 +1880,7 @@ impl Shell {
             let (cx, cb, ch) = layout.caret_pos(tab.document.caret, &measure);
             (cx, cb, ch, docs.editor_scroll)
         };
-        let screen_x = rect.x + crate::components::editor::INSET + caret_x;
+        let screen_x = Editor::content_x(rect) + caret_x;
         let screen_y =
             rect.y + crate::components::editor::TOP + caret_baseline - scroll + caret_height / 2.0;
         (screen_x, screen_y)
@@ -1746,6 +1919,7 @@ impl Shell {
                 RangeKind::Badge => commands::BADGE_MENU.to_vec(),
                 RangeKind::InlineCode => commands::INLINE_CODE_MENU.to_vec(),
                 RangeKind::CodeBlock => commands::CODE_BLOCK_MENU.to_vec(),
+                RangeKind::CodeWord => commands::CODE_COLOR_MENU.to_vec(),
             },
             ContextHit::Math {
                 block,
@@ -1766,9 +1940,12 @@ impl Shell {
                 match node {
                     Some(MathNode::Sym(ch)) if ch.is_alphabetic() => symbol_context_ids(*ch),
                     Some(MathNode::Resolved { variant, body, .. }) => {
+                        // A multi-letter identity like `sin` has no
+                        // mathematical-alphanumeric variants, but role and
+                        // styling still apply to it.
                         symbol_base_glyph(body, variant)
                             .map(symbol_context_ids)
-                            .unwrap_or_else(|| commands::SYMBOL_ROLE_MENU.to_vec())
+                            .unwrap_or_else(symbol_style_ids)
                     }
                     Some(MathNode::Group { .. }) => commands::GROUP_MENU.to_vec(),
                     Some(MathNode::Accent { .. }) => commands::ACCENT_MENU.to_vec(),
@@ -1831,6 +2008,24 @@ impl Shell {
     fn context_command_checked_for(document: &Document, target: ContextHit, id: &str) -> bool {
         match target {
             ContextHit::Range { range, .. } => {
+                if let Some(choice) = id.strip_prefix("context.code.") {
+                    let block = &document.body()[range.start.block];
+                    let syntax = document.code_style_at(range.start).unwrap_or_default();
+                    if let Some(color) = choice.strip_prefix("color.") {
+                        return syntax.manual && syntax.color == MathHue::from_keyword(color);
+                    }
+                    let language = syntax.language.or_else(|| match block {
+                        Block::CodeLine { lang, .. } => lang
+                            .as_deref()
+                            .and_then(crate::document::code::Language::from_name),
+                        _ => None,
+                    });
+                    return match choice {
+                        "manual" => syntax.manual,
+                        "plain" => !syntax.manual && language.is_none(),
+                        _ => !syntax.manual && language.is_some_and(|lang| lang.name() == choice),
+                    };
+                }
                 let mask = match id {
                     "context.bold" => Style {
                         bold: true,
@@ -1885,6 +2080,13 @@ impl Shell {
                         Inline::Math(list) => math::node_at(list, &address),
                         Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
                     });
+                // Hue and shape are not stored on the node — they are the
+                // reader's own vocabulary, kept in the vault config — so
+                // they are answered from the style server rather than from
+                // the tree, before the arms that read the tree.
+                if let Some(checked) = node.and_then(|node| symbol_style_checked(id, node)) {
+                    return checked;
+                }
                 match (id, node) {
                     ("context.symbol.variable", Some(MathNode::Resolved { role, .. })) => {
                         *role == SymbolRole::Variable
@@ -1895,6 +2097,10 @@ impl Shell {
                     ("context.symbol.function", Some(MathNode::Resolved { role, .. })) => {
                         *role == SymbolRole::Function
                     }
+                    // A bare letter is a variable nobody has said anything
+                    // else about — which is a role, and the card should
+                    // show it as the one the symbol already stands on.
+                    ("context.symbol.variable", Some(MathNode::Sym(ch))) => ch.is_alphabetic(),
                     ("context.variant.plain", Some(MathNode::Sym(ch))) => ch.is_alphabetic(),
                     ("context.variant.plain", Some(MathNode::Resolved { variant, .. })) => {
                         variant == "plain"
@@ -2031,6 +2237,74 @@ impl Shell {
         }
     }
 
+    pub(super) fn context_code_settings(&mut self) {
+        if let Some(state) = &self.context_menu {
+            let target = state.target.clone();
+            let anchor = state.anchor;
+            let is_block = target
+                .as_ref()
+                .and_then(|hit| match hit {
+                    ContextHit::Range { range, .. } => Some(range.start.block),
+                    _ => None,
+                })
+                .is_some_and(|index| {
+                    self.docs
+                        .borrow()
+                        .active()
+                        .is_some_and(|tab| tab.document.body()[index].is_code())
+                });
+            self.open_context_target(
+                if is_block {
+                    commands::CODE_BLOCK_MENU
+                } else {
+                    commands::INLINE_CODE_MENU
+                },
+                anchor,
+                target,
+            );
+        }
+    }
+
+    pub(super) fn context_code_options(
+        &mut self,
+        language: Option<crate::document::code::Language>,
+        manual: bool,
+    ) {
+        if let Some(range) = self.context_range() {
+            self.docs
+                .borrow_mut()
+                .set_code_options(range, language, manual);
+        }
+        self.brush_selected.clear();
+        self.brush_revision = self.brush_revision.wrapping_add(1);
+    }
+
+    pub(super) fn context_code_color(&mut self, color: Option<MathHue>) {
+        let mut ranges: Vec<_> = self
+            .brush_selected
+            .iter()
+            .filter_map(|hit| match hit {
+                ContextHit::Range {
+                    range,
+                    kind: RangeKind::CodeWord,
+                } => Some(*range),
+                _ => None,
+            })
+            .collect();
+        if ranges.is_empty()
+            && let Some(range) = self.context_range()
+        {
+            ranges.push(range);
+        }
+        self.docs.borrow_mut().transaction(|docs| {
+            for range in ranges {
+                docs.set_code_color(range, color);
+            }
+        });
+        self.brush_selected.clear();
+        self.brush_revision = self.brush_revision.wrapping_add(1);
+    }
+
     pub(super) fn context_set_badge_color(&mut self, color: BadgeColor) {
         if let Some(range) = self.context_range() {
             self.docs.borrow_mut().set_badge_color(range, color);
@@ -2088,6 +2362,75 @@ impl Shell {
         }
     }
 
+    /// The node the open formatting surface points at, if it is a math one.
+    fn context_math_node(&self) -> Option<MathNode> {
+        let (block, inline, address) = self.context_math_target()?;
+        let docs = self.docs.borrow();
+        docs.active()
+            .and_then(|tab| tab.document.body().get(block))
+            .and_then(|block| block.inlines().get(inline))
+            .and_then(|run| match run {
+                Inline::Math(list) => math::node_at(list, &address),
+                Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
+            })
+            .cloned()
+    }
+
+    /// The role and identity of the symbol under the open menu — the key its
+    /// styling is stored against.
+    ///
+    /// A bare letter has no `Resolved` wrapper and so no stored role; it is
+    /// a variable nobody has said anything else about, and it is keyed by
+    /// the letter itself. That is the same key math layout styles it under,
+    /// so recolouring an unresolved `x` reaches every `x` in the vault.
+    pub(super) fn context_symbol(&self) -> Option<(SymbolRole, String)> {
+        match self.context_math_node()? {
+            MathNode::Sym(ch) if ch.is_alphabetic() => Some((SymbolRole::Variable, ch.to_string())),
+            MathNode::Resolved { id, role, .. } => Some((role, id)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn context_set_math_hue(&mut self, hue: MathHue) {
+        self.edit_symbol_style(|edit| edit.hue = Some(hue));
+    }
+
+    pub(super) fn context_set_math_shape(&mut self, shape: HighlightShape) {
+        self.edit_symbol_style(|edit| edit.shape = Some(shape));
+    }
+
+    /// Puts a symbol back on its automatic look — the hue its letter falls
+    /// on and the shape its role asks for.
+    pub(super) fn context_reset_math_style(&mut self) {
+        self.edit_symbol_style(|edit| *edit = math_style::Override::default());
+    }
+
+    /// Applies `edit` to the targeted symbol's override, installs the result,
+    /// and writes it to the vault config.
+    ///
+    /// Persisting here rather than on exit is deliberate: this is a
+    /// preference the reader set by hand, and a crash between setting it and
+    /// closing the window should not quietly take it back.
+    fn edit_symbol_style(&mut self, edit: impl FnOnce(&mut math_style::Override)) {
+        let Some((_, id)) = self.context_symbol() else {
+            return;
+        };
+        let mut overrides = math_style::overrides();
+        let mut entry = overrides.get(&id);
+        edit(&mut entry);
+        overrides.set(&id, entry);
+        if !math_style::install(overrides.clone()) {
+            return;
+        }
+        if let Some(config) = &mut self.config {
+            config.math = overrides;
+            if let Err(e) = config.save() {
+                eprintln!("could not save symbol styling: {e}");
+            }
+        }
+        self.refresh_context_menu();
+    }
+
     fn open_context_menu(&mut self, ids: &[&str], anchor: (f32, f32)) {
         self.open_context_target(ids, anchor, None);
     }
@@ -2121,7 +2464,18 @@ impl Shell {
 
     /// Shadow layer rides every arm — ghosts included — so a closing menu
     /// always takes its halo away (see `refresh_slash_menu`).
+    ///
+    /// One region, two faces. Over a symbol the card is the inspector; over
+    /// anything else it is the command list. Which one is not stored state:
+    /// it follows from the target, and the sections are rebuilt on every
+    /// refresh so a colour picked from the card is on the card by the time
+    /// the click finishes.
     pub(super) fn refresh_context_menu(&mut self) {
+        if let Some(menu) = self.symbol_menu_component() {
+            self.regions[self.menu_region]
+                .set_component(Box::new(menu.with_shadow(self.popup_shadow.clone())));
+            return;
+        }
         let menu = match &self.context_menu {
             Some(state) => {
                 let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
@@ -2139,7 +2493,7 @@ impl Shell {
             }
             None => match &self.menu_dismiss {
                 Some(MenuDismiss::Context {
-                    state,
+                    state: ContextGhost::Commands(state),
                     anchor,
                     pill_row,
                 }) => ContextMenu::dismissing(state, *anchor, *pill_row),
@@ -2150,22 +2504,140 @@ impl Shell {
         self.regions[self.menu_region].set_component(Box::new(menu));
     }
 
+    /// The head and sections the inspector draws, or `None` when the open
+    /// menu is not over a symbol.
+    ///
+    /// Every cell shows its own outcome rather than naming it, so each one
+    /// is built from the style `resolve` *would* return after that choice —
+    /// not from the choice's own defaults. That matters once the reader has
+    /// pinned a shape by hand: picking a different role then leaves the
+    /// shape alone, and the role rows have to say so.
+    fn symbol_menu_content(&self) -> Option<(symbol_menu::Head, Vec<symbol_menu::Section>)> {
+        let state = self.context_menu.as_ref()?;
+        let (role, id) = self.context_symbol()?;
+        let glyph = self.context_symbol_glyph()?;
+        let current = math_style::resolve(role, &id);
+        let pinned = math_style::overrides().get(&id);
+        let automatic = math_style::automatic(role, &id);
+
+        let mut sections: Vec<symbol_menu::Section> = Vec::new();
+        for command in &state.items {
+            let art = symbol_art(command.id, current, pinned, automatic);
+            let cell = symbol_menu::Cell {
+                label: command.title.to_string(),
+                glyph: match art {
+                    symbol_menu::Art::Bare => variant_glyph(command.id, &id, &glyph),
+                    symbol_menu::Art::Preview(_) => glyph.clone(),
+                },
+                art,
+                checked: self.context_command_checked(command.id),
+            };
+            match sections.last_mut() {
+                Some(section) if section.title == command.group => section.cells.push(cell),
+                _ => sections.push(symbol_menu::Section {
+                    title: command.group.to_string(),
+                    shelf: shelf_for(command.group),
+                    cells: vec![cell],
+                }),
+            }
+        }
+
+        let head = symbol_menu::Head {
+            glyph,
+            name: id,
+            role: format!(
+                "{} \u{00b7} {} {}",
+                role_label(role),
+                current.hue.label(),
+                current.shape.label().to_lowercase()
+            ),
+            style: current,
+        };
+        Some((head, sections))
+    }
+
+    /// The snapshot a closing inspector leaves behind, and the cell its pill
+    /// had parked on.
+    fn symbol_menu_snapshot(&self) -> Option<(symbol_menu::Snapshot, Option<usize>)> {
+        let component = self.regions[self.menu_region].component_as::<SymbolMenu>();
+        let (head, sections) = self.symbol_menu_content()?;
+        let selected = self.context_menu.as_ref().map_or(0, |state| state.selected);
+        Some((
+            symbol_menu::Snapshot {
+                head,
+                sections,
+                selected,
+            },
+            component.and_then(|menu| menu.pill_cell()),
+        ))
+    }
+
+    /// The characters the symbol is actually set with — the current variant's
+    /// letterform, not the identity it stands for, so a bold `x` previews as
+    /// a bold `x`.
+    fn context_symbol_glyph(&self) -> Option<String> {
+        match self.context_math_node()? {
+            MathNode::Sym(ch) if ch.is_alphabetic() => Some(ch.to_string()),
+            MathNode::Resolved { body, .. } => Some(
+                body.iter()
+                    .filter_map(|node| match node {
+                        MathNode::Sym(ch) => Some(*ch),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The inspector for this menu, or `None` when the menu is not over a
+    /// symbol — in which case the command list takes the region instead.
+    fn symbol_menu_component(&self) -> Option<SymbolMenu> {
+        let standing = self.regions[self.menu_region]
+            .component_as::<SymbolMenu>()
+            .and_then(SymbolMenu::resting);
+        if let Some(state) = &self.context_menu {
+            let (head, sections) = self.symbol_menu_content()?;
+            return Some(
+                SymbolMenu::new(head, sections, state.selected, state.anchor).resuming(standing),
+            );
+        }
+        match &self.menu_dismiss {
+            Some(MenuDismiss::Context {
+                state: ContextGhost::Symbol(state),
+                anchor,
+                pill_row,
+            }) => Some(SymbolMenu::dismissing(state, *anchor, *pill_row)),
+            _ => None,
+        }
+    }
+
     fn close_context_menu(&mut self) {
         // Ghost fodder comes from the LIVE menu (rows with current checks +
         // the pill's row) — read before `take` empties it.
+        let symbol = self.symbol_menu_snapshot();
         let ghost = self.context_menu.take().map(|state| {
-            let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
-            let checked: Vec<bool> = state
-                .items
-                .iter()
-                .map(|command| self.context_command_checked(command.id))
-                .collect();
-            let entries = commands::menu_entries(&ids);
-            let snap = crate::components::context_menu::Snapshot { entries, checked };
-            let pill_row = self.regions[self.menu_region]
-                .component_as::<ContextMenu>()
-                .and_then(|m| m.pill_row())
-                .unwrap_or(state.selected.min(snap.entries.len().saturating_sub(1)));
+            let (snap, pill_row) = match symbol {
+                Some((snap, pill)) => {
+                    let fallback = state.selected;
+                    (ContextGhost::Symbol(snap), pill.unwrap_or(fallback))
+                }
+                None => {
+                    let ids: Vec<&str> = state.items.iter().map(|command| command.id).collect();
+                    let checked: Vec<bool> = state
+                        .items
+                        .iter()
+                        .map(|command| self.context_command_checked(command.id))
+                        .collect();
+                    let entries = commands::menu_entries(&ids);
+                    let snap = crate::components::context_menu::Snapshot { entries, checked };
+                    let pill_row = self.regions[self.menu_region]
+                        .component_as::<ContextMenu>()
+                        .and_then(|m| m.pill_row())
+                        .unwrap_or(state.selected.min(snap.entries.len().saturating_sub(1)));
+                    (ContextGhost::Commands(snap), pill_row)
+                }
+            };
             MenuDismiss::Context {
                 state: snap,
                 anchor: state.anchor,
@@ -2175,7 +2647,7 @@ impl Shell {
         // Zero-row menus have no ghost to show.
         let spawn = matches!(
             &ghost,
-            Some(MenuDismiss::Context { state, .. }) if !state.entries.is_empty()
+            Some(MenuDismiss::Context { state, .. }) if !state.is_empty()
         );
         if spawn {
             self.menu_dismiss = ghost;
@@ -2471,13 +2943,31 @@ impl Shell {
             return true;
         }
 
+        if self.context_menu.is_none() {
+            return true;
+        }
+        // Whichever face the card is wearing, its own geometry answers —
+        // never the other one's, or a click would land on the row a
+        // different card would have drawn there.
+        let sections = self.symbol_menu_content().map(|(_, sections)| sections);
         let Some(state) = &self.context_menu else {
             return true;
         };
-        let card = context_menu::card_anchored(viewport, state.anchor, state.items.len());
+        let card = match &sections {
+            Some(sections) => symbol_menu::card_anchored(viewport, state.anchor, sections),
+            None => crate::components::popup::revealed_card(
+                context_menu::card_anchored(viewport, state.anchor, state.items.len()),
+                state.anchor,
+                crate::components::popup::MENU_SLIDE_EASING.apply(self.popup_reveal.weight()),
+            ),
+        };
         let point = input.mouse_position();
         if input.is_cursor_in_window() {
-            if let Some(row) = context_menu::row_at(card, state.items.len(), point) {
+            let hit = match &sections {
+                Some(sections) => symbol_menu::cell_at(card, sections, point),
+                None => context_menu::row_at(card, state.items.len(), point),
+            };
+            if let Some(row) = hit {
                 let changed = self
                     .context_menu
                     .as_ref()
@@ -2507,6 +2997,9 @@ impl Shell {
             .copied();
         if let Some(command) = command {
             (command.run)(self);
+            if command.id == "context.code.settings" {
+                return;
+            }
         }
         self.close_context_menu();
     }
@@ -2709,12 +3202,25 @@ impl Shell {
         let card = math_menu::card_anchored(viewport, state.anchor, offers.len(), variant_start);
         if input.is_cursor_in_window() {
             let point = input.mouse_position();
-            if let Some(index) = math_menu::item_at(card, offers.len(), variant_start, point) {
+            if card.contains(point) && input.scroll_delta().1 != 0.0 {
+                self.move_math_menu(if input.scroll_delta().1 > 0.0 { -1 } else { 1 });
+                return true;
+            }
+            if let Some(index) = math_menu::item_at(
+                card,
+                offers.len(),
+                variant_start,
+                state.first_visible,
+                point,
+            ) {
                 let changed = self
                     .math_menu
                     .as_ref()
                     .is_some_and(|state| state.selected != index);
-                if changed {
+                if changed
+                    && (input.mouse_delta() != (0.0, 0.0)
+                        || input.is_mouse_pressed(MouseButton::Left))
+                {
                     if let Some(state) = &mut self.math_menu {
                         state.selected = index;
                     }
@@ -2739,6 +3245,7 @@ impl Shell {
     /// back.
     fn dismiss_math_menu(&mut self) {
         self.math_dismissed = self.math_menu.as_ref().map(|state| state.query.clone());
+        self.spawn_math_ghost_from_live();
         self.math_menu = None;
         self.refresh_math_menu();
     }
@@ -2755,6 +3262,7 @@ impl Shell {
         let Some(offer) = math_conversion::offers(&query).offers.get(index).cloned() else {
             return;
         };
+        self.spawn_math_ghost_from_live();
         self.docs
             .borrow_mut()
             .math_accept_conversion(&query, &offer);
@@ -2767,13 +3275,19 @@ impl Shell {
         let Some(state) = &mut self.math_menu else {
             return;
         };
-        let count = math_conversion::offers(&state.query).offers.len();
+        let offers = math_conversion::offers(&state.query).offers;
+        let count = offers.len();
         if count == 0 {
             return;
         }
         let next = moved_math_menu_selection(state.selected, count, delta);
         if next != state.selected {
             state.selected = next;
+            state.first_visible = math_menu::follow_selection(
+                math_menu_variant_start(&offers),
+                next,
+                state.first_visible,
+            );
             self.refresh_math_menu();
         }
     }
@@ -2784,7 +3298,9 @@ impl Shell {
     pub(super) fn sync_math_menu(&mut self) {
         let query = self.docs.borrow().math_conversion_query();
         let Some(query) = query else {
-            if self.math_menu.take().is_some() {
+            if self.math_menu.is_some() {
+                self.spawn_math_ghost_from_live();
+                self.math_menu = None;
                 self.refresh_math_menu();
             }
             return;
@@ -2792,15 +3308,25 @@ impl Shell {
         if self.math_dismissed.as_ref() == Some(&query)
             || math_conversion::offers(&query).offers.is_empty()
         {
-            if self.math_menu.take().is_some() {
+            if self.math_menu.is_some() {
                 // The card just closed with content on screen: leave a
                 // ghost falling away instead of popping to nothing. (An
                 // empty-offers close has no rows; the spawn check below
                 // covers it.)
                 self.spawn_math_ghost_from_live();
+                self.math_menu = None;
                 self.refresh_math_menu();
             }
             return;
+        }
+        if self.math_menu.is_none() {
+            // A new word supersedes a fading card immediately, including
+            // when typing resumes before its dismissal has finished.
+            if matches!(self.menu_dismiss, Some(MenuDismiss::Math { .. })) {
+                self.menu_dismiss = None;
+                self.menu_dismiss_clock = 0.0;
+            }
+            self.popup_reveal.restart();
         }
         let anchor = self.compute_math_menu_anchor();
         let changed = match &self.math_menu {
@@ -2810,6 +3336,7 @@ impl Shell {
         let state = self.math_menu.get_or_insert_with(|| MathMenuState {
             query: query.clone(),
             selected: 0,
+            first_visible: 0,
             anchor,
         });
         let moved = state.anchor != anchor;
@@ -2818,6 +3345,7 @@ impl Shell {
         if changed {
             state.query = query;
             state.selected = 0;
+            state.first_visible = 0;
         }
         if changed || moved {
             self.refresh_math_menu();
@@ -2847,7 +3375,7 @@ impl Shell {
             let (ox, oy, _) = math_layout::cursor_pos(list, cursor, 0, layout.scale, &measure);
             (cx, cy, docs.editor_scroll, ox, oy)
         };
-        let screen_x = rect.x + crate::components::editor::INSET + base_x + offset_x;
+        let screen_x = Editor::content_x(rect) + base_x + offset_x;
         let screen_y = rect.y + crate::components::editor::TOP + base_y - offset_y - scroll;
         (screen_x, screen_y)
     }
@@ -2862,6 +3390,7 @@ impl Shell {
                 rows: math_menu_rows(&offers),
                 variant_start: math_menu_variant_start(&offers),
                 selected: state.selected,
+                first_visible: state.first_visible,
             }
         });
         let anchor = self.math_menu.as_ref().map(|state| state.anchor);
@@ -2895,8 +3424,10 @@ impl Shell {
                     math_menu_rows(&offers),
                     math_menu_variant_start(&offers),
                     state.selected,
+                    state.first_visible,
                     state.anchor,
                 )
+                .resuming(self.regions[self.math_menu_region].component_as::<MathMenu>())
             }
             None => match &self.menu_dismiss {
                 Some(MenuDismiss::Math {
@@ -2909,6 +3440,49 @@ impl Shell {
         }
         .with_shadow(self.popup_shadow.clone());
         self.regions[self.math_menu_region].set_component(Box::new(menu));
+    }
+
+    /// The scroll thumb's drag, shaped like [`Shell::divider_drag`]: the
+    /// press takes hold, the release lets go, and every frame in between
+    /// puts the page where the pointer says.
+    fn scrollbar_drag(&mut self, input: &Input) {
+        if !input.is_mouse_down(MouseButton::Left) || !self.layout.style(self.scroll_column).visible
+        {
+            self.scroll_grab = None;
+            return;
+        }
+        let strip = self.layout.rect(self.scroll_column);
+        let track = scrollbar::track(strip);
+        // Last frame's span — the one the thumb on screen was drawn from,
+        // which is the thumb the reader just aimed at.
+        let span = self.scroll_span.get();
+        let mouse = input.mouse_position();
+
+        if input.is_mouse_pressed(MouseButton::Left) {
+            if !input.is_cursor_in_window() || !strip.contains(mouse) {
+                return;
+            }
+            let Some(thumb) = scrollbar::thumb(track, span) else {
+                return;
+            };
+            // On the thumb, hold it exactly where it was taken. On the track
+            // above or below, throw it to the pointer and hold it by the
+            // middle, so the jump and the drag that may follow are one
+            // movement rather than a jump and then a second one.
+            self.scroll_grab = Some(if thumb.contains(mouse) {
+                mouse.1 - thumb.y
+            } else {
+                thumb.height / 2.0
+            });
+        }
+        let Some(grab) = self.scroll_grab else {
+            return;
+        };
+        let (min, max) = self.editor_scroll_bounds();
+        let to = scrollbar::scroll_at(track, mouse.1 - grab, span).clamp(min, max);
+        // Under the hand, not behind it: a thumb that eased toward the
+        // pointer holding it would drift away from the pointer holding it.
+        self.scroll.settle(to);
     }
 
     fn divider_drag(&mut self, input: &Input) {
@@ -2967,6 +3541,23 @@ impl Shell {
 
     fn handle_dialog_input(&mut self, input: &Input, viewport: Rect) {
         let mut changed = false;
+        let click = input
+            .is_mouse_pressed(MouseButton::Left)
+            .then(|| input.mouse_position());
+
+        if let Some(Prompt::ExportPdf { dark }) = &mut self.dialog {
+            // The pill is a click target and the space bar is its keyboard
+            // equal. Neither reaches the buttons below — the switch's rect
+            // is nowhere near them — so a flick of the switch cannot
+            // confirm the card by accident.
+            if input.is_key_typed(KeyCode::Space)
+                || click.is_some_and(|at| dialog::toggle(viewport).contains(at))
+            {
+                *dark = !*dark;
+                changed = true;
+            }
+        }
+
         if let Some(
             Prompt::NewNote { input: name, caret } | Prompt::NewFolder { input: name, caret },
         ) = &mut self.dialog
@@ -2997,9 +3588,6 @@ impl Shell {
         }
 
         let (confirm_button, cancel_button) = dialog::buttons(viewport);
-        let click = input
-            .is_mouse_pressed(MouseButton::Left)
-            .then(|| input.mouse_position());
         let confirmed = input.is_key_typed(KeyCode::Enter)
             || click.is_some_and(|at| confirm_button.contains(at));
         let cancelled = input.is_key_pressed(KeyCode::Escape)
@@ -3024,6 +3612,13 @@ impl Shell {
                 self.create_folder(&input.iter().collect::<String>())
             }
             Some(Prompt::DeleteNote { .. }) => self.delete_selected(),
+            // Closed before the file dialog opens, not after it returns: it
+            // is a native modal, and a card left standing behind one is a
+            // card asking a question that has already been answered.
+            Some(Prompt::ExportPdf { dark }) => {
+                self.close_dialog();
+                self.run_export(if dark { Theme::DARK } else { Theme::LIGHT });
+            }
             None => {}
         }
     }
@@ -3373,7 +3968,7 @@ fn focus_note_at(docs: &mut Tabs, index: usize, caret: Caret) {
 /// Escape still leaves Insert and stays in the note, so leaving a note while
 /// typing is two presses, the same shape as leaving Insert and then leaving
 /// anything else.
-fn return_to_anchor(docs: &mut Tabs) {
+pub(super) fn return_to_anchor(docs: &mut Tabs) {
     let anchor = {
         let Some(tab) = docs.active() else { return };
         let Focus::Note(i) = tab.document.focus else {
@@ -3526,8 +4121,158 @@ fn math_menu_variant_start(offers: &[math_conversion::Offer]) -> usize {
         .unwrap_or(offers.len())
 }
 
-fn symbol_context_ids(glyph: char) -> Vec<&'static str> {
+/// What the inspector offers about a symbol's meaning and look, before any
+/// question of letterform. Every symbol has these, whatever it is spelled
+/// with.
+///
+/// Grouped by each command's own `group`, which is what turns this flat
+/// list into the card's sections — so a command's place in the table and
+/// its place on the card cannot disagree.
+fn symbol_style_ids() -> Vec<&'static str> {
     let mut ids = commands::SYMBOL_ROLE_MENU.to_vec();
+    ids.extend(commands::SYMBOL_HUE_MENU);
+    ids.extend(commands::SYMBOL_SHAPE_MENU);
+    ids.extend(commands::SYMBOL_AUTOMATIC_MENU);
+    ids
+}
+
+/// Whether `command` names the hue or shape `node` already carries, or
+/// whether `node` is already on its automatic look. `None` for every
+/// command that is about something else.
+fn symbol_style_checked(command: &str, node: &MathNode) -> Option<bool> {
+    let (role, id) = match node {
+        MathNode::Sym(ch) if ch.is_alphabetic() => (SymbolRole::Variable, ch.to_string()),
+        MathNode::Resolved { id, role, .. } => (*role, id.clone()),
+        _ => return None,
+    };
+    if command == "context.symbol.automatic" {
+        return Some(math_style::overrides().get(&id).is_empty());
+    }
+    let current = math_style::resolve(role, &id);
+    if let Some(hue) = command
+        .strip_prefix("context.hue.")
+        .and_then(MathHue::from_keyword)
+    {
+        return Some(hue == current.hue);
+    }
+    command
+        .strip_prefix("context.shape.")
+        .and_then(HighlightShape::from_keyword)
+        .map(|shape| shape == current.shape)
+}
+
+/// How each section of the inspector arranges its cells. A choice whose
+/// whole content is how it looks belongs in a grid — ten hues read as a
+/// palette, where ten rows spelling colours out read as a list.
+fn shelf_for(group: &str) -> symbol_menu::Shelf {
+    match group {
+        "Colour" => symbol_menu::Shelf::Grid {
+            columns: 5,
+            height: 28.0,
+        },
+        "Highlight" => symbol_menu::Shelf::Grid {
+            columns: 3,
+            height: 34.0,
+        },
+        "Variant" => symbol_menu::Shelf::Grid {
+            columns: 5,
+            height: 32.0,
+        },
+        _ => symbol_menu::Shelf::Rows,
+    }
+}
+
+/// What one cell of the inspector draws: the style the symbol would carry if
+/// that cell were chosen. `pinned` is what the reader has fixed by hand, and
+/// it survives every choice that does not name the same axis — so picking a
+/// role does not quietly undo a shape they set.
+fn symbol_art(
+    command: &str,
+    current: math_style::SymbolStyle,
+    pinned: math_style::Override,
+    automatic: math_style::SymbolStyle,
+) -> symbol_menu::Art {
+    use math_style::SymbolStyle;
+    let preview = symbol_menu::Art::Preview;
+    if command == "context.symbol.automatic" {
+        return preview(automatic);
+    }
+    if let Some(role) = command
+        .strip_prefix("context.symbol.")
+        .and_then(SymbolRole::from_keyword)
+    {
+        return preview(SymbolStyle {
+            hue: current.hue,
+            shape: pinned.shape.unwrap_or_else(|| math_style::role_shape(role)),
+        });
+    }
+    if let Some(hue) = command
+        .strip_prefix("context.hue.")
+        .and_then(MathHue::from_keyword)
+    {
+        // A swatch is a colour sample, so it shows the hue whole — fill and
+        // edge — whatever shape the symbol is currently wearing. Previewing
+        // an outlined symbol here would leave ten hues to be judged from
+        // ten hairlines, which is the one thing a palette must not ask.
+        return preview(SymbolStyle {
+            hue,
+            shape: HighlightShape::Both,
+        });
+    }
+    if let Some(shape) = command
+        .strip_prefix("context.shape.")
+        .and_then(HighlightShape::from_keyword)
+    {
+        return preview(SymbolStyle {
+            hue: current.hue,
+            shape,
+        });
+    }
+    // A variant is a letterform, and a wash over it would hide the one
+    // thing being chosen.
+    symbol_menu::Art::Bare
+}
+
+fn role_label(role: SymbolRole) -> &'static str {
+    match role {
+        SymbolRole::Variable => "Variable",
+        SymbolRole::Constant => "Constant",
+        SymbolRole::Function => "Function",
+    }
+}
+
+/// The letterform a variant command would spell `identity` with. `plain` is
+/// the symbol's own base; everything else comes out of the mathematical
+/// alphanumeric block.
+fn variant_glyph(command: &str, identity: &str, current: &str) -> String {
+    let Some(key) = command.strip_prefix("context.variant.") else {
+        return current.to_string();
+    };
+    let base = math_symbols::exact(identity)
+        .map(|symbol| symbol.glyph)
+        .or_else(|| {
+            let mut chars = identity.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        });
+    let Some(base) = base else {
+        return current.to_string();
+    };
+    if key == "plain" {
+        return base.to_string();
+    }
+    math_symbols::variants(base)
+        .into_iter()
+        .find(|variant| variant.key == key)
+        .map(|variant| variant.glyph.to_string())
+        .unwrap_or_else(|| base.to_string())
+}
+
+/// The same, plus the letterforms a single letter can be spelled with.
+fn symbol_context_ids(glyph: char) -> Vec<&'static str> {
+    let mut ids = symbol_style_ids();
     ids.push("context.variant.plain");
     ids.extend(
         crate::document::math_symbols::variants(glyph)
@@ -4362,7 +5107,9 @@ mod tests {
     fn our_own_clipboard_text_pastes_as_notation() {
         let mut tabs = insert_tabs("own", "");
         tabs.set_yank("costs $a/b$ today".to_string());
+        let before = tabs.layout_revision();
         paste(&mut tabs, false, 1, "costs $a/b$ today");
+        assert!(tabs.layout_revision() > before);
         let runs = tabs.active().unwrap().document.body()[0].inlines();
         assert!(matches!(runs[0], Inline::Text(ref t) if t.text == "costs "));
         assert!(matches!(runs[1], Inline::Math(_)));

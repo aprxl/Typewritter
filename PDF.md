@@ -82,16 +82,29 @@ deciding where a fraction's bar, a radical's vinculum and a script's
 offsets land, and two walks that agreed on the day they were written
 would not stay agreeing.
 
+A line's *marks* are the second, and they show that the test is not
+"is the shape hard". A code span's box, a chip, a highlight's bar and a
+done task's strike are one rectangle each; what is intricate is that all
+four are read off the same thing — the line's `Painted` pieces — through
+arithmetic no second painter would rediscover: a badge's label inset by
+one pad inside a box grown by two, a mark that has to merge across every
+run it spans, a checkbox tick at five derived offsets. So they became
+`document::decoration`.
+
+The test, then, is *what the drawing is read off*, not how many
+rectangles come out of it.
+
 So the rule is by element, not by file:
 
-- **Chrome** (caret, selection, band, hover, chevron) — `editor.rs`, on a
-  `Layer`. A page has none of it, so there is nothing to share.
-- **Simple document furniture** (a rule, a tint, a bullet) — one arm in
-  each painter. A rectangle at a computed y is not something two files
-  can disagree about, and duplicating it keeps both readable.
-- **Intricate drawing** (math, and whatever else earns it) — a shared
-  painter over `Canvas`, called by both. `document::math_paint` is the
-  pattern.
+- **Chrome** (caret, selection, band, hover, chevron, glow) — `editor.rs`,
+  on a `Layer`. A page has none of it, so there is nothing to share.
+- **Simple document furniture** (a rule, a slab at a computed y) — one arm
+  in each painter. A rectangle whose corners are two numbers the piece
+  already carries is not something two files can disagree about, and
+  duplicating it keeps both readable.
+- **Intricate drawing** (math, a line's marks, and whatever else earns it)
+  — a shared painter over `Canvas`, called by both. `document::math_paint`
+  and `document::decoration` are the pattern.
 
 `Canvas` is implemented for `&Layer` as well as for the PDF backend,
 which is what makes the third case possible. Its methods are named and
@@ -105,10 +118,10 @@ code it came from and `paint.rs` still reads as a diff against
 
 ### Decisions (April, 2026-08-30)
 
-1. **Book size.** `PT_PER_PX = 0.63`. The editor's column is a fixed
-   `editor::MEASURE = 634` logical px, so the PDF lays out at exactly that
+1. **Book size.** `PLAIN_SCALE = 0.63`. The editor's column is a fixed
+   `editor::MEASURE` logical px, so the PDF lays out at exactly that
    width and the line breaks are the editor's, character for character.
-   `0.63` maps that column to 399.4 pt and body text to 11.0 pt.
+   `0.63` maps body text to 11.0 pt.
 2. **Asymmetric page only when the note has sidenotes.** A note without
    them gets a centred column. A note with them gets column + margin
    column and a smaller scale, so both fit the paper.
@@ -121,20 +134,24 @@ code it came from and `paint.rs` still reads as a diff against
 
 A4 portrait, 595.276 × 841.890 pt. Two constructors, one struct:
 
+Every number below is derived from `MEASURE`, `RIGHT_MARGIN` and
+`sidenotes::WIDTH`, so read them from `geometry.rs` rather than from here
+if the measure has moved again since:
+
 ```
 PageGeometry::plain()                 no sidenotes
-    column     634 px  ×  0.63  =  399.42 pt
-    side       (595.276 − 399.42) / 2  =  97.93 pt
+    column     MEASURE (704 px)  ×  0.63  =  443.52 pt
+    side       (595.276 − 443.52) / 2  =  75.88 pt
     top/bottom 72 pt each
     content    697.89 pt  =  1107.8 px  ≈  37 body lines
 
 PageGeometry::noted()                 sidenotes present
     spread     MEASURE + RIGHT_MARGIN + sidenotes::WIDTH
-               634 + 24 + 215  =  873 px
+               704 + 24 + 215  =  943 px
     side       40 pt
-    pt_per_px  (595.276 − 80) / 873  =  0.590   → body 10.3 pt
-    content    697.89 pt  =  1182.4 px  ≈  39 body lines
-    NOTE_COLUMN  = MEASURE + RIGHT_MARGIN = 658 px, the margin's left edge
+    scale      (595.276 − 80) / 943  =  0.546   → body 9.6 pt
+    content    697.89 pt  =  1277.6 px  ≈  42 body lines
+    NOTE_COLUMN  = MEASURE + RIGHT_MARGIN = 728 px, the margin's left edge
 ```
 
 `content_width` is `MEASURE` in both. The spread is wider, the column is
@@ -161,17 +178,29 @@ writing one, something is wrong.
 
 ### Theme
 
-Export forces `Theme::LIGHT` for the duration and restores the caller's
-theme afterwards. `theme::set` is a global (`RwLock<ThemeServer>`) and
+Export swaps `Options::theme` in for the duration and restores the
+caller's afterwards. `theme::set` is a global (`RwLock<ThemeServer>`) and
 `layout::text_style` reads ink colours while laying out, so this has to
 wrap the layout pass as well as the paint pass. Export is synchronous on
 the main thread and nothing else draws during it, so the swap is not
 observable.
 
-Strict 1:1 would print a dark note on black. It is a knob
-(`Options::theme`) rather than a law, defaulting to light, because
-printing a dark page is a choice almost nobody makes on purpose and the
-one who does can say so.
+Strict 1:1 would print a dark note on black. It is a knob rather than a
+law, defaulting to light, because printing a dark page is a choice almost
+nobody makes on purpose — and the one who does says so on the export card
+(`dialog::Prompt::ExportPdf`), which is asked before the file dialog
+opens. The switch does not start from the palette the reader is editing
+in: reading in the dark must not quietly become printing in it.
+
+**A page paints its own ground** (`paint::ground`, first and edge to edge,
+from `PageGeometry::sheet`). Unconditionally, and that is what makes the
+knob work at all rather than a special case for one setting: every colour
+in the document is chosen against `theme::background`, so a sheet left to
+whatever the reader's viewer paints is the editor's ink on somebody
+else's paper. On the light palette that is `#FBF9F6` against white — a
+difference of two percent, and the difference between 1:1 and nearly.
+On the dark one it is `#F0E8EA` text on white, which is to say nothing at
+all.
 
 ---
 
@@ -193,8 +222,9 @@ Two of them are not under `export/`, because they are not the exporter's:
 
 | File | Owns |
 |---|---|
-| `src/canvas.rs` | The `Canvas` trait, `impl` for `&Layer`, `Offset`, and the `rule`/`outline` helpers |
+| `src/canvas.rs` | The `Canvas` trait, `impl` for `&Layer`, `Offset`, and the `rule`/`outline`/`polyline` helpers |
 | `src/document/math_paint.rs` | Drawing a `MathBox`. Called by the editor *and* the page |
+| `src/document/decoration.rs` | A line's marks and a list item's gutter. Called by both |
 
 Plus, in the vendored platform:
 
@@ -309,31 +339,45 @@ A piece is *a block, a slice of its lines, and where the slice lands*. One
 type covers both a whole block and a paragraph split across a break, so
 the painter has one path, not two.
 
-Rules, in order:
+The document is one column of visual lines, and the only question is
+where that column may be cut. Between two adjacent lines there either is a
+**break opportunity** or there is not; the run of lines between two
+opportunities is a *chunk*, and a chunk lands whole on a page or starts the
+next one. Every keep-rule is a statement about a *missing* opportunity, so
+all of them live in one predicate (`breakable`) rather than in four special
+cases in the packing loop.
 
-1. Break between blocks. A block that fits on the rest of the page goes
-   there; otherwise the page ends.
-2. A block taller than a whole page splits between its `VisLine`s.
-   Paragraphs, list items and code may split; nothing else reaches this
-   rule.
-3. **Keep-together** (`atomic`): `Block::Math` moves to the next page
-   whole rather than split — notation broken across a sheet is not a
-   smaller equation, it is two wrong ones. A fenced code block wants the
-   same rule but is a *run* of `CodeLine` blocks rather than one block, so
-   it needs the run found first.
-4. **Keep-with-next**: a `Block::Heading` never ends a page. If the block
-   after it does not fit, the heading goes with it.
-5. Inter-block gaps (`GAP_PARAGRAPH` and friends) are swallowed at a page
-   break — a page never opens with leading whitespace.
+Where an opportunity is missing:
 
-Rules 1–3 and 5 exist today; 4 arrives next, and the code half of 3 with
-the code row of §6. Sidenotes add a sixth that is not about height at all
-— see below.
+1. **Inside a block that is not prose.** Only `Paragraph` and `ListItem`
+   split between their own lines. `Math` does not — notation broken across
+   a sheet is not a smaller equation, it is two wrong ones. `CodeLine` does
+   not, and neither does `Heading`, for rule 3's reason.
+2. **Before a `CodeLine { first: false }`** — keep-together. A fence is a
+   *run* of `CodeLine` blocks rather than one block, and this is where the
+   run is found: gluing every continuation line to the line that opened the
+   fence makes the whole fence one chunk.
+3. **After a `Heading`** — keep-with-next. A heading is glued to whatever
+   follows it, so its chunk reaches into the next block's first line and a
+   heading can never be the last thing on a page.
 
-Rule 3 yields to the loop's own hang guard: a block too tall for any page
-takes the page it is on and overflows, atomic or not, because the
-alternative is asking for a fresh page forever. `paint` therefore measures
-a math band from the *piece*, not the block — see the arm's comment.
+Inter-block gaps (`GAP_PARAGRAPH` and friends) are swallowed at a page
+break — a page never opens with leading whitespace, because the page's top
+is set to the chunk that opens it. Sidenotes add a rule that is not about
+height at all — see below.
+
+A chunk taller than the whole sheet is the one case nothing can keep
+together, and `demand` drops it to a single line so the rest of it packs
+line by line. The alternative — insisting, and taking one page for a chunk
+that overflows it — loses content off the bottom edge of the paper, which
+is worse than an equation that prints in two halves. That is also why
+`paint` measures a math band from the *piece*, not the block: on the rare
+sheet where a band is split, a band drawn from the block's own extent would
+run off both pages it appears on.
+
+Consecutive lines of one block on one page are merged into a single
+`Piece`, which is what lets a painter draw one slab under all of them
+instead of notching a rounded corner at every line join.
 
 Folded blocks are expanded before pagination (decision 3), so
 `BlockLayout::hidden` is ignored and `indicator` is never painted. **This
@@ -390,10 +434,12 @@ The recipe, and the reason the structure is shaped the way it is.
 3. **Inline runs, if it has any, go in `paint::line`** — the shared loop
    every block's text passes through. A new `Inline` variant is an arm
    there.
-4. **Ask whether it needs a shared painter** (§1, "Two painters"). If the
-   drawing is a rectangle or two, no. If it is a recursive walk or a dozen
-   interdependent offsets, extract it over `Canvas` the way
-   `document::math_paint` is, and have `editor.rs` call it too — in the
+4. **Ask whether it needs a shared painter** (§1, "Two painters"). The
+   question is not how hard the shape is but what it is read off: a slab
+   whose corners are two numbers the `Piece` already carries, no; a mark
+   positioned by arithmetic over a line's runs, or a recursive walk over a
+   tree, yes. Extract it over `Canvas` the way `document::math_paint` and
+   `document::decoration` are, and have `editor.rs` call it too — in the
    same commit, so the two are never briefly duplicated.
 5. **A keep-together rule in `paginate::atomic`, if it must not split.**
 6. **A test.** `paint` against a recording `Canvas` — assert the calls,
@@ -410,23 +456,27 @@ thing would be indirection with no reader.
 | Element | Layout | Paint | Paginate |
 |---|---|---|---|
 | Paragraph | ✅ shared | ✅ | ✅ |
-| Heading (+ auto-number) | ✅ shared | ✅ | keep-with-next ⬜ |
+| Heading (+ auto-number) | ✅ shared | ✅ | ✅ keep-with-next |
 | bold / italic / plain runs | ✅ shared | ✅ | — |
 | Divider | ✅ shared | ✅ | ✅ |
 | Math, inline and display | ✅ shared | ✅ shared | ✅ |
 | Equation numbers, `@eq:` references | ✅ shared | ✅ | — |
-| Inline code, code blocks | ✅ shared | ⬜ | keep-together ⬜ |
-| Lists: bullet, number, task | ✅ shared | ⬜ | ✅ |
-| Badges | ✅ shared | ⬜ | — |
-| Highlights | ✅ shared | ⬜ | — |
+| Inline code, code blocks | ✅ shared | ✅ shared | ✅ keep-together |
+| Lists: bullet, number, task | ✅ shared | ✅ shared | ✅ |
+| Badges | ✅ shared | ✅ shared | — |
+| Highlights | ✅ shared | ✅ shared | — |
 | Sidenotes (anchor, marker, body) | ✅ shared | ✅ | ✅ travels with its anchor |
 | Images | — | ⬜ | ⬜ |
 
-Every ⬜ in the Paint column prints its **text** correctly today and only
-lacks its decoration: `layout::text_style` already styles every block kind,
-and `paint::line` already draws it. A list item prints without its bullet,
-not as a hole in the page. That is the layering AGENTS.md asks for — the
-product works at every step, and each row above is one commit.
+Images are the only row left, and they are ⬜ in *every* column: the
+document model has no image block, so there is nothing for the page to be
+missing. That row is a feature, not a gap in the export.
+
+The ⬜ rows that closed this pass all printed their **text** correctly
+before they closed — `layout::text_style` styles every block kind and
+`paint::line` drew it, so a list item printed without its bullet rather
+than as a hole in the page. That is the layering AGENTS.md asks for: the
+product works at every step.
 
 ---
 

@@ -7,7 +7,7 @@ use crate::renderer::{Color, Layer, Rounding};
 use crate::theme::{self, TextStyle, icons};
 use crate::ui::{Component, Context, Dirty};
 
-pub const HEIGHT: f32 = 38.0;
+pub const HEIGHT: f32 = 36.0;
 
 /// What the bar says about the active note. Rebuilt by the shell whenever
 /// the tabs change; the instrumentation on the right comes from [`Context`]
@@ -77,7 +77,7 @@ impl Component for StatusLine {
         // Measured against a fixed-width sample, not the live numbers: a
         // minimum that changed with every frametime digit would dirty the
         // layout on every frame, which is the opposite of the point.
-        let body = TextStyle::serif(13.5, theme::dim());
+        let body = TextStyle::sans(11.5, theme::dim());
         let note = if self.command.is_empty() {
             &self.note
         } else {
@@ -103,14 +103,17 @@ impl Component for StatusLine {
                 &TextStyle::mono(11.0, theme::faint()),
             )
             + 90.0;
-        (left + right, HEIGHT)
+        ((left + right).min(620.0), HEIGHT)
     }
 
     fn sync(&mut self, context: &Context) {
-        self.dirty.write(&mut self.frametime, context.frametime);
-        self.dirty.write(&mut self.layouts, context.layouts);
-        self.dirty.write(&mut self.redraws, context.redraws);
+        let show_stats_changed = self.show_stats != context.show_stats;
         self.dirty.write(&mut self.show_stats, context.show_stats);
+        if self.show_stats || show_stats_changed {
+            self.dirty.write(&mut self.frametime, context.frametime);
+            self.dirty.write(&mut self.layouts, context.layouts);
+            self.dirty.write(&mut self.redraws, context.redraws);
+        }
     }
 
     fn is_dirty(&self) -> bool {
@@ -123,16 +126,18 @@ impl Component for StatusLine {
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
         layer.draw_rectangle(rect.position(), rect.size(), theme::panel(), Rounding::NONE);
-        theme::rule(layer, (rect.x, rect.y), rect.width, 2.0, theme::border());
+        theme::rule(layer, (rect.x, rect.y), rect.width, 1.0, theme::border());
         let middle = rect.y + 2.0 + (rect.height - 2.0) / 2.0;
 
-        let mode_style = TextStyle::mono(10.0, theme::background()).tracked(0.18);
+        let mode_style = TextStyle::sans(9.5, self.mode_color.clone())
+            .bold()
+            .tracked(0.06);
         let mode_width = theme::width(layer, &self.mode, &mode_style) + 20.0;
         layer.draw_rectangle(
             (rect.x + 18.0, middle - 9.0),
             (mode_width, 18.0),
-            self.mode_color.clone(),
-            Rounding::NONE,
+            theme::fade(self.mode_color.clone(), 0.13),
+            Rounding::uniform(5.0),
         );
         theme::draw(
             layer,
@@ -142,7 +147,7 @@ impl Component for StatusLine {
             theme::LEFT,
         );
 
-        let body = TextStyle::serif(13.5, theme::dim());
+        let body = TextStyle::sans(11.5, theme::dim());
         let x = rect.x + 18.0 + mode_width + 12.0;
 
         // The right cluster is laid out backwards from the right edge and
@@ -177,11 +182,12 @@ impl Component for StatusLine {
             right -= 14.0;
         }
         if !self.saved.is_empty() {
-            theme::draw(layer, &self.saved, (right, middle), &body, theme::RIGHT);
-            right -= theme::width(layer, &self.saved, &body) + 7.0;
+            let saved = theme::elide(layer, &self.saved, (right - x - 70.0).max(0.0), &body);
+            theme::draw(layer, &saved, (right, middle), &body, theme::RIGHT);
+            right -= theme::width(layer, &saved, &body) + 7.0;
             theme::icon(
                 layer,
-                icons::BRANCH,
+                icons::CHECK,
                 (right - 13.0, middle - 6.5),
                 13.0,
                 theme::live(),
@@ -197,11 +203,12 @@ impl Component for StatusLine {
         } else {
             &self.command
         };
-        let note_width = theme::width(layer, note, &body);
+        let note = theme::elide(layer, note, right - x - 12.0, &body);
+        let note_width = theme::width(layer, &note, &body);
         if x + note_width < right {
             theme::draw(
                 layer,
-                note,
+                &note,
                 (x, middle),
                 &body.clone().color(theme::ink()),
                 theme::LEFT,

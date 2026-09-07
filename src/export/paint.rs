@@ -15,9 +15,11 @@ use crate::components::editor::{
     BLOCK_PAD, CODE_ROUNDING, EQ_NUMBER_INSET, EQ_NUMBER_SIZE, VIEW_CAP,
 };
 use crate::components::sidenotes;
+use crate::document::decoration::{self, Painted};
 use crate::document::layout::{self, DocLayout, NUMBER_GUTTER, NUMBER_SIZE};
-use crate::document::{ATOM, Block, Inline, math_layout, math_paint};
-use crate::renderer::Rounding;
+use crate::document::{ATOM, Block, Inline, code, math_layout, math_paint};
+use crate::layout::Rect;
+use crate::renderer::{Color, Rounding};
 use crate::theme::{self, TextStyle};
 
 use super::geometry::NOTE_COLUMN;
@@ -39,9 +41,91 @@ pub fn page(
     numbers: &[Option<String>],
     width: f32,
 ) {
+    fences(canvas, layout, page, width);
     for piece in &page.pieces {
         block(canvas, layout, piece, numbers, width);
     }
+}
+
+/// The page's own ground, edge to edge, under everything else.
+///
+/// The editor fills its pane with [`theme::background`] and every colour
+/// above is chosen against it, so a sheet left to whatever the reader's
+/// viewer paints is not the editor's page — it is the editor's ink on
+/// somebody else's paper. On the light palette that is a two percent
+/// difference nobody would notice; on the dark one it is near-white text
+/// on white, which is to say nothing at all. One rule covers both, so
+/// there is no branch here asking how dark a colour has to be before it
+/// counts.
+pub fn ground(canvas: &mut dyn Canvas, sheet: Rect) {
+    canvas.draw_rectangle(
+        sheet.position(),
+        sheet.size(),
+        theme::background(),
+        Rounding::NONE,
+    );
+}
+
+/// The tint under every fenced block on this page, one slab per fence.
+///
+/// The one decoration a [`Piece`] cannot draw for itself: a fence is a
+/// *run* of `CodeLine` blocks, its lines sit flush against each other, and
+/// a slab per line would notch the rounded corners at every join. So the
+/// run is found here — among the pieces this page actually carries, not
+/// the blocks the document has, so a fence that `paginate` had to split
+/// gets a slab on each side of the break rather than one drawn off the
+/// bottom of the first sheet.
+fn fences(canvas: &mut dyn Canvas, layout: &DocLayout, page: &Page, width: f32) {
+    let mut index = 0;
+    while index < page.pieces.len() {
+        if !layout.source[page.pieces[index].block].is_code() {
+            index += 1;
+            continue;
+        }
+        // Every continuation line of this fence that is also on this page.
+        // A `first: true` block opens a new fence and ends this one, and so
+        // does a gap in the block numbering.
+        let mut end = index;
+        while end + 1 < page.pieces.len()
+            && page.pieces[end + 1].block == page.pieces[end].block + 1
+            && matches!(
+                layout.source[page.pieces[end + 1].block],
+                Block::CodeLine { first: false, .. }
+            )
+        {
+            end += 1;
+        }
+        if let (Some((top, _)), Some((_, bottom))) = (
+            extent(layout, &page.pieces[index]),
+            extent(layout, &page.pieces[end]),
+        ) {
+            slab(canvas, top, bottom, width, theme::code());
+        }
+        index = end + 1;
+    }
+}
+
+/// Where a piece's lines start and end, in page coordinates.
+fn extent(layout: &DocLayout, piece: &Piece) -> Option<(f32, f32)> {
+    let laid = &layout.blocks[piece.block];
+    let first = laid.lines.get(piece.lines.start)?;
+    let last = laid.lines.get(piece.lines.end.checked_sub(1)?)?;
+    // Document y → page y, the same shift every line of this piece takes.
+    let dy = piece.y - first.y;
+    Some((first.y + dy, last.y + last.height + dy))
+}
+
+/// The ground under a block that owns its whole band — a fence's tint, a
+/// display equation's. It overhangs the column by [`BLOCK_PAD`] on every
+/// side, which is what makes it read as ground under the text rather than
+/// as a box drawn around it.
+fn slab(canvas: &mut dyn Canvas, top: f32, bottom: f32, width: f32, color: Color) {
+    canvas.draw_rectangle(
+        (-BLOCK_PAD.0, top - BLOCK_PAD.1),
+        (width + BLOCK_PAD.0 * 2.0, bottom - top + BLOCK_PAD.1 * 2.0),
+        color,
+        CODE_ROUNDING,
+    );
 }
 
 /// The margin column: every note this page carries, beside the line that
@@ -171,40 +255,46 @@ fn block(
         // hung flush right inside it.
         //
         // Measured from the *piece*, not the block. `paginate` keeps a math
-        // block atomic, so the two are the same slab in every ordinary case
-        // — but its guard against an unfittable block splits one anyway
-        // rather than hang, and a band drawn from the block's own extent
-        // would then run off both pages it appears on.
+        // block whole, so the two are the same slab in every ordinary case
+        // — but a block taller than a sheet packs line by line anyway
+        // rather than run off it, and a band drawn from the block's own
+        // extent would then overhang both pages it appears on.
         Block::Math { .. } => {
-            let Some(last) = laid.lines.get(piece.lines.end.saturating_sub(1)) else {
-                return;
-            };
-            let top = first.y + dy;
-            let bottom = last.y + last.height + dy;
-            canvas.draw_rectangle(
-                (-BLOCK_PAD.0, top - BLOCK_PAD.1),
-                (width + BLOCK_PAD.0 * 2.0, bottom - top + BLOCK_PAD.1 * 2.0),
-                theme::math_surface(),
-                CODE_ROUNDING,
-            );
-            // Virtual, like a heading's: only tagged blocks have one, the
-            // caret cannot reach it, and it never reflows the math it
-            // labels.
-            if let Some(number) = layout.equation_numbers.get(&piece.block) {
-                canvas.draw_text(
-                    number,
-                    (width - EQ_NUMBER_INSET, top + first.height * 0.5),
-                    &TextStyle::mono(EQ_NUMBER_SIZE, theme::non_text()),
-                    theme::RIGHT,
+            if let Some((top, bottom)) = extent(layout, piece) {
+                slab(canvas, top, bottom, width, theme::math_surface());
+                // Virtual, like a heading's: only tagged blocks have one,
+                // the caret cannot reach it, and it never reflows the math
+                // it labels.
+                if let Some(number) = layout.equation_numbers.get(&piece.block) {
+                    canvas.draw_text(
+                        number,
+                        (width - EQ_NUMBER_INSET, top + first.height * 0.5),
+                        &TextStyle::mono(EQ_NUMBER_SIZE, theme::non_text()),
+                        theme::RIGHT,
+                    );
+                }
+            }
+        }
+        // The marker in a list item's gutter: a bullet, a number, or a task
+        // box. Virtual like a heading's auto-number — drawn, never laid
+        // out — and hung beside the item's *first* line only, so a piece
+        // that opens mid-item is a continuation and carries none. Its
+        // hanging indent is already in `line.x`, which is why the marker
+        // hangs off that rather than off the column.
+        Block::ListItem { marker, .. } => {
+            if piece.lines.start == 0 {
+                decoration::marker(
+                    canvas,
+                    marker,
+                    first.x,
+                    first.y + dy + first.height * 0.5,
+                    layout.scale,
                 );
             }
         }
-        // Everything below draws its text and, for now, none of its own
-        // furniture — the tints, the markers. Each is one arm here and one
-        // row of `PDF.md` §6's table; until then a code block prints as
-        // correctly-styled code without its slab, which is incomplete
-        // rather than wrong.
-        Block::Paragraph(_) | Block::CodeLine { .. } | Block::ListItem { .. } => {}
+        // A fence's tint is drawn by `fences`, which sees the whole run;
+        // a paragraph has no furniture of its own at all.
+        Block::Paragraph(_) | Block::CodeLine { .. } => {}
     }
 
     for index in piece.lines.clone() {
@@ -225,11 +315,17 @@ fn line(
     dy: f32,
 ) {
     let kind = &layout.source[index];
+    let top = line.y + dy;
     // Not a typographic baseline: the editor draws text vertically centred
     // on the line, and this is that centre. `Canvas::draw_text` recovers the
     // real baseline from the shaped run.
-    let baseline = line.y + dy + line.height * 0.5;
+    let baseline = top + line.height * 0.5;
     let mut cursor = line.x;
+    // Measured first, drawn second, exactly as the editor does it: the
+    // marks these runs carry are read off their extents, so they cannot be
+    // drawn until every run on the line has been measured — and they go
+    // *under* the text, so the text cannot be drawn until they are down.
+    let mut pieces: Vec<Painted> = Vec::new();
 
     for segment in &line.segments {
         let run = &kind.inlines()[segment.inline];
@@ -257,10 +353,9 @@ fn line(
         );
 
         match run {
-            Inline::Text(_) => {
-                let style = layout::text_style(kind, segment.style, layout.scale);
-                canvas.draw_text(&text, (cursor, baseline), &style, theme::LEFT);
-            }
+            // Text waits for the pass below: it is drawn over every mark
+            // this line carries, and none of those is placed yet.
+            Inline::Text(_) => {}
             // Notation, drawn through the painter the editor draws it with
             // — see `document::math_paint`. `slots` is false: an empty slot
             // says where the next character lands, and nothing lands on a
@@ -297,7 +392,42 @@ fn line(
                 canvas.draw_text(&text, (cursor, baseline), &style, theme::LEFT);
             }
         }
+        pieces.push(decoration::piece(
+            text,
+            segment.style,
+            cursor,
+            width,
+            layout.scale,
+        ));
         cursor += width;
+    }
+
+    // The box behind a code span, a badge's chip, a highlight's bar, a done
+    // task's strike — the editor's own painter, so a page cannot disagree
+    // with the screen about where any of them lands.
+    decoration::runs(
+        canvas,
+        &pieces,
+        kind,
+        top,
+        line.height,
+        baseline,
+        layout.scale,
+    );
+
+    // The prose, last and on top of every mark. Drawn from the *piece's* x
+    // rather than the pen's: a badge's label sits one pad inside the chip
+    // drawn around it, and the piece is what knows that.
+    for ((text, _, at, _), segment) in pieces.iter().zip(&line.segments) {
+        if !matches!(kind.inlines()[segment.inline], Inline::Text(_)) {
+            continue;
+        }
+        let mut prefix = String::new();
+        for (part, style) in code::painted(layout, index, segment, text) {
+            let x = at + canvas.measure(&prefix, &style);
+            canvas.draw_text(part, (x, baseline), &style, theme::LEFT);
+            prefix.push_str(part);
+        }
     }
 }
 
@@ -308,7 +438,7 @@ mod tests {
     use super::*;
     use crate::document::layout::VisLine;
     use crate::document::math::MathNode;
-    use crate::document::{Document, Style, Text};
+    use crate::document::{Document, ListMarker, Style, Text};
     use crate::renderer::{Alignment, Color, HorizontalAlign, PathPaint, VerticalAlign};
 
     /// Every glyph is ten wide — the same fake `components/editor.rs`'s own
@@ -328,6 +458,14 @@ mod tests {
         Rectangle {
             at: (f32, f32),
             size: (f32, f32),
+            color: Color,
+        },
+        Circle {
+            center: (f32, f32),
+            radius: f32,
+        },
+        Path {
+            at: (f32, f32),
         },
     }
 
@@ -351,16 +489,42 @@ mod tests {
                 .iter()
                 .find(|call| matches!(call, Call::Text { text, .. } if text == wanted))
         }
+
+        /// Every rectangle drawn in `color` — which is what tells a fence's
+        /// tint from an equation's band and a chip from a highlight's bar.
+        fn rectangles(&self, color: Color) -> Vec<((f32, f32), (f32, f32))> {
+            self.calls
+                .iter()
+                .filter_map(|call| match call {
+                    Call::Rectangle { at, size, color: c } if *c == color => Some((*at, *size)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn first_rectangle(&self) -> ((f32, f32), (f32, f32)) {
+            self.calls
+                .iter()
+                .find_map(|call| match call {
+                    Call::Rectangle { at, size, .. } => Some((*at, *size)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("a rectangle is drawn, got {:?}", self.calls))
+        }
     }
 
     impl Canvas for Recorder {
-        fn draw_rectangle(&mut self, at: (f32, f32), size: (f32, f32), _: Color, _: Rounding) {
-            self.calls.push(Call::Rectangle { at, size });
+        fn draw_rectangle(&mut self, at: (f32, f32), size: (f32, f32), color: Color, _: Rounding) {
+            self.calls.push(Call::Rectangle { at, size, color });
         }
 
-        fn draw_circle(&mut self, _: (f32, f32), _: f32, _: Color) {}
+        fn draw_circle(&mut self, center: (f32, f32), radius: f32, _: Color) {
+            self.calls.push(Call::Circle { center, radius });
+        }
 
-        fn draw_path(&mut self, _: &str, _: (f32, f32), _: f32, _: &PathPaint) {}
+        fn draw_path(&mut self, _: &str, at: (f32, f32), _: f32, _: &PathPaint) {
+            self.calls.push(Call::Path { at });
+        }
 
         fn draw_text(&mut self, text: &str, at: (f32, f32), style: &TextStyle, align: Alignment) {
             self.calls.push(Call::Text {
@@ -397,6 +561,20 @@ mod tests {
         let numbers = super::super::heading_numbers(layout);
         super::page(&mut recorder, layout, page, &numbers, width);
         recorder
+    }
+
+    #[test]
+    fn the_ground_covers_the_whole_sheet_in_the_pages_own_colour() {
+        let geometry =
+            super::super::geometry::PageGeometry::plain(super::super::geometry::Paper::A4);
+        let sheet = geometry.sheet();
+        let mut recorder = Recorder::default();
+        super::ground(&mut recorder, sheet);
+        assert_eq!(
+            recorder.rectangles(theme::background()),
+            vec![(sheet.position(), sheet.size())],
+            "one rectangle, the sheet's, in the editor's page colour"
+        );
     }
 
     #[test]
@@ -494,15 +672,9 @@ mod tests {
     fn a_divider_rules_the_full_column() {
         let layout = laid_out(vec![Block::Divider(vec![text("")])], 500.0);
         let painted = paint(&layout, &whole(&layout), 500.0);
-        let Some(Call::Rectangle { at, size }) = painted
-            .calls
-            .iter()
-            .find(|call| matches!(call, Call::Rectangle { .. }))
-        else {
-            panic!("a divider draws its rule, got {:?}", painted.calls);
-        };
+        let (at, size) = painted.first_rectangle();
         assert_eq!(at.0, 0.0);
-        assert_eq!(*size, (500.0, RULE_THICKNESS));
+        assert_eq!(size, (500.0, RULE_THICKNESS));
     }
 
     /// The tagged display block `(1)`, with one symbol in it.
@@ -517,13 +689,7 @@ mod tests {
     fn display_math_gets_a_band_wider_than_the_column() {
         let layout = laid_out(vec![equation()], 500.0);
         let painted = paint(&layout, &whole(&layout), 500.0);
-        let Some(Call::Rectangle { at, size }) = painted
-            .calls
-            .iter()
-            .find(|call| matches!(call, Call::Rectangle { .. }))
-        else {
-            panic!("a display block draws its slab, got {:?}", painted.calls);
-        };
+        let (at, size) = painted.first_rectangle();
         // The slab overhangs the column by the block padding on both sides,
         // exactly as the editor's does.
         assert_eq!(at.0, -BLOCK_PAD.0);
@@ -682,6 +848,327 @@ mod tests {
         );
     }
 
+    /// One line of a fenced block. `first` opens the fence; the rest
+    /// continue it, which is what makes a fence a run rather than a block.
+    fn code_line(value: &str, first: bool) -> Block {
+        Block::CodeLine {
+            content: vec![text(value)],
+            first,
+            lang: None,
+        }
+    }
+
+    #[test]
+    fn a_fence_is_tinted_as_one_slab_over_all_its_lines() {
+        // Three blocks, one tint. Per-line boxes would notch the rounded
+        // corner at every join, which is why the run is found first.
+        let layout = laid_out(
+            vec![
+                code_line("one", true),
+                code_line("two", false),
+                code_line("three", false),
+            ],
+            500.0,
+        );
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let tints = painted.rectangles(theme::code());
+        let [(at, size)] = tints[..] else {
+            panic!("one slab under the whole fence, got {tints:?}");
+        };
+        let first = &layout.blocks[0].lines[0];
+        let last = &layout.blocks[2].lines[0];
+        assert_eq!(at, (-BLOCK_PAD.0, first.y - BLOCK_PAD.1));
+        assert_eq!(size.0, 500.0 + BLOCK_PAD.0 * 2.0);
+        assert_eq!(
+            size.1,
+            last.y + last.height - first.y + BLOCK_PAD.1 * 2.0,
+            "the slab reaches the bottom of the last line of the fence"
+        );
+    }
+
+    #[test]
+    fn two_fences_are_two_slabs() {
+        // A `first: true` line opens a new fence and closes the one above
+        // it, however flush the two sit.
+        let layout = laid_out(
+            vec![
+                code_line("one", true),
+                code_line("two", true),
+                code_line("three", false),
+            ],
+            500.0,
+        );
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        assert_eq!(painted.rectangles(theme::code()).len(), 2);
+    }
+
+    #[test]
+    fn a_fence_split_across_a_break_is_tinted_on_both_pages() {
+        // The slab is drawn from the pieces this page carries, not from the
+        // blocks the document has, or the first sheet would carry a slab
+        // long enough for lines that are not on it.
+        let layout = laid_out(
+            vec![
+                code_line("one", true),
+                code_line("two", false),
+                code_line("three", false),
+            ],
+            500.0,
+        );
+        let split = Page {
+            pieces: vec![Piece {
+                block: 0,
+                lines: 0..1,
+                y: 0.0,
+            }],
+        };
+        let painted = paint(&layout, &split, 500.0);
+        let tints = painted.rectangles(theme::code());
+        let [(_, size)] = tints[..] else {
+            panic!("the half on this page is tinted, got {tints:?}");
+        };
+        let line = &layout.blocks[0].lines[0];
+        assert_eq!(size.1, line.height + BLOCK_PAD.1 * 2.0, "one line's worth");
+    }
+
+    #[test]
+    fn a_code_span_in_prose_gets_a_box_of_its_own() {
+        let code_run = Inline::Text(Text {
+            text: "run".into(),
+            style: Style {
+                code: true,
+                ..Style::PLAIN
+            },
+        });
+        let layout = laid_out(vec![Block::Paragraph(vec![text("a "), code_run])], 500.0);
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let boxes = painted.rectangles(theme::code());
+        let [(at, _)] = boxes[..] else {
+            panic!("a code span is boxed, got {:?}", painted.calls);
+        };
+        assert!(
+            at.0 < 2.0 * GLYPH,
+            "the box overhangs the run's left edge, not {}",
+            at.0
+        );
+    }
+
+    #[test]
+    fn a_run_inside_a_fence_gets_no_box_of_its_own() {
+        // It is already on the fence's slab; a second box per line would
+        // draw a ladder down the block.
+        let layout = laid_out(vec![code_line("one", true)], 500.0);
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        assert_eq!(
+            painted.rectangles(theme::code()).len(),
+            1,
+            "the slab and nothing else, got {:?}",
+            painted.calls
+        );
+    }
+
+    fn item(marker: ListMarker, value: &str) -> Block {
+        Block::ListItem {
+            marker,
+            content: vec![text(value)],
+        }
+    }
+
+    #[test]
+    fn a_bullet_is_drawn_in_the_gutter_beside_its_item() {
+        let layout = laid_out(vec![item(ListMarker::Bullet, "milk")], 500.0);
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let line = &layout.blocks[0].lines[0];
+        let Some(Call::Circle { center, .. }) = painted
+            .calls
+            .iter()
+            .find(|call| matches!(call, Call::Circle { .. }))
+        else {
+            panic!("a bullet is drawn, got {:?}", painted.calls);
+        };
+        assert!(
+            center.0 < line.x,
+            "the dot hangs left of the item's text at {}, not {}",
+            line.x,
+            center.0
+        );
+        assert!((center.1 - (line.y + line.height * 0.5)).abs() <= 1.0);
+    }
+
+    #[test]
+    fn a_numbered_item_draws_its_ordinal_right_aligned() {
+        let layout = laid_out(vec![item(ListMarker::Number(7), "seventh")], 500.0);
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let Some(Call::Text { at, align, .. }) = painted.saying("7") else {
+            panic!("the ordinal is drawn, got {:?}", painted.calls);
+        };
+        assert_eq!(at.0, layout.blocks[0].lines[0].x - NUMBER_GUTTER);
+        assert_eq!(align.horizontal, HorizontalAlign::Right);
+    }
+
+    #[test]
+    fn an_open_task_draws_an_empty_box_and_a_done_one_a_tick() {
+        let open = laid_out(vec![item(ListMarker::Task { done: false }, "todo")], 500.0);
+        let open = paint(&open, &whole(&open), 500.0);
+        let done = laid_out(vec![item(ListMarker::Task { done: true }, "todo")], 500.0);
+        let done = paint(&done, &whole(&done), 500.0);
+
+        let paths = |painted: &Recorder| {
+            painted
+                .calls
+                .iter()
+                .filter(|call| matches!(call, Call::Path { .. }))
+                .count()
+        };
+        assert_eq!(paths(&open), 1, "just the outline, got {:?}", open.calls);
+        assert_eq!(
+            paths(&done),
+            2,
+            "the outline and the tick, got {:?}",
+            done.calls
+        );
+    }
+
+    #[test]
+    fn a_done_task_is_struck_through_its_own_text() {
+        let layout = laid_out(vec![item(ListMarker::Task { done: true }, "done")], 500.0);
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let strikes = painted.rectangles(theme::dim());
+        let [(at, size)] = strikes[..] else {
+            panic!("a done task is struck, got {:?}", painted.calls);
+        };
+        let line = &layout.blocks[0].lines[0];
+        assert!((at.1 - (line.y + line.height * 0.5)).abs() < 1.0);
+        assert!(
+            size.0 >= 4.0 * GLYPH,
+            "the rule crosses the whole word, not {}",
+            size.0
+        );
+    }
+
+    #[test]
+    fn a_marker_is_drawn_once_however_far_its_item_wraps() {
+        let layout = laid_out(vec![item(ListMarker::Number(1), "aaaa bbbb cccc")], 90.0);
+        assert!(
+            layout.blocks[0].lines.len() > 1,
+            "the fixture must actually wrap"
+        );
+        let painted = paint(&layout, &whole(&layout), 90.0);
+        let markers = painted
+            .texts()
+            .into_iter()
+            .filter(|call| matches!(call, Call::Text { text, .. } if text == "1"))
+            .count();
+        assert_eq!(markers, 1);
+    }
+
+    #[test]
+    fn a_continuation_piece_carries_no_marker() {
+        // The second half of an item split across a break keeps the indent
+        // and leaves the bullet on the page its first line went to.
+        let layout = laid_out(vec![item(ListMarker::Bullet, "aaaa bbbb cccc")], 90.0);
+        let lines = layout.blocks[0].lines.len();
+        assert!(lines > 1, "the fixture must actually wrap");
+        let rest = Page {
+            pieces: vec![Piece {
+                block: 0,
+                lines: 1..lines,
+                y: 0.0,
+            }],
+        };
+        let painted = paint(&layout, &rest, 90.0);
+        assert!(
+            !painted
+                .calls
+                .iter()
+                .any(|call| matches!(call, Call::Circle { .. })),
+            "got {:?}",
+            painted.calls
+        );
+    }
+
+    fn styled(value: &str, style: Style) -> Inline {
+        Inline::Text(Text {
+            text: value.into(),
+            style,
+        })
+    }
+
+    #[test]
+    fn a_badge_draws_its_chip_around_an_inset_label() {
+        let badge = Style {
+            badge: true,
+            ..Style::PLAIN
+        };
+        let layout = laid_out(vec![Block::Paragraph(vec![styled("TODO", badge)])], 500.0);
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let Some(Call::Text { at: label, .. }) = painted.saying("TODO") else {
+            panic!("the chip's label is painted, got {:?}", painted.calls);
+        };
+        assert_eq!(
+            label.0,
+            theme::BADGE_PAD,
+            "the label sits one pad inside the chip"
+        );
+        let (chip, size) = painted.first_rectangle();
+        assert_eq!(chip.0, 0.0, "the chip starts where the run does");
+        assert_eq!(size.1, theme::BADGE_HEIGHT);
+        assert_eq!(
+            size.0,
+            4.0 * GLYPH + theme::BADGE_PAD * 2.0,
+            "the chip is the label plus a pad each side"
+        );
+    }
+
+    #[test]
+    fn a_highlight_draws_its_bar_under_the_run_it_marks() {
+        let mark = Style {
+            highlight: true,
+            ..Style::PLAIN
+        };
+        let layout = laid_out(
+            vec![Block::Paragraph(vec![text("a "), styled("marked", mark)])],
+            500.0,
+        );
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let bars = painted.rectangles(theme::highlight());
+        let [(at, size)] = bars[..] else {
+            panic!("a marked run is barred, got {:?}", painted.calls);
+        };
+        let Some(Call::Text { at: word, .. }) = painted.saying("marked") else {
+            panic!("the marked word is painted");
+        };
+        assert!(at.1 > word.1, "the bar hangs below the line it marks");
+        assert!(
+            size.0 >= 6.0 * GLYPH,
+            "the bar spans the marked run, not {}",
+            size.0
+        );
+    }
+
+    #[test]
+    fn text_is_drawn_over_the_marks_beneath_it() {
+        // Order is the whole promise here: a bar drawn after its glyphs
+        // would strike them out.
+        let mark = Style {
+            highlight: true,
+            ..Style::PLAIN
+        };
+        let layout = laid_out(vec![Block::Paragraph(vec![styled("marked", mark)])], 500.0);
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let bar = painted
+            .calls
+            .iter()
+            .position(|call| matches!(call, Call::Rectangle { .. }))
+            .expect("the bar is drawn");
+        let word = painted
+            .calls
+            .iter()
+            .position(|call| matches!(call, Call::Text { text, .. } if text == "marked"))
+            .expect("the word is drawn");
+        assert!(bar < word, "the mark goes under the glyphs, not over them");
+    }
+
     /// One note in the margin, with `body` as its text, placed at `y`.
     fn placed(body: &str, y: f32) -> Placed {
         Placed {
@@ -733,10 +1220,10 @@ mod tests {
             )
         );
         assert!(
-            painted.calls.contains(&Call::Rectangle {
-                at: (NOTE_COLUMN, 100.0 + sidenotes::TICK_TOP),
-                size: (sidenotes::TICK_LENGTH, sidenotes::TICK_THICKNESS),
-            }),
+            painted.rectangles(theme::border()).contains(&(
+                (NOTE_COLUMN, 100.0 + sidenotes::TICK_TOP),
+                (sidenotes::TICK_LENGTH, sidenotes::TICK_THICKNESS)
+            )),
             "the tick beside the note is drawn, got {:?}",
             painted.calls
         );

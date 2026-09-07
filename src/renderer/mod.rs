@@ -27,6 +27,7 @@ use winit::{event::WindowEvent, window::Window};
 mod alignment;
 mod color;
 mod draw_command;
+mod focus_band;
 mod font;
 mod font_parameters;
 mod glyph_effects;

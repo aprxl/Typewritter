@@ -4,10 +4,8 @@
 //! [`Shell`](typewritter::shell::Shell), which owns the layout tree, the
 //! components, and one Atomos layer per region.
 //!
-//! Onboarding lives here, in front of the window: first launch (and
-//! `--onboard`) has no saved config, so `main` raises the native folder
-//! dialog, writes `~/.typewritter/config.toml`, and only then starts the
-//! app pointed at that vault.
+//! First launch (and `--onboard`) opens the welcome screen. Its button
+//! raises the native folder picker and remembers the chosen vault.
 //!
 //! Frames are demand-driven — the loop sleeps until input changes state or
 //! an animation asks for another one — and within a frame, only the
@@ -16,15 +14,15 @@
 //!
 //! Keys: vim modes drive the editor (Normal/Insert; `h j k l`, `w b e`,
 //! `0 ^ $`, `gg`/`G`, `x`, `dd`, `o`/`O`, `i a I A`), and the space leader
-//! opens the command palette every binding is routed through. Outside vim's
-//! own keys: `Ctrl+1..4` toggle the tree/sidenotes/topics/status,
-//! `Ctrl+Shift+C` is capture mode (all four at once). Drag the tree's right
-//! edge to resize it.
+//! opens the command palette every binding is routed through.
+//! `Ctrl+Shift+C` toggles focus mode; the toolbar also exposes focus,
+//! sidebar, search, and appearance. Drag panel dividers to resize them.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use typewritter::config::Config;
+use typewritter::document::math_style;
 use typewritter::layout::Rect;
 use typewritter::renderer::Renderer;
 use typewritter::shell::Shell;
@@ -117,10 +115,12 @@ impl ApplicationHandler for App {
                 // reader's, this is a local vault with git sync planned, and a
                 // dialog between a student and their closing laptop is a way
                 // to lose work, not a way to protect it.
-                if let Some(shell) = &mut self.shell {
-                    shell.save_all();
+                let saved = self.shell.as_mut().is_none_or(|shell| shell.save_all());
+                if saved {
+                    event_loop.exit();
+                } else {
+                    self.scheduler.request_redraw();
                 }
-                event_loop.exit();
             }
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
@@ -259,6 +259,13 @@ fn main() -> Result<(), winit::error::EventLoopError> {
     // folder dialog from there — the dialog never comes out of thin air.
     let onboard = std::env::args().any(|arg| arg == "--onboard");
     let config = Config::load().filter(|_| !onboard);
+
+    // Before the first frame: symbol styling is read from every math draw
+    // call, and installing it later would mean one frame drawn in colours
+    // the reader replaced.
+    if let Some(config) = &config {
+        math_style::install(config.math.clone());
+    }
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App {

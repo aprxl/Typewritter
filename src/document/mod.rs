@@ -6,6 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod code;
+mod code_metadata;
+pub mod decoration;
 pub mod layout;
 pub mod markdown;
 pub mod math;
@@ -13,6 +16,7 @@ pub mod math_conversion;
 pub mod math_layout;
 pub mod math_notation;
 pub mod math_paint;
+pub mod math_style;
 pub mod math_symbols;
 pub mod outline;
 
@@ -152,6 +156,7 @@ pub enum BadgeColor {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Style {
+    pub syntax: code::CodeStyle,
     pub bold: bool,
     pub italic: bool,
     pub code: bool,
@@ -218,6 +223,7 @@ impl FlatRange {
 
 impl Style {
     pub const PLAIN: Style = Style {
+        syntax: code::CodeStyle::PLAIN,
         bold: false,
         italic: false,
         code: false,
@@ -230,6 +236,17 @@ impl Style {
     /// code spans and badges. Nothing else may be layered onto one.
     pub fn is_boxed(&self) -> bool {
         self.code || self.badge
+    }
+
+    /// Saved code annotations do not add style-context stops to arrow motions.
+    fn same_context(self, other: Self) -> bool {
+        Self {
+            syntax: code::CodeStyle::PLAIN,
+            ..self
+        } == Self {
+            syntax: code::CodeStyle::PLAIN,
+            ..other
+        }
     }
 
     pub fn is_plain(&self) -> bool {
@@ -451,6 +468,11 @@ fn continued(marker: ListMarker) -> ListMarker {
 /// every note body, so invariants hold in every scope rather than only where
 /// the caret is.
 fn prune_block(block: &mut Block) {
+    let syntax = block
+        .inlines()
+        .first()
+        .map(|run| run.style().syntax)
+        .unwrap_or_default();
     let runs = std::mem::take(block.inlines_mut());
     let mut merged = Vec::with_capacity(runs.len());
     for run in runs {
@@ -497,6 +519,7 @@ fn prune_block(block: &mut Block) {
                     text: String::new(),
                     style: Style {
                         code: true,
+                        syntax,
                         ..Style::PLAIN
                     },
                 })],
@@ -738,6 +761,13 @@ impl Document {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Updates the persistence marker without touching document content.
+    /// Tabs use this when restoring an undo snapshot and comparing it with
+    /// the last successfully serialized content.
+    pub(crate) fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
     }
 
     /// The blocks the caret is in — the body, or the focused note's body.
@@ -1675,7 +1705,7 @@ impl Document {
         let at_seam = o == 0 || o == run_len_i;
         let after = self.style_at(b, self.caret_flat(b));
         let target = after.unwrap_or(Style::PLAIN);
-        if at_seam && self.caret.style != target {
+        if at_seam && !self.caret.style.same_context(target) {
             self.caret.style = target; // pop out of the run — no movement
             return;
         }
@@ -1704,7 +1734,7 @@ impl Document {
         let at_seam = o == 0 || o == run_len_i;
         let before = self.style_before(b, self.caret_flat(b));
         let target = before.unwrap_or(Style::PLAIN);
-        if at_seam && self.caret.style != target {
+        if at_seam && !self.caret.style.same_context(target) {
             self.caret.style = target; // re-enter the run to the left
             return;
         }
@@ -1778,7 +1808,15 @@ impl Document {
             }
             return;
         }
-        let s = self.caret.style;
+        let s = if self.scope()[b].is_code() {
+            Style {
+                code: true,
+                syntax: self.scope()[b].inlines()[self.caret.inline].style().syntax,
+                ..Style::PLAIN
+            }
+        } else {
+            self.caret.style
+        };
         let i = self.caret.inline;
         let o = self.caret.offset;
         let flat = self.caret_flat(b);
@@ -2323,6 +2361,9 @@ impl Document {
     pub fn set_code(&mut self, on: bool) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_code() == on {
+            return;
+        }
         let flat_text: String = self.scope()[b].inlines().iter().map(Inline::text).collect();
         let style = if on {
             Style {
@@ -2393,11 +2434,20 @@ impl Document {
             if !(1..=4).contains(&level) {
                 return;
             }
+            if matches!(
+                self.scope()[b],
+                Block::Heading {
+                    level: current, ..
+                } if current == level
+            ) {
+                return;
+            }
             let mut inlines = std::mem::take(self.scope_mut()[b].inlines_mut());
             if self.scope()[b].is_code() {
                 for run in &mut inlines {
                     run.set_style(Style {
                         code: false,
+                        syntax: code::CodeStyle::PLAIN,
                         ..run.style()
                     });
                 }
@@ -2408,11 +2458,15 @@ impl Document {
                 content: inlines,
             };
         } else {
+            if matches!(self.scope()[b], Block::Paragraph(_)) {
+                return;
+            }
             let mut inlines = std::mem::take(self.scope_mut()[b].inlines_mut());
             if self.scope()[b].is_code() {
                 for run in &mut inlines {
                     run.set_style(Style {
                         code: false,
+                        syntax: code::CodeStyle::PLAIN,
                         ..run.style()
                     });
                 }
@@ -2470,6 +2524,9 @@ impl Document {
         self.clamp_caret();
         let b = self.caret.block;
         if self.scope()[b].is_code() {
+            return;
+        }
+        if marker.is_none() && matches!(self.scope()[b], Block::Paragraph(_)) {
             return;
         }
         let same_kind = matches!(

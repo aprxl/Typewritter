@@ -1,11 +1,10 @@
 //! Vault-wide text search for the finder panel.
 //!
 //! The finder matches files by name; this extends the same panel to match
-//! lines *inside* files. One scan reads every file in the vault once per
-//! query — the notes are one-lecture files, so the whole vault is a few
-//! hundred kilobytes and a scan costs less than the keyboard's repeat rate.
-//! §11's budget says results must arrive under 100 ms; at 8 KB a note, even
-//! a thousand notes read in well under that.
+//! lines *inside* files. The finder builds a parsed snapshot when it opens,
+//! then each query only ranks the in-memory rows. The compatibility helper
+//! [`search`] still builds a short-lived snapshot for callers without a
+//! finder session.
 //!
 //! Results come back as one ranked list: file matches first, then text
 //! hits ranked by fuzzy score. A hit carries the block and offset it was
@@ -48,6 +47,85 @@ pub enum Row {
     Text(TextHit),
 }
 
+#[derive(Clone)]
+struct IndexedRun {
+    path: PathBuf,
+    name: String,
+    text: String,
+    block: usize,
+    offset: usize,
+}
+
+/// Parsed vault content reused across finder query changes. Building the
+/// index performs filesystem I/O once; ranking a new query only scans these
+/// in-memory runs.
+#[derive(Clone)]
+pub struct SearchIndex {
+    files: Vec<crate::vault::VaultFile>,
+    runs: Vec<IndexedRun>,
+}
+
+impl SearchIndex {
+    pub fn build(files: &[crate::vault::VaultFile]) -> Self {
+        let mut runs = Vec::new();
+        for file in files {
+            let Ok(text) = std::fs::read_to_string(&file.path) else {
+                continue;
+            };
+            let doc = crate::document::markdown::parse(&file.path, &text);
+            for (block_index, block) in doc.body().iter().enumerate() {
+                let tag_prefix = match block {
+                    crate::document::Block::Math { tag: Some(tag), .. } => {
+                        format!("#{tag} ")
+                    }
+                    _ => String::new(),
+                };
+                let mut offset = 0usize;
+                for run in block.inlines() {
+                    let (chars, text) = match run {
+                        crate::document::Inline::Text(t) => {
+                            (t.text.chars().count(), t.text.clone())
+                        }
+                        crate::document::Inline::Math(list) => (
+                            1,
+                            format!(
+                                "{}${}$",
+                                tag_prefix,
+                                crate::document::math_notation::print(list)
+                            ),
+                        ),
+                        crate::document::Inline::Note(_) => (1, String::new()),
+                        crate::document::Inline::EqRef(label) => (1, format!("@{label}")),
+                    };
+                    runs.push(IndexedRun {
+                        path: file.path.clone(),
+                        name: file.name.clone(),
+                        text,
+                        block: block_index,
+                        offset,
+                    });
+                    offset += chars;
+                }
+            }
+        }
+        Self {
+            files: files.to_vec(),
+            runs,
+        }
+    }
+
+    pub fn search(&self, query: &str) -> Vec<Row> {
+        let mut rows: Vec<Row> = file_rows(&self.files, query)
+            .into_iter()
+            .map(|(path, name)| Row::File { path, name })
+            .collect();
+        if !query.is_empty() {
+            rows.extend(text_rows(&self.runs, query));
+        }
+        rows
+    }
+}
+
 impl Row {
     pub fn path(&self) -> &Path {
         match self {
@@ -77,19 +155,11 @@ impl Row {
 /// (vault order, the same ranking the finder always used), then text hits
 /// ranked by fuzzy score with source order breaking ties.
 ///
-/// Reading every file on every keystroke is deliberate: the vault is small
-/// (one note per lecture), the parse is the same one opening a tab runs,
-/// and an incremental index is a second copy of the document model to keep
-/// honest. Revisit only if a real vault makes the scan perceptible.
+/// `search` is the compatibility entry point for callers that have no
+/// long-lived finder. The shell uses [`SearchIndex`] so adjacent queries do
+/// not repeat filesystem reads or Markdown parsing.
 pub fn search(files: &[crate::vault::VaultFile], query: &str) -> Vec<Row> {
-    let mut rows: Vec<Row> = file_rows(files, query)
-        .into_iter()
-        .map(|(path, name)| Row::File { path, name })
-        .collect();
-    if !query.is_empty() {
-        rows.extend(text_rows(files, query));
-    }
-    rows
+    SearchIndex::build(files).search(query)
 }
 
 /// Files whose name fuzzy-matches, ranked the way `file_finder::filter`
@@ -122,67 +192,33 @@ fn file_rows(files: &[crate::vault::VaultFile], query: &str) -> Vec<(PathBuf, St
 /// Fuzzy text hits across every file, ranked by score then source order.
 /// Math is searched as its canonical notation — the `$…$`/fence form on
 /// disk — so `R_2 / R_1` finds the equation (§7.3).
-fn text_rows(files: &[crate::vault::VaultFile], query: &str) -> Vec<Row> {
+fn text_rows(runs: &[IndexedRun], query: &str) -> Vec<Row> {
     let matcher = SkimMatcherV2::default();
     let mut scored: Vec<(usize, i64, TextHit)> = Vec::new();
-    for (source, file) in files.iter().enumerate() {
-        let Ok(text) = std::fs::read_to_string(&file.path) else {
-            continue;
-        };
-        let doc = crate::document::markdown::parse(&file.path, &text);
-        for block in doc.body().iter().enumerate() {
-            let (block_index, b) = block;
-            // A tagged equation is searchable by its tag as well as by its
-            // notation — the tag is part of what the equation "says".
-            let tag_prefix = match b {
-                crate::document::Block::Math { tag: Some(tag), .. } => format!("#{tag} "),
-                _ => String::new(),
-            };
-            let mut offset = 0usize;
-            for run in b.inlines() {
-                let (chars, text) = match run {
-                    crate::document::Inline::Text(t) => (t.text.chars().count(), t.text.clone()),
-                    // One flat position each, exactly as the editor counts.
-                    crate::document::Inline::Math(list) => (
-                        1,
-                        format!(
-                            "{}${}$",
-                            tag_prefix,
-                            crate::document::math_notation::print(list)
-                        ),
-                    ),
-                    crate::document::Inline::Note(_) => (1, String::new()),
-                    crate::document::Inline::EqRef(label) => (1, format!("@{label}")),
-                };
-                if let Some((score, indices)) = matcher.fuzzy_indices(&text, query) {
-                    let at = chars_min_prefix(&text, indices[0]);
-                    // The row shows one line: the whole run when it fits,
-                    // otherwise a window that keeps a little context before
-                    // the match. Match positions are kept as CHAR offsets
-                    // within what is shown, so the panel can highlight them
-                    // without touching bytes again.
-                    let from = at.saturating_sub(CONTEXT_BEFORE);
-                    let at_chars: Vec<usize> = indices
-                        .iter()
-                        .map(|&b| chars_min_prefix(&text, b))
-                        .filter(|&c| c >= from)
-                        .map(|c| c - from)
-                        .collect();
-                    scored.push((
-                        source,
-                        score,
-                        TextHit {
-                            path: file.path.clone(),
-                            name: file.name.clone(),
-                            line: clip(&text, from),
-                            matches: at_chars,
-                            block: block_index,
-                            offset,
-                        },
-                    ));
-                }
-                offset += chars;
-            }
+    for (source, run) in runs.iter().enumerate() {
+        if let Some((score, indices)) = matcher.fuzzy_indices(&run.text, query) {
+            let at = chars_min_prefix(&run.text, indices[0]);
+            // The row shows one line: the whole run when it fits, otherwise
+            // a window that keeps context before the match.
+            let from = at.saturating_sub(CONTEXT_BEFORE);
+            let at_chars: Vec<usize> = indices
+                .iter()
+                .map(|&b| chars_min_prefix(&run.text, b))
+                .filter(|&c| c >= from)
+                .map(|c| c - from)
+                .collect();
+            scored.push((
+                source,
+                score,
+                TextHit {
+                    path: run.path.clone(),
+                    name: run.name.clone(),
+                    line: clip(&run.text, from),
+                    matches: at_chars,
+                    block: run.block,
+                    offset: run.offset,
+                },
+            ));
         }
     }
     scored.sort_by(

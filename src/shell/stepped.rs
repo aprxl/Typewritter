@@ -62,12 +62,6 @@ impl Stepped {
         }
     }
 
-    /// Reverse at each end rather than snapping back — a fade, not a blink.
-    pub fn ping_pong(mut self) -> Self {
-        self.animation = self.animation.ping_pong();
-        self
-    }
-
     fn step_of(animation: &Animation, steps: u32) -> u32 {
         let steps = steps.max(1);
         ((animation.progress() * steps as f32) as u32).min(steps - 1)
@@ -164,7 +158,7 @@ mod tests {
         assert!(blink.wake_in() <= per_step);
         assert!(blink.wake_in() >= Duration::from_millis(1));
 
-        let fade = Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16).ping_pong();
+        let fade = Stepped::new(Duration::from_millis(1200), Easing::EaseInOut, 16);
         assert!(fade.wake_in() <= Duration::from_millis(75));
         assert!(fade.wake_in() >= Duration::from_millis(1));
     }

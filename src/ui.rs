@@ -24,7 +24,7 @@
 //! Neither one is guessed at — components report the first, the layout
 //! reports the second.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::animation::{Animation, Easing};
 use crate::layout::{Layout, NodeId, Rect};
@@ -73,10 +73,12 @@ pub struct Context {
     pub divider_hot: bool,
     /// Caret visibility this frame — step-end, not a fade.
     pub caret_on: bool,
-    /// 0..1 from the writing-indicator animation.
-    pub pulse: f32,
     /// Whether the status line shows render instrumentation.
     pub show_stats: bool,
+    /// Every auxiliary panel is closed for focused writing.
+    pub focus_mode: bool,
+    /// Animated emphasis, independent of the editor snapshot's lifetime.
+    pub focus_amount: f32,
     /// Mouse state, for components that handle clicks and hovers.
     pub mouse: Mouse,
     /// Whether THIS region owns the shared popup shadow layer this frame —
@@ -222,6 +224,121 @@ impl Hover {
 impl Default for Hover {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A number that eases toward a target which may move while it travels.
+///
+/// [`Hover`]'s shape, for a value that is not a 0..1 weight — the page's
+/// scroll offset. Two properties make it the right primitive for that:
+///
+/// - **Re-aiming picks up from wherever the value is now**, so a second
+///   wheel notch during the first one's travel reads as one continuous push
+///   rather than a jump back to the old resting place.
+/// - **Aiming where it is already going does nothing**, so a target that is
+///   recomputed and re-aimed every frame does not hold the glide at its
+///   start forever.
+///
+/// [`Glide::advance`] reports the frame it *lands* on as a change, not just
+/// the frames before it: the landing frame is the one that moves the value
+/// onto the target, and a caller that stopped asking for frames a moment
+/// early would leave the last pixel of travel undrawn.
+///
+/// It keeps its own wall clock rather than taking the frame delta, for the
+/// same reason [`Stepped`] does. Under a `ControlFlow::Wait` scheduler the
+/// first frame after an idle window carries the whole idle gap as its
+/// delta — clamped by [`MAX_ANIMATION_DELTA`] to 100 ms, which is still
+/// most of a travel this short. Charging that to a target aimed *during*
+/// that frame is charging it for time it did not exist: one wheel notch on
+/// a resting window would jump almost the whole way and then ease the
+/// remainder, while a continuous scroll (which keeps the loop awake, and
+/// its deltas at a frame apiece) looked perfectly smooth. Nothing here can
+/// teleport instead, because a travelling glide reports itself as animating
+/// and so keeps the frames coming.
+///
+/// [`Stepped`]: crate::shell::stepped::Stepped
+/// [`MAX_ANIMATION_DELTA`]: crate::frame::MAX_ANIMATION_DELTA
+#[derive(Debug)]
+pub struct Glide {
+    animation: Animation,
+    from: f32,
+    to: f32,
+    duration: Duration,
+    easing: Easing,
+    /// Wall clock of the last aim or advance.
+    last: Instant,
+}
+
+impl Glide {
+    /// A glide resting at zero. `duration` is one full travel, whatever the
+    /// distance: a scroll should take the same time to settle whether it
+    /// moved a line or a screen.
+    pub fn new(duration: Duration, easing: Easing) -> Self {
+        Self {
+            animation: Animation::new(duration, easing).paused(),
+            from: 0.0,
+            to: 0.0,
+            duration,
+            easing,
+            last: Instant::now(),
+        }
+    }
+
+    /// Travel to `to`, starting from wherever the value is now.
+    pub fn aim(&mut self, to: f32) {
+        self.aim_at(Instant::now(), to);
+    }
+
+    fn aim_at(&mut self, now: Instant, to: f32) {
+        if to == self.to {
+            return;
+        }
+        // Bring the travel up to the present before re-aiming. `from` has to
+        // be where the value is *now*, so a target that arrives mid-flight
+        // must not throw away the frame of travel that came just before it —
+        // which is exactly what a scroll does, a notch at a time.
+        self.animation.advance(now - self.last);
+        self.from = self.value();
+        self.to = to;
+        self.animation = Animation::new(self.duration, self.easing);
+        self.last = now;
+    }
+
+    /// Arrive at `to` this instant. For the moves that are not travel at
+    /// all: a different document under the same offset, or a thumb the
+    /// reader is dragging, which must stay under the pointer holding it.
+    ///
+    /// Leaves the clock alone deliberately: the animation it parks is
+    /// paused, and advancing a paused animation does nothing however stale
+    /// the reading behind it is.
+    pub fn settle(&mut self, to: f32) {
+        self.from = to;
+        self.to = to;
+        self.animation = Animation::new(self.duration, self.easing).paused();
+    }
+
+    /// Steps the clock and reports whether anything visible changed.
+    pub fn advance(&mut self) -> bool {
+        self.advance_at(Instant::now())
+    }
+
+    fn advance_at(&mut self, now: Instant) -> bool {
+        let before = self.value();
+        let running = self.animation.advance(now - self.last);
+        self.last = now;
+        running || before != self.value()
+    }
+
+    pub fn value(&self) -> f32 {
+        self.animation.value(self.from, self.to)
+    }
+
+    /// Where it is heading — what to read when deciding where to go next.
+    /// Accumulating onto [`Glide::value`] instead would make each notch of
+    /// a fast scroll shorter than the one before it, because every one
+    /// would start from a journey that had not finished.
+    pub fn target(&self) -> f32 {
+        self.to
     }
 }
 
@@ -479,6 +596,123 @@ mod tests {
 
         dirty.write(&mut frametime, Duration::from_millis(6));
         assert!(dirty.get());
+    }
+
+    /// A glide's clock is its own, so the tests drive it from a synthetic
+    /// one: `at(n)` is `n` milliseconds into the run.
+    fn at(millis: u64) -> Instant {
+        *EPOCH + Duration::from_millis(millis)
+    }
+
+    static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+    /// A linear glide of `millis`, with its clock wound back to `at(0)`.
+    ///
+    /// Winding it back is not decoration. `Instant` subtraction panics on a
+    /// negative result, and tests run in parallel: a glide left holding the
+    /// real `Instant::now()` from its constructor would be handed a
+    /// synthetic instant from an `EPOCH` some *other* test had already
+    /// initialised, and subtract its way off the end of a clock.
+    fn glide(millis: u64) -> Glide {
+        let mut glide = Glide::new(Duration::from_millis(millis), Easing::Linear);
+        glide.last = at(0);
+        glide
+    }
+
+    /// The scroll case, in miniature: a notch lands, a second notch arrives
+    /// mid-travel, and the page must carry both without losing the distance
+    /// the first one had left to run.
+    #[test]
+    fn a_second_aim_mid_flight_keeps_the_distance_the_first_had_left() {
+        let mut glide = glide(100);
+        glide.aim_at(at(0), 100.0);
+        glide.advance_at(at(50));
+        assert!((glide.value() - 50.0).abs() < 0.001, "halfway");
+
+        // A second notch: the target grows, and travel resumes from 50 —
+        // not from 0, and not by teleporting to the old target first.
+        glide.aim_at(at(50), 200.0);
+        assert!((glide.value() - 50.0).abs() < 0.001, "no jump on re-aim");
+        assert_eq!(glide.target(), 200.0);
+        glide.advance_at(at(100));
+        assert!((glide.value() - 125.0).abs() < 0.001);
+        glide.advance_at(at(150));
+        assert_eq!(glide.value(), 200.0, "arrives exactly");
+    }
+
+    /// A notch that arrives *between* frames must be credited with the
+    /// travel that happened before it, or the page stalls for a frame every
+    /// time the wheel is touched. `aim` catches up before it re-aims.
+    #[test]
+    fn a_notch_between_frames_does_not_lose_the_travel_before_it() {
+        let mut glide = glide(100);
+        glide.aim_at(at(0), 100.0);
+        glide.advance_at(at(20));
+        assert!((glide.value() - 20.0).abs() < 0.001);
+
+        // 20 ms later a notch lands, and no frame ran in between: the value
+        // it re-aims from is 40, the travel that really happened.
+        glide.aim_at(at(40), 300.0);
+        assert!(
+            (glide.value() - 40.0).abs() < 0.001,
+            "caught up before aiming"
+        );
+    }
+
+    /// The regression the wheel exposed. Under `ControlFlow::Wait` the frame
+    /// that wakes an idle window carries the whole idle gap; a glide aimed
+    /// on that frame must be charged none of it, because its target did not
+    /// exist for any of it.
+    #[test]
+    fn a_glide_aimed_on_the_frame_that_woke_the_window_starts_from_zero() {
+        let mut glide = glide(150);
+        glide.settle(0.0);
+
+        // A minute of nothing, then one wheel notch, then that frame's
+        // advance — which is the same instant, because the aim happened in
+        // this frame's own input pass.
+        let woke = at(60_000);
+        glide.aim_at(woke, 90.0);
+        glide.advance_at(woke);
+        assert_eq!(glide.value(), 0.0, "the idle gap belongs to nobody");
+
+        // And from there it travels at its own pace, not the gap's.
+        glide.advance_at(woke + Duration::from_millis(75));
+        assert!(
+            (glide.value() - 45.0).abs() < 0.001,
+            "halfway, one frame in"
+        );
+    }
+
+    /// The camera aims at the same offset every frame it is asked to follow
+    /// a caret that has not moved. Restarting there would pin the value at
+    /// the start of a travel it never finishes.
+    #[test]
+    fn aiming_where_it_is_already_going_is_not_a_restart() {
+        let mut glide = glide(100);
+        glide.aim_at(at(0), 100.0);
+        for step in 1..=4 {
+            glide.aim_at(at(step * 25), 100.0);
+            glide.advance_at(at(step * 25));
+        }
+        assert_eq!(glide.value(), 100.0);
+    }
+
+    /// A frame that lands the value has to be reported, or the caller stops
+    /// asking for frames one short and the last pixel is never drawn.
+    #[test]
+    fn the_landing_frame_counts_as_a_change_and_the_rest_do_not() {
+        let mut glide = glide(100);
+        glide.aim_at(at(0), 10.0);
+        assert!(glide.advance_at(at(60)), "still travelling");
+        assert!(glide.advance_at(at(120)), "landed this frame");
+        assert!(!glide.advance_at(at(180)), "at rest");
+
+        // Settling is arrival without travel: nothing to animate afterwards.
+        glide.settle(400.0);
+        assert_eq!(glide.value(), 400.0);
+        assert_eq!(glide.target(), 400.0);
+        assert!(!glide.advance_at(at(240)), "a parked glide has no clock");
     }
 
     #[test]
