@@ -346,6 +346,49 @@ enum InsertEvent {
     Backspace,
     Delete,
     Enter,
+    SetHeading(u8),
+    SetEmphasis { bold: bool, italic: bool },
+    ToggleInlineCode,
+    ToggleBadge,
+    ToggleHighlight,
+    BulletList,
+    NumberedList,
+    TaskList,
+    InsertDivider,
+    InsertSidenote,
+    CodeBlock,
+}
+
+/// The partial typed marker at the front of an Insert-mode shorthand.
+///
+/// Markers are input gestures rather than document text, but `[[`, `==`,
+/// and `]]` need to remember their first character long enough to recognise
+/// their second one on the next input frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InsertMarker {
+    OpenBracket,
+    BadgeClose,
+    Equals,
+}
+
+/// Small, local state for Typewritter's structural Markdown gestures.
+///
+/// This is intentionally shell state, not document state: the markers are
+/// never part of the note tree. Once one resolves it invokes the same
+/// document operation as the slash menu or command palette.
+#[derive(Default)]
+struct InsertShortcuts {
+    stars: u8,
+    backticks: u8,
+    dashes: u8,
+    ordered_digits: usize,
+    marker: Option<InsertMarker>,
+}
+
+impl InsertShortcuts {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Half-width of the grab zone around a divider, in logical pixels.
@@ -543,6 +586,8 @@ pub struct Shell {
     repeat: Option<RepeatOp>,
     insert_repeat: Vec<InsertEvent>,
     insert_prefix: Option<RepeatOp>,
+    /// Partial Markdown marker gestures while Insert mode is active.
+    insert_shortcuts: InsertShortcuts,
     /// Geometry affects wrapping and the focus camera even without an edit.
     last_editor_rect: Rect,
     focus_panels: Option<[bool; 4]>,
@@ -848,6 +893,7 @@ impl Shell {
             repeat: None,
             insert_repeat: Vec::new(),
             insert_prefix: None,
+            insert_shortcuts: InsertShortcuts::default(),
             last_editor_rect: Rect::default(),
             focus_panels: None,
             focus_fade: Hover::new(),

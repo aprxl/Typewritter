@@ -25,8 +25,8 @@ use crate::document::math::{self, AccentKind, BigOp, MathNode, NodeAddress, Slot
 use crate::document::math_style::{self, HighlightShape, MathHue};
 use crate::document::math_symbols;
 use crate::document::{
-    BadgeColor, Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, Style, math_conversion,
-    math_layout,
+    BadgeColor, Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, ListMarker, Style,
+    math_conversion, math_layout,
 };
 use crate::input::Input;
 use crate::layout::Rect;
@@ -42,9 +42,267 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    ContextGhost, ContextMenuState, MathMenuState, MenuDismiss, PaletteState, Shell,
-    SlashMenuState, WordFormatState,
+    ContextGhost, ContextMenuState, InsertEvent, InsertMarker, InsertShortcuts, MathMenuState,
+    MenuDismiss, PaletteState, Shell, SlashMenuState, WordFormatState,
 };
+
+/// Apply one recorded Insert-mode event. Text and editing keys are recorded
+/// alongside structural gestures so `.` repeats the document operation that
+/// was actually performed, rather than spelling its hidden marker into
+/// prose.
+fn apply_insert_event(docs: &mut Tabs, event: &InsertEvent) {
+    match event {
+        InsertEvent::Text(c) => docs.type_text(&c.to_string()),
+        InsertEvent::Backspace => docs.backspace(),
+        InsertEvent::Delete => docs.delete_forward(),
+        InsertEvent::Enter => docs.newline(),
+        InsertEvent::SetHeading(level) => docs.set_heading(Some(*level)),
+        InsertEvent::SetEmphasis { bold, italic } => docs.touch(|doc| {
+            if !doc.caret.style.is_boxed() {
+                doc.caret.style.bold = *bold;
+                doc.caret.style.italic = *italic;
+            }
+        }),
+        InsertEvent::ToggleInlineCode => docs.toggle_code(),
+        InsertEvent::ToggleBadge => docs.toggle_badge(),
+        InsertEvent::ToggleHighlight => docs.toggle_highlight(),
+        InsertEvent::BulletList => docs.set_list(Some(ListMarker::Bullet)),
+        InsertEvent::NumberedList => docs.set_list(Some(ListMarker::Number(1))),
+        InsertEvent::TaskList => docs.set_list(Some(ListMarker::Task { done: false })),
+        InsertEvent::InsertDivider => docs.insert_divider(),
+        InsertEvent::InsertSidenote => docs.insert_sidenote(),
+        InsertEvent::CodeBlock => docs.set_code(true),
+    }
+}
+
+/// Apply and record a structural Insert gesture.
+fn insert_event(docs: &mut Tabs, repeat: &mut Vec<InsertEvent>, event: InsertEvent) {
+    apply_insert_event(docs, &event);
+    repeat.push(event);
+}
+
+/// Forget the typed marker text the current structural gesture replaces.
+///
+/// The candidate only exists after this Insert session inserted the text, so
+/// its matching [`InsertEvent::Text`] is always the tail of `repeat`.
+fn erase_marker_text(docs: &mut Tabs, repeat: &mut Vec<InsertEvent>, count: usize) {
+    for _ in 0..count {
+        docs.backspace();
+        if matches!(repeat.last(), Some(InsertEvent::Text(_))) {
+            repeat.pop();
+        }
+    }
+}
+
+fn empty_body_block(docs: &Tabs) -> bool {
+    docs.active().is_some_and(|tab| {
+        matches!(tab.document.focus, Focus::Body)
+            && !tab.document.scope()[tab.document.caret.block].is_code()
+            && tab.document.block_len(tab.document.caret.block) == 0
+    })
+}
+
+fn emphasis_allowed(docs: &Tabs) -> bool {
+    docs.active()
+        .is_some_and(|tab| !tab.document.caret.style.is_boxed())
+}
+
+fn bracket_allowed(docs: &Tabs) -> bool {
+    docs.active().is_some_and(|tab| {
+        !tab.document.caret.style.is_boxed()
+            && !tab.document.scope()[tab.document.caret.block].is_code()
+    })
+}
+
+/// How many characters form the hidden task marker at the cursor, if it is
+/// the only content of a bullet item apart from optional Markdown spacing.
+fn task_marker_len(docs: &Tabs) -> Option<usize> {
+    let tab = docs.active()?;
+    if !matches!(tab.document.focus, Focus::Body) {
+        return None;
+    }
+    let block = tab.document.caret.block;
+    if !matches!(
+        tab.document.scope().get(block),
+        Some(Block::ListItem {
+            marker: ListMarker::Bullet,
+            ..
+        })
+    ) {
+        return None;
+    }
+    let text = tab.document.block_text(block);
+    let (before, after) = text.split_once('[')?;
+    (before.chars().all(char::is_whitespace) && after.chars().all(char::is_whitespace))
+        .then(|| text.chars().count())
+}
+
+impl InsertShortcuts {
+    /// Handles the custom Markdown gestures that create or configure
+    /// structural nodes. Returns `true` when `c` was consumed; otherwise the
+    /// normal Insert path writes it as prose.
+    ///
+    /// The gestures deliberately differ from the on-disk spelling where
+    /// that makes typing faster: `*` is bold, `**` italic, and `***` both,
+    /// exactly as the reader requested. Serialization remains canonical.
+    fn apply(&mut self, c: char, docs: &mut Tabs, repeat: &mut Vec<InsertEvent>) -> bool {
+        let marker = self.marker.take();
+        match marker {
+            Some(InsertMarker::OpenBracket) if c == '[' => {
+                erase_marker_text(docs, repeat, 1);
+                insert_event(docs, repeat, InsertEvent::ToggleBadge);
+                self.reset();
+                return true;
+            }
+            Some(InsertMarker::OpenBracket) if c == '^' => {
+                erase_marker_text(docs, repeat, 1);
+                insert_event(docs, repeat, InsertEvent::InsertSidenote);
+                self.reset();
+                return true;
+            }
+            Some(InsertMarker::BadgeClose) if c == ']' => {
+                erase_marker_text(docs, repeat, 1);
+                insert_event(docs, repeat, InsertEvent::ToggleBadge);
+                self.reset();
+                return true;
+            }
+            Some(InsertMarker::Equals) if c == '=' => {
+                erase_marker_text(docs, repeat, 1);
+                insert_event(docs, repeat, InsertEvent::ToggleHighlight);
+                self.reset();
+                return true;
+            }
+            _ => {}
+        }
+
+        // `- [ ]` is the on-disk spelling; the leading dash has already
+        // made the empty block a bullet, so finishing the box simply
+        // promotes that bullet to a task and removes the marker text.
+        if c == ']'
+            && let Some(count) = task_marker_len(docs)
+        {
+            erase_marker_text(docs, repeat, count);
+            insert_event(docs, repeat, InsertEvent::TaskList);
+            self.reset();
+            return true;
+        }
+
+        if c != '*' {
+            self.stars = 0;
+        }
+        if c != '`' {
+            self.backticks = 0;
+        }
+        if c != '-' {
+            self.dashes = 0;
+        }
+        if !c.is_ascii_digit() && c != '.' {
+            self.ordered_digits = 0;
+        }
+
+        if c == '#' && empty_body_block(docs) && emphasis_allowed(docs) {
+            let level = docs.active().and_then(|tab| {
+                match tab.document.scope()[tab.document.caret.block] {
+                    Block::Heading { level, .. } => level.checked_add(1),
+                    _ => Some(1),
+                }
+            });
+            if let Some(level @ 1..=4) = level {
+                insert_event(docs, repeat, InsertEvent::SetHeading(level));
+                return true;
+            }
+        }
+
+        if c == '*' && emphasis_allowed(docs) {
+            self.stars += 1;
+            let (bold, italic) = match self.stars {
+                1 => (true, false),
+                2 => (false, true),
+                3 => (true, true),
+                _ => {
+                    self.stars = 0;
+                    return false;
+                }
+            };
+            insert_event(docs, repeat, InsertEvent::SetEmphasis { bold, italic });
+            return true;
+        }
+
+        if c == '`'
+            && docs
+                .active()
+                .is_some_and(|tab| !tab.document.caret.style.badge)
+        {
+            if self.backticks == 2 && empty_body_block(docs) {
+                insert_event(docs, repeat, InsertEvent::CodeBlock);
+                self.reset();
+            } else {
+                self.backticks += 1;
+                if self.backticks == 1 {
+                    insert_event(docs, repeat, InsertEvent::ToggleInlineCode);
+                }
+            }
+            return true;
+        }
+
+        if c == '-' && empty_body_block(docs) && emphasis_allowed(docs) {
+            self.dashes += 1;
+            match self.dashes {
+                1 => insert_event(docs, repeat, InsertEvent::BulletList),
+                2 => {}
+                3 => {
+                    insert_event(docs, repeat, InsertEvent::InsertDivider);
+                    self.reset();
+                }
+                _ => unreachable!("three dashes reset the marker"),
+            }
+            return true;
+        }
+
+        if c.is_ascii_digit() {
+            if self.ordered_digits > 0 || (empty_body_block(docs) && emphasis_allowed(docs)) {
+                self.ordered_digits += 1;
+            }
+        } else if c == '.' && self.ordered_digits > 0 {
+            let marker_is_intact = docs.active().is_some_and(|tab| {
+                matches!(tab.document.focus, Focus::Body)
+                    && tab
+                        .document
+                        .block_text(tab.document.caret.block)
+                        .chars()
+                        .count()
+                        == self.ordered_digits
+                    && tab
+                        .document
+                        .block_text(tab.document.caret.block)
+                        .chars()
+                        .all(|digit| digit.is_ascii_digit())
+            });
+            if marker_is_intact {
+                erase_marker_text(docs, repeat, self.ordered_digits);
+                insert_event(docs, repeat, InsertEvent::NumberedList);
+                self.reset();
+                return true;
+            }
+            self.ordered_digits = 0;
+        } else {
+            self.ordered_digits = 0;
+        }
+
+        match c {
+            '[' if bracket_allowed(docs) => self.marker = Some(InsertMarker::OpenBracket),
+            ']' if docs
+                .active()
+                .is_some_and(|tab| tab.document.caret.style.badge) =>
+            {
+                self.marker = Some(InsertMarker::BadgeClose)
+            }
+            '=' if emphasis_allowed(docs) => self.marker = Some(InsertMarker::Equals),
+            _ => {}
+        }
+        false
+    }
+}
 
 impl Shell {
     /// Choosing a vault is a shell job: the picker persists the config and
@@ -486,6 +744,22 @@ impl Shell {
         let has_tab = self.docs.borrow().active().is_some();
         let in_math = self.docs.borrow().in_math();
 
+        // A pending two-character marker belongs to one uninterrupted typing
+        // gesture. Moving the caret or clicking elsewhere makes its first
+        // character ordinary prose, rather than allowing a later keystroke
+        // to reach back across the move and reinterpret it.
+        if matches!(self.vim.current_mode(), VimMode::Insert)
+            && (input.is_key_typed(KeyCode::ArrowUp)
+                || input.is_key_typed(KeyCode::ArrowDown)
+                || input.is_key_typed(KeyCode::ArrowLeft)
+                || input.is_key_typed(KeyCode::ArrowRight)
+                || input.is_key_typed(KeyCode::Home)
+                || input.is_key_typed(KeyCode::End)
+                || input.is_mouse_pressed(MouseButton::Left))
+        {
+            self.insert_shortcuts.reset();
+        }
+
         // Anywhere over the sheet, not just over the text: a pointer that
         // has drifted onto a margin note is still pointing at the document.
         let over_canvas =
@@ -706,6 +980,7 @@ impl Shell {
         // call refresh_slash_menu (which needs &mut self) without a conflict.
         let text = input.text();
         if text == "/" {
+            self.insert_shortcuts.reset();
             let anchor = self.compute_slash_anchor();
             // An in-flight fade-out of THIS menu is superseded: it is back.
             if matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })) {
@@ -738,7 +1013,16 @@ impl Shell {
                     continue;
                 }
                 if c == '$' {
+                    self.insert_shortcuts.reset();
                     self.docs.borrow_mut().insert_inline_math();
+                    continue;
+                }
+                let consumed = {
+                    let mut docs = self.docs.borrow_mut();
+                    self.insert_shortcuts
+                        .apply(c, &mut docs, &mut self.insert_repeat)
+                };
+                if consumed {
                     continue;
                 }
                 if matches!(
@@ -755,25 +1039,30 @@ impl Shell {
             // rest of the frame belongs to math, which picks it up next
             // frame; dropping one key beats editing the wrong scope.
             if self.docs.borrow().in_math() {
+                self.insert_shortcuts.reset();
                 self.goal_x = None;
                 return;
             }
             if input.is_key_typed(KeyCode::Backspace) {
+                self.insert_shortcuts.reset();
                 let _ = self.vim.key_extended(Key::Backspace);
                 self.docs.borrow_mut().backspace();
                 self.insert_repeat.push(super::InsertEvent::Backspace);
             }
             if input.is_key_typed(KeyCode::Delete) {
+                self.insert_shortcuts.reset();
                 self.docs.borrow_mut().delete_forward();
                 self.insert_repeat.push(super::InsertEvent::Delete);
             }
             if input.is_key_typed(KeyCode::Enter) {
+                self.insert_shortcuts.reset();
                 let _ = self.vim.key_extended(Key::Enter);
                 self.docs.borrow_mut().newline();
                 self.insert_repeat.push(super::InsertEvent::Enter);
             }
         }
         if input.is_key_pressed(KeyCode::Escape) {
+            self.insert_shortcuts.reset();
             // Esc pops one level (§4.3): a pending style context → plain,
             // still Insert; plain → Normal. Popping the style must bump the
             // revision (like any caret change) so the B/I marker disappears
@@ -1136,6 +1425,7 @@ impl Shell {
 
     fn start_insert(&mut self) {
         self.insert_repeat.clear();
+        self.insert_shortcuts.reset();
         enter_insert(&mut self.docs.borrow_mut(), &mut self.vim);
     }
 
@@ -1532,12 +1822,7 @@ impl Shell {
             super::RepeatOp::Insert(events) => {
                 self.docs.borrow_mut().transaction(|docs| {
                     for event in events {
-                        match event {
-                            super::InsertEvent::Text(c) => docs.type_text(&c.to_string()),
-                            super::InsertEvent::Backspace => docs.backspace(),
-                            super::InsertEvent::Delete => docs.delete_forward(),
-                            super::InsertEvent::Enter => docs.newline(),
-                        }
+                        apply_insert_event(docs, &event);
                     }
                 });
             }
@@ -4689,6 +4974,178 @@ mod tests {
         let mut tabs = Tabs::new();
         tabs.open_full(&path);
         tabs
+    }
+
+    /// Feed text through the same structural-marker layer Insert mode uses.
+    /// The shell's Vim pass-through check is intentionally absent here: all
+    /// of these fixture characters are ordinary Insert text.
+    fn type_shortcuts(tabs: &mut Tabs, text: &str) -> Vec<super::InsertEvent> {
+        let mut shortcuts = super::InsertShortcuts::default();
+        let mut repeat = Vec::new();
+        for c in text.chars() {
+            if !shortcuts.apply(c, tabs, &mut repeat) {
+                tabs.type_text(&c.to_string());
+                repeat.push(super::InsertEvent::Text(c));
+            }
+        }
+        repeat
+    }
+
+    fn text_style(run: &Inline) -> (&str, Style) {
+        match run {
+            Inline::Text(text) => (&text.text, text.style),
+            _ => panic!("expected text run"),
+        }
+    }
+
+    #[test]
+    fn insert_markers_make_heading_levels_without_leaving_hashes_in_text() {
+        let mut first = insert_tabs("marker-h1", "");
+        type_shortcuts(&mut first, "#Title");
+        assert!(matches!(
+            first.active().unwrap().document.body()[0],
+            Block::Heading { level: 1, .. }
+        ));
+        assert_eq!(first.active().unwrap().document.block_text(0), "Title");
+
+        let mut second = insert_tabs("marker-h2", "");
+        type_shortcuts(&mut second, "##Subtitle");
+        assert!(matches!(
+            second.active().unwrap().document.body()[0],
+            Block::Heading { level: 2, .. }
+        ));
+        assert_eq!(second.active().unwrap().document.block_text(0), "Subtitle");
+    }
+
+    #[test]
+    fn insert_star_markers_follow_typewritters_emphasis_convention() {
+        let mut bold = insert_tabs("marker-bold", "");
+        type_shortcuts(&mut bold, "*strong");
+        let bold_run = &bold.active().unwrap().document.body()[0].inlines()[0];
+        let (text, style) = text_style(bold_run);
+        assert!(style.bold);
+        assert!(!style.italic);
+        assert_eq!(text, "strong");
+
+        let mut italic = insert_tabs("marker-italic", "");
+        type_shortcuts(&mut italic, "**slanted");
+        let italic_run = &italic.active().unwrap().document.body()[0].inlines()[0];
+        let (text, style) = text_style(italic_run);
+        assert!(!style.bold);
+        assert!(style.italic);
+        assert_eq!(text, "slanted");
+
+        let mut both = insert_tabs("marker-both", "");
+        type_shortcuts(&mut both, "***both");
+        let both_run = &both.active().unwrap().document.body()[0].inlines()[0];
+        let (text, style) = text_style(both_run);
+        assert!(style.bold && style.italic);
+        assert_eq!(text, "both");
+    }
+
+    #[test]
+    fn paired_inline_markers_leave_only_the_structural_content() {
+        let mut tabs = insert_tabs("marker-inline", "");
+        type_shortcuts(&mut tabs, "[[TODO]] ==important== `code`");
+        let runs = tabs.active().unwrap().document.body()[0].inlines();
+        let (text, style) = text_style(&runs[0]);
+        assert_eq!(text, "TODO");
+        assert!(style.badge);
+        assert_eq!(text_style(&runs[1]).0, " ");
+        let (text, style) = text_style(&runs[2]);
+        assert_eq!(text, "important");
+        assert!(style.highlight);
+        assert_eq!(text_style(&runs[3]).0, " ");
+        let (text, style) = text_style(&runs[4]);
+        assert_eq!(text, "code");
+        assert!(style.code);
+    }
+
+    #[test]
+    fn structural_insert_markers_repeat_as_structural_edits() {
+        let mut source = insert_tabs("marker-repeat-source", "");
+        let repeat = type_shortcuts(&mut source, "[[TODO]] ==important==");
+
+        let mut target = insert_tabs("marker-repeat-target", "");
+        target.transaction(|tabs| {
+            for event in &repeat {
+                super::apply_insert_event(tabs, event);
+            }
+        });
+
+        let runs = target.active().unwrap().document.body()[0].inlines();
+        let (text, style) = text_style(&runs[0]);
+        assert_eq!(text, "TODO");
+        assert!(style.badge);
+        assert_eq!(text_style(&runs[1]).0, " ");
+        let (text, style) = text_style(&runs[2]);
+        assert_eq!(text, "important");
+        assert!(style.highlight);
+    }
+
+    #[test]
+    fn block_markers_reach_the_existing_list_rule_and_code_operations() {
+        let mut bullet = insert_tabs("marker-bullet", "");
+        type_shortcuts(&mut bullet, "-item");
+        assert!(matches!(
+            bullet.active().unwrap().document.body()[0],
+            Block::ListItem {
+                marker: crate::document::ListMarker::Bullet,
+                ..
+            }
+        ));
+        assert_eq!(bullet.active().unwrap().document.block_text(0), "item");
+
+        let mut numbered = insert_tabs("marker-numbered", "");
+        type_shortcuts(&mut numbered, "12.item");
+        assert!(matches!(
+            numbered.active().unwrap().document.body()[0],
+            Block::ListItem {
+                marker: crate::document::ListMarker::Number(1),
+                ..
+            }
+        ));
+        assert_eq!(numbered.active().unwrap().document.block_text(0), "item");
+
+        let mut task = insert_tabs("marker-task", "");
+        type_shortcuts(&mut task, "- [ ]item");
+        assert!(matches!(
+            task.active().unwrap().document.body()[0],
+            Block::ListItem {
+                marker: crate::document::ListMarker::Task { done: false },
+                ..
+            }
+        ));
+        assert_eq!(task.active().unwrap().document.block_text(0), "item");
+
+        let mut divider = insert_tabs("marker-divider", "");
+        type_shortcuts(&mut divider, "---");
+        assert!(matches!(
+            divider.active().unwrap().document.body()[0],
+            Block::Divider(_)
+        ));
+        assert!(matches!(
+            divider.active().unwrap().document.body()[1],
+            Block::Paragraph(_)
+        ));
+
+        let mut code = insert_tabs("marker-code", "");
+        type_shortcuts(&mut code, "```let x");
+        assert!(matches!(
+            code.active().unwrap().document.body()[0],
+            Block::CodeLine { first: true, .. }
+        ));
+        assert_eq!(code.active().unwrap().document.block_text(0), "let x");
+    }
+
+    #[test]
+    fn sidenote_marker_uses_the_documents_existing_anchor_operation() {
+        let mut tabs = insert_tabs("marker-sidenote", "");
+        type_shortcuts(&mut tabs, "[^after");
+        let document = &tabs.active().unwrap().document;
+        assert_eq!(document.notes.len(), 1);
+        assert!(matches!(document.body()[0].inlines()[0], Inline::Note(_)));
+        assert_eq!(document.block_text(0), "\u{FFFC}after");
     }
 
     fn note_tabs(tag: &str) -> Tabs {
