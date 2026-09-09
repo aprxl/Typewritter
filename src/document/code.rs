@@ -170,6 +170,18 @@ pub enum Ink {
     Syntax(usize),
     Manual(MathHue),
 }
+/// Force the bundled grammars to build now, off whatever thread calls this.
+///
+/// [`CONFIGS`] builds *every* grammar's highlight configuration on first
+/// touch, and that first touch is otherwise whichever frame first paints a
+/// code span — usually the reader's first keystroke, which it stalls for
+/// ~97ms on this machine. `LazyLock` is a thread-safe one-shot, so warming it
+/// from a background thread at startup is free of races: a main thread that
+/// gets there first simply builds it itself, exactly as before.
+pub fn warm() {
+    LazyLock::force(&CONFIGS);
+}
+
 pub fn capture(index: usize) -> &'static str {
     CAPTURES[index]
 }

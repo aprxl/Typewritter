@@ -873,14 +873,6 @@ impl Shell {
     /// `renderer` is here for the overlay layers, which are attached on open
     /// and dropped on close rather than held for the session, and for the
     /// palette swap, which captures a frame into a layer of its own.
-    /// How many regions actually repainted on the last frame. The
-    /// diagnostic trace in `main` pairs this with input latency: a frame that
-    /// served input without repainting anything is the signature of a
-    /// snapshot that was rebuilt too late to be drawn.
-    pub fn redrew(&self) -> usize {
-        self.redraws.0
-    }
-
     pub fn update(
         &mut self,
         input: &Input,

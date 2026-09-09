@@ -48,14 +48,6 @@ struct App {
     /// When the shell next wants a frame for an animation that is currently
     /// holding still — see [`Shell::wake_at`].
     wake_at: Option<Instant>,
-    /// `TW_DIAG=1`: when the oldest unserved input arrived, and how many
-    /// input events are still waiting on a frame. See [`App::diagnose`].
-    input_at: Option<Instant>,
-    pending_input: u32,
-    /// `TW_DIAG` segment stamps: when the loop asked the OS for a frame, and
-    /// when the OS delivered that request back as `RedrawRequested`.
-    asked_at: Option<Instant>,
-    redraw_at: Option<Instant>,
 }
 
 impl Default for App {
@@ -70,10 +62,6 @@ impl Default for App {
             window_minimum: (0.0, 0.0),
             config: None,
             wake_at: None,
-            input_at: None,
-            pending_input: 0,
-            asked_at: None,
-            redraw_at: None,
         }
     }
 }
@@ -97,6 +85,26 @@ impl ApplicationHandler for App {
         // simply dropped.
         window.set_ime_allowed(true);
 
+        // Pace frames to the display. `FrameScheduler` defaults to "as fast
+        // as the display allows", on the reasoning that `PresentMode::Fifo`
+        // is already vsync-paced and needs no deadline of its own. That does
+        // not hold in practice: measured on an M-series Mac, the loop
+        // presented 74-252 frames a second into a 120 Hz display while
+        // `get_current_texture` returned in ~0ns, so nothing was throttling
+        // it. Everything past the refresh rate is a frame the display cannot
+        // show, and worse than wasted: presenting faster than the compositor
+        // drains its queue means what reaches the screen is several frames
+        // behind what was just drawn. That is felt as input lag even though
+        // input itself is served in about a millisecond.
+        //
+        // A target *above* the refresh rate does nothing — vsync still gates
+        // presentation — so this only ever removes overdraw.
+        let refresh = window
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+            .map(|millihertz| millihertz as f32 / 1000.0);
+        self.scheduler.set_target_fps(refresh);
+
         let mut renderer = pollster::block_on(Renderer::new(window.clone()));
 
         // The shell opens the vault (or starts on boarding) from here.
@@ -116,13 +124,6 @@ impl ApplicationHandler for App {
         let woke = self.input.handle_event(&event);
         if woke {
             self.scheduler.request_redraw();
-        }
-        // Diagnostics: stamp the *first* input still waiting on a frame, so
-        // the measurement below is "how long has the oldest unserved
-        // keystroke been on screen-less", not "how long since the last one".
-        if woke && diag() && !matches!(event, WindowEvent::RedrawRequested) {
-            self.pending_input += 1;
-            self.input_at.get_or_insert_with(Instant::now);
         }
         if let Some(r) = &mut self.renderer {
             r.handle_event(&event);
@@ -201,52 +202,7 @@ impl ApplicationHandler for App {
     }
 }
 
-/// `TW_DIAG=1` turns on the input-latency trace — see [`App::diagnose`].
-fn diag() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("TW_DIAG").is_some())
-}
-
 impl App {
-    /// Report how long input waited for the frame that answered it.
-    ///
-    /// Frames here are demand-driven, so "slow" is rarely the renderer being
-    /// heavy — it is a frame that was never asked for, or asked for and then
-    /// spent on a pass that drew nothing the reader wanted. Only outliers are
-    /// printed: a line per input that waited more than a couple of refreshes,
-    /// with whether any region actually redrew on the frame that served it.
-    /// A burst of lines with `redrew=0` means the frame arrived but carried
-    /// no new content; a long gap with no lines at all means no frame was
-    /// requested. Both read very differently from "the GPU is busy".
-    fn diagnose(&mut self, redrew: usize, acquire: std::time::Duration) {
-        if !diag() {
-            return;
-        }
-        let Some(at) = self.input_at.take() else {
-            return;
-        };
-        let waited = at.elapsed();
-        let n = std::mem::take(&mut self.pending_input);
-        // Split the wait into the three places it can go: this loop deciding
-        // to ask for a frame, the OS delivering that request, and the frame
-        // itself. Only the last is this app's own work — and inside even that,
-        // `acquire` is time spent waiting for the compositor to hand back a
-        // drawable, which is not work either.
-        let asked = self.asked_at.take();
-        let redraw = self.redraw_at.take();
-        let decide = asked.map(|a| a.saturating_duration_since(at));
-        let deliver = match (asked, redraw) {
-            (Some(a), Some(r)) => Some(r.saturating_duration_since(a)),
-            _ => None,
-        };
-        let frame = redraw.map(|r| r.elapsed());
-        if waited > std::time::Duration::from_millis(32) {
-            eprintln!(
-                "[diag] waited {waited:.1?} (events={n}, redrew={redrew}) = decide {decide:.1?} + os-deliver {deliver:.1?} + frame {frame:.1?}, of which acquire {acquire:.1?}"
-            );
-        }
-    }
-
     fn frame(&mut self) {
         let (Some(window), Some(renderer), Some(shell)) =
             (&self.window, &mut self.renderer, &mut self.shell)
@@ -283,9 +239,13 @@ impl App {
         if let Err(e) = renderer.render() {
             eprintln!("render error: {e}");
         }
-        let redrew = shell.redrew();
-        let acquire = renderer.last_acquire();
-        self.diagnose(redrew, acquire);
+        // A frame skipped to let the queue drain drew nothing and cleared no
+        // pending reconfigure; ask for the frame that will. Bounded, because
+        // skipped frames submit no work: each one lets the queue drain
+        // further, so this resolves in a frame or two.
+        if renderer.has_pending_resize() {
+            self.scheduler.request_redraw();
+        }
     }
 }
 
@@ -334,6 +294,11 @@ fn main() -> Result<(), winit::error::EventLoopError> {
     if let Some(config) = &config {
         math_style::install(config.math.clone());
     }
+
+    // Build the syntax grammars off the main thread while the window comes
+    // up. They are built all at once on first use, and that first use would
+    // otherwise be a frame the reader is waiting on — see `code::warm`.
+    std::thread::spawn(typewritter::document::code::warm);
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App {

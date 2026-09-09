@@ -202,10 +202,6 @@ pub struct Renderer {
     // display density (crisp, no blur from upscaling a logical-resolution
     // render) while callers never have to think about DPI themselves — the
     // same contract CSS px/SwiftUI points/Android dp give their callers.
-    // How long the last frame spent inside `get_current_texture` — the wait
-    // for the compositor to hand back a drawable, which is not this app's own
-    // work. Read by the `TW_DIAG` trace in `main`.
-    last_acquire: Duration,
     scale_factor: f64,
     // Whether the surface was configured with `COPY_SRC` — see
     // `Renderer::supports_capture`.
@@ -511,7 +507,13 @@ impl Renderer {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // One frame in flight, not two. Every extra queued frame is a
+            // frame of display latency: the image the compositor shows is
+            // that many frames behind what was just drawn. Two suits a game
+            // that renders continuously for throughput; this renders on
+            // demand, a keystroke at a time, and would rather the frame it
+            // just drew be the one on screen.
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &surface_config);
 
@@ -566,7 +568,6 @@ impl Renderer {
             previous_frame_at: None,
             frame_delta: Duration::ZERO,
             start_time: Instant::now(),
-            last_acquire: Duration::ZERO,
             scale_factor,
             capture_supported,
             pending_capture: None,
@@ -718,16 +719,31 @@ impl Renderer {
         // The one place the swap chain is reconfigured, before the frame is
         // acquired and only once the queue has actually drained — see
         // `Renderer::resize` for the macOS hang that rules out anywhere else.
-        if let Some((width, height)) = self.pending_surface_size
-            && matches!(
+        if let Some((width, height)) = self.pending_surface_size {
+            if matches!(
                 self.device.poll(wgpu::PollType::Poll),
                 Ok(wgpu::PollStatus::QueueEmpty)
-            )
-        {
-            self.pending_surface_size = None;
-            self.surface_config.width = width;
-            self.surface_config.height = height;
-            self.surface.configure(&self.device, &self.surface_config);
+            ) {
+                self.pending_surface_size = None;
+                self.surface_config.width = width;
+                self.surface_config.height = height;
+                self.surface.configure(&self.device, &self.surface_config);
+            } else {
+                // Draw nothing this frame. The reconfigure above waits for
+                // the queue to drain, and rendering is what fills it —
+                // carrying on would submit another frame's work and leave the
+                // queue no emptier than it found it, so the swap chain could
+                // sit at the old size indefinitely while the window is at the
+                // new one. That is the visible "stretched until it snaps
+                // back": the compositor scaling a stale surface.
+                //
+                // Skipping keeps the last frame up for a frame or two — the
+                // same stretch the deferral already accepts — and lets the
+                // queue empty so the next frame reconfigures for real. The
+                // caller has to ask for that next frame; see
+                // `has_pending_resize`.
+                return Ok(());
+            }
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -928,9 +944,15 @@ impl Renderer {
         self.start_time.elapsed()
     }
 
-    /// Time the last frame spent waiting for a drawable — see `last_acquire`.
-    pub fn last_acquire(&self) -> Duration {
-        self.last_acquire
+    /// Whether a surface reconfigure is still queued — see
+    /// [`Renderer::resize`] for why it is deferred, and `render` for why a
+    /// frame is skipped while it is pending.
+    ///
+    /// The frame loop must keep asking for frames while this is true. Frames
+    /// are demand-driven, and the resize event that queued the reconfigure has
+    /// already been serviced, so nothing else will ask.
+    pub fn has_pending_resize(&self) -> bool {
+        self.pending_surface_size.is_some()
     }
 
     /// Current window scale factor — see [`Renderer::set_scale_factor`].
