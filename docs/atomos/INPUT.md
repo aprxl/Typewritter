@@ -8,7 +8,7 @@ Companion docs: [`RENDERER.md`](./RENDERER.md), [`ANIMATION.md`](./ANIMATION.md)
 
 winit hands you a *stream of events*. Almost every caller actually wants to ask a *state question* at an arbitrary point in a frame — "is Ctrl held right now?", "where is the cursor?", "did the user just press Enter?".
 
-`Input` sits between the two. You feed it events; everything else is a cheap state query callable from anywhere, with no borrow of the event loop.
+`Input` sits between the two. You feed it events; everything else is a cheap state query callable from anywhere, with no borrow of the event loop. Aggregate queries describe the whole frame; `events()` exposes one event-local view per OS event when ordering matters.
 
 Three query flavours, and picking the wrong one is the most common mistake:
 
@@ -30,6 +30,16 @@ Get this wrong and every edge query is permanently true.
 4. Call `end_frame()` **exactly once**, at the end of the frame.
 
 `end_frame` is what makes edge queries and deltas mean "since the last frame" rather than "since the program started". Held state (`is_key_down`, `mouse_position`, `modifiers`) survives it; edges, deltas, scroll, and typed text do not.
+
+For commands and text editing, consume `events()` in order. Each returned `&Input` has the same query API, with held state and modifiers captured at that event and only that event's edges/text/deltas:
+
+```rust
+for event in input.events() {
+    handle_command_or_edit(event);
+}
+```
+
+This is required for sequences such as text → Backspace → text and for a shortcut whose modifier is released before the next redraw. The aggregate queries deliberately remain available for components that only need final frame state, such as hover drawing.
 
 ```rust
 // in ApplicationHandler
@@ -105,9 +115,10 @@ if input.is_shortcut_pressed(ModifiersState::CONTROL | ModifiersState::SHIFT, Ke
 
 ```rust
 text() -> &str
+events() -> impl Iterator<Item = &Input>
 ```
 
-Characters typed this frame, control characters stripped. Empty on frames with no typing. **This is the one to insert into a document** — it is layout- and modifier-resolved, so a French layout's `KeyCode::KeyQ` correctly yields `"a"`.
+Characters typed in this view, control characters stripped. On the top-level `Input`, this is all text typed during the frame; on an item from `events()`, it is only that event's text. **The ordered event view is the one to insert into a document** — it is layout- and modifier-resolved, so a French layout's `KeyCode::KeyQ` correctly yields `"a"`.
 
 Never reconstruct text from `KeyCode`. `KeyCode` answers "which physical key"; `text()` answers "what did the user type". Only one of those is ever the right question.
 
@@ -171,7 +182,8 @@ This runs automatically on focus loss. Call it manually when the app takes over 
 4. **Chord matching is exact.** `is_shortcut_pressed(CONTROL, KeyS)` is `false` while Shift is also held. That is intentional; if you want "Ctrl held, whatever else", test `ctrl() && is_key_pressed(...)` instead.
 5. **`raw_mouse_delta` is not pixels** and is zero unless you forward `DeviceEvent`s.
 6. **`mouse_position` is logical pixels, `Renderer::resize` takes physical pixels.** Do not mix them.
-7. **IME is not implemented.** Dead keys, compose sequences, and CJK candidate windows do not work. `text()` receives only what winit's `KeyEvent::text` delivers. See [`TODO.md`](./TODO.md).
+7. **IME commits join the ordered stream.** Preedit text is deliberately not returned by `text()` because it has not been committed to the document yet.
+8. **Do not apply edits from the aggregate frame edges.** They lose ordering and repeated presses. Iterate `events()` and apply one event view at a time.
 
 ## Worked example
 

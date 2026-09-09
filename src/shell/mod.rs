@@ -884,7 +884,9 @@ impl Shell {
         // short-circuit and stop advancing the rest.
         let dt = FrameScheduler::animation_delta(frametime);
 
-        self.handle_input(input, viewport);
+        for event in input.events() {
+            self.handle_input(event, viewport);
+        }
         // Straight after the input that aimed it, and before the regions
         // sync: the scrollbar reads the span this publishes. It takes no
         // frame delta — the glide keeps its own clock, because this frame's

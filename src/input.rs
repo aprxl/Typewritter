@@ -96,6 +96,12 @@ pub struct Input {
 
     focused: bool,
     cursor_in_window: bool,
+
+    /// One state snapshot per input event, in OS delivery order. The top-level
+    /// value remains the aggregate frame state used by components; shell
+    /// commands and edits consume these snapshots so distinct events cannot
+    /// be reordered or collapsed by the frame boundary.
+    events: Vec<Input>,
 }
 
 // The whole query surface is the point of this type; `main.rs` only drives
@@ -124,7 +130,89 @@ impl Input {
             text: String::new(),
             focused: true,
             cursor_in_window: false,
+            events: Vec::new(),
         }
+    }
+
+    /// Event-local views in the exact order winit delivered them. Each view
+    /// carries held state as it was at that event, but only that event's
+    /// edges, text, pointer delta, and scroll delta.
+    pub fn events(&self) -> impl Iterator<Item = &Input> {
+        self.events.iter()
+    }
+
+    fn snapshot(&self) -> Input {
+        Input {
+            scale_factor: self.scale_factor,
+            keys_down: self.keys_down.clone(),
+            keys_pressed: HashSet::new(),
+            keys_typed: HashSet::new(),
+            keys_released: HashSet::new(),
+            modifiers: self.modifiers,
+            buttons_down: self.buttons_down.clone(),
+            buttons_pressed: HashSet::new(),
+            buttons_released: HashSet::new(),
+            mouse_position: self.mouse_position,
+            last_mouse_position: self.last_mouse_position,
+            mouse_delta: (0.0, 0.0),
+            raw_mouse_delta: (0.0, 0.0),
+            scroll_delta: (0.0, 0.0),
+            text: String::new(),
+            focused: self.focused,
+            cursor_in_window: self.cursor_in_window,
+            events: Vec::new(),
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        code: Option<KeyCode>,
+        state: ElementState,
+        repeat: bool,
+        text: Option<&str>,
+    ) {
+        let mut event_text = String::new();
+        if let Some(text) = text
+            && state.is_pressed()
+            && !suppresses_text(self.modifiers)
+            && self.text.len() + text.len() <= MAX_TEXT_PER_FRAME
+        {
+            event_text.extend(text.chars().filter(|c| !c.is_control()));
+            self.text.push_str(&event_text);
+        }
+
+        if let Some(code) = code {
+            match state {
+                ElementState::Pressed => {
+                    self.keys_typed.insert(code);
+                    if !repeat {
+                        self.keys_pressed.insert(code);
+                    }
+                    self.keys_down.insert(code);
+                }
+                ElementState::Released => {
+                    self.keys_down.remove(&code);
+                    self.keys_released.insert(code);
+                }
+            }
+        }
+
+        let mut snapshot = self.snapshot();
+        snapshot.text = event_text;
+        if let Some(code) = code {
+            match state {
+                ElementState::Pressed => {
+                    snapshot.keys_typed.insert(code);
+                    if !repeat {
+                        snapshot.keys_pressed.insert(code);
+                    }
+                }
+                ElementState::Released => {
+                    snapshot.keys_released.insert(code);
+                }
+            }
+        }
+        self.events.push(snapshot);
     }
 
     // ---- event intake ----------------------------------------------------
@@ -138,55 +226,38 @@ impl Input {
     pub fn handle_event(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
-                if let Some(text) = &event.text
-                    && event.state.is_pressed()
-                    && !suppresses_text(self.modifiers)
-                    && self.text.len() + text.len() <= MAX_TEXT_PER_FRAME
-                {
-                    // Filter control characters (Esc, Backspace, …) — winit
-                    // reports them as `text`, but a caller appending this to
-                    // a document wants typed characters, not control bytes.
-                    self.text.extend(text.chars().filter(|c| !c.is_control()));
-                }
-
                 // Layout-independent identity: `KeyCode::KeyW` is the
                 // physical W position regardless of the active layout, which
                 // is what keybinds should be expressed against.
-                let PhysicalKey::Code(code) = event.physical_key else {
+                let code = match event.physical_key {
+                    PhysicalKey::Code(code) => Some(code),
                     // No usable physical identity, but a keyboard event is
                     // user intent regardless — it may still have produced
                     // text above.
-                    return true;
+                    PhysicalKey::Unidentified(_) => None,
                 };
-                match event.state {
-                    ElementState::Pressed => {
-                        self.keys_typed.insert(code);
-                        // `repeat` is the OS auto-repeat stream from a key
-                        // that's already held — not a new press edge.
-                        if !event.repeat {
-                            self.keys_pressed.insert(code);
-                        }
-                        self.keys_down.insert(code);
-                    }
-                    ElementState::Released => {
-                        self.keys_down.remove(&code);
-                        self.keys_released.insert(code);
-                    }
-                }
+                self.handle_key(code, event.state, event.repeat, event.text.as_deref());
                 true
             }
 
             WindowEvent::Ime(ime) => {
+                let mut event_text = String::new();
                 if let Ime::Commit(text) = ime
                     && self.text.len() + text.len() <= MAX_TEXT_PER_FRAME
                 {
-                    self.text.extend(text.chars().filter(|c| !c.is_control()));
+                    event_text.extend(text.chars().filter(|c| !c.is_control()));
+                    self.text.push_str(&event_text);
                 }
+                let mut snapshot = self.snapshot();
+                snapshot.text = event_text;
+                self.events.push(snapshot);
                 true
             }
 
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
+                let snapshot = self.snapshot();
+                self.events.push(snapshot);
                 true
             }
 
@@ -201,6 +272,16 @@ impl Input {
                         self.buttons_released.insert(*button);
                     }
                 }
+                let mut snapshot = self.snapshot();
+                match state {
+                    ElementState::Pressed => {
+                        snapshot.buttons_pressed.insert(*button);
+                    }
+                    ElementState::Released => {
+                        snapshot.buttons_released.insert(*button);
+                    }
+                }
+                self.events.push(snapshot);
                 true
             }
 
@@ -209,32 +290,47 @@ impl Input {
                     (position.x / self.scale_factor) as f32,
                     (position.y / self.scale_factor) as f32,
                 );
-                if let Some(last) = self.last_mouse_position {
-                    self.mouse_delta.0 += next.0 - last.0;
-                    self.mouse_delta.1 += next.1 - last.1;
-                }
+                let delta = self
+                    .last_mouse_position
+                    .map_or((0.0, 0.0), |last| (next.0 - last.0, next.1 - last.1));
+                self.mouse_delta.0 += delta.0;
+                self.mouse_delta.1 += delta.1;
                 self.mouse_position = next;
                 self.last_mouse_position = Some(next);
                 self.cursor_in_window = true;
+                let mut snapshot = self.snapshot();
+                snapshot.mouse_delta = delta;
+                self.events.push(snapshot);
                 true
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                match delta {
+                let lines = match delta {
                     MouseScrollDelta::LineDelta(x, y) => {
                         self.scroll_delta.0 += x;
                         self.scroll_delta.1 += y;
+                        (*x, *y)
                     }
                     MouseScrollDelta::PixelDelta(position) => {
-                        self.scroll_delta.0 += position.x as f32 / PIXELS_PER_LINE;
-                        self.scroll_delta.1 += position.y as f32 / PIXELS_PER_LINE;
+                        let lines = (
+                            position.x as f32 / PIXELS_PER_LINE,
+                            position.y as f32 / PIXELS_PER_LINE,
+                        );
+                        self.scroll_delta.0 += lines.0;
+                        self.scroll_delta.1 += lines.1;
+                        lines
                     }
-                }
+                };
+                let mut snapshot = self.snapshot();
+                snapshot.scroll_delta = lines;
+                self.events.push(snapshot);
                 true
             }
 
             WindowEvent::CursorEntered { .. } => {
                 self.cursor_in_window = true;
+                let snapshot = self.snapshot();
+                self.events.push(snapshot);
                 true
             }
             WindowEvent::CursorLeft { .. } => {
@@ -243,14 +339,24 @@ impl Input {
                 // drag — forget the old anchor so it doesn't report one huge
                 // delta across the gap.
                 self.last_mouse_position = None;
+                let snapshot = self.snapshot();
+                self.events.push(snapshot);
                 true
             }
 
             WindowEvent::Focused(focused) => {
+                let released_keys = self.keys_down.clone();
+                let released_buttons = self.buttons_down.clone();
                 self.focused = *focused;
                 if !focused {
                     self.release_all();
                 }
+                let mut snapshot = self.snapshot();
+                if !focused {
+                    snapshot.keys_released = released_keys;
+                    snapshot.buttons_released = released_buttons;
+                }
+                self.events.push(snapshot);
                 true
             }
 
@@ -259,6 +365,8 @@ impl Input {
                 // Stale logical coordinates measured against the old factor
                 // would produce a phantom delta at the next move.
                 self.last_mouse_position = None;
+                let snapshot = self.snapshot();
+                self.events.push(snapshot);
                 true
             }
 
@@ -307,6 +415,7 @@ impl Input {
         self.raw_mouse_delta = (0.0, 0.0);
         self.scroll_delta = (0.0, 0.0);
         self.text.clear();
+        self.events.clear();
     }
 
     // ---- keyboard --------------------------------------------------------
@@ -459,6 +568,7 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vim::{ExtendedAction, Key, Mode, Vim};
     use winit::{
         dpi::PhysicalPosition,
         event::{DeviceId, TouchPhase},
@@ -626,5 +736,72 @@ mod tests {
         let mut input = input();
         input.handle_event(&WindowEvent::Ime(Ime::Preedit("^".into(), Some((0, 1)))));
         assert_eq!(input.text(), "", "a preedit is in progress, not committed");
+    }
+
+    #[test]
+    fn event_views_preserve_key_order_and_repetition() {
+        let mut input = input();
+        input.handle_key(Some(KeyCode::KeyA), ElementState::Pressed, false, Some("a"));
+        input.handle_key(Some(KeyCode::Backspace), ElementState::Pressed, false, None);
+        input.handle_key(Some(KeyCode::Backspace), ElementState::Pressed, true, None);
+        input.handle_key(Some(KeyCode::KeyB), ElementState::Pressed, false, Some("b"));
+
+        let events: Vec<&Input> = input.events().collect();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].text(), "a");
+        assert!(events[1].is_key_typed(KeyCode::Backspace));
+        assert!(events[1].is_key_pressed(KeyCode::Backspace));
+        assert!(events[2].is_key_typed(KeyCode::Backspace));
+        assert!(!events[2].is_key_pressed(KeyCode::Backspace));
+        assert_eq!(events[3].text(), "b");
+
+        // Aggregate frame queries intentionally remain available for widgets
+        // that only care whether something happened during this frame.
+        assert_eq!(input.text(), "ab");
+        assert!(input.is_key_typed(KeyCode::Backspace));
+    }
+
+    #[test]
+    fn event_views_capture_modifiers_at_the_key_event() {
+        let mut input = input();
+        input.modifiers = ModifiersState::CONTROL;
+        input.handle_key(Some(KeyCode::KeyS), ElementState::Pressed, false, None);
+        input.modifiers = ModifiersState::empty();
+
+        let event = input.events().next().unwrap();
+        assert!(event.is_shortcut_pressed(ModifiersState::CONTROL, KeyCode::KeyS));
+        assert!(!input.is_shortcut_pressed(ModifiersState::CONTROL, KeyCode::KeyS));
+    }
+
+    #[test]
+    fn event_views_expire_with_the_frame() {
+        let mut input = input();
+        input.handle_event(&WindowEvent::Ime(Ime::Commit("a".into())));
+        assert_eq!(input.events().count(), 1);
+        input.end_frame();
+        assert_eq!(input.events().count(), 0);
+    }
+
+    #[test]
+    fn ordered_views_apply_a_mode_change_before_the_following_character() {
+        let mut input = input();
+        input.handle_key(Some(KeyCode::KeyI), ElementState::Pressed, false, Some("i"));
+        input.handle_key(Some(KeyCode::KeyA), ElementState::Pressed, false, Some("a"));
+        let mut vim = Vim::new();
+        let mut inserted = String::new();
+
+        for event in input.events() {
+            for character in event.text().chars() {
+                match vim.key_extended(Key::Char(character)) {
+                    ExtendedAction::Enter(mode) => vim.set_mode(mode),
+                    ExtendedAction::InsertAt(_) => vim.set_mode(Mode::Insert),
+                    ExtendedAction::Passthrough => inserted.push(character),
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(vim.mode(), Mode::Insert);
+        assert_eq!(inserted, "a");
     }
 }
