@@ -52,6 +52,10 @@ struct App {
     /// input events are still waiting on a frame. See [`App::diagnose`].
     input_at: Option<Instant>,
     pending_input: u32,
+    /// `TW_DIAG` segment stamps: when the loop asked the OS for a frame, and
+    /// when the OS delivered that request back as `RedrawRequested`.
+    asked_at: Option<Instant>,
+    redraw_at: Option<Instant>,
 }
 
 impl Default for App {
@@ -68,6 +72,8 @@ impl Default for App {
             wake_at: None,
             input_at: None,
             pending_input: 0,
+            asked_at: None,
+            redraw_at: None,
         }
     }
 }
@@ -212,7 +218,7 @@ impl App {
     /// A burst of lines with `redrew=0` means the frame arrived but carried
     /// no new content; a long gap with no lines at all means no frame was
     /// requested. Both read very differently from "the GPU is busy".
-    fn diagnose(&mut self, redrew: usize) {
+    fn diagnose(&mut self, redrew: usize, acquire: std::time::Duration) {
         if !diag() {
             return;
         }
@@ -221,9 +227,22 @@ impl App {
         };
         let waited = at.elapsed();
         let n = std::mem::take(&mut self.pending_input);
+        // Split the wait into the three places it can go: this loop deciding
+        // to ask for a frame, the OS delivering that request, and the frame
+        // itself. Only the last is this app's own work — and inside even that,
+        // `acquire` is time spent waiting for the compositor to hand back a
+        // drawable, which is not work either.
+        let asked = self.asked_at.take();
+        let redraw = self.redraw_at.take();
+        let decide = asked.map(|a| a.saturating_duration_since(at));
+        let deliver = match (asked, redraw) {
+            (Some(a), Some(r)) => Some(r.saturating_duration_since(a)),
+            _ => None,
+        };
+        let frame = redraw.map(|r| r.elapsed());
         if waited > std::time::Duration::from_millis(32) {
             eprintln!(
-                "[diag] input waited {waited:.1?} for a frame (events={n}, regions redrawn={redrew})"
+                "[diag] waited {waited:.1?} (events={n}, redrew={redrew}) = decide {decide:.1?} + os-deliver {deliver:.1?} + frame {frame:.1?}, of which acquire {acquire:.1?}"
             );
         }
     }
@@ -265,13 +284,8 @@ impl App {
             eprintln!("render error: {e}");
         }
         let redrew = shell.redrew();
-        // A reconfigure that could not run this frame (the queue had not
-        // drained) needs another one to land on — see `has_pending_resize`.
-        let pending_resize = renderer.has_pending_resize();
-        if pending_resize {
-            self.scheduler.request_redraw();
-        }
-        self.diagnose(redrew);
+        let acquire = renderer.last_acquire();
+        self.diagnose(redrew, acquire);
     }
 }
 

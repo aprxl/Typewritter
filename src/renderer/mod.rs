@@ -202,6 +202,10 @@ pub struct Renderer {
     // display density (crisp, no blur from upscaling a logical-resolution
     // render) while callers never have to think about DPI themselves — the
     // same contract CSS px/SwiftUI points/Android dp give their callers.
+    // How long the last frame spent inside `get_current_texture` — the wait
+    // for the compositor to hand back a drawable, which is not this app's own
+    // work. Read by the `TW_DIAG` trace in `main`.
+    last_acquire: Duration,
     scale_factor: f64,
     // Whether the surface was configured with `COPY_SRC` — see
     // `Renderer::supports_capture`.
@@ -562,6 +566,7 @@ impl Renderer {
             previous_frame_at: None,
             frame_delta: Duration::ZERO,
             start_time: Instant::now(),
+            last_acquire: Duration::ZERO,
             scale_factor,
             capture_supported,
             pending_capture: None,
@@ -923,18 +928,9 @@ impl Renderer {
         self.start_time.elapsed()
     }
 
-    /// Whether a surface reconfigure is still queued — see
-    /// [`Renderer::resize`], which records the new size and leaves applying
-    /// it to a later frame, once the GPU queue has drained.
-    ///
-    /// The caller has to keep asking for frames while this is true. Frames
-    /// are demand-driven, and a deferred reconfigure is a change nobody else
-    /// is asking for: the resize event that started it has already been
-    /// serviced, so if the reconfigure does not land on that frame there is
-    /// nothing left to bring the window up to its new size. It would sit at
-    /// the old one until something unrelated wanted a frame.
-    pub fn has_pending_resize(&self) -> bool {
-        self.pending_surface_size.is_some()
+    /// Time the last frame spent waiting for a drawable — see `last_acquire`.
+    pub fn last_acquire(&self) -> Duration {
+        self.last_acquire
     }
 
     /// Current window scale factor — see [`Renderer::set_scale_factor`].
