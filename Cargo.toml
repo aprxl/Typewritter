@@ -38,3 +38,25 @@ tree-sitter-java = "0.23.5"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-go = "0.25.0"
 serde_json = "1.0.151"
+
+# Dependencies are optimized even in dev builds. Nothing in this app's own
+# hot path is the problem — the shell's per-frame `update` costs single-digit
+# microseconds — but a frame's cost is almost entirely *inside* the
+# dependencies: wgpu encoding and submitting one render pass per layer, swash
+# rasterizing glyphs, lyon tessellating paths. Unoptimized, those are 6-17x
+# slower, which is the difference between a frame that fits in a 120 Hz
+# budget and one that misses 60 Hz.
+#
+# Measured on an M-series Mac, debug, scale factor 2, 13 layers, idle:
+#
+#              deps -O0   deps -O3
+#   render      7-19ms     1.12ms
+#   encode     210-295µs     27µs
+#   submit     2.2-3.1ms   1.06ms
+#
+# `opt-level = 3` for dependencies only — this crate stays at `0`, so its own
+# debuginfo, overflow checks, and step-through debugging are unaffected. The
+# cost is a one-time ~2 minute rebuild of the dependency graph; incremental
+# rebuilds of this crate are unchanged.
+[profile.dev.package."*"]
+opt-level = 3
