@@ -52,8 +52,8 @@ let layer = renderer.new_layer_top(LayerInvalidation::Automatic);
 ## Invalidation modes (choose at layer creation)
 
 - **`LayerInvalidation::Automatic`** — immediate-mode. Re-issue *all* `draw_*`
-  calls every frame. The layer hashes the commands and skips the GPU rebuild
-  when nothing changed, so redrawing identical content is cheap.
+  calls every frame. The layer hashes the commands and retains both GPU
+  buffers and rendered pixels when nothing changed.
 - **`LayerInvalidation::Manual`** — retained. `draw_*` calls accumulate
   forever. Call `layer.clear()` then re-issue draws when content changes.
   Never re-issue draws without clearing first (they pile up).
@@ -137,10 +137,10 @@ Two mechanisms, both per-layer, both logical px, both clearable with `None`:
 
 - **`set_clip_rect(Some((top_left, size)))`** — hardware scissor on the
   layer's render pass. Clips geometry, images, and text together.
-  Effectively free (it *reduces* GPU work); changing it every frame costs
-  nothing. Default choice for scroll viewports, panes, popup bounds. Rects
-  partially outside the surface are clamped; a fully off-surface rect
-  renders nothing.
+  The scissor itself is free and reduces fragment work, but changing it marks
+  the retained layer for redraw. Default choice for scroll viewports, panes,
+  and popup bounds. Rects partially outside the surface are clamped; a fully
+  off-surface rect renders nothing.
 - **`set_clip_shape(Some(ClipShape::...))`** — arbitrary-shape mask applied
   to the layer's *composited* output (same whole-layer unit as
   `set_effect`; an active effect is masked too, so blur can't bleed outside

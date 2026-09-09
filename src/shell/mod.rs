@@ -644,9 +644,8 @@ impl Shell {
         // below everything else. The blur is set once — it is the effect,
         // and it never changes.
         //
-        // ponytail: the blur runs over the whole layer every frame, even
-        // with no highlight on screen. Gate it on `set_effect` when a
-        // document with no marks costs measurably more than one without.
+        // The renderer retains both this layer's content and effect output;
+        // the blur runs again only when the editor redraws the highlights.
         let glow = renderer.new_layer_top(LayerInvalidation::Manual);
         glow.set_effect(Some(ShaderEffect::Blur {
             radius: editor::GLOW_RADIUS,
@@ -742,20 +741,10 @@ impl Shell {
         // when they open, so this layer sits below every popup that will
         // ever attach and above every panel that exists.
         //
-        // The blur is DISABLED. `render_layers` runs `apply_effect` for
-        // every live layer on every frame with no dirty check, and this
-        // layer is full-surface and never detaches, so the blur cost two
-        // fullscreen passes on every frame of the session — popup on
-        // screen or not. Measured on this machine, debug: 70 fps / 7.3 ms
-        // render with it, 97 fps / 3.2 ms without. Gating it on ownership
-        // fixes the idle cost but not the cost while a popup is open,
-        // which is still enough to stall the window.
-        //
-        // ponytail: restore the shadow once the blur is affordable —
-        // guard `apply_effect`/`render_to_texture` on the rebuild flag
-        // `render_layers` currently discards, or blur a popup-sized
-        // region instead of the whole surface. The same note on `glow`
-        // above is the same bug on a smaller radius.
+        // The shadow effect itself remains disabled until its visual design
+        // returns. The retained renderer now makes enabling it proportional
+        // to shadow changes rather than charging two fullscreen blur passes
+        // on every unrelated animation frame.
         let popup_shadow = renderer.new_layer_top(LayerInvalidation::Manual);
 
         Self {

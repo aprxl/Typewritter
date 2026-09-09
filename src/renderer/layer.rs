@@ -3,9 +3,9 @@
 //! A `Layer` owns its own offscreen GPU texture and a queue of pending
 //! [`DrawCommand`]s. Calling a `draw_*` method never touches the GPU
 //! directly — it only records a command and marks the layer dirty; the
-//! actual tessellation, upload, and render-to-texture happen once per frame
-//! inside [`super::Renderer::render`], which also composites every live
-//! layer's texture onto the screen in bottom-to-top order.
+//! actual tessellation, upload, and render-to-texture happen lazily inside
+//! [`super::Renderer::render`]. Clean textures are retained; each frame only
+//! composites every live layer's cached texture in bottom-to-top order.
 //!
 //! Because a layer renders into its own texture, applying a shader to
 //! "everything in the layer" later just means swapping which pipeline the
@@ -82,9 +82,9 @@ impl From<lyon_extra::parser::ParseError> for PathFileError {
 pub enum LayerInvalidation {
     /// The caller re-issues the full set of `draw_*` calls every frame
     /// (immediate-mode style). The layer hashes the incoming content each
-    /// frame and only re-tessellates/re-renders when the hash differs from
+    /// frame and only re-tessellates and renders when the hash differs from
     /// the previous frame's — an unchanged frame's worth of `draw_*` calls
-    /// costs a hash comparison, not a GPU rebuild.
+    /// costs a hash comparison, not a layer render pass.
     Automatic,
     /// `draw_*` calls accumulate (they are *not* cleared automatically) —
     /// call [`Layer::clear`] before redrawing when content actually
@@ -1307,6 +1307,12 @@ pub(super) struct LayerInner {
     pending: Vec<DrawCommand>,
     invalidation: InvalidationState,
 
+    // The retained textures are the cache boundary. Rebuilding CPU/GPU draw
+    // buffers only marks them stale; `render_layers` consumes these flags and
+    // leaves clean layer/effect textures untouched on subsequent frames.
+    content_texture_dirty: bool,
+    effect_texture_dirty: bool,
+
     // Set by `Renderer::capture_into`: this layer's texture holds a copy of
     // a presented frame rather than anything it drew, so its own render
     // pass is skipped entirely — that pass begins by clearing the texture,
@@ -1453,6 +1459,10 @@ impl LayerInner {
             scale_factor,
             pending: Vec::new(),
             invalidation: invalidation_state,
+            // A freshly allocated texture has undefined contents even when
+            // the layer has no commands, so its first frame must clear it.
+            content_texture_dirty: true,
+            effect_texture_dirty: true,
             frozen: false,
             effect_output_empty: false,
         }
@@ -1468,9 +1478,6 @@ impl LayerInner {
         }
     }
 
-    // The layer spike's one `Manual` layer never redraws, so nothing calls
-    // this yet — real `Manual`-layer callers are the next pass's work.
-    #[allow(dead_code)]
     fn clear(&mut self) {
         self.pending.clear();
         if let InvalidationState::Manual { dirty } = &mut self.invalidation {
@@ -1501,6 +1508,8 @@ impl LayerInner {
         );
         self.texture = texture;
         self.texture_view = texture_view;
+        self.content_texture_dirty = true;
+        self.effect_texture_dirty = true;
         self.set_composite_source(self.texture_view.clone());
         // Shared across every layer, so this runs redundantly once per
         // layer on an actual resize — harmless, it's just a small
@@ -1656,6 +1665,7 @@ impl LayerInner {
     }
 
     fn rebuild_effect_gpu(&mut self) {
+        self.effect_texture_dirty = true;
         // A brand-new output texture has not been cleared to the empty
         // result, whatever the layer holds.
         self.effect_output_empty = false;
@@ -1822,6 +1832,9 @@ impl LayerInner {
     /// would free and reallocate its surface-sized textures every time the
     /// layer went empty and back.
     fn apply_effect_if_needed(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if !std::mem::take(&mut self.effect_texture_dirty) {
+            return;
+        }
         // A frozen layer holds a captured frame: content, though nothing was
         // drawn for it.
         let empty =
@@ -1911,6 +1924,9 @@ impl LayerInner {
         // change doesn't leave the mask at the old density.
         if changed && self.clip_shape.is_some() {
             self.rebuild_mask();
+        }
+        if changed && self.clip_rect.is_some() {
+            self.content_texture_dirty = true;
         }
     }
 
@@ -2028,10 +2044,8 @@ impl LayerInner {
 
     /// Rebuild the GPU vertex/index buffers from `pending` if this layer's
     /// `LayerInvalidation` rule says the content actually changed, then
-    /// reset that rule's state for the next frame. Returns whether a
-    /// rebuild happened (useful for smoke-testing that unchanged
-    /// `Automatic` layers really do skip work).
-    fn rebuild_if_needed(&mut self) -> bool {
+    /// reset that rule's state for the next frame.
+    fn rebuild_if_needed(&mut self) {
         let should_rebuild = match &mut self.invalidation {
             InvalidationState::Automatic { last_hash } => {
                 let mut hasher = DefaultHasher::new();
@@ -2098,13 +2112,15 @@ impl LayerInner {
         }
         self.had_text = has_text;
 
+        if should_rebuild || needs_prepare {
+            self.content_texture_dirty = true;
+        }
+
         // `Automatic` layers expect a full re-description of their content
         // every frame; `Manual` layers persist theirs until `clear()`.
         if matches!(self.invalidation, InvalidationState::Automatic { .. }) {
             self.pending.clear();
         }
-
-        should_rebuild
     }
 
     fn build_buffers(&mut self) {
@@ -2185,12 +2201,18 @@ impl LayerInner {
     /// swap-chain pass — cheap to skip entirely for layers with no
     /// geometry (an empty `pending` still needs its texture cleared to
     /// transparent so it doesn't keep showing stale content).
-    fn render_to_texture(&self, encoder: &mut wgpu::CommandEncoder, msaa_view: &wgpu::TextureView) {
+    fn render_to_texture_if_needed(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        msaa_view: &wgpu::TextureView,
+    ) {
         // A frozen layer's texture is a captured frame, not something it
         // drew; the pass below would clear it before drawing nothing.
-        if self.frozen {
+        if self.frozen || !self.content_texture_dirty {
             return;
         }
+        self.content_texture_dirty = false;
+        self.effect_texture_dirty = true;
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("atomos-layer-pass"),
             // Render into the renderer's shared multisampled scratch
@@ -2282,6 +2304,8 @@ impl LayerInner {
     /// see the `frozen` field.
     pub(super) fn freeze(&mut self) {
         self.frozen = true;
+        self.content_texture_dirty = false;
+        self.effect_texture_dirty = true;
     }
 
     /// Composite this layer's already-rendered texture onto `view`
@@ -3476,6 +3500,7 @@ impl Layer {
             && inner.update_effect_uniforms(effect)
         {
             inner.effect = Some(effect.clone());
+            inner.effect_texture_dirty = true;
             return;
         }
         inner.effect = effect;
@@ -3495,7 +3520,11 @@ impl Layer {
     /// Dropping the layer does the same thing and frees the texture with
     /// it, which is what a one-shot transition should do instead.
     pub fn thaw(&self) {
-        self.0.borrow_mut().frozen = false;
+        let mut inner = self.0.borrow_mut();
+        if inner.frozen {
+            inner.frozen = false;
+            inner.content_texture_dirty = true;
+        }
     }
 
     /// Restrict this layer's rendering to an axis-aligned rectangle
@@ -3503,14 +3532,19 @@ impl Layer {
     /// the layer draws — geometry, images, and text — outside the rect is
     /// discarded.
     ///
-    /// This is a hardware scissor: it *reduces* GPU work rather than
-    /// adding any, and changing it per frame is free. The everyday clip
-    /// for scroll viewports, panes, and popup bounds — reach for
-    /// [`Layer::set_clip_shape`] only when the clip genuinely isn't an
-    /// unrotated rectangle. Both can be active at once (content is
-    /// scissored while rendering, then masked while compositing).
+    /// This is a hardware scissor: it *reduces* fragment work rather than
+    /// adding any. Changing it invalidates the retained texture. It is the
+    /// everyday clip for scroll viewports, panes, and popup bounds — reach
+    /// for [`Layer::set_clip_shape`] only when the clip genuinely isn't an
+    /// unrotated rectangle. Both can be active at once (content is scissored
+    /// while rendering, then masked while compositing).
     pub fn set_clip_rect(&self, rect: Option<((f32, f32), (f32, f32))>) {
-        self.0.borrow_mut().clip_rect = rect.map(|((x, y), (w, h))| [x, y, w, h]);
+        let mut inner = self.0.borrow_mut();
+        let rect = rect.map(|((x, y), (w, h))| [x, y, w, h]);
+        if inner.clip_rect != rect {
+            inner.clip_rect = rect;
+            inner.content_texture_dirty = true;
+        }
     }
 
     /// Clip this layer's composited output to an arbitrary [`ClipShape`]
@@ -3525,7 +3559,7 @@ impl Layer {
     /// active then pays one extra fullscreen texture sample plus a
     /// surface-sized mask texture's memory. Cheap enough to animate the
     /// shape per frame, but for a plain unrounded rectangle use
-    /// [`Layer::set_clip_rect`], which costs nothing at all.
+    /// [`Layer::set_clip_rect`], which needs no mask texture or extra sample.
     ///
     /// [`ClipShape::Path`]'s `d` is validated here, same as
     /// [`Layer::draw_path`]; the other variants can't fail.
@@ -3547,9 +3581,6 @@ impl Layer {
     /// this before re-describing content that changed); harmless on
     /// [`LayerInvalidation::Automatic`] layers, which already clear their
     /// own pending content every rebuilt frame.
-    // Not called by the layer spike (its one `Manual` layer draws once and
-    // never redraws) — kept as the real API `Manual`-layer callers need.
-    #[allow(dead_code)]
     pub fn clear(&self) {
         self.0.borrow_mut().clear();
     }
@@ -3578,7 +3609,7 @@ pub(super) fn render_layers(
         inner.set_scale_factor(scale_factor);
         inner.rebuild_if_needed();
         inner.render_mask_if_needed(encoder, msaa_view);
-        inner.render_to_texture(encoder, msaa_view);
+        inner.render_to_texture_if_needed(encoder, msaa_view);
         inner.apply_effect_if_needed(encoder);
     }
 
