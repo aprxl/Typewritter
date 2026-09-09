@@ -1316,6 +1316,16 @@ pub(super) struct LayerInner {
     // with a fresh, never-rendered one: staying frozen would composite
     // whatever the driver left in it.
     frozen: bool,
+
+    // Whether this layer's effect output currently holds the result of
+    // running the effect over an *empty* layer. An empty layer's texture is
+    // transparent and every effect here maps transparent to transparent, so
+    // once the output has been cleared that way, re-running the effect on
+    // each frame the layer redraws-but-draws-nothing rebuilds an identical
+    // texture. That is what the editor's highlight glow does on every
+    // document without a mark in it: two fullscreen blur passes per frame to
+    // produce transparency.
+    effect_output_empty: bool,
 }
 
 /// GPU state for one `DrawCommand::Image`, rebuilt whenever the layer
@@ -1444,6 +1454,7 @@ impl LayerInner {
             pending: Vec::new(),
             invalidation: invalidation_state,
             frozen: false,
+            effect_output_empty: false,
         }
     }
 
@@ -1645,6 +1656,9 @@ impl LayerInner {
     }
 
     fn rebuild_effect_gpu(&mut self) {
+        // A brand-new output texture has not been cleared to the empty
+        // result, whatever the layer holds.
+        self.effect_output_empty = false;
         let Some(effect) = self.effect.clone() else {
             self.effect_gpu = None;
             self.set_composite_source(self.texture_view.clone());
@@ -1802,6 +1816,23 @@ impl LayerInner {
     /// `texture_view` as input) and before `composite` (which reads
     /// whatever this leaves in `composite_bind_group`, already repointed
     /// by `rebuild_effect_gpu`).
+    /// [`LayerInner::apply_effect`], skipping the passes when the layer has
+    /// nothing drawn on it and its output already holds that same empty
+    /// result. Cheaper than toggling the effect off with `set_effect`, which
+    /// would free and reallocate its surface-sized textures every time the
+    /// layer went empty and back.
+    fn apply_effect_if_needed(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        // A frozen layer holds a captured frame: content, though nothing was
+        // drawn for it.
+        let empty =
+            !self.frozen && self.num_indices == 0 && self.image_draws.is_empty() && !self.had_text;
+        if empty && self.effect_output_empty {
+            return;
+        }
+        self.effect_output_empty = empty;
+        self.apply_effect(encoder);
+    }
+
     fn apply_effect(&self, encoder: &mut wgpu::CommandEncoder) {
         let Some(effect_gpu) = &self.effect_gpu else {
             return;
@@ -3548,7 +3579,7 @@ pub(super) fn render_layers(
         inner.rebuild_if_needed();
         inner.render_mask_if_needed(encoder, msaa_view);
         inner.render_to_texture(encoder, msaa_view);
-        inner.apply_effect(encoder);
+        inner.apply_effect_if_needed(encoder);
     }
 
     if live.is_empty() {
