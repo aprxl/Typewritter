@@ -94,6 +94,17 @@ const MSAA_SAMPLE_COUNT_FALLBACK: u32 = 4;
 /// climbing even if an adapter offers more.
 const MSAA_SAMPLE_COUNT_MAX: u32 = 8;
 
+fn supports_timestamp_queries(backend: wgpu::Backend, features: wgpu::Features) -> bool {
+    // wgpu 29's legacy Metal counter path is not usable on macOS 26: it
+    // returns zero timestamps and encoder-level writes can wedge the queue.
+    // Timing is optional diagnostics, so do not put production rendering on
+    // that path until wgpu implements Metal 4's replacement counter API.
+    backend != wgpu::Backend::Metal
+        && features.contains(
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+        )
+}
+
 /// Pick the highest MSAA sample count (up to [`MSAA_SAMPLE_COUNT_MAX`])
 /// this adapter actually supports for `format`, including
 /// `resolve_target` support at that count (every layer's render pass
@@ -435,7 +446,8 @@ impl Renderer {
         // feature would fail device creation outright, hence the check.
         let timestamp_features =
             wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-        let timestamps_supported = adapter.features().contains(timestamp_features);
+        let timestamps_supported =
+            supports_timestamp_queries(adapter.get_info().backend, adapter.features());
 
         // `TextureFormatFeatureFlags`/`get_texture_format_features` reports
         // what the adapter's hardware can *physically* do, but wgpu only
@@ -931,7 +943,8 @@ impl Renderer {
     /// recently *measured* frame — a profiling metric, measured with GPU
     /// timestamp queries and read back asynchronously, so the value is 1–3
     /// frames old. `None` when the adapter doesn't support timestamp
-    /// queries, or before the first measurement completes. Use
+    /// queries, on Metal (where wgpu 29's counter path is unsafe), or before
+    /// the first measurement completes. Use
     /// [`Renderer::get_frametime`] for animation stepping, not this.
     pub fn get_gpu_frametime(&self) -> Option<Duration> {
         self.timestamps
@@ -962,4 +975,32 @@ impl Renderer {
 
     /// Reserved for future per-window state. Currently a no-op.
     pub fn handle_event(&mut self, _event: &WindowEvent) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supports_timestamp_queries;
+
+    const TIMESTAMPS: wgpu::Features =
+        wgpu::Features::TIMESTAMP_QUERY.union(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+
+    #[test]
+    fn metal_never_uses_legacy_timestamp_queries() {
+        assert!(!supports_timestamp_queries(
+            wgpu::Backend::Metal,
+            TIMESTAMPS
+        ));
+    }
+
+    #[test]
+    fn other_backends_require_both_timestamp_features() {
+        assert!(supports_timestamp_queries(
+            wgpu::Backend::Vulkan,
+            TIMESTAMPS
+        ));
+        assert!(!supports_timestamp_queries(
+            wgpu::Backend::Vulkan,
+            wgpu::Features::TIMESTAMP_QUERY
+        ));
+    }
 }

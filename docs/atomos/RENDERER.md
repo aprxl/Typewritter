@@ -46,7 +46,7 @@ let layer = renderer.new_layer_top(LayerInvalidation::Automatic);
 | `set_scale_factor(f64)` / `scale_factor() -> f64` | wire to `ScaleFactorChanged` |
 | `get_frametime() -> Duration` | wall-clock frame-to-frame |
 | `get_render_time() -> Duration` | CPU time inside `render()` |
-| `get_gpu_frametime() -> Option<Duration>` | GPU timestamps; `None` if unsupported |
+| `get_gpu_frametime() -> Option<Duration>` | GPU timestamps; `None` if unsupported or on Metal |
 | `handle_event(&WindowEvent)` | forward every event; currently a no-op seam |
 
 ## Invalidation modes (choose at layer creation)
