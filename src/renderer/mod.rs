@@ -688,6 +688,28 @@ impl Renderer {
     /// (timeout, occlusion, suboptimal/outdated swap chain). The `Result`
     /// only carries genuinely unrecoverable surface errors.
     pub fn render(&mut self) -> Result<(), RenderError> {
+        // Wall-clock frame delta, the anchor for `get_frametime`. Measured at
+        // the same point every frame so the delta is stable under vsync — and
+        // measured *here*, before anything below can return early, because
+        // several paths do: an occluded window, a timed-out or outdated
+        // surface, a frame skipped while a resize is still pending.
+        //
+        // Taking it at the end of the frame instead deadlocked the loop.
+        // `frame_delta` starts at zero, animations step by it, and a fresh
+        // `Animation` starts out playing — so a run of early returns before
+        // the first presented frame left the delta at zero, every animation
+        // frozen mid-play, and `Shell::update` reporting "still animating"
+        // forever. That asks for another frame immediately, which returns
+        // early again: a spin at whatever rate the machine allows, burning a
+        // core and starving input, with nothing on screen to show for it.
+        // Measured while stuck: 79k frames/second in a debug build, 300k in a
+        // release one — which is why the optimized build felt *worse*.
+        let now = Instant::now();
+        if let Some(previous) = self.previous_frame_at {
+            self.frame_delta = now.duration_since(previous);
+        }
+        self.previous_frame_at = Some(now);
+
         // The one place the swap chain is reconfigured, before the frame is
         // acquired and only once the queue has actually drained — see
         // `Renderer::resize` for the macOS hang that rules out anywhere else.
@@ -839,14 +861,6 @@ impl Renderer {
             timestamps.collect(&self.device);
         }
 
-        // Wall-clock frame delta, the anchor for `get_frametime`. Measured
-        // at the same point every frame so the delta is stable under vsync.
-        let now = Instant::now();
-        if let Some(previous) = self.previous_frame_at {
-            self.frame_delta = now.duration_since(previous);
-        }
-        self.previous_frame_at = Some(now);
-
         Ok(())
     }
 
@@ -907,6 +921,20 @@ impl Renderer {
     /// Wall-clock time elapsed since this `Renderer` was created.
     pub fn get_render_time(&self) -> Duration {
         self.start_time.elapsed()
+    }
+
+    /// Whether a surface reconfigure is still queued — see
+    /// [`Renderer::resize`], which records the new size and leaves applying
+    /// it to a later frame, once the GPU queue has drained.
+    ///
+    /// The caller has to keep asking for frames while this is true. Frames
+    /// are demand-driven, and a deferred reconfigure is a change nobody else
+    /// is asking for: the resize event that started it has already been
+    /// serviced, so if the reconfigure does not land on that frame there is
+    /// nothing left to bring the window up to its new size. It would sit at
+    /// the old one until something unrelated wanted a frame.
+    pub fn has_pending_resize(&self) -> bool {
+        self.pending_surface_size.is_some()
     }
 
     /// Current window scale factor — see [`Renderer::set_scale_factor`].

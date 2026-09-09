@@ -22,7 +22,12 @@ impl Panel {
     pub fn new(node: NodeId, extent: f32) -> Self {
         Self {
             node,
-            animation: Animation::new(Duration::from_millis(140), Easing::EaseOut),
+            // Paused: `from` and `to` are both the full extent here, so
+            // there is nothing to play. A playing animation keeps the frame
+            // scheduler awake, and `Animation::new` starts out playing — four
+            // panels each asking for frames they do not need. `toggle`
+            // restarts it, which is the only time it has anywhere to travel.
+            animation: Animation::new(Duration::from_millis(140), Easing::EaseOut).paused(),
             open: true,
             extent,
             from: extent,

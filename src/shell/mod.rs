@@ -873,6 +873,14 @@ impl Shell {
     /// `renderer` is here for the overlay layers, which are attached on open
     /// and dropped on close rather than held for the session, and for the
     /// palette swap, which captures a frame into a layer of its own.
+    /// How many regions actually repainted on the last frame. The
+    /// diagnostic trace in `main` pairs this with input latency: a frame that
+    /// served input without repainting anything is the signature of a
+    /// snapshot that was rebuilt too late to be drawn.
+    pub fn redrew(&self) -> usize {
+        self.redraws.0
+    }
+
     pub fn update(
         &mut self,
         input: &Input,
@@ -1149,6 +1157,16 @@ impl Shell {
             self.last_active_path = active_path;
             self.last_editor_scroll = editor_scroll;
             self.rebuild_views_with(update);
+            // Ask for one more frame. The snapshots this just installed are
+            // dirty and this frame's draw pass has already run, so they paint
+            // on the *next* frame — and nothing else here is asking for one.
+            // `animating` was decided before the rebuild, so on a still
+            // window it is false, the loop returns to `ControlFlow::Wait`,
+            // and the new content sits invisible until something unrelated
+            // wants a frame. On a window with a caret that is the blink: a
+            // typed character reaching the screen a blink-phase late, and a
+            // hover that had settled looking stuck until the next one.
+            animating = true;
         }
         animating
     }

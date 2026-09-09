@@ -48,6 +48,10 @@ struct App {
     /// When the shell next wants a frame for an animation that is currently
     /// holding still — see [`Shell::wake_at`].
     wake_at: Option<Instant>,
+    /// `TW_DIAG=1`: when the oldest unserved input arrived, and how many
+    /// input events are still waiting on a frame. See [`App::diagnose`].
+    input_at: Option<Instant>,
+    pending_input: u32,
 }
 
 impl Default for App {
@@ -62,6 +66,8 @@ impl Default for App {
             window_minimum: (0.0, 0.0),
             config: None,
             wake_at: None,
+            input_at: None,
+            pending_input: 0,
         }
     }
 }
@@ -101,8 +107,16 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         // Only events that genuinely changed input state wake the renderer.
-        if self.input.handle_event(&event) {
+        let woke = self.input.handle_event(&event);
+        if woke {
             self.scheduler.request_redraw();
+        }
+        // Diagnostics: stamp the *first* input still waiting on a frame, so
+        // the measurement below is "how long has the oldest unserved
+        // keystroke been on screen-less", not "how long since the last one".
+        if woke && diag() && !matches!(event, WindowEvent::RedrawRequested) {
+            self.pending_input += 1;
+            self.input_at.get_or_insert_with(Instant::now);
         }
         if let Some(r) = &mut self.renderer {
             r.handle_event(&event);
@@ -181,7 +195,39 @@ impl ApplicationHandler for App {
     }
 }
 
+/// `TW_DIAG=1` turns on the input-latency trace — see [`App::diagnose`].
+fn diag() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TW_DIAG").is_some())
+}
+
 impl App {
+    /// Report how long input waited for the frame that answered it.
+    ///
+    /// Frames here are demand-driven, so "slow" is rarely the renderer being
+    /// heavy — it is a frame that was never asked for, or asked for and then
+    /// spent on a pass that drew nothing the reader wanted. Only outliers are
+    /// printed: a line per input that waited more than a couple of refreshes,
+    /// with whether any region actually redrew on the frame that served it.
+    /// A burst of lines with `redrew=0` means the frame arrived but carried
+    /// no new content; a long gap with no lines at all means no frame was
+    /// requested. Both read very differently from "the GPU is busy".
+    fn diagnose(&mut self, redrew: usize) {
+        if !diag() {
+            return;
+        }
+        let Some(at) = self.input_at.take() else {
+            return;
+        };
+        let waited = at.elapsed();
+        let n = std::mem::take(&mut self.pending_input);
+        if waited > std::time::Duration::from_millis(32) {
+            eprintln!(
+                "[diag] input waited {waited:.1?} for a frame (events={n}, regions redrawn={redrew})"
+            );
+        }
+    }
+
     fn frame(&mut self) {
         let (Some(window), Some(renderer), Some(shell)) =
             (&self.window, &mut self.renderer, &mut self.shell)
@@ -218,6 +264,14 @@ impl App {
         if let Err(e) = renderer.render() {
             eprintln!("render error: {e}");
         }
+        let redrew = shell.redrew();
+        // A reconfigure that could not run this frame (the queue had not
+        // drained) needs another one to land on — see `has_pending_resize`.
+        let pending_resize = renderer.has_pending_resize();
+        if pending_resize {
+            self.scheduler.request_redraw();
+        }
+        self.diagnose(redrew);
     }
 }
 
