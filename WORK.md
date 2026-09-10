@@ -578,3 +578,84 @@ full-width code blocks, entry/re-entry toggling, sweep sampling, and Esc reset.
 Final verification: fmt, warnings-denied Clippy, and 448 tests passed. Renderer
 smoke reached the expected headless Wayland `NoCompositor` boundary before any
 renderer work; the brush SVG ring has a parser test.
+
+---
+
+## Table performance baseline — `examples/table_bench.rs`
+
+The D6 harness, committed so the numbers a table refactor is judged against
+exist somewhere other than a scratch probe. It measures with a counting global
+allocator, so the `allocs` and `bytes` columns repeat run to run; the `micros`
+column is one wall-clock sample and does not — compare counts, not times.
+
+```
+cargo run --release --example table_bench
+```
+
+Run 2026-09-10 on this machine (Windows 11, rustc 1.98.0, release profile),
+against the tree at `8caa324`:
+
+```
+table_bench — profile release
+measure = 8 px/char, layout width 700, allocation counts repeat run to run, micros do not
+case                                             allocs     bytes    micros  per
+
+-- typing: 20 `Document::insert_text` keystrokes --
+typing: 2x2 table, one cell                          82      3224      14.5  4.1 allocs/keystroke
+typing: 8x4 table, one cell                         642     25624      28.5  32.1 allocs/keystroke
+typing: 24x4 table, one cell                       1922     76824      77.3  96.1 allocs/keystroke
+      sanity: first data cell "xxxxxxxxxxxxxxxxxxxxr10" — 20 of the 20 keystrokes in it
+typing: 20-paragraph document (prose)               400     16000      19.8  20.0 allocs/keystroke
+typing: 120-paragraph document (prose)             2400     96000      96.7  120.0 allocs/keystroke
+
+-- layout: one `layout(&doc, 700.0, &measure)` pass, 1 column(s) --
+layout: 2x1 (2 cells), one pass                      44      2930      29.3  22.0 allocs/cell, 1.4 KB/cell
+layout: 8x1 (8 cells), one pass                     164     12158       8.5  20.5 allocs/cell, 1.5 KB/cell
+layout: 24x1 (24 cells), one pass                   484     39834      23.5  20.2 allocs/cell, 1.6 KB/cell
+layout: 48x1 (48 cells), one pass                   964     89082      57.2  20.1 allocs/cell, 1.8 KB/cell
+layout: 64x1 (64 cells), one pass                  1284    127034      75.5  20.1 allocs/cell, 1.9 KB/cell
+
+-- layout: one `layout(&doc, 700.0, &measure)` pass, 4 column(s) --
+layout: 2x4 (8 cells), one pass                     110      9800       8.9  13.8 allocs/cell, 1.2 KB/cell
+layout: 8x4 (32 cells), one pass                    428     39800      18.5  13.4 allocs/cell, 1.2 KB/cell
+layout: 24x4 (96 cells), one pass                  1276    123624      69.7  13.3 allocs/cell, 1.3 KB/cell
+layout: 48x4 (192 cells), one pass                 2548    257256     172.4  13.3 allocs/cell, 1.3 KB/cell
+layout: 64x4 (256 cells), one pass                 3396    351464     222.1  13.3 allocs/cell, 1.3 KB/cell
+
+-- layout: empty cells, to separate structure from text --
+layout: 24x4, EMPTY cells, one pass                 580     39936      28.3  6.0 allocs/cell
+
+-- drag: 20 `Document::resize_table_column` steps on a 24x4 table --
+drag: 24x4, 20 column steps                        1000     56000      28.9  50.0 allocs/step
+
+-- paint: the per-row walk of `Editor::draw_table` (mirrored, no GPU) --
+paint: 2x4, first row on screen                      32       596       3.4  2 of 2 rows walked (0 = early return)
+paint: 64x4, first row on screen                   1024     19412      32.8  64 of 64 rows walked (0 = early return)
+paint: 64x4, whole table scrolled far away            0         0       0.1  0 of 64 rows walked (0 = early return)
+```
+
+Every allocation count reproduces the scratch probe in `tw-tables/evidence/`
+exactly — 82 / 642 / 1922 keystrokes, 1276 and 580 for the 24×4 layout pass,
+1000 for the drag. Its microseconds came out 2–4× higher than this run's, which
+is the half of a scratch measurement worth discarding; the byte totals differ
+only in the last few percent (76 824 bytes for the 24×4 typing case, 75 KiB,
+against the probe's 77 KB).
+
+The numbers point at three causes. **Per-keystroke pruning is document-wide**:
+one allocation per cell of the whole document on every keystroke, 96/keystroke
+on a 24×4 table, so a results table is cheaper than 120 paragraphs of prose but
+only just — and the prose curve is itself O(document). **Layout does per-cell
+work that clones the cell**: 13.3 allocations and 1.3 KB per cell, of which 6
+allocations survive with the text stripped out, which is the part the container
+refactor removes. And **the paint path walks every row of the table**: with one
+row on screen a 64×4 table costs 1024 allocations against a 2×4's 32 — 4 per
+cell, but over every cell in the table rather than the four on screen; only a
+table scrolled entirely off screen is free, because the whole-table early
+return is the only viewport test in `draw_table`.
+
+The paint case mirrors `Editor::draw_table` (`draw_table` needs a live Atomos
+`Layer`, and there is no headless one). `paint_table` in the example names the
+lines it reproduces and the ones it omits — `theme::width` and every draw call
+— so it is a lower bound on the real path, never an overstatement. The harness
+reads a cell through `Inline::table_cell_contents` in exactly two places, both
+marked for the container refactor.
