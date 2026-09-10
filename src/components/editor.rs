@@ -272,6 +272,12 @@ impl Editor {
         for row in first..end {
             let block = &self.layout.blocks[row];
             let row_top = content + block.y - self.scroll;
+            // The whole-table test above only says *some* of the table is on
+            // screen. A row below the fold or above the top is scissored away,
+            // so skip it before building anything for it.
+            if row_top + block.height < rect.y || row_top > rect.bottom() {
+                continue;
+            }
             let row_table = self.layout.tables[row]
                 .as_ref()
                 .expect("table row must have table layout");
@@ -291,7 +297,6 @@ impl Editor {
                     // cell: its runs are that line's, and its cell-flat start
                     // comes from the cell's own line arithmetic.
                     let logical = &cell.lines()[line.cell_line.min(cell.lines().len() - 1)];
-                    let cell_block = Block::Paragraph(logical.to_vec());
                     let top = content_top + line.y;
                     let baseline = top + line.height * 0.5;
                     let mut cursor = left + inset + line.x;
@@ -311,10 +316,14 @@ impl Editor {
                                 segment.number.clone().unwrap_or_default()
                             }
                         };
+                        // The row block is the run's measuring kind: a table
+                        // cell is measured in the row's own text style, and
+                        // building a block per cell line only to read it back
+                        // cloned the cell's runs on every paint.
                         let width = segment.advance(
                             run,
                             &text,
-                            &cell_block,
+                            cell_source,
                             self.layout.scale,
                             &|text, style| theme::width(layer, text, style),
                         );
@@ -423,7 +432,7 @@ impl Editor {
                     decoration::runs(
                         &mut canvas,
                         &pieces,
-                        &cell_block,
+                        cell_source,
                         top,
                         line.height,
                         baseline,
@@ -597,7 +606,6 @@ impl Editor {
                     for line in lines {
                         let logical =
                             &source_cell.lines()[line.cell_line.min(source_cell.lines().len() - 1)];
-                        let cell_block = Block::Paragraph(logical.to_vec());
                         let mut cursor = left + TABLE_CELL_PAD * self.layout.scale + line.x;
                         for segment in &line.segments {
                             let run = &logical[segment.inline];
@@ -617,7 +625,7 @@ impl Editor {
                             let advance = segment.advance(
                                 run,
                                 &text,
-                                &cell_block,
+                                cell_source,
                                 self.layout.scale,
                                 &|text, style| theme::width(layer, text, style),
                             );

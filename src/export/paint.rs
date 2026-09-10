@@ -337,7 +337,6 @@ fn table_row(
         let content_top = top + (height - content_height).max(0.0) * 0.5;
         for line in lines {
             let logical = &cell.lines()[line.cell_line.min(cell.lines().len() - 1)];
-            let cell_block = Block::Paragraph(logical.to_vec());
             let line_top = content_top + line.y;
             let baseline = line_top + line.height * 0.5;
             let mut cursor = left + inset + line.x;
@@ -356,8 +355,10 @@ fn table_row(
                         segment.number.clone().unwrap_or_default()
                     }
                 };
+                // The row block is the run's measuring kind; no block is
+                // built per cell line, so a paint clones no cell content.
                 let advance =
-                    segment.advance(run, &text, &cell_block, layout.scale, &|text, style| {
+                    segment.advance(run, &text, cell_source, layout.scale, &|text, style| {
                         canvas.measure(text, style)
                     });
                 match run {
@@ -395,7 +396,7 @@ fn table_row(
             decoration::runs(
                 canvas,
                 &pieces,
-                &cell_block,
+                cell_source,
                 line_top,
                 line.height,
                 baseline,
