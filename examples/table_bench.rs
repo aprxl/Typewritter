@@ -31,8 +31,9 @@
 //!     (`src/components/editor.rs:202`). `draw_table` needs a live Atomos
 //!     `Layer` (a wgpu render target), so it cannot be called from here; the
 //!     walk is mirrored in `paint_table` instead. That function's comment
-//!     lists exactly which lines are faithful and what is omitted — read it
-//!     before trusting the numbers.
+//!     lists exactly which lines are faithful and what is omitted, and it is
+//!     a *lower bound*: no glyph measuring and no draw calls. Read it before
+//!     trusting the numbers.
 //!
 //! The baseline these numbers record is in `WORK.md`.
 
@@ -204,22 +205,24 @@ fn run_text(run: &Inline) -> String {
 ///   * the whole-table viewport test, `bottom < rect.y || top > rect.bottom()`
 ///     (`:217`), so a table scrolled entirely off screen really does return
 ///     before any row work;
-///   * `for row in first..end` (`:272`) — EVERY row of the table, because
-///     there is still no per-row viewport guard (`CONTRACT.md` §5.3 asks for
-///     one), so one visible row costs allocations proportional to the whole
-///     table;
-///   * per cell, `Block::Paragraph(contents.to_vec())` (`:284`);
+///   * the per-row viewport guard, `row_top + block.height < rect.y ||
+///     row_top > rect.bottom()` (`:272`), so a row the viewport does not show
+///     is skipped before anything is built for it;
+///   * the cell's runs are read in place, out of the layout's own source
+///     snapshot — no `Block` is built per cell line any more;
 ///   * per visual line, `Vec::with_capacity(line.segments.len())` (`:308`);
 ///   * per segment, the sliced `String` (`:321`).
 ///
-/// `black_box` keeps the optimizer from deleting the clone and the pieces
-/// vector, which the real function reads and this one does not. Omitted:
-/// `theme::width` (a glyph measure through the layer, which may allocate
-/// inside glyphon) and every `layer.draw_*` call — so this mirror is a lower
-/// bound on the real paint path, never an overstatement.
+/// `black_box` keeps the optimizer from deleting the pieces vector, which the
+/// real function reads and this one does not. Omitted: `theme::width` (a glyph
+/// measure through the layer, which may allocate inside glyphon) and every
+/// `layer.draw_*` call — so this mirror is a lower bound on the real paint
+/// path, never an overstatement. The row guard makes the counts bounded by the
+/// viewport rather than by the table: one visible row of a 64-row table is one
+/// row's work here, exactly as it is on screen.
 ///
-/// Returns the number of rows walked: `0` means the early return fired, and
-/// equals `end - first` otherwise.
+/// Returns the number of rows walked: `0` means the whole-table early return
+/// fired, and otherwise it is how many rows the viewport actually shows.
 fn paint_table(doc_layout: &DocLayout, first: usize, scroll: f32, viewport_height: f32) -> usize {
     let Some(table) = doc_layout.tables.get(first).and_then(Option::as_ref) else {
         return 0;
@@ -236,26 +239,37 @@ fn paint_table(doc_layout: &DocLayout, first: usize, scroll: f32, viewport_heigh
     if bottom < 0.0 || top > viewport_height {
         return 0;
     }
+    let mut walked = 0;
     for row in first..end {
+        let block = &doc_layout.blocks[row];
+        let row_top = block.y - scroll;
+        if row_top + block.height < 0.0 || row_top > viewport_height {
+            continue;
+        }
+        walked += 1;
         let row_table = doc_layout.tables[row]
             .as_ref()
             .expect("table row must have table layout");
         for (column, cell) in doc_layout.source[row].cells().iter().enumerate() {
-            let contents = cell.runs();
-            let cell_block = Block::Paragraph(contents.to_vec());
-            black_box(&cell_block);
             for line in &row_table.cells[column] {
+                let logical = &cell.lines()[line.cell_line.min(cell.lines().len() - 1)];
                 let mut pieces: Vec<String> = Vec::with_capacity(line.segments.len());
                 for segment in &line.segments {
-                    let run = &contents[segment.inline];
+                    let run = &logical[segment.inline];
                     let text: String = match run {
+                        // The real `draw_table` also caps the slice at
+                        // `VIEW_CAP`; a `String` is one allocation whatever
+                        // its length, so the omission does not move the count.
                         Inline::Text(text) => text
                             .text
                             .chars()
                             .skip(segment.start)
                             .take(segment.len)
                             .collect(),
-                        _ => segment.number.clone().unwrap_or_else(|| ATOM.to_string()),
+                        Inline::Math(_) => ATOM.to_string(),
+                        Inline::Note(_) | Inline::EqRef(_) => {
+                            segment.number.clone().unwrap_or_default()
+                        }
                     };
                     pieces.push(text);
                 }
@@ -264,7 +278,7 @@ fn paint_table(doc_layout: &DocLayout, first: usize, scroll: f32, viewport_heigh
         }
     }
     black_box(&table.columns);
-    end - first
+    walked
 }
 
 // ---- the cases -------------------------------------------------------------

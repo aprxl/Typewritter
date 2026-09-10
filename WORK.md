@@ -656,6 +656,124 @@ return is the only viewport test in `draw_table`.
 The paint case mirrors `Editor::draw_table` (`draw_table` needs a live Atomos
 `Layer`, and there is no headless one). `paint_table` in the example names the
 lines it reproduces and the ones it omits — `theme::width` and every draw call
-— so it is a lower bound on the real path, never an overstatement. The harness
-reads a cell through `Inline::table_cell_contents` in exactly two places, both
-marked for the container refactor.
+— so it is a lower bound on the real path, never an overstatement. See the
+section below for what that mirror looks like once it culls per row.
+
+---
+
+## Table layout and paint — after the shared-geometry pass
+
+`src/document/layout.rs`, `src/components/editor.rs`, `src/export/paint.rs`,
+`examples/table_bench.rs`. Same bench, same machine, same command; **every
+number below is an allocation count, not a timing.** Allocation counts repeat
+run to run; the `micros` column is one wall-clock sample and does not, so it is
+quoted but not compared.
+
+What changed:
+
+- **A table's tracks, row count and settings are measured once**, at its first
+  row, and shared down its rows: `TableLayout.columns` is an `Arc<[f32]>` and
+  `TableLayout.rows` is the table's row count, so the per-row back-scan, the
+  per-row row recount, the per-row `settings.clone().normalized()` and the
+  per-row track vector are gone. `table_resize_at` reads `rows` instead of
+  re-walking the table.
+- **No table path clones cell content.** The temporary
+  `Block::Paragraph(contents.to_vec())` is deleted from `table_cell_layout`,
+  `table_cell_line_block` (now `table_cell_line_runs`, returning `&[Inline]`),
+  `Editor::draw_table`, `Editor::draw_table_selection_range` and
+  `export/paint.rs::table_row`. `tokens`, `wrap`, `piece_width`,
+  `chunk_width`, `segments_for`, `x_of_flat` and the flat-length/style helpers
+  take the `&[Inline]` they actually read, and the row block is passed as the
+  style *kind* rather than a per-cell copy of it.
+- **A cell line's segments address that line's own runs.** They were cell-wide,
+  which every consumer (the caret, the click hit tests, the editor's paint, the
+  PDF paint) reads as line-local — so a two-line cell panicked on the first
+  caret placement or click. Tokenizing per logical line fixes the indexing and
+  removes the cell-wide run list the old code had to build.
+- **`draw_table` culls per row** against the editor rect, not just per table,
+  and builds nothing for a row it will not draw.
+
+Where one `layout(&doc, 700.0, &measure)` pass is linear in rows *and* columns,
+the two constants separate cleanly. Solving the 1-column and 4-column lines for
+each tree, per row and per cell, with the 24x4 empty-cell case for the
+structural floor:
+
+| 24x4 table, one layout pass | per row | per cell (text) | per cell (empty) |
+|---|---|---|---|
+| before (`4508480`) | 8.1 allocs | 12.0 allocs | 4.8 allocs |
+| after | 4.1 allocs | 9.0 allocs | 3.8 allocs |
+| after, less the document snapshot | 2.1 allocs | 6.0 allocs | 2.1 allocs |
+
+**The per-row constant is the one that moved**: 8.1 → 4.1 allocations, and of
+the 4.1 that remain, 2.1 is table code. The third row of the table is measured
+by re-running the bench with `DocLayout.source` and `code::colors` stubbed to
+empty: `DocLayout.source` is `blocks.to_vec()`, a deep clone of every block —
+and therefore of every table cell — taken on every pass, and `code::colors`
+allocates a `Vec` per block even for a table row nothing ever reads. Together
+they are ~2.0 allocations per row and ~3.0 per cell (text) of the residual, and
+neither is table code. Removing the snapshot means changing
+`DocLayout.source`'s type and its construction in `Shell::current_layout`
+(`src/shell/mod.rs`), which this branch does not own.
+
+`<= 2 allocations per cell per pass` is **not reached**: 14.0 → 10.1 on the
+24x4 case. Of the 10.1, 3.0 is the document snapshot above and 6.0 is the
+per-cell shape: a `Vec<VisLine>` per cell, a `Vec<Segment>` per visual line,
+`wrap`'s `Vec<Vec<Chunk>>` and its current `Vec<Chunk>`, the `Vec<Piece>` and
+one `String` per piece. Getting to 2 needs the snapshot gone *and* those
+buffers pooled across cells, which is a bigger change than this branch was
+chartered for. The per-row target (`~0`) is not reached for the same reason:
+what remains per row is one `Vec` for the row's cell lines, one for the block
+layout's `VisLine`, and the snapshot's own row share.
+
+```text
+cargo run --release --example table_bench
+```
+
+Run 2026-09-10 on this machine (Windows 11, release profile), against the tree
+at this commit. Everything is an allocation count except `micros`:
+
+```text
+-- layout: one `layout(&doc, 700.0, &measure)` pass, 1 column(s) --
+layout: 2x1 (2 cells), one pass                      35      2974      40.1  17.5 allocs/cell, 1.5 KB/cell
+layout: 8x1 (8 cells), one pass                     113     11848       9.3  14.1 allocs/cell, 1.4 KB/cell
+layout: 24x1 (24 cells), one pass                   321     35750      27.5  13.4 allocs/cell, 1.5 KB/cell
+layout: 48x1 (48 cells), one pass                   633     71654      46.9  13.2 allocs/cell, 1.5 KB/cell
+layout: 64x1 (64 cells), one pass                   841     95590      52.5  13.1 allocs/cell, 1.5 KB/cell
+
+-- layout: one `layout(&doc, 700.0, &measure)` pass, 4 column(s) --
+layout: 2x4 (8 cells), one pass                      89     10128       5.3  11.1 allocs/cell, 1.2 KB/cell
+layout: 8x4 (32 cells), one pass                    329     40512      24.9  10.3 allocs/cell, 1.2 KB/cell
+layout: 24x4 (96 cells), one pass                   969    122488      71.6  10.1 allocs/cell, 1.2 KB/cell
+layout: 48x4 (192 cells), one pass                 1929    245656     165.7  10.0 allocs/cell, 1.2 KB/cell
+layout: 64x4 (256 cells), one pass                 2569    327768     264.6  10.0 allocs/cell, 1.3 KB/cell
+
+-- layout: empty cells, to separate structure from text --
+layout: 24x4, EMPTY cells, one pass                 465     45284      37.8  4.8 allocs/cell
+
+-- paint: the per-row walk of `Editor::draw_table` (mirrored, no GPU) --
+paint: 2x4, first row on screen                      16       256       1.1  2 of 2 rows walked (0 = early return)
+paint: 64x4, first row on screen                     16       256       0.8  2 of 64 rows walked (0 = early return)
+paint: 64x4, whole table scrolled far away            0         0       0.1  0 of 64 rows walked (0 = early return)
+```
+
+The 24x4 pass is `1276 → 969` allocations against the numbers recorded for
+`8caa324` above, and `1348 → 969` against the tree this branch was cut from
+(`4508480`), which is the like-for-like comparison. The paint case is the one
+that moved the most: with one row of a 64x4 table on screen it was 1024
+allocations over 64 rows walked, and is now 16 allocations over the **2 rows
+the 40px viewport actually shows** (row 0 and the row whose top is 38px down).
+Nothing outside the viewport is touched, and a table scrolled entirely away is
+still 0.
+
+Typing (`0.1 allocs/keystroke`) and the column drag (`4.0 allocs/step`) are
+unchanged by this pass — the drag number is the one the 4508480 tree already
+had after the local-prune and `Arc`-settings work.
+
+Three new tests pin the invariants this pass introduced: every row of a table
+shares one track vector and one row count
+(`a_tables_rows_share_one_track_vector_and_row_count`), two tables in one
+document measure their own tracks rather than reusing the cache
+(`two_tables_in_one_document_do_not_share_tracks`), and a two-line cell places
+the caret on both of its lines
+(`a_two_line_cell_places_the_caret_on_both_its_lines` — this panicked before,
+on the first `caret_pos`).
