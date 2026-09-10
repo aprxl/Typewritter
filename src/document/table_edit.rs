@@ -549,6 +549,33 @@ impl Document {
         out
     }
 
+    /// Removes the runs a cell-flat `[from, to)` window covers, line by
+    /// line, folding the covered lines into one when the window spans a line
+    /// break. The removal mirror of [`Self::style_cell_slice`].
+    pub(crate) fn clear_cell_slice(cell: &mut table::Cell, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let (start_line, start_offset) = cell.position(from);
+        let (end_line, end_offset) = cell.position(to);
+        if start_line == end_line {
+            let runs = cell.lines()[start_line].clone();
+            let len: usize = runs.iter().map(flat_len).sum();
+            let mut rebuilt = slice_inline_runs(&runs, 0, start_offset);
+            rebuilt.extend(slice_inline_runs(&runs, end_offset, len));
+            cell.lines_mut()[start_line] = placeholder_if_empty(rebuilt);
+            return;
+        }
+        let first = cell.lines()[start_line].clone();
+        let last = cell.lines()[end_line].clone();
+        let last_len: usize = last.iter().map(flat_len).sum();
+        let mut joined = slice_inline_runs(&first, 0, start_offset);
+        joined.extend(slice_inline_runs(&last, end_offset, last_len));
+        let joined = placeholder_if_empty(joined);
+        cell.lines_mut()[start_line] = joined;
+        cell.lines_mut().drain(start_line + 1..=end_line);
+    }
+
     /// The text of the cell the caret sits in, if it is in a table. Read
     /// before a cell-clearing edit so the yank register can carry what the
     /// edit removed.

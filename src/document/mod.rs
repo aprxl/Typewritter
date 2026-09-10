@@ -1692,40 +1692,41 @@ impl Document {
         }
     }
 
-    /// Delete range and leave caret at its start. Returns deleted text for the
-    /// unnamed yank buffer.
-    pub fn delete_range(&mut self, range: FlatRange) -> String {
+    /// Delete range and leave caret at its start. Returns the deleted text
+    /// for the unnamed yank buffer, or `None` when the document refuses the
+    /// range — a table range that would collapse the grid — so the caller
+    /// leaves the register untouched rather than clearing it.
+    pub fn delete_range(&mut self, range: FlatRange) -> Option<String> {
         let range = range.normalized();
         let start = self.position(range.start.block, range.start.offset);
         let end = self.position(range.end.block, range.end.offset);
         if (start.block, start.offset) >= (end.block, end.offset) {
-            return String::new();
+            return None;
+        }
+        if start.block != end.block
+            && (start.block..=end.block).any(|block| self.scope()[block].is_table())
+        {
+            // A cross-row character range cannot collapse table blocks into
+            // each other without deleting tracks. Keep the grid intact; row
+            // removal remains an explicit popup action.
+            return None;
         }
         let deleted = self.range_text(FlatRange::new(start, end));
         if start.block == end.block && self.scope()[start.block].is_table() {
             let (landing_cell, landing_offset) = self.flat_to_pos(start.block, start.offset);
             for (cell, from, to) in self.table_cells_in_range(start.block, start.offset, end.offset)
             {
-                let original = self.scope()[start.block].cells()[cell].runs();
-                let len: usize = original.iter().map(flat_len).sum();
-                let mut contents = slice_inline_runs(original, 0, from);
-                contents.extend(slice_inline_runs(original, to, len));
-                self.scope_mut()[start.block]
+                let row_cells = self.scope_mut()[start.block]
                     .cells_mut()
-                    .expect("table row")[cell] = table::Cell::from_runs(contents);
+                    .expect("table row");
+                Self::clear_cell_slice(&mut row_cells[cell], from, to);
             }
             self.enforce();
             let landing_offset =
                 landing_offset.min(self.scope()[start.block].cells()[landing_cell].flat_len());
             self.set_caret(start.block, landing_cell, landing_offset);
             self.dirty = true;
-            return deleted;
-        }
-        if (start.block..=end.block).any(|block| self.scope()[block].is_table()) {
-            // A cross-row character range cannot collapse table blocks into
-            // each other without deleting tracks. Keep the grid intact; row
-            // removal remains an explicit popup action.
-            return String::new();
+            return Some(deleted);
         }
         if start.block == end.block {
             let block = self.scope()[start.block].clone();
@@ -1746,25 +1747,27 @@ impl Document {
         self.dirty = true;
         self.set_flat_position(start);
         self.enforce();
-        deleted
+        Some(deleted)
     }
 
     pub fn replace_range(&mut self, range: FlatRange, text: &str) -> String {
-        let deleted = self.delete_range(range);
+        let deleted = self.delete_range(range).unwrap_or_default();
         self.set_flat_position(range.normalized().start);
         self.insert_text(text);
         deleted
     }
 
-    /// Delete complete logical blocks, as used by visual-line mode.
-    pub fn delete_lines(&mut self, first: usize, last: usize) -> String {
+    /// Delete complete logical blocks, as used by visual-line mode. Returns
+    /// the deleted text for the yank register, or `None` when a table row is
+    /// in the way and the document refuses rather than destroying the grid.
+    pub fn delete_lines(&mut self, first: usize, last: usize) -> Option<String> {
         if self.scope().is_empty() {
-            return String::new();
+            return None;
         }
         let first = first.min(self.scope().len() - 1);
         let last = last.min(self.scope().len() - 1).max(first);
         if (first..=last).any(|block| self.scope()[block].is_table()) {
-            return String::new();
+            return None;
         }
         let deleted = (first..=last)
             .map(|block| self.block_text(block))
@@ -1780,11 +1783,11 @@ impl Document {
         self.caret.style = Style::PLAIN;
         self.dirty = true;
         self.enforce();
-        deleted
+        Some(deleted)
     }
 
     pub fn open_change(&mut self, range: FlatRange) -> String {
-        self.delete_range(range)
+        self.delete_range(range).unwrap_or_default()
     }
 
     pub fn text_object_range(&self, object: TextObject) -> Option<FlatRange> {
@@ -6056,16 +6059,18 @@ mod tests {
             Block::Paragraph(vec![plain_run("ab"), bold_run("cd")]),
             Block::Paragraph(vec![plain_run("ef")]),
         ];
-        let deleted = d.delete_range(FlatRange::new(
-            FlatPos {
-                block: 0,
-                offset: 1,
-            },
-            FlatPos {
-                block: 1,
-                offset: 1,
-            },
-        ));
+        let deleted = d
+            .delete_range(FlatRange::new(
+                FlatPos {
+                    block: 0,
+                    offset: 1,
+                },
+                FlatPos {
+                    block: 1,
+                    offset: 1,
+                },
+            ))
+            .expect("a prose range is deletable");
         assert_eq!(deleted, "bcd\ne");
         assert_eq!(text_of_block(&d, 0), "af");
         assert_eq!(d.body().len(), 1);
@@ -6512,7 +6517,7 @@ mod tests {
 
         // Delete the anchor labelled "1" — its note is dropped with it, so
         // "1" is free again and the next insert reclaims it.
-        d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
+        let _ = d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
         assert_eq!(d.notes.len(), 2);
         assert_eq!(d.insert_sidenote(), Some("1".into()));
     }
@@ -6526,7 +6531,7 @@ mod tests {
         assert_eq!(d.notes.len(), 1);
         assert_eq!(d.block_text(0), format!("{ATOM}note"));
 
-        d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
+        let _ = d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
         assert!(d.notes.is_empty(), "deleting the anchor drops the note");
         assert_eq!(d.block_text(0), "note");
     }

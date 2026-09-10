@@ -461,13 +461,27 @@ impl Tabs {
         self.edit(Document::delete_char);
     }
 
+    /// `dd` on a table cell clears the cell; that is a real deletion, so the
+    /// register carries what it cleared. A prose line is removed without
+    /// touching the register, exactly as before.
     pub fn delete_line(&mut self) {
-        self.edit(Document::delete_line);
+        let mut cleared = None;
+        self.edit(|doc| {
+            cleared = doc.caret_cell_text();
+            doc.delete_line();
+        });
+        if let Some(text) = cleared.filter(|text| !text.is_empty())
+            && let Some(tab) = self.active_mut()
+        {
+            tab.yank = text;
+        }
     }
 
+    /// A refused delete returns `None` from the document; the register is
+    /// left untouched rather than assigned the empty string and wiped.
     pub fn delete_range(&mut self, range: FlatRange) {
         let mut yank = None;
-        self.edit(|doc| yank = Some(doc.delete_range(range)));
+        self.edit(|doc| yank = doc.delete_range(range));
         if let Some(text) = yank
             && let Some(tab) = self.active_mut()
         {
@@ -477,7 +491,7 @@ impl Tabs {
 
     pub fn delete_lines(&mut self, first: usize, last: usize) {
         let mut yank = None;
-        self.edit(|doc| yank = Some(doc.delete_lines(first, last)));
+        self.edit(|doc| yank = doc.delete_lines(first, last));
         if let Some(text) = yank
             && let Some(tab) = self.active_mut()
         {
@@ -1849,5 +1863,73 @@ mod tests {
             body_before.as_slice(),
             "the body is byte-for-byte identical"
         );
+    }
+}
+
+#[cfg(test)]
+mod clip_yank_tests {
+    use super::*;
+    use std::fs;
+
+    fn tabs_with(tag: &str, text: &str) -> Tabs {
+        let path = std::env::temp_dir().join(format!("tw-yank-{tag}-{}.md", std::process::id()));
+        fs::write(&path, text).unwrap();
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        tabs
+    }
+
+    const TABLE: &str = "| A | B |\n| --- | --- |\n| a | b |\n";
+
+    #[test]
+    fn a_refused_table_delete_leaves_the_yank_register_intact() {
+        let mut tabs = tabs_with("refused", TABLE);
+        tabs.set_yank("keep me".to_string());
+        // Two whole rows: the document refuses rather than destroying the grid.
+        tabs.delete_lines(0, 1);
+        assert_eq!(tabs.yank(), Some("keep me"));
+        // A cross-row character range is refused for the same reason.
+        tabs.delete_range(FlatRange::new(
+            crate::document::FlatPos {
+                block: 0,
+                offset: 0,
+            },
+            crate::document::FlatPos {
+                block: 1,
+                offset: 0,
+            },
+        ));
+        assert_eq!(tabs.yank(), Some("keep me"));
+        assert!(
+            tabs.active()
+                .unwrap()
+                .document
+                .body()
+                .iter()
+                .all(Block::is_table),
+            "the grid is intact"
+        );
+    }
+
+    #[test]
+    fn a_real_delete_still_yanks_what_it_removed() {
+        let mut tabs = tabs_with("real", "one\n\ntwo\n");
+        tabs.set_yank("old".to_string());
+        tabs.delete_lines(0, 0);
+        assert_eq!(tabs.yank(), Some("one"));
+        assert_eq!(tabs.active().unwrap().document.body().len(), 1);
+    }
+
+    #[test]
+    fn clearing_a_cell_yanks_what_it_cleared() {
+        let mut tabs = tabs_with("cell", TABLE);
+        tabs.set_yank("old".to_string());
+        tabs.touch(|doc| doc.set_caret(0, 0, 0));
+        tabs.delete_line();
+        assert_eq!(tabs.yank(), Some("A"));
+        let doc = &tabs.active().unwrap().document;
+        assert_eq!(doc.body()[0].cells().len(), 2, "the row is intact");
+        assert!(doc.body()[0].cells()[0].is_blank(), "the cell is cleared");
+        assert_eq!(crate::document::cell_text(&doc.body()[0].cells()[1]), "B");
     }
 }
