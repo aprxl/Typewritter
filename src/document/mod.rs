@@ -2677,8 +2677,14 @@ impl Document {
             }
             let at = self.scope()[b].cells()[i].run_at(o - 1);
             let run_start = self.scope()[b].cells()[i].run_start(at.line, at.run);
-            if let Inline::Math(list) = &self.scope()[b].cells()[i].lines()[at.line][at.run] {
-                let end = list.len();
+            // A non-empty atom is entered and edited through its tree; an
+            // empty one has no tree to enter, so it falls through to the
+            // opaque removal below — the same choice the prose branch makes.
+            let math_len = match &self.scope()[b].cells()[i].lines()[at.line][at.run] {
+                Inline::Math(list) => Some(list.len()),
+                _ => None,
+            };
+            if let Some(end) = math_len.filter(|len| *len > 0) {
                 self.caret.offset = run_start;
                 self.math = Some(math::MathCursor {
                     path: Vec::new(),
@@ -2822,10 +2828,13 @@ impl Document {
                 return;
             }
             let at = self.scope()[b].cells()[i].run_at(o);
-            if matches!(
-                self.scope()[b].cells()[i].lines()[at.line][at.run],
-                Inline::Math(_)
-            ) {
+            // A non-empty atom is entered and edited through its tree; an
+            // empty one is removed whole, like any opaque run.
+            let math_len = match &self.scope()[b].cells()[i].lines()[at.line][at.run] {
+                Inline::Math(list) => Some(list.len()),
+                _ => None,
+            };
+            if math_len.is_some_and(|len| len > 0) {
                 self.math = Some(math::MathCursor::default());
                 let _ = self.math_delete_forward();
                 return;
@@ -2998,10 +3007,13 @@ impl Document {
                 return;
             }
             let at = self.scope()[b].cells()[cell].run_at(offset);
-            if matches!(
-                self.scope()[b].cells()[cell].lines()[at.line][at.run],
-                Inline::Math(_)
-            ) {
+            // A non-empty atom is entered and edited through its tree; an
+            // empty one is removed whole, like any opaque run.
+            let math_len = match &self.scope()[b].cells()[cell].lines()[at.line][at.run] {
+                Inline::Math(list) => Some(list.len()),
+                _ => None,
+            };
+            if math_len.is_some_and(|len| len > 0) {
                 self.math = Some(math::MathCursor::default());
                 let _ = self.math_delete_forward();
                 return;
@@ -6838,6 +6850,133 @@ mod tests {
 
         d.delete_line();
         assert_eq!(cell_text(&d.body()[0].cells()[0]), "");
+        assert_eq!(d.body().len(), 2);
+        assert!(d.body().iter().all(|row| row.cells().len() == 2));
+        assert_invariants(&d);
+    }
+
+    // ---- cell atoms: the edit paths audited against the container shape ----
+
+    /// `$` inside a cell splits the cell's run around the atom and focuses
+    /// it; the grid keeps its shape.
+    #[test]
+    fn a_dollar_in_a_cell_splits_the_cells_run_around_the_atom() {
+        let mut d = doc();
+        d.insert_table();
+        d.insert_text("ab");
+        d.set_caret(0, 0, 1); // between a and b
+
+        d.insert_inline_math();
+
+        let line = &d.body()[0].cells()[0].lines()[0];
+        assert!(
+            matches!(line.as_slice(), [Inline::Text(l), Inline::Math(_), Inline::Text(r)] if l.text == "a" && r.text == "b"),
+            "the cell's run split around the atom: {line:?}"
+        );
+        assert!(d.math.is_some(), "the new atom is focused");
+        assert_eq!(d.caret.offset, 1, "the caret sits on the new atom");
+        assert_eq!((d.caret.block, d.caret.inline), (0, 0));
+        assert!(d.body().iter().all(Block::is_table));
+        assert!(d.body().iter().all(|row| row.cells().len() == 2));
+        assert_invariants(&d);
+    }
+
+    /// Backspace onto a cell atom edits it through its tree when it holds
+    /// something, and removes an empty one whole (`is_opaque`).
+    #[test]
+    fn backspace_onto_a_cell_atom_edits_it_or_removes_it_whole() {
+        // Non-empty: the tree opens and the element goes.
+        let mut d = doc();
+        d.insert_table();
+        d.insert_inline_math();
+        d.math_insert_char('x');
+        d.math_exit_after();
+        assert!(d.math.is_none());
+        assert_eq!(d.caret.offset, 1);
+
+        d.backspace();
+        assert!(d.math.is_some(), "backspace on a live atom enters its tree");
+        assert!(matches!(
+            &d.body()[0].cells()[0].lines()[0][0],
+            Inline::Math(list) if list.is_empty()
+        ));
+        assert_eq!(d.caret.offset, 0);
+
+        // Empty: no tree to enter, so the atom is removed whole.
+        let mut d = doc();
+        d.insert_table();
+        d.insert_inline_math();
+        d.math_exit_after();
+        assert!(d.math.is_none());
+        assert_eq!(d.caret.offset, 1);
+
+        d.backspace();
+        assert!(d.math.is_none());
+        assert_eq!(d.caret.offset, 0);
+        assert!(
+            matches!(d.body()[0].cells()[0].lines()[0].as_slice(), [Inline::Text(t)] if t.text.is_empty()),
+            "the empty atom is gone whole: {:?}",
+            d.body()[0].cells()[0].lines()[0]
+        );
+        assert_invariants(&d);
+    }
+
+    /// Delete before a cell atom mirrors Backspace onto it.
+    #[test]
+    fn delete_onto_a_cell_atom_edits_it_or_removes_it_whole() {
+        let mut d = doc();
+        d.insert_table();
+        d.insert_inline_math();
+        d.math_insert_char('x');
+        d.math_exit_before();
+        assert!(d.math.is_none());
+
+        d.delete_forward();
+        assert!(d.math.is_some(), "Delete on a live atom enters its tree");
+        assert!(matches!(
+            &d.body()[0].cells()[0].lines()[0][0],
+            Inline::Math(list) if list.is_empty()
+        ));
+
+        let mut d = doc();
+        d.insert_table();
+        d.insert_inline_math();
+        d.math_exit_before();
+        assert!(matches!(
+            d.body()[0].cells()[0].lines()[0].as_slice(),
+            [Inline::Math(list)] if list.is_empty()
+        ));
+
+        d.delete_forward();
+        assert!(d.math.is_none());
+        assert!(
+            matches!(d.body()[0].cells()[0].lines()[0].as_slice(), [Inline::Text(t)] if t.text.is_empty()),
+            "the empty atom is removed whole: {:?}",
+            d.body()[0].cells()[0].lines()[0]
+        );
+        assert_invariants(&d);
+    }
+
+    /// `dd` on a cell clears that cell and leaves the grid alone.
+    #[test]
+    fn dd_clears_a_cell_and_keeps_the_grid() {
+        let mut d = doc();
+        d.insert_table();
+        d.insert_text("one");
+        d.insert_inline_math();
+        d.math_insert_char('x');
+        d.math_exit_after();
+        d.table_tab(false);
+        d.insert_text("two");
+
+        d.set_caret(0, 0, 0);
+        d.delete_line();
+
+        assert_eq!(cell_text(&d.body()[0].cells()[0]), "");
+        assert_eq!(cell_text(&d.body()[0].cells()[1]), "two");
+        assert!(d.math.is_none());
+        assert_eq!((d.caret.block, d.caret.inline, d.caret.offset), (0, 0, 0));
+        assert!(d.body().iter().all(Block::is_table));
         assert_eq!(d.body().len(), 2);
         assert!(d.body().iter().all(|row| row.cells().len() == 2));
         assert_invariants(&d);
