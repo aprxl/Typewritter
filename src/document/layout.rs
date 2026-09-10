@@ -4818,6 +4818,23 @@ mod tests {
     }
 
     #[test]
+    fn two_tables_in_one_document_do_not_share_tracks() {
+        // The shared tracks are cached per table, keyed on the rows it
+        // covers: a second table must measure its own rather than inherit
+        // the first one's column count or widths.
+        let markdown = "| a | b |\n| --- | --- |\n| c | d |\n\n\
+                        | x | y | z |\n| --- | --- | --- |\n| p | q | r |\n";
+        let document =
+            crate::document::markdown::parse(std::path::Path::new("notes/two.md"), markdown);
+        let laid = layout(&document, 600.0, &fake_measure);
+        let first = laid.tables[0].as_ref().expect("the first table lays out");
+        let second = laid.tables[2].as_ref().expect("the second table lays out");
+        assert_eq!((first.rows, first.columns.len()), (2, 2));
+        assert_eq!((second.rows, second.columns.len()), (2, 3));
+        assert!(!std::sync::Arc::ptr_eq(&first.columns, &second.columns));
+    }
+
+    #[test]
     fn a_two_line_cell_places_the_caret_on_both_its_lines() {
         // A cell line's segments address that line's own runs, never the
         // cell's whole run list. The second line's list is one run long, so

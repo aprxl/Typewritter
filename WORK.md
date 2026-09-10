@@ -769,9 +769,11 @@ Typing (`0.1 allocs/keystroke`) and the column drag (`4.0 allocs/step`) are
 unchanged by this pass — the drag number is the one the 4508480 tree already
 had after the local-prune and `Arc`-settings work.
 
-Two new tests pin the invariants this pass introduced: every row of a table
+Three new tests pin the invariants this pass introduced: every row of a table
 shares one track vector and one row count
-(`a_tables_rows_share_one_track_vector_and_row_count`), and a two-line cell
-places the caret on both of its lines
+(`a_tables_rows_share_one_track_vector_and_row_count`), two tables in one
+document measure their own tracks rather than reusing the cache
+(`two_tables_in_one_document_do_not_share_tracks`), and a two-line cell places
+the caret on both of its lines
 (`a_two_line_cell_places_the_caret_on_both_its_lines` — this panicked before,
 on the first `caret_pos`).
