@@ -41,6 +41,13 @@ pub(super) fn append(doc: &Document, text: &mut String) {
     );
     for (note, blocks) in scopes {
         for (block, source) in blocks.iter().enumerate() {
+            // A table row's content is its cells, not a run list: the flat
+            // text this pass walks cannot address it, and nothing inside a
+            // cell can carry a code brush. Skipping keeps `block` aligned
+            // with the scope index `apply` reads back.
+            if source.is_table() {
+                continue;
+            }
             let mut start = 0;
             let content = source
                 .inlines()
@@ -89,6 +96,9 @@ pub(super) fn apply(doc: &mut Document, metadata: Metadata) {
         let Some(block) = doc.scope().get(entry.block) else {
             continue;
         };
+        if block.is_table() {
+            continue;
+        }
         let text = block.inlines().iter().map(Inline::text).collect::<String>();
         if text != entry.text || entry.start > entry.end || entry.end > text.chars().count() {
             continue;
@@ -124,6 +134,11 @@ pub(super) fn plain(doc: &Document) -> Document {
         .iter_mut()
         .chain(doc.notes.iter_mut().flat_map(|note| &mut note.body))
     {
+        // A table row's content is its cells, not a run list, and nothing
+        // inside a cell can carry a code annotation.
+        if block.is_table() {
+            continue;
+        }
         for run in block.inlines_mut() {
             if let Inline::Text(text) = run {
                 text.style.syntax = CodeStyle::PLAIN;

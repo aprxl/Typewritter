@@ -13,6 +13,7 @@ use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
 use crate::document::BadgeColor;
 use crate::document::math_style::MathHue;
+use crate::document::table::TableLines;
 use crate::layout::Rect;
 use crate::renderer::{
     Alignment, Color, Font, FontParameters, GradientDirection, HorizontalAlign, Layer, LineCap,
@@ -441,9 +442,12 @@ pub fn sans() -> Font {
     Font::Bytes(include_bytes!("../resources/fonts/InterVariable.ttf"))
 }
 
-/// Labels, numbers, and anything that wants to read as machinery.
+/// JetBrains Mono is embedded so code and monospace labels use the same
+/// distinct letterforms on screen, in exports, and on every platform.
 pub fn mono() -> Font {
-    Font::Named("monospace".into())
+    Font::Bytes(include_bytes!(
+        "../resources/fonts/JetBrainsMono-Regular.ttf"
+    ))
 }
 
 /// Math. Stays separate from `mono` because the two answer different
@@ -831,6 +835,71 @@ pub fn rounded_rect_path(rect: Rect, radius: f32) -> String {
     )
 }
 
+/// The SVG path data for a table's border: the enabled edges of the same
+/// rounded rectangle [`rounded_rect_path`] traces, so a table whose reader
+/// switched an edge off still follows the shape of the rounded panel behind it
+/// instead of collapsing into a square. A corner curves only where the two
+/// edges that meet there are both drawn — a lone edge ends on the flat part of
+/// the rectangle rather than hooking into empty space.
+pub fn table_border_path(rect: Rect, radius: f32, lines: TableLines) -> String {
+    let r = radius.max(0.0).min(rect.width / 2.0).min(rect.height / 2.0);
+    let (x, y) = rect.position();
+    let right_edge = rect.right();
+    let bottom_edge = rect.bottom();
+    let (mx, tx) = (x + r, right_edge - r);
+    let (ty, by) = (y + r, bottom_edge - r);
+    let arc = |from: (f32, f32), to: (f32, f32)| {
+        format!("M{} {} A{r} {r} 0 0 1 {} {} ", from.0, from.1, to.0, to.1)
+    };
+    let mut d = String::new();
+    if lines.top {
+        d.push_str(&format!("M{mx} {y} H{tx} "));
+    }
+    if lines.bottom {
+        d.push_str(&format!("M{tx} {bottom_edge} H{mx} "));
+    }
+    if lines.left {
+        d.push_str(&format!("M{x} {by} V{ty} "));
+    }
+    if lines.right {
+        d.push_str(&format!("M{right_edge} {ty} V{by} "));
+    }
+    if lines.top && lines.left {
+        d.push_str(&arc((x, ty), (mx, y)));
+    }
+    if lines.top && lines.right {
+        d.push_str(&arc((tx, y), (right_edge, ty)));
+    }
+    if lines.bottom && lines.right {
+        d.push_str(&arc((right_edge, by), (tx, bottom_edge)));
+    }
+    if lines.bottom && lines.left {
+        d.push_str(&arc((mx, bottom_edge), (x, by)));
+    }
+    d.trim_end().to_string()
+}
+
+/// Stroke a table's border — [`table_border_path`] through a layer, the way
+/// [`rounded_outline`] strokes a whole rounded rectangle.
+pub fn table_border(
+    layer: &Layer,
+    rect: Rect,
+    radius: f32,
+    width: f32,
+    color: Color,
+    lines: TableLines,
+) {
+    let d = table_border_path(rect, radius, lines);
+    if d.is_empty() {
+        return;
+    }
+    let mut pen = Stroke::new(color, width);
+    pen.join = LineJoin::Round;
+    layer
+        .draw_path(&d, (0.0, 0.0), PathPaint::Stroke(pen))
+        .expect("table_border_path generates its own path data");
+}
+
 /// The hover surface every interactive row and button shares: one tint, one
 /// opacity curve, so nothing in the interface highlights differently from
 /// anything else. A weight of zero draws nothing at all.
@@ -1120,6 +1189,63 @@ mod tests {
             0.0
         )));
     }
+    /// Every combination of table edges, because a path that fails to parse
+    /// panics at draw time and the editor strokes this one on every frame a
+    /// table is on screen.
+    #[test]
+    fn the_table_border_path_parses_for_every_edge_combination() {
+        fn parses(d: &str) -> bool {
+            if d.is_empty() {
+                return true;
+            }
+            let mut parser = lyon_extra::parser::PathParser::new();
+            let mut builder = lyon::path::Path::builder();
+            let mut source = lyon_extra::parser::Source::new(d.chars());
+            parser
+                .parse(
+                    &lyon_extra::parser::ParserOptions::DEFAULT,
+                    &mut source,
+                    &mut builder,
+                )
+                .is_ok()
+        }
+        let card = Rect::new(10.0, 20.0, 200.0, 34.0);
+        // The four border edges as bits; the interior flags a table also
+        // carries play no part in its outline.
+        let edges = |case: u8| TableLines {
+            top: case & 1 != 0,
+            bottom: case & 2 != 0,
+            left: case & 4 != 0,
+            right: case & 8 != 0,
+            horizontal: true,
+            vertical: true,
+        };
+        for case in 0..16u8 {
+            let lines = edges(case);
+            for rect in [
+                card,
+                Rect::new(0.0, 0.0, 40.0, 2.0),
+                Rect::new(0.0, 0.0, 8.0, 8.0),
+            ] {
+                let d = table_border_path(rect, 7.5, lines);
+                assert!(parses(&d), "case {case} on {rect:?} produced {d:?}");
+            }
+        }
+        // No edges is nothing to stroke, not an empty path.
+        assert!(table_border_path(card, 7.5, edges(0)).is_empty());
+        // One edge is a straight run, with no corner to curve.
+        let lone = table_border_path(card, 7.5, edges(1));
+        assert!(!lone.contains('A'), "a lone edge curves nowhere: {lone}");
+        // Two edges that meet curve the corner between them.
+        let corner = table_border_path(card, 7.5, edges(5));
+        assert_eq!(corner.matches('A').count(), 1, "one corner: {corner}");
+        // Opposite edges never meet, so they never curve.
+        let rails = table_border_path(card, 7.5, edges(3));
+        assert!(!rails.contains('A'), "parallel edges meet nowhere: {rails}");
+        // All four is the same shape the background draws: four corners.
+        let closed = table_border_path(card, 7.5, edges(15));
+        assert_eq!(closed.matches('A').count(), 4, "four corners: {closed}");
+    }
 
     /// The palette a widget reads has to be the one that was set, or a
     /// theme switch is only half a switch.
@@ -1209,5 +1335,195 @@ mod tests {
             scale_alpha(Color::rgba(1, 2, 3, 0), weight),
             Color::rgba(1, 2, 3, 0)
         );
+    }
+
+    /// One drawn piece of a path, in hundredths so floats compare exactly.
+    /// An arc keeps its flags whole: a corner curving the wrong way is a
+    /// different segment, not a rounding coincidence.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum Segment {
+        Line {
+            from: (i32, i32),
+            to: (i32, i32),
+        },
+        Arc {
+            from: (i32, i32),
+            to: (i32, i32),
+            flags: [i32; 5],
+        },
+    }
+
+    /// A generated path read back as absolute segments — the form in which two
+    /// paths describing one shape agree whatever order or anchoring they were
+    /// written in, which is what lets a test ask whether the border lies on the
+    /// panel's outline rather than merely resembling it.
+    struct PathReader {
+        out: Vec<Segment>,
+        at: (f32, f32),
+        command: char,
+        numbers: Vec<f32>,
+        digits: String,
+    }
+
+    impl PathReader {
+        fn read(d: &str) -> Vec<Segment> {
+            let mut reader = PathReader {
+                out: Vec::new(),
+                at: (0.0, 0.0),
+                command: ' ',
+                numbers: Vec::new(),
+                digits: String::new(),
+            };
+            for ch in d.chars() {
+                if ch.is_ascii_alphabetic() {
+                    reader.flush();
+                    reader.command = ch;
+                } else if ch == ' ' || ch == ',' {
+                    reader.number();
+                } else {
+                    reader.digits.push(ch);
+                }
+            }
+            reader.number();
+            reader.flush();
+            let mut out = reader.out;
+            out.sort();
+            out
+        }
+
+        fn number(&mut self) {
+            if let Ok(value) = self.digits.parse::<f32>() {
+                self.numbers.push(value);
+            }
+            self.digits.clear();
+        }
+
+        fn flush(&mut self) {
+            let hundredths = |value: f32| (value * 100.0).round() as i32;
+            let point = |at: (f32, f32)| (hundredths(at.0), hundredths(at.1));
+            match (self.command, self.numbers.as_slice()) {
+                ('M', [x, y]) => self.at = (*x, *y),
+                ('H', [x]) => {
+                    let end = (*x, self.at.1);
+                    self.out.push(Segment::Line {
+                        from: point(self.at),
+                        to: point(end),
+                    });
+                    self.at = end;
+                }
+                ('V', [y]) => {
+                    let end = (self.at.0, *y);
+                    self.out.push(Segment::Line {
+                        from: point(self.at),
+                        to: point(end),
+                    });
+                    self.at = end;
+                }
+                ('A', [rx, ry, rotation, large, sweep, x, y]) => {
+                    self.out.push(Segment::Arc {
+                        from: point(self.at),
+                        to: point((*x, *y)),
+                        flags: [
+                            hundredths(*rx),
+                            hundredths(*ry),
+                            hundredths(*rotation),
+                            hundredths(*large),
+                            hundredths(*sweep),
+                        ],
+                    });
+                    self.at = (*x, *y);
+                }
+                // `Z` closes a subpath whose ends already meet: nothing to add.
+                _ => {}
+            }
+            self.numbers.clear();
+        }
+    }
+
+    /// A path's segments, sorted so two paths of one shape compare equal.
+    fn segments(d: &str) -> Vec<Segment> {
+        PathReader::read(d)
+    }
+
+    /// The table the editor draws its border around, and the half-pixel inset
+    /// the stroke sits at — the two numbers that tie the border to the panel.
+    fn table_rect() -> Rect {
+        Rect::new(10.0, 20.0, 200.0, 34.0)
+    }
+
+    /// Where the border is stroked: the panel's rect, half a pixel in, at the
+    /// panel's radius less that inset. Corner centres come out at the panel's
+    /// own (8.0 - 0.5 + 0.5), so the two outlines are concentric.
+    fn border_rect(rect: Rect) -> Rect {
+        rect.inset(0.5)
+    }
+
+    fn all_edges() -> TableLines {
+        TableLines {
+            top: true,
+            bottom: true,
+            left: true,
+            right: true,
+            horizontal: true,
+            vertical: true,
+        }
+    }
+
+    /// With every edge switched on the border is the panel's own outline: same
+    /// edges, same corners, same way round. This is the shape the reader saw
+    /// before, and the one a partial border has to stay on.
+    #[test]
+    fn all_four_edges_draw_the_panel_own_outline() {
+        let rect = table_rect();
+        let outline = rounded_rect_path(border_rect(rect), 7.5);
+        let border = table_border_path(border_rect(rect), 7.5, all_edges());
+        assert_eq!(
+            segments(&outline).len(),
+            8,
+            "four edges and four corners, read whole"
+        );
+        assert_eq!(
+            segments(&border),
+            segments(&outline),
+            "border {border}\noutline {outline}"
+        );
+    }
+
+    /// Every combination, including the one that used to square off: each
+    /// drawn edge and corner lies exactly on the panel's rounded outline, and
+    /// none of the omitted edges is drawn.
+    #[test]
+    fn every_edge_combination_stays_on_the_panel_outline() {
+        let rect = table_rect();
+        let outline = segments(&rounded_rect_path(border_rect(rect), 7.5));
+        for case in 0..16u8 {
+            let lines = TableLines {
+                top: case & 1 != 0,
+                bottom: case & 2 != 0,
+                left: case & 4 != 0,
+                right: case & 8 != 0,
+                horizontal: true,
+                vertical: true,
+            };
+            let border = table_border_path(rect.inset(0.5), 7.5, lines);
+            let drawn = segments(&border);
+            // One run per enabled edge, plus a corner wherever two enabled
+            // edges meet: the count is what says the path was read at all.
+            let seams = [0b0101u8, 0b1001, 0b0110, 0b1010]
+                .iter()
+                .filter(|pair| case & *pair == **pair)
+                .count();
+            assert_eq!(
+                drawn.len(),
+                case.count_ones() as usize + seams,
+                "case {case} draws its edges and their seams: {border}"
+            );
+            for segment in drawn {
+                assert!(
+                    outline.contains(&segment),
+                    "case {case} draws {segment:?}, which is not on the panel's outline: {border}"
+                );
+            }
+        }
     }
 }

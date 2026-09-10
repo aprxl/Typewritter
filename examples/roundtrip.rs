@@ -31,7 +31,7 @@ fn main() {
         if matches!(block, Block::Math { .. }) {
             math += 1;
         }
-        for run in block.inlines() {
+        for run in typewritter::document::block_runs(block) {
             match run {
                 Inline::Math(_) => inline_math += 1,
                 Inline::Note(_) => notes += 1,

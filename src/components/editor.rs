@@ -8,16 +8,16 @@ use std::rc::Rc;
 use crate::document::decoration::{self, Painted};
 use crate::document::layout::{
     self, CHEVRON_WIDTH, ContextHit, DocLayout, FOLD_INDICATOR_HEIGHT, NUMBER_GUTTER, NUMBER_SIZE,
-    RangeKind,
+    RangeKind, TABLE_CELL_PAD, TableResize,
 };
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_layout::{self, MathBox};
 use crate::document::math_paint;
-use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style};
+use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style, flat_len, table};
 use crate::layout::Rect;
 use crate::renderer::{Layer, PathPaint, Rounding, ShaderEffect};
 use crate::theme::{self, TextStyle};
-use crate::ui::{Component, Context, Dirty};
+use crate::ui::{Component, Context, Dirty, Hover};
 
 /// Top padding of the content area (the filename title is gone — the
 /// document's own H1 is the title).
@@ -48,6 +48,15 @@ const MATH_SELECTION_ROUNDING: Rounding = Rounding::uniform(4.0);
 /// not as a second object under it.
 const GLOW_SPREAD: f32 = 1.0;
 const GLOW_ALPHA: f32 = 0.45;
+
+/// Corner radius of a table's panel. Its border is stroked half a pixel inside
+/// the panel's edge ([`TABLE_BORDER_INSET`]), so the two roundings come from
+/// this one number: the border follows the panel's corners instead of squaring
+/// them off.
+const TABLE_RADIUS: f32 = 8.0;
+const TABLE_BORDER_INSET: f32 = 0.5;
+/// The panel is the table's own background; every grid stroke is a hairline.
+const TABLE_BORDER_WIDTH: f32 = 1.0;
 pub const GLOW_RADIUS: f32 = 2.5;
 /// Truncate a segment's drawing to this many characters before shaping it —
 /// a single pathological line must cost the same as a normal one, not
@@ -182,14 +191,486 @@ pub struct Editor {
     /// document caret — two blinking bars would be two claims about where
     /// typing goes.
     math: Option<MathCursor>,
-    math_selection: Option<(usize, usize, NodeAddress)>,
+    math_selection: Option<(usize, usize, usize, NodeAddress)>,
     context_selections: Vec<ContextHit>,
     brush_point: Option<(f32, f32)>,
+    /// The divider under the pointer, kept in the editor because this is the
+    /// one component that owns the grid's paint. It stays visible even when
+    /// that table's normal divider stroke is disabled.
+    table_resize_hover: Option<TableResize>,
+    table_resize_fade: Hover,
     empty: super::empty_state::EmptyState,
     dirty: Dirty,
 }
 
 impl Editor {
+    /// Paint a contiguous table group from the exact track geometry layout
+    /// produced. The same `DocLayout::tables` snapshot drives its cells,
+    /// click hits, caret, and drag dividers, so resize interaction cannot
+    /// slowly separate from the grid the reader sees.
+    fn draw_table(&self, layer: &Layer, rect: Rect, x: f32, content: f32, first: usize) {
+        let Some(table) = self.layout.tables.get(first).and_then(Option::as_ref) else {
+            return;
+        };
+        let mut end = first + 1;
+        while matches!(
+            self.layout.source.get(end),
+            Some(Block::TableRow { first: false, .. })
+        ) {
+            end += 1;
+        }
+        let top = content + self.layout.blocks[first].y - self.scroll;
+        let bottom = content + self.layout.blocks[end - 1].y + self.layout.blocks[end - 1].height
+            - self.scroll;
+        let width: f32 = table.columns.iter().sum();
+        if bottom < rect.y || top > rect.bottom() {
+            return;
+        }
+        layer.draw_rectangle(
+            (x, top),
+            (width, bottom - top),
+            theme::fade(theme::alt(), 0.78),
+            Rounding::uniform(TABLE_RADIUS),
+        );
+
+        if let Some(caret) = self.caret
+            && (first..end).contains(&caret.block)
+        {
+            let row = &self.layout.blocks[caret.block];
+            let mut left = x;
+            for column in table.columns.iter().take(caret.inline) {
+                left += column;
+            }
+            let cell_width = table.columns[caret.inline.min(table.columns.len() - 1)];
+            layer.draw_rectangle(
+                (left + 1.0, content + row.y - self.scroll + 1.0),
+                (cell_width - 2.0, row.height - 2.0),
+                theme::fade(theme::selection(), 0.35),
+                Rounding::uniform(4.0),
+            );
+        }
+
+        // Tables are painted after the page's ordinary selection pass. Put
+        // their selection wash above the card and below the cell contents so
+        // Visual mode stays as legible here as it is in prose.
+        if let Some(selection) = self.selection {
+            self.draw_table_selection_range(
+                layer,
+                rect,
+                x,
+                content,
+                first,
+                end,
+                table,
+                selection,
+                self.line_selection,
+            );
+        }
+        let (spans, blocks) = self.selection_bars();
+        for range in spans {
+            self.draw_table_selection_range(
+                layer, rect, x, content, first, end, table, range, false,
+            );
+        }
+        for range in blocks {
+            self.draw_table_selection_range(
+                layer, rect, x, content, first, end, table, range, true,
+            );
+        }
+
+        for row in first..end {
+            let block = &self.layout.blocks[row];
+            let row_top = content + block.y - self.scroll;
+            // The whole-table test above only says *some* of the table is on
+            // screen. A row below the fold or above the top is scissored away,
+            // so skip it before building anything for it.
+            if row_top + block.height < rect.y || row_top > rect.bottom() {
+                continue;
+            }
+            let row_table = self.layout.tables[row]
+                .as_ref()
+                .expect("table row must have table layout");
+            let mut left = x;
+            let cell_source = &self.layout.source[row];
+            for (column, cell) in cell_source.cells().iter().enumerate() {
+                let inset = TABLE_CELL_PAD * self.layout.scale;
+                let lines = &row_table.cells[column];
+                let content_height: f32 = lines.iter().map(|line| line.height).sum();
+                let content_top = row_top + (block.height - content_height).max(0.0) * 0.5;
+                let cell_base: usize = cell_source.cells()[..column]
+                    .iter()
+                    .map(table::Cell::flat_len)
+                    .sum();
+                for line in lines {
+                    // A wrapped visual line belongs to one logical line of the
+                    // cell: its runs are that line's, and its cell-flat start
+                    // comes from the cell's own line arithmetic.
+                    let logical = &cell.lines()[line.cell_line.min(cell.lines().len() - 1)];
+                    let top = content_top + line.y;
+                    let baseline = top + line.height * 0.5;
+                    let mut cursor = left + inset + line.x;
+                    let mut pieces = Vec::with_capacity(line.segments.len());
+                    for segment in &line.segments {
+                        let run = &logical[segment.inline];
+                        let run_start = cell.run_start(line.cell_line, segment.inline);
+                        let text: String = match run {
+                            Inline::Text(text) => text
+                                .text
+                                .chars()
+                                .skip(segment.start)
+                                .take(segment.len.min(VIEW_CAP))
+                                .collect(),
+                            Inline::Math(_) => ATOM.to_string(),
+                            Inline::Note(_) | Inline::EqRef(_) => {
+                                segment.number.clone().unwrap_or_default()
+                            }
+                        };
+                        // The row block is the run's measuring kind: a table
+                        // cell is measured in the row's own text style, and
+                        // building a block per cell line only to read it back
+                        // cloned the cell's runs on every paint.
+                        let width = segment.advance(
+                            run,
+                            &text,
+                            cell_source,
+                            self.layout.scale,
+                            &|text, style| theme::width(layer, text, style),
+                        );
+                        if matches!(run, Inline::Note(_)) {
+                            theme::draw(
+                                layer,
+                                &text,
+                                (cursor, baseline - layout::ANCHOR_RISE),
+                                &layout::anchor_style(),
+                                theme::LEFT,
+                            );
+                        }
+                        if matches!(run, Inline::EqRef(_)) {
+                            theme::draw(
+                                layer,
+                                &text,
+                                (cursor, baseline),
+                                &layout::eq_ref_style(&text, self.layout.scale),
+                                theme::LEFT,
+                            );
+                        }
+                        pieces.push(decoration::piece(
+                            text,
+                            segment.style,
+                            cursor,
+                            width,
+                            self.layout.scale,
+                            segment.padding,
+                        ));
+                        if let Inline::Math(list) = run {
+                            let math_offset = cell_base + run_start;
+                            let measure =
+                                |text: &str, style: &TextStyle| theme::width(layer, text, style);
+                            let box_ = math_layout::layout(list, 0, self.layout.scale, &measure);
+                            let origin = (cursor, baseline);
+                            if let Some((selected_block, selected_inline, selected_offset, address)) =
+                                &self.math_selection
+                                && *selected_block == row
+                                && *selected_inline == column
+                                && *selected_offset == math_offset
+                            {
+                                draw_math_selection(
+                                    layer,
+                                    list,
+                                    Some(address),
+                                    &box_,
+                                    origin,
+                                    self.layout.scale,
+                                    &measure,
+                                );
+                            }
+                            for target in &self.context_selections {
+                                if let ContextHit::Math {
+                                    block,
+                                    inline,
+                                    offset,
+                                    node,
+                                } = target
+                                    && *block == row
+                                    && *inline == column
+                                    && *offset == math_offset
+                                {
+                                    draw_math_selection(
+                                        layer,
+                                        list,
+                                        node.as_ref(),
+                                        &box_,
+                                        origin,
+                                        self.layout.scale,
+                                        &measure,
+                                    );
+                                }
+                            }
+                            let typing_here = self.math.as_ref().is_some_and(|_| {
+                                self.caret.is_some_and(|caret| {
+                                    caret.block == row
+                                        && caret.inline == column
+                                        && caret.offset == run_start
+                                        && !self.block_caret
+                                })
+                            });
+                            let mut canvas = layer;
+                            math_paint::draw(&mut canvas, &box_, origin, typing_here);
+                            if typing_here && let Some(math_cursor) = &self.math {
+                                let (cursor_x, cursor_y, cursor_height) = math_layout::cursor_pos(
+                                    list,
+                                    math_cursor,
+                                    0,
+                                    self.layout.scale,
+                                    &measure,
+                                );
+                                layer.draw_rectangle(
+                                    (
+                                        origin.0 + cursor_x,
+                                        origin.1 - cursor_y - cursor_height * 0.5 + 2.0,
+                                    ),
+                                    (2.0, cursor_height - 4.0),
+                                    theme::accent(),
+                                    Rounding::NONE,
+                                );
+                            }
+                        }
+                        cursor += width;
+                    }
+                    let mut canvas = layer;
+                    decoration::runs(
+                        &mut canvas,
+                        &pieces,
+                        cell_source,
+                        top,
+                        line.height,
+                        baseline,
+                        self.layout.scale,
+                    );
+                    if let Some(glow) = &self.glow {
+                        for (at, size) in decoration::highlight_bars(&pieces, baseline) {
+                            glow.draw_rectangle(
+                                (at.0 - GLOW_SPREAD, at.1 - GLOW_SPREAD),
+                                (size.0 + GLOW_SPREAD * 2.0, size.1 + GLOW_SPREAD * 2.0),
+                                theme::fade(
+                                    theme::highlight(),
+                                    GLOW_ALPHA * (1.0 - self.focus_amount),
+                                ),
+                                decoration::HIGHLIGHT_ROUNDING,
+                            );
+                        }
+                    }
+                    for ((text, _, at, _), segment) in pieces.iter().zip(&line.segments) {
+                        if !matches!(logical[segment.inline], Inline::Text(_)) {
+                            continue;
+                        }
+                        theme::draw(
+                            layer,
+                            text,
+                            (*at, baseline),
+                            &layout::table_text_style(segment.style, self.layout.scale),
+                            theme::LEFT,
+                        );
+                    }
+                }
+                left += table.columns[column];
+            }
+        }
+
+        let line = theme::border();
+        // The border traces the panel's own rounded rectangle and omits the
+        // edges the reader switched off, so a partially outlined table keeps
+        // the panel's corners instead of collapsing into a square.
+        theme::table_border(
+            layer,
+            Rect::new(x, top, width, bottom - top).inset(TABLE_BORDER_INSET),
+            TABLE_RADIUS - TABLE_BORDER_INSET,
+            TABLE_BORDER_WIDTH,
+            line.clone(),
+            table.lines,
+        );
+        if table.lines.vertical {
+            let mut edge = x;
+            for width in table
+                .columns
+                .iter()
+                .take(table.columns.len().saturating_sub(1))
+            {
+                edge += width;
+                theme::vertical_rule(layer, (edge, top), bottom - top, 1.0, line.clone());
+            }
+        }
+        if table.lines.horizontal {
+            for row in first..end - 1 {
+                let y = content + self.layout.blocks[row].y + self.layout.blocks[row].height
+                    - self.scroll;
+                theme::rule(layer, (x, y), width, 1.0, line.clone());
+            }
+        }
+        if let Some(hover) = self.table_resize_hover {
+            let alpha = self.table_resize_fade.value();
+            let hover_line = theme::fade(theme::accent(), 0.45 + alpha * 0.55);
+            match hover {
+                TableResize::Column {
+                    first: hover_first,
+                    divider,
+                } if hover_first == first && divider + 1 < table.columns.len() => {
+                    let edge = x + table.columns.iter().take(divider + 1).sum::<f32>();
+                    theme::vertical_rule(layer, (edge, top), bottom - top, 2.0, hover_line);
+                }
+                TableResize::Row {
+                    first: hover_first,
+                    divider,
+                } if hover_first == first && first + divider + 1 < end => {
+                    let edge = content
+                        + self.layout.blocks[first + divider].y
+                        + self.layout.blocks[first + divider].height
+                        - self.scroll;
+                    theme::rule(layer, (x, edge), width, 2.0, hover_line);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_table_selection_range(
+        &self,
+        layer: &Layer,
+        rect: Rect,
+        x: f32,
+        content: f32,
+        first: usize,
+        end: usize,
+        table: &layout::TableLayout,
+        selection: FlatRange,
+        line_selection: bool,
+    ) {
+        let range = selection.normalized();
+        for bi in first..end {
+            let block = &self.layout.blocks[bi];
+            let table_len: usize = self.layout.source[bi]
+                .cells()
+                .iter()
+                .map(table::Cell::flat_len)
+                .sum();
+            let from = if range.start.block == bi {
+                range.start.offset
+            } else if range.start.block < bi {
+                0
+            } else {
+                table_len
+            };
+            let to = if range.end.block == bi {
+                range.end.offset
+            } else if range.end.block > bi {
+                table_len
+            } else {
+                0
+            };
+            if from >= to {
+                continue;
+            }
+            let top = content + block.y - self.scroll;
+            if top + block.height < rect.y || top > rect.bottom() {
+                continue;
+            }
+            if line_selection {
+                layer.draw_rectangle(
+                    (x, top),
+                    (table.columns.iter().sum(), block.height),
+                    theme::selection(),
+                    Rounding::NONE,
+                );
+                continue;
+            }
+
+            let mut left = x;
+            let mut cell_start = 0;
+            let cell_source = &self.layout.source[bi];
+            for (cell, width) in table.columns.iter().enumerate() {
+                let source_cell = &cell_source.cells()[cell];
+                let cell_len = source_cell.flat_len();
+                let cell_end = cell_start + cell_len;
+                if from < cell_end && to > cell_start {
+                    let lines = &self.layout.tables[bi]
+                        .as_ref()
+                        .expect("table row must have table layout")
+                        .cells[cell];
+                    let content_height: f32 = lines.iter().map(|line| line.height).sum();
+                    let content_top = top + (block.height - content_height).max(0.0) * 0.5;
+                    for line in lines {
+                        let logical =
+                            &source_cell.lines()[line.cell_line.min(source_cell.lines().len() - 1)];
+                        let mut cursor = left + TABLE_CELL_PAD * self.layout.scale + line.x;
+                        for segment in &line.segments {
+                            let run = &logical[segment.inline];
+                            let run_start = source_cell.run_start(line.cell_line, segment.inline);
+                            let text: String = match run {
+                                Inline::Text(text) => text
+                                    .text
+                                    .chars()
+                                    .skip(segment.start)
+                                    .take(segment.len)
+                                    .collect(),
+                                Inline::Math(_) => ATOM.to_string(),
+                                Inline::Note(_) | Inline::EqRef(_) => {
+                                    segment.number.clone().unwrap_or_default()
+                                }
+                            };
+                            let advance = segment.advance(
+                                run,
+                                &text,
+                                cell_source,
+                                self.layout.scale,
+                                &|text, style| theme::width(layer, text, style),
+                            );
+                            let segment_start = cell_start + run_start + segment.start;
+                            let segment_end = segment_start + segment.len;
+                            let selected_start = from.max(segment_start).min(segment_end);
+                            let selected_end = to.max(segment_start).min(segment_end);
+                            if selected_start < selected_end {
+                                if matches!(run, Inline::Text(_)) {
+                                    let style =
+                                        layout::table_text_style(segment.style, self.layout.scale);
+                                    let prefix: String =
+                                        text.chars().take(selected_start - segment_start).collect();
+                                    let selected: String = text
+                                        .chars()
+                                        .skip(selected_start - segment_start)
+                                        .take(selected_end - selected_start)
+                                        .collect();
+                                    let selection_x = cursor
+                                        + segment.text_inset(self.layout.scale)
+                                        + theme::width(layer, &prefix, &style);
+                                    layer.draw_rectangle(
+                                        (selection_x, content_top + line.y),
+                                        (
+                                            theme::width(layer, &selected, &style).max(1.0),
+                                            line.height,
+                                        ),
+                                        theme::selection(),
+                                        Rounding::NONE,
+                                    );
+                                } else {
+                                    layer.draw_rectangle(
+                                        (cursor, content_top + line.y),
+                                        (advance.max(1.0), line.height),
+                                        theme::fade(theme::selection(), 0.6),
+                                        Rounding::uniform(4.0),
+                                    );
+                                }
+                            }
+                            cursor += advance;
+                        }
+                    }
+                }
+                cell_start = cell_end;
+                left += width;
+            }
+        }
+    }
+
     pub fn new(
         layout: Rc<DocLayout>,
         caret: Option<Caret>,
@@ -218,6 +699,8 @@ impl Editor {
             math_selection: None,
             context_selections: Vec::new(),
             brush_point: None,
+            table_resize_hover: None,
+            table_resize_fade: Hover::new(),
             caret_on: true,
             glow: None,
             empty: super::empty_state::EmptyState::default(),
@@ -230,7 +713,10 @@ impl Editor {
         self
     }
 
-    pub fn with_math_selection(mut self, selection: Option<(usize, usize, NodeAddress)>) -> Self {
+    pub fn with_math_selection(
+        mut self,
+        selection: Option<(usize, usize, usize, NodeAddress)>,
+    ) -> Self {
         self.math_selection = selection;
         self
     }
@@ -257,6 +743,7 @@ impl Editor {
         Self {
             layout: Rc::new(DocLayout {
                 blocks: Vec::new(),
+                tables: Vec::new(),
                 height: 0.0,
                 scale: 1.0,
                 source: Vec::new(),
@@ -278,6 +765,8 @@ impl Editor {
             math_selection: None,
             context_selections: Vec::new(),
             brush_point: None,
+            table_resize_hover: None,
+            table_resize_fade: Hover::new(),
             caret_on: true,
             glow: None,
             empty: super::empty_state::EmptyState::default(),
@@ -336,6 +825,19 @@ impl Component for Editor {
         if self.has_file && self.caret.is_some() {
             self.dirty.write(&mut self.caret_on, context.caret_on);
         }
+        let hover = if self.has_file && self.metrics.page && context.mouse.in_window {
+            let x = context.mouse.position.0 - Self::content_x(context.self_rect);
+            let y = context.mouse.position.1 - context.self_rect.y - self.metrics.top + self.scroll;
+            self.layout.table_resize_at(x, y, 5.0)
+        } else {
+            None
+        };
+        if self
+            .table_resize_fade
+            .track(&mut self.table_resize_hover, hover, context.animation_dt)
+        {
+            self.dirty.set();
+        }
     }
 
     fn is_dirty(&self) -> bool {
@@ -347,7 +849,7 @@ impl Component for Editor {
     }
 
     fn is_animating(&self) -> bool {
-        !self.has_file && self.empty.is_animating()
+        (!self.has_file && self.empty.is_animating()) || self.table_resize_fade.is_animating()
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
@@ -504,17 +1006,12 @@ impl Component for Editor {
         }
 
         self.draw_selection(layer, rect, x, content);
-        for target in &self.context_selections {
-            if let ContextHit::Range { range, kind } = target {
-                self.draw_selection_range(
-                    layer,
-                    rect,
-                    x,
-                    content,
-                    *range,
-                    *kind == RangeKind::CodeBlock,
-                );
-            }
+        let (spans, blocks) = self.selection_bars();
+        for range in spans {
+            self.draw_selection_range(layer, rect, x, content, range, false);
+        }
+        for range in blocks {
+            self.draw_selection_range(layer, rect, x, content, range, true);
         }
 
         // (text, style, x, width) for one visual line — measured first so
@@ -526,6 +1023,12 @@ impl Component for Editor {
             // slabs, not a hint of what is hidden. The folded heading's own
             // indicator is the only trace.
             if block.hidden.is_some() {
+                continue;
+            }
+            if kind.is_table() {
+                if kind.table_first() {
+                    self.draw_table(layer, rect, x, content, bi);
+                }
                 continue;
             }
             // A rule has no runs to paint, so it is drawn here rather than
@@ -593,15 +1096,10 @@ impl Component for Editor {
                         Inline::Note(_) => segment.number.clone().unwrap_or_default(),
                         Inline::EqRef(_) => segment.number.clone().unwrap_or_default(),
                     };
-                    let width = layout::advance(
-                        run,
-                        &text,
-                        kind,
-                        segment.style,
-                        segment.number.as_deref(),
-                        self.layout.scale,
-                        &|text, style| theme::width(layer, text, style),
-                    );
+                    let width =
+                        segment.advance(run, &text, kind, self.layout.scale, &|text, style| {
+                            theme::width(layer, text, style)
+                        });
                     if is_note {
                         let style = layout::anchor_style();
                         theme::draw(
@@ -622,6 +1120,7 @@ impl Component for Editor {
                         cursor,
                         width,
                         self.layout.scale,
+                        segment.padding,
                     ));
                     if is_math {
                         let Inline::Math(list) = run else {
@@ -635,10 +1134,15 @@ impl Component for Editor {
                         // it, and a box behind every inline `$x$` reads as
                         // clutter down a page of them. A display block keeps
                         // its slab — that one is a block, not a phrase.
-                        if let Some((selected_block, selected_inline, address)) =
+                        if let Some((selected_block, selected_inline, selected_offset, address)) =
                             &self.math_selection
                             && *selected_block == bi
                             && *selected_inline == segment.inline
+                            && *selected_offset
+                                == kind.inlines()[..segment.inline]
+                                    .iter()
+                                    .map(flat_len)
+                                    .sum::<usize>()
                         {
                             draw_math_selection(
                                 layer,
@@ -654,10 +1158,16 @@ impl Component for Editor {
                             if let ContextHit::Math {
                                 block,
                                 inline,
+                                offset,
                                 node,
                             } = target
                                 && *block == bi
                                 && *inline == segment.inline
+                                && *offset
+                                    == kind.inlines()[..segment.inline]
+                                        .iter()
+                                        .map(flat_len)
+                                        .sum::<usize>()
                             {
                                 draw_math_selection(
                                     layer,
@@ -856,16 +1366,21 @@ impl Component for Editor {
 
         // The caret's glyph context, for Normal mode's block.
         let caret_char = caret.and_then(|caret| {
-            self.layout
-                .source
-                .get(caret.block)
-                .and_then(|b| b.inlines().get(caret.inline))
-                .and_then(|run| match run {
+            let block = self.layout.source.get(caret.block)?;
+            if block.is_table() {
+                let cell = block.cells().get(caret.inline)?;
+                let at = cell.run_at(caret.offset);
+                match cell.lines().get(at.line).and_then(|line| line.get(at.run)) {
+                    Some(Inline::Text(t)) => t.text.chars().nth(at.offset),
+                    Some(Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_)) => Some(ATOM),
+                    None => None,
+                }
+            } else {
+                match block.inlines().get(caret.inline)? {
                     Inline::Text(t) => t.text.chars().nth(caret.offset),
-                    Inline::Math(_) => Some(ATOM),
-                    Inline::Note(_) => Some(ATOM),
-                    Inline::EqRef(_) => Some(ATOM),
-                })
+                    Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => Some(ATOM),
+                }
+            }
         });
         let screen_x = x + caret_x;
         let screen_y = content + caret_baseline - self.scroll;
@@ -930,6 +1445,54 @@ impl Component for Editor {
 }
 
 impl Editor {
+    /// The multi-selection's washes, as `(spans, whole blocks)`.
+    ///
+    /// Two selected words with nothing but blanks between them are one
+    /// stretch of the sentence to the eye, so they are painted as one bar:
+    /// a brush that swept a phrase would otherwise leave a row of
+    /// rectangles with a notch at every space, which reads as a stutter
+    /// rather than as a selection. Merging in flat offsets rather than in
+    /// pixels means the bar covers exactly the text between the words, and
+    /// a wrap between them still draws the two lines a selection draws.
+    ///
+    /// A code block's wash spans its whole line and never merges with a
+    /// word's — the two are different claims about what is selected.
+    fn selection_bars(&self) -> (Vec<FlatRange>, Vec<FlatRange>) {
+        let mut spans: Vec<FlatRange> = Vec::new();
+        let mut blocks = Vec::new();
+        for target in &self.context_selections {
+            let ContextHit::Range { range, kind } = target else {
+                continue;
+            };
+            if *kind == RangeKind::CodeBlock {
+                blocks.push(*range);
+            } else {
+                spans.push(range.normalized());
+            }
+        }
+        spans.sort_by_key(|range| {
+            (
+                range.start.block,
+                range.start.offset,
+                range.end.block,
+                range.end.offset,
+            )
+        });
+
+        let mut merged: Vec<FlatRange> = Vec::new();
+        for range in spans {
+            match merged.last_mut() {
+                Some(last) if only_blanks_between(&self.layout.source, *last, range) => {
+                    if (range.end.block, range.end.offset) > (last.end.block, last.end.offset) {
+                        last.end = range.end;
+                    }
+                }
+                _ => merged.push(range),
+            }
+        }
+        (merged, blocks)
+    }
+
     fn draw_selection(&self, layer: &Layer, rect: Rect, x: f32, content: f32) {
         let Some(selection) = self.selection else {
             return;
@@ -948,6 +1511,9 @@ impl Editor {
     ) {
         let range = selection.normalized();
         for (bi, block) in self.layout.blocks.iter().enumerate() {
+            if self.layout.source[bi].is_table() {
+                continue;
+            }
             let mut line_start = 0;
             for line in &block.lines {
                 let top = content + line.y - self.scroll;
@@ -1034,20 +1600,12 @@ impl Editor {
                 Inline::EqRef(_) => ATOM.to_string(),
             };
             if flat >= cursor + segment.len {
-                x += layout::advance(
-                    run,
-                    &text,
-                    block,
-                    segment.style,
-                    segment.number.as_deref(),
-                    scale,
-                    &|text, style| theme::width(layer, text, style),
-                );
+                x += segment.advance(run, &text, block, scale, &|text, style| {
+                    theme::width(layer, text, style)
+                });
             } else {
                 let count = flat.saturating_sub(cursor);
-                if segment.style.badge {
-                    x += theme::BADGE_PAD * scale;
-                }
+                x += segment.text_inset(scale);
                 let prefix: String = text.chars().take(count).collect();
                 x += theme::width(
                     layer,
@@ -1098,6 +1656,25 @@ pub fn max_scroll(content_height: f32, view_height: f32) -> f32 {
 /// breathing room above the first line; the same transform drives hits.
 pub fn focus_scroll(band: (f32, f32), editor: Rect, window: Rect) -> f32 {
     editor.y + TOP + (band.0 + band.1) * 0.5 - (window.y + window.height * 0.5)
+}
+
+/// Whether `next` carries on where `previous` left off, with nothing but
+/// blank characters in the gap. Both are normalized, and `next` starts no
+/// earlier than `previous` — [`Editor::selection_bars`] sorts them first.
+fn only_blanks_between(source: &[Block], previous: FlatRange, next: FlatRange) -> bool {
+    if previous.end.block != next.start.block {
+        return false;
+    }
+    if next.start.offset <= previous.end.offset {
+        // Overlapping or touching: one wash already, no gap to inspect.
+        return true;
+    }
+    let Some(block) = source.get(next.start.block) else {
+        return false;
+    };
+    layout::flat_chars(block)
+        .get(previous.end.offset..next.start.offset)
+        .is_some_and(|gap| gap.iter().all(|ch| ch.is_whitespace()))
 }
 
 #[cfg(test)]
@@ -1259,6 +1836,44 @@ mod tests {
         );
     }
 
+    /// One paragraph with a brush selection over the given `(start, end)`
+    /// character spans, ready to be asked what it would paint.
+    fn selection_editor(text: &str, words: &[(usize, usize)]) -> Editor {
+        let mut document = Document::new(Path::new("notes/test.md"));
+        *document.body_mut() = vec![Block::Paragraph(vec![Inline::Text(Text {
+            text: text.into(),
+            style: Style::PLAIN,
+        })])];
+        let layout = layout::layout(&document, 4000.0, &|value, _| {
+            value.chars().count() as f32 * 10.0
+        });
+        let targets = words
+            .iter()
+            .map(|(start, end)| ContextHit::Range {
+                range: FlatRange::new(
+                    crate::document::FlatPos {
+                        block: 0,
+                        offset: *start,
+                    },
+                    crate::document::FlatPos {
+                        block: 0,
+                        offset: *end,
+                    },
+                ),
+                kind: RangeKind::Word,
+            })
+            .collect();
+        Editor::new(
+            Rc::new(layout),
+            Some(document.caret),
+            0.0,
+            false,
+            Style::PLAIN,
+            Metrics::PAGE,
+        )
+        .with_context_selections(targets, None)
+    }
+
     #[test]
     fn editor_keeps_brush_targets_and_pointer_together() {
         let mut document = Document::new(Path::new("notes/test.md"));
@@ -1294,6 +1909,54 @@ mod tests {
 
         assert_eq!(editor.context_selections, vec![target]);
         assert_eq!(editor.brush_point, Some((42.0, 24.0)));
+    }
+
+    /// The three words of "Implement aim assistance" are one stretch of the
+    /// sentence, so a stroke that took all three paints one bar. Drawn a
+    /// range at a time they came out as three rectangles with a notch at
+    /// every space, which reads as a stutter rather than as a selection.
+    #[test]
+    fn adjacent_selected_words_paint_one_bar() {
+        let editor = selection_editor(
+            "Implement aim assistance by shaping",
+            &[(0, 9), (10, 13), (14, 24)],
+        );
+        let (spans, blocks) = editor.selection_bars();
+        assert!(blocks.is_empty());
+        assert_eq!(spans.len(), 1, "one bar over the phrase: {spans:?}");
+        assert_eq!(spans[0].start.offset, 0);
+        assert_eq!(spans[0].end.offset, 24);
+    }
+
+    /// Only blanks close a gap. Two words with a word between them that was
+    /// never selected are two selections, and drawing them as one would
+    /// claim the reader had picked something they had not.
+    #[test]
+    fn words_with_unselected_text_between_them_stay_apart() {
+        let editor = selection_editor("Implement aim assistance by shaping", &[(0, 9), (14, 24)]);
+        let (spans, _) = editor.selection_bars();
+        assert_eq!(spans.len(), 2, "the skipped word breaks the bar: {spans:?}");
+        assert_eq!(spans[0].end.offset, 9);
+        assert_eq!(spans[1].start.offset, 14);
+    }
+
+    /// A stroke sweeps a phrase in whichever direction the hand went, and
+    /// the hits come back in the order they were touched. The bar is a
+    /// picture of the text, not of the gesture, so it is sorted first.
+    #[test]
+    fn a_backwards_stroke_merges_the_same_as_a_forwards_one() {
+        let editor = selection_editor(
+            "Implement aim assistance by shaping",
+            &[(14, 24), (0, 9), (10, 13)],
+        );
+        let (spans, _) = editor.selection_bars();
+        assert_eq!(
+            spans.len(),
+            1,
+            "order of arrival changes nothing: {spans:?}"
+        );
+        assert_eq!(spans[0].start.offset, 0);
+        assert_eq!(spans[0].end.offset, 24);
     }
 
     #[test]

@@ -39,14 +39,14 @@ use crate::components::tab_strip::TabView;
 use crate::components::topics::Entry;
 use crate::components::{
     Backdrop, Breadcrumb, ContextMenu, Dialog, Editor, FileTree, Finder, FormatBar, MathMenu,
-    Onboarding, Palette, Scrollbar, SidenoteMargin, SlashMenu, StatusLine, TabStrip, TitleBar,
-    Topics, breadcrumb, editor, file_tree, format_bar, scrollbar, sidenotes, status_line,
-    tab_strip, title_bar, topics,
+    Onboarding, Palette, Scrollbar, SidenoteMargin, SlashMenu, StatusLine, TabStrip,
+    TableLinesMenu, TitleBar, Topics, breadcrumb, editor, file_tree, format_bar, scrollbar,
+    sidenotes, status_line, tab_strip, title_bar, topics,
 };
 use crate::config::Config;
 use crate::document::Caret;
 use crate::document::Focus;
-use crate::document::layout::{ContextHit, DocLayout, RangeKind, layout_blocks};
+use crate::document::layout::{ContextHit, DocLayout, RangeKind, TableResize, layout_blocks};
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_conversion;
 use crate::document::math_style;
@@ -190,18 +190,28 @@ struct ContextMenuState {
 }
 
 /// The open word-format bar's resolved commands, selection, anchor, and
-/// target — the same shape as the context menu's state, but for the bar
+/// targets — the same shape as the context menu's state, but for the bar
 /// that opens over a word in Normal mode. Lives in the shell for the same
 /// reason the menu's does: the shell owns the keystrokes while it is open.
 struct WordFormatState {
     items: Vec<&'static commands::Command>,
     selected: usize,
     anchor: (f32, f32),
-    target: Option<ContextHit>,
+    /// Everything a toggle applies to: one word for a click, a whole
+    /// Ctrl-brush selection for a stroke. The bar owns its own copy
+    /// rather than reading `brush_selected`, because the very first
+    /// toggle bumps the document revision and that clears the brush —
+    /// a bar that stayed open over a selection it had forgotten would
+    /// apply its second format to nothing.
+    targets: Vec<ContextHit>,
     /// The cell the pill last sat on — the shell's copy of the bar's
     /// persistent hover, fed back into every refreshed snapshot. Lives
     /// here because snapshots are recreated per toggle; this survives.
     hover_cell: Option<usize>,
+    /// The reader has been told this selection holds more than prose and
+    /// asked for it anyway. One warning per bar: a second format on the
+    /// same selection is not a second question.
+    mixed_ack: bool,
 }
 
 /// A word-format bar animating out: the state is closed, but the drawing
@@ -346,6 +356,49 @@ enum InsertEvent {
     Backspace,
     Delete,
     Enter,
+    SetHeading(u8),
+    SetEmphasis { bold: bool, italic: bool },
+    ToggleInlineCode,
+    ToggleBadge,
+    ToggleHighlight,
+    BulletList,
+    NumberedList,
+    TaskList,
+    InsertDivider,
+    InsertSidenote,
+    CodeBlock,
+}
+
+/// The partial typed marker at the front of an Insert-mode shorthand.
+///
+/// Markers are input gestures rather than document text, but `[[`, `==`,
+/// and `]]` need to remember their first character long enough to recognise
+/// their second one on the next input frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InsertMarker {
+    OpenBracket,
+    BadgeClose,
+    Equals,
+}
+
+/// Small, local state for Typewritter's structural Markdown gestures.
+///
+/// This is intentionally shell state, not document state: the markers are
+/// never part of the note tree. Once one resolves it invokes the same
+/// document operation as the slash menu or command palette.
+#[derive(Default)]
+struct InsertShortcuts {
+    stars: u8,
+    backticks: u8,
+    dashes: u8,
+    ordered_digits: usize,
+    marker: Option<InsertMarker>,
+}
+
+impl InsertShortcuts {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Half-width of the grab zone around a divider, in logical pixels.
@@ -364,6 +417,37 @@ enum Divider {
     Tree,
     Sidenotes,
     Topics,
+}
+
+/// The Normal-click highlight a context menu shows: the selected range when
+/// the target is one, whether it covers a whole code block, and the math atom
+/// under the pointer with its address.
+type ContextSelection = (
+    Option<crate::document::FlatRange>,
+    bool,
+    Option<(usize, usize, usize, NodeAddress)>,
+);
+
+/// The table card belongs to one concrete cell and is anchored to that
+/// click. Its structural controls consequently add or remove the row and
+/// column the reader is already looking at.
+struct TableLinesState {
+    first: usize,
+    row: usize,
+    column: usize,
+    anchor: (f32, f32),
+    /// The keyboard's card cursor. It lives here, not in the widget, so a
+    /// snapshot-recreating refresh keeps it — the same rule the hover pill
+    /// follows. Seeded `None` on every open, whatever raised the card.
+    focus: Option<crate::components::table_lines::TableHit>,
+}
+
+/// A live resize carries the exact divider and the last pointer position.
+/// Applying deltas rather than recomputing from the original drag point
+/// keeps repeated frames numerically stable and makes every pixel count.
+struct TableDrag {
+    resize: TableResize,
+    last: (f32, f32),
 }
 
 pub struct Shell {
@@ -418,6 +502,10 @@ pub struct Shell {
     context_menu: Option<ContextMenuState>,
     /// The open word-format bar, if any — see [`WordFormatState`].
     format_bar: Option<WordFormatState>,
+    /// The direct grid-line selector opened from a Normal-mode table click.
+    table_lines: Option<TableLinesState>,
+    /// The table divider currently being dragged, if any.
+    table_drag: Option<TableDrag>,
     /// Persistent Ctrl-brush selection, plus the targets currently under the
     /// brush so a held stroke toggles each target only on entry.
     brush_selected: Vec<ContextHit>,
@@ -450,6 +538,7 @@ pub struct Shell {
     menu_region: usize,
     format_region: usize,
     math_menu_region: usize,
+    table_lines_region: usize,
     /// Blinks the caret in the editor and the name prompt.
     caret: Stepped,
     /// The entrance-reveal clock for whichever popup is opening — a menu
@@ -543,6 +632,8 @@ pub struct Shell {
     repeat: Option<RepeatOp>,
     insert_repeat: Vec<InsertEvent>,
     insert_prefix: Option<RepeatOp>,
+    /// Partial Markdown marker gestures while Insert mode is active.
+    insert_shortcuts: InsertShortcuts,
     /// Geometry affects wrapping and the focus camera even without an edit.
     last_editor_rect: Rect,
     focus_panels: Option<[bool; 4]>,
@@ -729,6 +820,11 @@ impl Shell {
             Box::new(FormatBar::closed()),
         ));
         let format_region = regions.len() - 1;
+        regions.push(Region::detached(
+            Layout::ROOT,
+            Box::new(TableLinesMenu::closed()),
+        ));
+        let table_lines_region = regions.len() - 1;
 
         // The blur layer carrying popups' drop shadows. Created *here* —
         // after every regular region, before any overlay opens — because
@@ -771,6 +867,8 @@ impl Shell {
             slash_menu: None,
             context_menu: None,
             format_bar: None,
+            table_lines: None,
+            table_drag: None,
             menu_dismiss: None,
             menu_dismiss_clock: 0.0,
             brush_selected: Vec::new(),
@@ -798,6 +896,7 @@ impl Shell {
             menu_region,
             format_region,
             math_menu_region,
+            table_lines_region,
             // Two steps: the caret should wake the renderer only when it flips.
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
             popup_reveal: Animation::new(
@@ -845,6 +944,7 @@ impl Shell {
             repeat: None,
             insert_repeat: Vec::new(),
             insert_prefix: None,
+            insert_shortcuts: InsertShortcuts::default(),
             last_editor_rect: Rect::default(),
             focus_panels: None,
             focus_fade: Hover::new(),
@@ -1202,6 +1302,7 @@ impl Shell {
             || self.format_bar.is_some()
             || self.math_menu.is_some()
             || self.finder.is_some()
+            || self.table_lines.is_some()
     }
 
     /// The smallest the window may be before regions start overlapping.
@@ -1365,6 +1466,7 @@ impl Shell {
                 self.math_menu.is_some()
                     || matches!(self.menu_dismiss, Some(MenuDismiss::Math { .. })),
             ),
+            (self.table_lines_region, self.table_lines.is_some()),
         ];
         for (index, open) in overlays {
             match (open, self.regions[index].is_attached()) {
@@ -1575,6 +1677,7 @@ impl Shell {
                 }
                 None => DocLayout {
                     blocks: Vec::new(),
+                    tables: Vec::new(),
                     height: 0.0,
                     scale: 1.0,
                     source: Vec::new(),
@@ -1712,7 +1815,11 @@ impl Shell {
     }
 
     /// Mouse position within a rendered math atom and its nearest cursor.
-    fn math_at(&mut self, rect: Rect, mouse: (f32, f32)) -> Option<(usize, usize, MathCursor)> {
+    fn math_at(
+        &mut self,
+        rect: Rect,
+        mouse: (f32, f32),
+    ) -> Option<(usize, usize, usize, MathCursor)> {
         let layout = self.current_layout(Editor::content_width(rect));
         let (local_x, local_y) = self.editor_point(rect, mouse)?;
         let layer = self.regions[self.text_region].layer();
@@ -1728,15 +1835,30 @@ impl Shell {
         layout.hit_context(local_x, local_y, &measure)
     }
 
+    /// Everything the page washes as picked out, beside the caret's own
+    /// selection: the live brush stroke, plus whatever the open format bar
+    /// is aimed at.
+    ///
+    /// The bar's own targets are on this list for two reasons. A single
+    /// Normal-mode click on a word opens the bar over a word that would
+    /// otherwise carry no mark at all, and the first toggle bumps the
+    /// document revision, which drops the brush — without this the
+    /// selection would vanish out from under a bar still pointed at it.
+    fn marked_targets(&self) -> Vec<ContextHit> {
+        let mut targets = self.brush_selected.clone();
+        if let Some(state) = &self.format_bar {
+            for target in &state.targets {
+                if !targets.contains(target) {
+                    targets.push(target.clone());
+                }
+            }
+        }
+        targets
+    }
+
     /// Temporary Normal-click highlight. It exists only as part of the open
     /// context menu state, so closing the popup also clears the selection.
-    fn context_selection(
-        &self,
-    ) -> (
-        Option<crate::document::FlatRange>,
-        bool,
-        Option<(usize, usize, NodeAddress)>,
-    ) {
+    fn context_selection(&self) -> ContextSelection {
         let target = self
             .context_menu
             .as_ref()
@@ -1748,41 +1870,25 @@ impl Shell {
             Some(ContextHit::Math {
                 block,
                 inline,
+                offset,
                 node: Some(node),
-            }) => (None, false, Some((*block, *inline, node.clone()))),
+            }) => (None, false, Some((*block, *inline, *offset, node.clone()))),
             Some(ContextHit::Math {
                 block,
-                inline,
+                offset,
                 node: None,
+                ..
             }) => {
-                let range = self.docs.borrow().active().and_then(|tab| {
-                    let block_ref = tab.document.body().get(*block)?;
-                    matches!(
-                        block_ref.inlines().get(*inline),
-                        Some(crate::document::Inline::Math(_))
-                    )
-                    .then(|| {
-                        let offset = block_ref.inlines()[..*inline]
-                            .iter()
-                            .map(|run| match run {
-                                crate::document::Inline::Text(text) => text.text.chars().count(),
-                                crate::document::Inline::Math(_) => 1,
-                                crate::document::Inline::Note(_) => 1,
-                                crate::document::Inline::EqRef(_) => 1,
-                            })
-                            .sum();
-                        crate::document::FlatRange::new(
-                            crate::document::FlatPos {
-                                block: *block,
-                                offset,
-                            },
-                            crate::document::FlatPos {
-                                block: *block,
-                                offset: offset + 1,
-                            },
-                        )
-                    })
-                });
+                let range = Some(crate::document::FlatRange::new(
+                    crate::document::FlatPos {
+                        block: *block,
+                        offset: *offset,
+                    },
+                    crate::document::FlatPos {
+                        block: *block,
+                        offset: *offset + 1,
+                    },
+                ));
                 (range, false, None)
             }
             None => (None, false, None),
@@ -2110,7 +2216,7 @@ impl Shell {
                             )
                             .with_math(math)
                             .with_math_selection(math_selection)
-                            .with_context_selections(self.brush_selected.clone(), self.brush_point)
+                            .with_context_selections(self.marked_targets(), self.brush_point)
                             .with_selection(selection, line_selection),
                             StatusLine::new(
                                 mode_label,

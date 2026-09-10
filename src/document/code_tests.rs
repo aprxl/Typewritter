@@ -191,3 +191,71 @@ fn colors_do_not_add_arrow_key_stops() {
     document.move_left();
     assert_eq!(document.caret_flat(0), 2);
 }
+
+#[test]
+fn inline_padding_survives_color_splits_and_caret_roundtrips_at_each_scale() {
+    let mut document = doc("pre`hello`post");
+    document.set_code_options(range(0, 3, 8), None, true);
+    document.set_code_color(range(0, 4, 6), Some(MathHue::Rose));
+    for scale in [0.7, 1.0, 1.5] {
+        let measure =
+            |text: &str, _: &crate::theme::TextStyle| text.chars().count() as f32 * 10.0 * scale;
+        let laid = layout::layout_blocks(document.body(), 500.0, scale, &measure);
+        let segments = &laid.blocks[0].lines[0].segments;
+        let total: f32 = segments.iter().map(|s| s.padding.0 + s.padding.1).sum();
+        assert_eq!(
+            total,
+            2.0 * (layout::INLINE_CODE_INSET + layout::INLINE_CODE_GAP)
+        );
+        assert_eq!(
+            segments[2].padding,
+            (0.0, 0.0),
+            "color boundaries reserve no extra space"
+        );
+        for flat in 0..=12 {
+            let (inline, offset) = document.flat_to_pos(0, flat);
+            let caret = super::super::Caret {
+                block: 0,
+                inline,
+                offset,
+                style: super::super::Style::PLAIN,
+            };
+            let (x, y, _) = laid.caret_pos(caret, &measure);
+            let hit = laid.hit(x, y, &measure);
+            let found: usize = document.body()[0].inlines()[..hit.inline]
+                .iter()
+                .map(|r| r.text().chars().count())
+                .sum::<usize>()
+                + hit.offset;
+            assert_eq!(found, flat, "caret at {flat}, scale {scale}");
+        }
+    }
+}
+
+#[test]
+fn wrapping_reserves_code_background_on_every_visual_line() {
+    let document = doc("a `foo bar baz` end");
+    let measure = |text: &str, _: &crate::theme::TextStyle| text.chars().count() as f32 * 10.0;
+    let laid = layout::layout(&document, 95.0, &measure);
+    assert!(laid.blocks[0].lines.len() >= 3);
+    for line in &laid.blocks[0].lines {
+        let mut cursor = 0.0;
+        for segment in &line.segments {
+            let run = &document.body()[0].inlines()[segment.inline];
+            let text: String = run
+                .text()
+                .chars()
+                .skip(segment.start)
+                .take(segment.len)
+                .collect();
+            cursor += segment.advance(run, &text, &document.body()[0], 1.0, &measure);
+            // Trailing prose whitespace may hang past the column; code boxes may not.
+            if segment.style.code {
+                assert!(
+                    cursor <= 95.0,
+                    "code padding must participate in wrapping: {cursor}"
+                );
+            }
+        }
+    }
+}

@@ -484,9 +484,8 @@ impl Finder {
         doc.body()
             .iter()
             .map(|block| {
-                block
-                    .inlines()
-                    .iter()
+                crate::document::block_runs(block)
+                    .into_iter()
                     .map(|run| match run {
                         crate::document::Inline::Text(t) => t.text.clone(),
                         crate::document::Inline::Math(list) => {

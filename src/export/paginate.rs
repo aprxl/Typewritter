@@ -179,6 +179,7 @@ mod tests {
                     x: 0.0,
                     height,
                     segments: Vec::new(),
+                    cell_line: 0,
                 }],
                 height,
                 hidden: None,
@@ -188,6 +189,7 @@ mod tests {
         }
         DocLayout {
             blocks,
+            tables: vec![None; heights.len()],
             height: y,
             scale: 1.0,
             code_colors: vec![Vec::new(); heights.len()],
@@ -208,6 +210,7 @@ mod tests {
                 x: 0.0,
                 height,
                 segments: Vec::new(),
+                cell_line: 0,
             })
             .collect();
         let total = lines.len() as f32 * height;
@@ -219,6 +222,7 @@ mod tests {
                 hidden: None,
                 indicator: None,
             }],
+            tables: vec![None],
             height: total,
             scale: 1.0,
             source: vec![Block::Paragraph(Vec::new())],

@@ -22,7 +22,9 @@ use std::io;
 use std::path::Path;
 
 use super::math_notation;
-use super::{BadgeColor, Block, Caret, Document, Focus, Inline, ListMarker, Sidenote, Style, Text};
+use super::{
+    BadgeColor, Block, Caret, Document, Focus, Inline, ListMarker, Sidenote, Style, Text, table,
+};
 
 /// Scan for the next unescaped occurrence of `marker` at or after `start`.
 /// The char immediately before a match must be non-whitespace. Escaped
@@ -469,6 +471,247 @@ fn note_block(body: &str) -> Block {
     Block::Paragraph(runs)
 }
 
+/// One pipe-table row. A leading and trailing pipe are optional on disk; the
+/// serializer always writes both. `\\|` belongs to a cell rather than ending
+/// it, and remains escaped for `parse_inline` to turn back into literal text.
+fn parse_table_cells(line: &str, columns: Option<usize>) -> Option<Vec<String>> {
+    let line = line.trim();
+    if !line.contains('|') {
+        return None;
+    }
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line.strip_suffix('|').unwrap_or(line);
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut escaped = false;
+    for ch in line.chars() {
+        if escaped {
+            cell.push('\\');
+            cell.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '|' {
+            cells.push(cell.trim().to_string());
+            cell.clear();
+        } else {
+            cell.push(ch);
+        }
+    }
+    if escaped {
+        cell.push('\\');
+    }
+    cells.push(cell.trim().to_string());
+    if cells.is_empty() || columns.is_some_and(|columns| columns != cells.len()) {
+        None
+    } else {
+        Some(cells)
+    }
+}
+
+/// The Markdown delimiter row which makes a pipe row a table header, with
+/// each column's alignment — `---`, `:--`, `--:`, `:-:`.
+fn table_divider_columns(line: &str) -> Option<Vec<table::ColumnAlign>> {
+    let cells = parse_table_cells(line, None)?;
+    if cells.is_empty() {
+        return None;
+    }
+    let mut aligns = Vec::with_capacity(cells.len());
+    for cell in &cells {
+        let dashes = cell.trim_matches(':');
+        if dashes.len() < 3 || !dashes.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        aligns.push(match (cell.starts_with(':'), cell.ends_with(':')) {
+            (true, true) => table::ColumnAlign::Centre,
+            (true, false) => table::ColumnAlign::Left,
+            (false, true) => table::ColumnAlign::Right,
+            (false, false) => table::ColumnAlign::None,
+        });
+    }
+    Some(aligns)
+}
+
+/// The length of an unescaped `<br>` / `<br/>` at `i`, any case, or `None`
+/// when this `<` opens something else.
+fn cell_break_at(chars: &[char], i: usize) -> Option<usize> {
+    if chars.get(i) != Some(&'<') {
+        return None;
+    }
+    match (chars.get(i + 1), chars.get(i + 2)) {
+        (Some(b), Some(r)) if b.eq_ignore_ascii_case(&'b') && r.eq_ignore_ascii_case(&'r') => {}
+        _ => return None,
+    }
+    match chars.get(i + 3) {
+        Some('>') => Some(4),
+        Some('/') if chars.get(i + 4) == Some(&'>') => Some(5),
+        _ => None,
+    }
+}
+
+/// Split a cell's text into its lines on an unescaped `<br>` — the spelling
+/// a multi-line cell writes on disk. `\<br>` is the literal text `<br>`: the
+/// backslash is kept for `parse_inline` to collapse.
+fn split_cell_breaks(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut lines = vec![String::new()];
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            lines.last_mut().expect("a cell has a line").push('\\');
+            if i + 1 < chars.len() {
+                lines
+                    .last_mut()
+                    .expect("a cell has a line")
+                    .push(chars[i + 1]);
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(len) = cell_break_at(&chars, i) {
+            lines.push(String::new());
+            i += len;
+            continue;
+        }
+        lines.last_mut().expect("a cell has a line").push(chars[i]);
+        i += 1;
+    }
+    lines
+}
+
+fn table_cells(cells: Vec<String>) -> Vec<table::Cell> {
+    cells
+        .into_iter()
+        .map(|text| {
+            let lines = split_cell_breaks(&text)
+                .into_iter()
+                .map(|line| {
+                    let mut contents = parse_inline(&line);
+                    if contents.is_empty() {
+                        contents.push(Inline::Text(Text {
+                            text: unescape(&line.chars().collect::<Vec<_>>()),
+                            style: Style::PLAIN,
+                        }));
+                    }
+                    contents
+                })
+                .collect();
+            table::Cell::from_lines(lines)
+        })
+        .collect()
+}
+
+fn table_rows(blocks: &[Block], first: usize) -> usize {
+    (first..blocks.len())
+        .take_while(|&index| {
+            index == first
+                || matches!(
+                    blocks.get(index),
+                    Some(Block::TableRow { first: false, .. })
+                )
+        })
+        .count()
+}
+
+fn apply_table_settings(blocks: &mut [Block], first: usize, settings: table::TableSettings) {
+    let rows = table_rows(blocks, first);
+    let columns = blocks[first].cells().len();
+    let mut settings = settings.normalized(columns, rows);
+    // The metadata comment carries geometry, not alignment: the divider row
+    // owns the alignment, so keep what the header already parsed.
+    if settings
+        .align
+        .iter()
+        .all(|align| *align == table::ColumnAlign::None)
+        && let Some(existing) = blocks[first].table_settings()
+    {
+        settings.align = existing.align.clone();
+    }
+    let shared = std::sync::Arc::new(settings);
+    for row in &mut blocks[first..first + rows] {
+        if let Block::TableRow {
+            settings: row_settings,
+            ..
+        } = row
+        {
+            *row_settings = std::sync::Arc::clone(&shared);
+        }
+    }
+}
+
+/// Parse the presentation comment placed immediately after a table. The
+/// Markdown remains a standard GFM table without it; absent or malformed
+/// metadata simply gets the default full grid and equal tracks.
+fn parse_table_metadata(line: &str) -> Option<table::TableSettings> {
+    let body = line
+        .trim()
+        .strip_prefix("<!-- typewritter-table v1 ")?
+        .strip_suffix(" -->")?;
+    let mut lines = None;
+    let mut columns = None;
+    let mut rows = None;
+    for part in body.split_whitespace() {
+        if let Some(bits) = part.strip_prefix("lines=") {
+            lines = table::TableLines::from_bits(bits);
+        } else if let Some(values) = part.strip_prefix("cols=") {
+            columns = Some(
+                values
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<Vec<f32>, _>>()
+                    .ok()?,
+            );
+        } else if let Some(values) = part.strip_prefix("rows=") {
+            rows = Some(
+                values
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<Vec<f32>, _>>()
+                    .ok()?,
+            );
+        }
+    }
+    Some(table::TableSettings {
+        lines: lines?,
+        column_shares: columns?,
+        row_heights: rows?,
+        // Alignment is the divider row's, not the comment's.
+        align: Vec::new(),
+    })
+}
+
+fn table_metadata(settings: &table::TableSettings) -> String {
+    let columns = settings
+        .column_shares
+        .iter()
+        .map(|value| format!("{value:.6}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let rows = settings
+        .row_heights
+        .iter()
+        .map(|value| format!("{value:.2}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "<!-- typewritter-table v1 lines={} cols={columns} rows={rows} -->",
+        settings.lines.bits()
+    )
+}
+
+fn serialize_table_cell(cell: &table::Cell) -> String {
+    cell.lines()
+        .iter()
+        // A literal `<br` in the text would read back as a line break, so it
+        // is escaped; the cells' own line breaks are joined after.
+        .map(|line| serialize_runs(line).replace("<br", "\\<br"))
+        .collect::<Vec<_>>()
+        .join("<br>")
+        .replace('|', "\\|")
+}
+
 /// Build a `Document` from Markdown text. `path` only seeds `Document`'s
 /// `path`/`name` fields. Pure — no IO.
 pub fn parse(path: &Path, text: &str) -> Document {
@@ -490,6 +733,10 @@ pub fn parse(path: &Path, text: &str) -> Document {
     let mut fence_tag: Option<String> = None;
     let mut math_body = String::new();
     let mut definitions: Vec<(String, Block)> = Vec::new();
+    // Pipe tables are read as a contiguous group after their header divider.
+    // The optional Typewritter comment immediately following the last row
+    // restores presentation state without making the Markdown itself opaque.
+    let mut open_table: Option<(usize, usize)> = None;
     // The running ordinal of the ordered run being read. Reset by every
     // non-ordered-item block, so a run numbers 1,2,3… the way serialization
     // writes it.
@@ -505,6 +752,34 @@ pub fn parse(path: &Path, text: &str) -> Document {
 
     for raw in text.split('\n') {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some((first, columns)) = open_table {
+            if let Some(cells) = parse_table_cells(line, Some(columns)) {
+                let rows = table_rows(&blocks, first) + 1;
+                let settings = blocks[first]
+                    .table_settings()
+                    .expect("open table starts on a table row")
+                    .clone()
+                    .normalized(columns, rows);
+                let shared = std::sync::Arc::clone(
+                    blocks[first]
+                        .table_settings_arc()
+                        .expect("open table starts on a table row"),
+                );
+                blocks.push(Block::TableRow {
+                    cells: table_cells(cells),
+                    first: false,
+                    settings: shared,
+                });
+                apply_table_settings(&mut blocks, first, settings);
+                continue;
+            }
+            if let Some(settings) = parse_table_metadata(line) {
+                apply_table_settings(&mut blocks, first, settings);
+                open_table = None;
+                continue;
+            }
+            open_table = None;
+        }
         if in_fence {
             if line.trim() == "```" {
                 if fence_math {
@@ -578,6 +853,27 @@ pub fn parse(path: &Path, text: &str) -> Document {
                 text: String::new(),
                 style: Style::PLAIN,
             })]));
+            continue;
+        }
+        // The delimiter row claims the one pending pipe row as a table
+        // header. We do this before ordinary paragraph parsing, so a table
+        // is recognised even though the streaming parser has no look-ahead.
+        if let Some(aligns) = table_divider_columns(line)
+            && para.len() == 1
+            && let Some(cells) = parse_table_cells(&para[0], Some(aligns.len()))
+        {
+            para.clear();
+            let columns = aligns.len();
+            let mut settings = table::TableSettings::new(columns, 1);
+            settings.align = aligns;
+            let settings = std::sync::Arc::new(settings);
+            let first = blocks.len();
+            blocks.push(Block::TableRow {
+                cells: table_cells(cells),
+                first: true,
+                settings,
+            });
+            open_table = Some((first, columns));
             continue;
         }
         // A definition is collected out of the block stream into the
@@ -845,6 +1141,68 @@ fn serialize_plain(doc: &Document) -> String {
             ordinal = 0;
         }
         match &doc.body()[i] {
+            Block::TableRow {
+                first: true,
+                settings,
+                ..
+            } => {
+                let first_table_row = &doc.body()[i];
+                let columns = first_table_row.cells().len();
+                let mut end = i + 1;
+                while matches!(
+                    doc.body().get(end),
+                    Some(Block::TableRow { first: false, .. })
+                ) {
+                    end += 1;
+                }
+                let rows = end - i;
+                let settings = (**settings).clone().normalized(columns, rows);
+                let write_row = |out: &mut String, row: &Block| {
+                    out.push('|');
+                    for cell in row.cells() {
+                        out.push(' ');
+                        out.push_str(&serialize_table_cell(cell));
+                        out.push_str(" |");
+                    }
+                };
+                write_row(&mut out, first_table_row);
+                out.push('\n');
+                out.push('|');
+                for align in &settings.align {
+                    out.push(' ');
+                    out.push_str(match align {
+                        table::ColumnAlign::None => "---",
+                        table::ColumnAlign::Left => ":---",
+                        table::ColumnAlign::Centre => ":---:",
+                        table::ColumnAlign::Right => "---:",
+                    });
+                    out.push_str(" |");
+                }
+                for row in &doc.body()[i + 1..end] {
+                    out.push('\n');
+                    write_row(&mut out, row);
+                }
+                out.push('\n');
+                out.push_str(&table_metadata(&settings));
+                i = end;
+            }
+            // A malformed external edit can leave a continuation row without
+            // its first row. It still serializes as a harmless paragraph
+            // rather than panicking or dropping the reader's text.
+            Block::TableRow {
+                cells,
+                first: false,
+                ..
+            } => {
+                out.push_str(
+                    &cells
+                        .iter()
+                        .map(serialize_table_cell)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                i += 1;
+            }
             Block::CodeLine { lang, .. } => {
                 let opener = match lang {
                     Some(l) => format!("```{l}\n"),
@@ -1167,6 +1525,85 @@ mod tests {
             let ast = serialize(&parse(Path::new("x"), s));
             assert_eq!(once, ast, "canonical stability failed for {s:?}");
         }
+    }
+
+    #[test]
+    fn pipe_tables_round_trip_with_local_grid_and_track_metadata() {
+        let text = "| Left | Right |\n| --- | --- |\n| a\\|b | c |\n<!-- typewritter-table v1 lines=101011 cols=0.250000,0.750000 rows=42.00,31.00 -->\n";
+        let document = parse(Path::new("table.md"), text);
+        assert_eq!(document.body().len(), 2);
+        assert!(document.body().iter().all(Block::is_table));
+        assert!(document.body()[0].table_first());
+        assert_eq!(
+            super::super::cell_text(&document.body()[1].cells()[0]),
+            "a|b"
+        );
+        let settings = document.body()[0].table_settings().unwrap();
+        assert!(!settings.lines.bottom);
+        assert!(settings.lines.left);
+        assert!(!settings.lines.right);
+        assert_eq!(settings.column_shares, vec![0.25, 0.75]);
+        assert_eq!(settings.row_heights, vec![42.0, 31.0]);
+        assert_eq!(serialize(&document), text);
+        assert_eq!(
+            parse(Path::new("table.md"), &serialize(&document)).body(),
+            document.body()
+        );
+    }
+
+    #[test]
+    fn a_plain_gfm_table_receives_deterministic_local_defaults() {
+        let document = parse(
+            Path::new("table.md"),
+            "| A | B |\n| --- | --- |\n| C | D |\n",
+        );
+        let saved = serialize(&document);
+        assert!(saved.contains("<!-- typewritter-table v1 lines=111111"));
+        assert_eq!(parse(Path::new("table.md"), &saved).body(), document.body());
+    }
+
+    #[test]
+    fn a_formatted_table_cell_remains_one_structural_cell_on_disk() {
+        let text = "| **Left** | Right |\n| --- | --- |\n<!-- typewritter-table v1 lines=111111 cols=0.500000,0.500000 rows=38.00 -->\n";
+        let document = parse(Path::new("table.md"), text);
+        let [Inline::Text(cell)] = document.body()[0].cells()[0].runs() else {
+            panic!("the formatted cell contains one text run")
+        };
+        assert!(cell.style.bold);
+        assert_eq!(document.body()[0].cells().len(), 2);
+        assert_eq!(serialize(&document), text);
+    }
+
+    #[test]
+    fn a_math_table_cell_round_trips_as_one_structural_cell() {
+        let text = "| $x/2$ | Right |\n| --- | --- |\n<!-- typewritter-table v1 lines=111111 cols=0.500000,0.500000 rows=38.00 -->\n";
+        let document = parse(Path::new("table.md"), text);
+        assert!(matches!(
+            document.body()[0].cells()[0].runs(),
+            [Inline::Math(_)]
+        ));
+        assert_eq!(document.body()[0].cells().len(), 2);
+        assert_eq!(serialize(&document), text);
+        assert_eq!(
+            parse(Path::new("table.md"), &serialize(&document)).body(),
+            document.body()
+        );
+    }
+
+    #[test]
+    fn mixed_table_cell_formatting_and_math_round_trip_in_one_cell() {
+        let text = "| **bold** plain $x$ tail | Right |\n| --- | --- |\n<!-- typewritter-table v1 lines=111111 cols=0.500000,0.500000 rows=38.00 -->\n";
+        let document = parse(Path::new("table.md"), text);
+        let contents = document.body()[0].cells()[0].runs();
+        assert!(
+            matches!(&contents[0], Inline::Text(text) if text.text == "bold" && text.style.bold)
+        );
+        assert!(contents.iter().any(|run| matches!(run, Inline::Math(_))));
+        assert_eq!(serialize(&document), text);
+        assert_eq!(
+            parse(Path::new("table.md"), &serialize(&document)).body(),
+            document.body()
+        );
     }
 
     #[test]
