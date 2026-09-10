@@ -859,9 +859,18 @@ mod tests {
         );
         d.math_insert_char('x');
         d.math_exit_after();
-        d.set_caret(0, 0, 1);
 
-        // `h` from the cell end steps onto the atom and opens the tree.
+        // Reach it from the keyboard with no mouse: from the right-hand
+        // cell, `h` crosses to this cell's end, and a second `h` steps onto
+        // the atom and opens the tree from the right.
+        d.set_caret(0, 1, 0);
+        apply(&mut d, Motion::Left, 1);
+        assert_eq!(
+            (d.caret.inline, d.caret.offset),
+            (0, 1),
+            "h from the neighbour crosses to this cell's end"
+        );
+        assert!(d.math.is_none());
         apply(&mut d, Motion::Left, 1);
         assert_eq!((d.caret.inline, d.caret.offset), (0, 0));
         assert_eq!(
@@ -870,7 +879,7 @@ mod tests {
                 path: Vec::new(),
                 index: 1
             }),
-            "h onto the display cell atom opens it"
+            "a second h steps onto the display cell atom and opens it"
         );
 
         // Enter inside the tree: the shell's insert path exits then calls

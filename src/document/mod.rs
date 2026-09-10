@@ -6855,6 +6855,48 @@ mod tests {
         assert_invariants(&d);
     }
 
+    /// The arrow keys call `move_left`/`move_right` directly, so the enter
+    /// rule lives in the model and not only in the vim motion layer.
+    #[test]
+    fn an_arrow_onto_an_atom_opens_its_tree() {
+        let para = || {
+            Block::Paragraph(vec![
+                plain_run("ab"),
+                Inline::Math(vec![math::MathNode::Sym('x')]),
+                plain_run("cd"),
+            ])
+        };
+
+        let mut d = doc();
+        *d.body_mut() = vec![para()];
+        d.set_caret(0, 0, 1);
+        d.move_right();
+        assert_eq!((d.caret.inline, d.caret.offset), (1, 0));
+        assert_eq!(
+            d.math,
+            Some(math::MathCursor {
+                path: Vec::new(),
+                index: 0
+            }),
+            "the right arrow enters the atom at its start"
+        );
+
+        let mut d = doc();
+        *d.body_mut() = vec![para()];
+        d.set_caret(0, 2, 0);
+        d.move_left();
+        assert_eq!((d.caret.inline, d.caret.offset), (1, 0));
+        assert_eq!(
+            d.math,
+            Some(math::MathCursor {
+                path: Vec::new(),
+                index: 1
+            }),
+            "the left arrow enters the atom at its end"
+        );
+        assert_invariants(&d);
+    }
+
     // ---- cell atoms: the edit paths audited against the container shape ----
 
     /// `$` inside a cell splits the cell's run around the atom and focuses
