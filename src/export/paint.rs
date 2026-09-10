@@ -332,18 +332,18 @@ fn table_row(
     let cell_source = &layout.source[piece.block];
     for (column, cell) in cell_source.cells().iter().enumerate() {
         let inset = TABLE_CELL_PAD * layout.scale;
-        let contents = cell.runs();
-        let cell_block = Block::Paragraph(contents.to_vec());
         let lines = &table.cells[column];
         let content_height: f32 = lines.iter().map(|line| line.height).sum();
         let content_top = top + (height - content_height).max(0.0) * 0.5;
         for line in lines {
+            let logical = &cell.lines()[line.cell_line.min(cell.lines().len() - 1)];
+            let cell_block = Block::Paragraph(logical.to_vec());
             let line_top = content_top + line.y;
             let baseline = line_top + line.height * 0.5;
-            let mut cursor = left + inset;
+            let mut cursor = left + inset + line.x;
             let mut pieces = Vec::with_capacity(line.segments.len());
             for segment in &line.segments {
-                let run = &contents[segment.inline];
+                let run = &logical[segment.inline];
                 let text: String = match run {
                     Inline::Text(text) => text
                         .text
@@ -402,7 +402,7 @@ fn table_row(
                 layout.scale,
             );
             for ((text, _, at, _), segment) in pieces.iter().zip(&line.segments) {
-                if matches!(contents[segment.inline], Inline::Text(_)) {
+                if matches!(logical[segment.inline], Inline::Text(_)) {
                     canvas.draw_text(
                         text,
                         (*at, baseline),

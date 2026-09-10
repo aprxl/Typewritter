@@ -279,8 +279,6 @@ impl Editor {
             let cell_source = &self.layout.source[row];
             for (column, cell) in cell_source.cells().iter().enumerate() {
                 let inset = TABLE_CELL_PAD * self.layout.scale;
-                let contents = cell.runs();
-                let cell_block = Block::Paragraph(contents.to_vec());
                 let lines = &row_table.cells[column];
                 let content_height: f32 = lines.iter().map(|line| line.height).sum();
                 let content_top = row_top + (block.height - content_height).max(0.0) * 0.5;
@@ -289,14 +287,18 @@ impl Editor {
                     .map(table::Cell::flat_len)
                     .sum();
                 for line in lines {
+                    // A wrapped visual line belongs to one logical line of the
+                    // cell: its runs are that line's, and its cell-flat start
+                    // comes from the cell's own line arithmetic.
+                    let logical = &cell.lines()[line.cell_line.min(cell.lines().len() - 1)];
+                    let cell_block = Block::Paragraph(logical.to_vec());
                     let top = content_top + line.y;
                     let baseline = top + line.height * 0.5;
-                    let mut cursor = left + inset;
+                    let mut cursor = left + inset + line.x;
                     let mut pieces = Vec::with_capacity(line.segments.len());
                     for segment in &line.segments {
-                        let run = &contents[segment.inline];
-                        let run_start: usize =
-                            contents[..segment.inline].iter().map(flat_len).sum();
+                        let run = &logical[segment.inline];
+                        let run_start = cell.run_start(line.cell_line, segment.inline);
                         let text: String = match run {
                             Inline::Text(text) => text
                                 .text
@@ -441,7 +443,7 @@ impl Editor {
                         }
                     }
                     for ((text, _, at, _), segment) in pieces.iter().zip(&line.segments) {
-                        if !matches!(contents[segment.inline], Inline::Text(_)) {
+                        if !matches!(logical[segment.inline], Inline::Text(_)) {
                             continue;
                         }
                         theme::draw(
@@ -582,11 +584,10 @@ impl Editor {
             let mut cell_start = 0;
             let cell_source = &self.layout.source[bi];
             for (cell, width) in table.columns.iter().enumerate() {
-                let contents = cell_source.cells()[cell].runs();
-                let cell_len: usize = contents.iter().map(flat_len).sum();
+                let source_cell = &cell_source.cells()[cell];
+                let cell_len = source_cell.flat_len();
                 let cell_end = cell_start + cell_len;
                 if from < cell_end && to > cell_start {
-                    let cell_block = Block::Paragraph(contents.to_vec());
                     let lines = &self.layout.tables[bi]
                         .as_ref()
                         .expect("table row must have table layout")
@@ -594,11 +595,13 @@ impl Editor {
                     let content_height: f32 = lines.iter().map(|line| line.height).sum();
                     let content_top = top + (block.height - content_height).max(0.0) * 0.5;
                     for line in lines {
-                        let mut cursor = left + TABLE_CELL_PAD * self.layout.scale;
+                        let logical =
+                            &source_cell.lines()[line.cell_line.min(source_cell.lines().len() - 1)];
+                        let cell_block = Block::Paragraph(logical.to_vec());
+                        let mut cursor = left + TABLE_CELL_PAD * self.layout.scale + line.x;
                         for segment in &line.segments {
-                            let run = &contents[segment.inline];
-                            let run_start: usize =
-                                contents[..segment.inline].iter().map(flat_len).sum();
+                            let run = &logical[segment.inline];
+                            let run_start = source_cell.run_start(line.cell_line, segment.inline);
                             let text: String = match run {
                                 Inline::Text(text) => text
                                     .text

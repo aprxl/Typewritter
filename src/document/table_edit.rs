@@ -8,8 +8,15 @@
 mod tests {
     use std::path::Path;
 
+    use crate::document::layout;
     use crate::document::markdown::{parse, serialize};
-    use crate::document::{Block, Document, cell_text};
+    use crate::document::{Block, Document, Inline, cell_text};
+    use crate::theme::TextStyle;
+
+    /// Deterministic text width: half the font size per character.
+    fn measure(text: &str, style: &TextStyle) -> f32 {
+        text.chars().count() as f32 * style.size * 0.5
+    }
 
     fn table() -> Document {
         let mut document = Document::new(Path::new("table.md"));
@@ -153,6 +160,74 @@ mod tests {
         assert_eq!(cell.lines().len(), 2);
         assert_eq!(cell_text(cell), "a|b\nlit <br> here");
         assert_eq!(serialize(&back), text, "the escaping is a fixpoint");
+    }
+
+    #[test]
+    fn a_two_line_cell_lays_out_both_lines() {
+        let mut document = table();
+        document.insert_text("one");
+        document.set_caret(0, 0, 3);
+        document.newline();
+        document.insert_text("two");
+        let laid = layout::layout(&document, 400.0, &measure);
+        let table = laid.tables[0].as_ref().expect("a table layout");
+        let lines = &table.cells[0];
+        assert_eq!(lines.len(), 2, "each cell line lays out");
+        assert_eq!(lines[0].cell_line, 0);
+        assert_eq!(lines[1].cell_line, 1);
+        assert_eq!(
+            lines[1].y, lines[0].height,
+            "the second line sits below the first"
+        );
+        assert!(table.row_height >= lines[0].height + lines[1].height);
+        assert_eq!(
+            lines[0]
+                .segments
+                .iter()
+                .map(|segment| segment.len)
+                .sum::<usize>(),
+            3,
+            "the first line carries its own run, not the whole cell"
+        );
+    }
+
+    #[test]
+    fn a_display_math_cell_line_leads_and_centres() {
+        let mut document = table();
+        document.insert_inline_math();
+        document.math_insert_char('x');
+        let laid = layout::layout(&document, 400.0, &measure);
+        let table = laid.tables[0].as_ref().expect("a table layout");
+        let math_line = &table.cells[0][0];
+        let text_height = table.cells[1][0].height;
+        assert!(
+            math_line.height > text_height,
+            "a display cell line leads: {} vs {text_height}",
+            math_line.height
+        );
+        assert!(math_line.x > 0.0, "the atom centres in its column");
+        assert!(matches!(
+            document.body()[0].cells()[0].lines()[0].as_slice(),
+            [Inline::Math(_)]
+        ));
+    }
+
+    #[test]
+    fn a_display_math_cell_line_round_trips() {
+        let path = Path::new("table.md");
+        let text = "| A | B |\n| --- | --- |\n| $x$<br>second | y |\n\
+                    <!-- typewritter-table v1 lines=111111 cols=0.500000,0.500000 rows=38.00,38.00 -->\n";
+        let document = parse(path, text);
+        let cell = &document.body()[1].cells()[0];
+        assert_eq!(cell.lines().len(), 2);
+        assert!(matches!(cell.lines()[0].as_slice(), [Inline::Math(_)]));
+        assert!(
+            matches!(&cell.lines()[1][0], Inline::Text(t) if t.text == "second"),
+            "the second line reads back as text"
+        );
+        let once = serialize(&document);
+        assert!(once.contains("$x$<br>second"), "{once}");
+        assert_eq!(serialize(&parse(path, &once)), once);
     }
 
     #[test]
