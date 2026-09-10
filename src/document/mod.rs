@@ -2327,6 +2327,9 @@ impl Document {
             self.caret.offset = 0;
             self.caret.style = Style::PLAIN;
         }
+        // A step that lands on an inline atom enters it; one that lands off
+        // it leaves the tree (the one rule, shared with the table path).
+        self.settle_math_at_caret(true);
     }
 
     pub fn move_left(&mut self) {
@@ -2356,6 +2359,7 @@ impl Document {
             self.caret.offset = o;
             self.caret.style = Style::PLAIN;
         }
+        self.settle_math_at_caret(false);
     }
 
     /// Logical start of the block's flat text, context per the style-before
@@ -4143,6 +4147,64 @@ impl Document {
         self.set_caret(block, inline, 0);
         self.math = Some(math::MathCursor::default());
         true
+    }
+
+    /// The keyboard's one enter/leave rule for an inline atom, model half.
+    ///
+    /// After a caret move, this settles the math focus: if the caret landed
+    /// on an atom's own position (an `Inline::Math` run at offset 0), the
+    /// atom's tree opens with the cursor on the side the caret came from.
+    /// `from_left` names that side — a motion that steps *forward* onto the
+    /// atom (`l`, `w`, `e`, `$`, the right arrow, a step into the next
+    /// cell) came from its left, so the cursor sits at index 0 and typing
+    /// continues rightwards; one that steps *back* (`h`, `b`, `0`, the left
+    /// arrow) came from its right, so the cursor sits at `list.len()`.
+    /// Landing anywhere else closes the tree — a step that lands off the
+    /// atom is an ordinary caret move that leaves the cursor nowhere to sit.
+    ///
+    /// This is the *same* rule in prose and inside a table cell: the only
+    /// thing that differs is the arithmetic that finds the run, and that
+    /// lives on `Block`/`Cell` (see `atom_at_caret`). Returning whether an
+    /// atom opened lets a caller branch on it.
+    pub fn settle_math_at_caret(&mut self, from_left: bool) -> bool {
+        let Some(len) = self.atom_at_caret() else {
+            self.math = None;
+            return false;
+        };
+        self.math = Some(math::MathCursor {
+            path: Vec::new(),
+            index: if from_left { 0 } else { len },
+        });
+        true
+    }
+
+    /// The length of the math atom the caret rests on, if the caret's flat
+    /// position is the atom's own position: the run under it is
+    /// `Inline::Math` and the caret sits at its start (offset 0 within it).
+    /// A caret one position *past* the atom is after it, not on it — that is
+    /// the distinction that keeps `$`/`e` out of the tree. In prose the
+    /// caret's `inline` names a run; in a table row it names a cell, so the
+    /// run comes from the cell's own line arithmetic.
+    fn atom_at_caret(&self) -> Option<usize> {
+        let block = self.scope().get(self.caret.block)?;
+        if let Block::TableRow { cells, .. } = block {
+            let cell = cells.get(self.caret.inline)?;
+            let at = cell.run_at(self.caret.offset);
+            if at.offset != 0 {
+                return None;
+            }
+            return match cell.lines().get(at.line).and_then(|line| line.get(at.run)) {
+                Some(Inline::Math(list)) => Some(list.len()),
+                _ => None,
+            };
+        }
+        if self.caret.offset != 0 {
+            return None;
+        }
+        match block.inlines().get(self.caret.inline) {
+            Some(Inline::Math(list)) => Some(list.len()),
+            _ => None,
+        }
     }
 
     /// Enters the atom at `block`/`inline` with an already-resolved

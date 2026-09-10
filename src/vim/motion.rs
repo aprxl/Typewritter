@@ -271,6 +271,36 @@ fn word_end(doc: &Document, start: (usize, usize)) -> (usize, usize) {
     pos
 }
 
+/// The side an atom-opening motion approaches an atom from: `Some(true)`
+/// when it steps *forward* (the caret comes from the atom's left, so the
+/// tree opens at its start), `Some(false)` when it steps back (it opens at
+/// the end). `None` for motions that do not land on a position an atom can
+/// occupy — vertical moves, `Here`, and the block jumps.
+fn approaches_from_left(motion: Motion) -> Option<bool> {
+    match motion {
+        Motion::Right
+        | Motion::Append
+        | Motion::WordForward
+        | Motion::WordEnd
+        | Motion::LineEnd
+        | Motion::FindForward(_)
+        | Motion::TillForward(_) => Some(true),
+        Motion::Left
+        | Motion::WordBack
+        | Motion::LineStart
+        | Motion::FirstNonBlank
+        | Motion::FindBack(_)
+        | Motion::TillBack(_) => Some(false),
+        Motion::Here
+        | Motion::Up
+        | Motion::Down
+        | Motion::FirstLine
+        | Motion::LastLine
+        | Motion::ParagraphBack
+        | Motion::ParagraphForward => None,
+    }
+}
+
 /// Applies `motion` to the document's caret, `count` times. Up/Down are out
 /// of scope here — the shell routes them through the layout.
 pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
@@ -456,12 +486,20 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
             set_pos(doc, pos.0, pos.1);
         }
     }
+    // The keyboard's one enter/leave rule for an inline atom, shared by
+    // prose and a table cell: a motion that lands the caret on an atom's own
+    // position opens its tree, cursor on the side the caret came from; one
+    // that lands off it closes the tree. Vertical moves and block jumps do
+    // not enter (they land on a block start, not on an atom).
+    if let Some(from_left) = approaches_from_left(motion) {
+        doc.settle_math_at_caret(from_left);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{Focus, Sidenote};
+    use crate::document::{Focus, Sidenote, math};
     use std::path::Path;
 
     fn doc(blocks: Vec<Block>) -> Document {
@@ -675,6 +713,177 @@ mod tests {
             (d.caret.inline, d.caret.offset),
             (0, 1),
             "F walks back to the n"
+        );
+    }
+
+    /// A paragraph "ab", an atom, "cd" — flat 0..4, the atom at flat 2.
+    fn prose_with_atom() -> Document {
+        let mut d = Document::new(Path::new("notes/m.md"));
+        *d.body_mut() = vec![Block::Paragraph(vec![
+            Inline::Text(crate::document::Text {
+                text: "ab".into(),
+                style: crate::document::Style::PLAIN,
+            }),
+            Inline::Math(vec![math::MathNode::Sym('x')]),
+            Inline::Text(crate::document::Text {
+                text: "cd".into(),
+                style: crate::document::Style::PLAIN,
+            }),
+        ])];
+        d
+    }
+
+    /// A 2x2 table whose first cell is "ab" then a one-symbol atom (flat
+    /// 0..2, the atom at 2); the second cell is "cd".
+    fn cell_with_atom() -> Document {
+        let mut d = Document::new(Path::new("notes/table.md"));
+        d.insert_table();
+        d.insert_text("ab");
+        d.set_caret(0, 0, 2);
+        d.insert_inline_math();
+        d.math_insert_char('x');
+        d.math_exit_after();
+        d.set_caret(0, 0, 2);
+        assert!(d.math.is_none(), "the fixture starts with the tree closed");
+        d
+    }
+
+    #[test]
+    fn a_prose_motion_onto_an_atom_opens_its_tree() {
+        // `l` from "ab" steps onto the atom (flat 2): the caret came from
+        // the atom's left, so the tree opens at its start.
+        let mut d = prose_with_atom();
+        d.set_caret(0, 0, 1);
+        apply(&mut d, Motion::Right, 1);
+        assert_eq!((d.caret.inline, d.caret.offset), (1, 0));
+        assert_eq!(
+            d.math,
+            Some(math::MathCursor {
+                path: Vec::new(),
+                index: 0
+            }),
+            "l onto the atom opens it at its start"
+        );
+
+        // `h` from "cd" steps back onto it: the caret came from the right,
+        // so the tree opens at its end.
+        let mut d = prose_with_atom();
+        d.set_caret(0, 2, 0);
+        apply(&mut d, Motion::Left, 1);
+        assert_eq!((d.caret.inline, d.caret.offset), (1, 0));
+        assert_eq!(
+            d.math,
+            Some(math::MathCursor {
+                path: Vec::new(),
+                index: 1
+            }),
+            "h onto the atom opens it at its end"
+        );
+
+        // `$` moves to the block's end (one past the atom) and leaves it
+        // closed: landing past an atom is not landing on it.
+        let mut d = prose_with_atom();
+        apply(&mut d, Motion::LineEnd, 1);
+        assert_eq!((d.caret.inline, d.caret.offset), (2, 2));
+        assert!(d.math.is_none(), "$ lands past the atom, so none opens");
+
+        // A step off an open atom closes the tree and lands on the neighbour.
+        let mut d = prose_with_atom();
+        d.set_caret(0, 1, 0);
+        assert!(d.settle_math_at_caret(true), "the caret is on the atom");
+        apply(&mut d, Motion::Left, 1);
+        assert!(d.math.is_none(), "h off the atom closes the tree");
+        assert_eq!((d.caret.inline, d.caret.offset), (0, 1));
+    }
+
+    #[test]
+    fn a_cell_motion_onto_an_atom_opens_its_tree() {
+        // `h` off the atom lands on the cell's text and leaves the tree
+        // closed; `l` back onto it opens it at its start.
+        let mut d = cell_with_atom();
+        apply(&mut d, Motion::Left, 1);
+        assert_eq!((d.caret.inline, d.caret.offset), (0, 1));
+        assert!(d.math.is_none());
+
+        apply(&mut d, Motion::Right, 1);
+        assert_eq!((d.caret.inline, d.caret.offset), (0, 2));
+        assert_eq!(
+            d.math,
+            Some(math::MathCursor {
+                path: Vec::new(),
+                index: 0
+            }),
+            "l onto a cell atom opens it at its start"
+        );
+
+        // `h` at the next cell's start crosses to the previous cell's end
+        // (a cell boundary is a scope edge), then a second `h` steps onto
+        // the atom and enters it from the right.
+        let mut d = cell_with_atom();
+        d.set_caret(0, 1, 0);
+        apply(&mut d, Motion::Left, 1);
+        assert_eq!(
+            (d.caret.inline, d.caret.offset),
+            (0, 3),
+            "h at a cell start crosses to the previous cell's end"
+        );
+        assert!(d.math.is_none());
+        apply(&mut d, Motion::Left, 1);
+        assert_eq!((d.caret.inline, d.caret.offset), (0, 2));
+        assert_eq!(
+            d.math,
+            Some(math::MathCursor {
+                path: Vec::new(),
+                index: 1
+            }),
+            "entering from the right puts the cursor at the atom's end"
+        );
+    }
+
+    #[test]
+    fn a_display_math_cell_line_is_reachable_and_enter_splits_it() {
+        // A cell whose only run is an atom — the layout renders it
+        // display-style. The keyboard reaches it like any other atom, and
+        // Enter inside it exits and splits the cell line, the rule
+        // `split_cell_line` already implements.
+        let mut d = Document::new(Path::new("notes/equations.md"));
+        d.insert_table();
+        d.insert_inline_math();
+        assert!(
+            matches!(
+                d.body()[0].cells()[0].lines()[0].as_slice(),
+                [Inline::Math(_)]
+            ),
+            "prune leaves the display cell line as a lone atom: {:?}",
+            d.body()[0].cells()[0].lines()[0]
+        );
+        d.math_insert_char('x');
+        d.math_exit_after();
+        d.set_caret(0, 0, 1);
+
+        // `h` from the cell end steps onto the atom and opens the tree.
+        apply(&mut d, Motion::Left, 1);
+        assert_eq!((d.caret.inline, d.caret.offset), (0, 0));
+        assert_eq!(
+            d.math,
+            Some(math::MathCursor {
+                path: Vec::new(),
+                index: 1
+            }),
+            "h onto the display cell atom opens it"
+        );
+
+        // Enter inside the tree: the shell's insert path exits then calls
+        // `newline`, which in a table row is `split_cell_line`.
+        d.math_exit_after();
+        d.newline();
+        let lines = d.body()[0].cells()[0].lines();
+        assert_eq!(lines.len(), 2, "Enter made a second cell line");
+        assert!(matches!(lines[0].as_slice(), [Inline::Math(_)]));
+        assert!(
+            matches!(lines[1].as_slice(), [Inline::Text(t)] if t.text.is_empty()),
+            "the split left a placeholder line below the equation: {:?}",
+            lines[1]
         );
     }
 }
