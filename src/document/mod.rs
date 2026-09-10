@@ -2440,88 +2440,17 @@ impl Document {
             return;
         }
         if self.scope()[b].is_table() {
-            let cell = self.caret.inline;
-            let flat = self.caret.offset;
-            let style = self.caret.style;
-            let at = self.scope()[b].cells()[cell].run_at(flat);
-            let (run, offset) = (at.run, at.offset);
-            let contents =
-                &mut self.scope_mut()[b].cells_mut().expect("table row")[cell].lines_mut()[at.line];
-            let placeholder = contents.len() == 1 && contents[0].text().is_empty();
-            let current_len = flat_len(&contents[run]);
-            let left_style = if offset > 0 {
-                merge_style(&contents[run])
-            } else if run > 0 {
-                merge_style(&contents[run - 1])
-            } else {
-                None
-            };
-            let right_style = if offset < current_len {
-                merge_style(&contents[run])
-            } else if run + 1 < contents.len() {
-                merge_style(&contents[run + 1])
-            } else {
-                None
-            };
-            if placeholder {
-                let value = contents[0].text_mut().expect("a table placeholder is text");
-                value.push_str(text);
-                contents[0].set_style(style);
-            } else if left_style == Some(style) {
-                if offset > 0 {
-                    insert_str(
-                        contents[run]
-                            .text_mut()
-                            .expect("a prose merge target is text"),
-                        offset,
-                        text,
-                    );
-                } else {
-                    contents[run - 1]
-                        .text_mut()
-                        .expect("a prose merge target is text")
-                        .push_str(text);
-                }
-            } else if right_style == Some(style) {
-                if offset < current_len {
-                    insert_str(
-                        contents[run]
-                            .text_mut()
-                            .expect("a prose merge target is text"),
-                        offset,
-                        text,
-                    );
-                } else {
-                    insert_str(
-                        contents[run + 1]
-                            .text_mut()
-                            .expect("a prose merge target is text"),
-                        0,
-                        text,
-                    );
-                }
-            } else {
-                let (prefix, suffix) = split_run(contents.remove(run), offset);
-                contents.splice(
-                    run..run,
-                    [
-                        prefix,
-                        Inline::Text(Text {
-                            text: text.to_string(),
-                            style,
-                        }),
-                        suffix,
-                    ],
-                );
+            // A newline in incoming text is a cell line break, never a raw
+            // `\n` inside a cell: each segment lands on its own line and the
+            // row stays one GFM row.
+            let mut segments = text.split('\n');
+            if let Some(first) = segments.next() {
+                self.insert_cell_text(first);
             }
-            self.caret.offset = flat + text.chars().count();
-            self.dirty = true;
-            self.enforce_block(b);
-            self.caret.inline = cell;
-            self.caret.offset = self
-                .caret
-                .offset
-                .min(self.scope()[b].cells()[cell].flat_len());
+            for segment in segments {
+                self.split_cell_line();
+                self.insert_cell_text(segment);
+            }
             return;
         }
         let s = if self.scope()[b].is_code() {
@@ -2620,6 +2549,101 @@ impl Document {
         let (ni, no) = self.flat_to_pos(b, target.min(self.block_flat_len(b)));
         self.caret.inline = ni;
         self.caret.offset = no;
+    }
+
+    /// Inserts literal text into the caret's table cell at the caret,
+    /// splitting or merging runs exactly as the prose path does. This is one
+    /// segment of a paste: a `\n` never reaches here — the caller has already
+    /// turned it into a cell line break — so a cell holds no raw newline and
+    /// the row stays one GFM row.
+    fn insert_cell_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.clamp_caret();
+        let b = self.caret.block;
+        let cell = self.caret.inline;
+        let flat = self.caret.offset;
+        let style = self.caret.style;
+        let at = self.scope()[b].cells()[cell].run_at(flat);
+        let (run, offset) = (at.run, at.offset);
+        let contents =
+            &mut self.scope_mut()[b].cells_mut().expect("table row")[cell].lines_mut()[at.line];
+        let placeholder = contents.len() == 1 && contents[0].text().is_empty();
+        let current_len = flat_len(&contents[run]);
+        let left_style = if offset > 0 {
+            merge_style(&contents[run])
+        } else if run > 0 {
+            merge_style(&contents[run - 1])
+        } else {
+            None
+        };
+        let right_style = if offset < current_len {
+            merge_style(&contents[run])
+        } else if run + 1 < contents.len() {
+            merge_style(&contents[run + 1])
+        } else {
+            None
+        };
+        if placeholder {
+            let value = contents[0].text_mut().expect("a table placeholder is text");
+            value.push_str(text);
+            contents[0].set_style(style);
+        } else if left_style == Some(style) {
+            if offset > 0 {
+                insert_str(
+                    contents[run]
+                        .text_mut()
+                        .expect("a prose merge target is text"),
+                    offset,
+                    text,
+                );
+            } else {
+                contents[run - 1]
+                    .text_mut()
+                    .expect("a prose merge target is text")
+                    .push_str(text);
+            }
+        } else if right_style == Some(style) {
+            if offset < current_len {
+                insert_str(
+                    contents[run]
+                        .text_mut()
+                        .expect("a prose merge target is text"),
+                    offset,
+                    text,
+                );
+            } else {
+                insert_str(
+                    contents[run + 1]
+                        .text_mut()
+                        .expect("a prose merge target is text"),
+                    0,
+                    text,
+                );
+            }
+        } else {
+            let (prefix, suffix) = split_run(contents.remove(run), offset);
+            contents.splice(
+                run..run,
+                [
+                    prefix,
+                    Inline::Text(Text {
+                        text: text.to_string(),
+                        style,
+                    }),
+                    suffix,
+                ],
+            );
+        }
+        self.caret.offset = flat + text.chars().count();
+        self.dirty = true;
+        self.enforce_block(b);
+        self.caret.inline = cell;
+        self.caret.offset = self
+            .caret
+            .offset
+            .min(self.scope()[b].cells()[cell].flat_len());
     }
 
     /// Inserts inline Markdown that this app produced, reading `$…$` back as

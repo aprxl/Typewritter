@@ -973,8 +973,8 @@ mod tests {
 mod clip_tests {
     use std::path::Path;
 
-    use crate::document::Document;
     use crate::document::markdown::parse;
+    use crate::document::{Block, Document, cell_text};
 
     fn path() -> &'static Path {
         Path::new("table.md")
@@ -983,6 +983,31 @@ mod clip_tests {
     /// Copy a whole-block range with the operator path the shell uses.
     fn copy(document: &Document, first: usize, last: usize) -> String {
         document.range_text(document.line_range(first, last))
+    }
+
+    fn table_document() -> Document {
+        let mut document = Document::new(path());
+        document.insert_table();
+        document
+    }
+
+    #[test]
+    fn a_newline_pasted_into_a_cell_becomes_two_cell_lines() {
+        let mut document = table_document();
+        document.insert_text("a\nb");
+        assert_eq!(document.body().len(), 2, "the row is not duplicated");
+        assert!(document.body().iter().all(Block::is_table));
+        let cell = &document.body()[0].cells()[0];
+        assert_eq!(cell.lines().len(), 2);
+        assert_eq!(cell_text(cell), "a\nb");
+    }
+
+    #[test]
+    fn a_newline_outside_a_table_keeps_its_meaning() {
+        let mut document = Document::new(path());
+        document.insert_text("a\nb");
+        assert_eq!(document.body().len(), 1, "a soft wrap stays one block");
+        assert_eq!(document.block_text(0), "a\nb");
     }
 
     #[test]
