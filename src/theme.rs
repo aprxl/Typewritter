@@ -1336,4 +1336,194 @@ mod tests {
             Color::rgba(1, 2, 3, 0)
         );
     }
+
+    /// One drawn piece of a path, in hundredths so floats compare exactly.
+    /// An arc keeps its flags whole: a corner curving the wrong way is a
+    /// different segment, not a rounding coincidence.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum Segment {
+        Line {
+            from: (i32, i32),
+            to: (i32, i32),
+        },
+        Arc {
+            from: (i32, i32),
+            to: (i32, i32),
+            flags: [i32; 5],
+        },
+    }
+
+    /// A generated path read back as absolute segments — the form in which two
+    /// paths describing one shape agree whatever order or anchoring they were
+    /// written in, which is what lets a test ask whether the border lies on the
+    /// panel's outline rather than merely resembling it.
+    struct PathReader {
+        out: Vec<Segment>,
+        at: (f32, f32),
+        command: char,
+        numbers: Vec<f32>,
+        digits: String,
+    }
+
+    impl PathReader {
+        fn read(d: &str) -> Vec<Segment> {
+            let mut reader = PathReader {
+                out: Vec::new(),
+                at: (0.0, 0.0),
+                command: ' ',
+                numbers: Vec::new(),
+                digits: String::new(),
+            };
+            for ch in d.chars() {
+                if ch.is_ascii_alphabetic() {
+                    reader.flush();
+                    reader.command = ch;
+                } else if ch == ' ' || ch == ',' {
+                    reader.number();
+                } else {
+                    reader.digits.push(ch);
+                }
+            }
+            reader.number();
+            reader.flush();
+            let mut out = reader.out;
+            out.sort();
+            out
+        }
+
+        fn number(&mut self) {
+            if let Ok(value) = self.digits.parse::<f32>() {
+                self.numbers.push(value);
+            }
+            self.digits.clear();
+        }
+
+        fn flush(&mut self) {
+            let hundredths = |value: f32| (value * 100.0).round() as i32;
+            let point = |at: (f32, f32)| (hundredths(at.0), hundredths(at.1));
+            match (self.command, self.numbers.as_slice()) {
+                ('M', [x, y]) => self.at = (*x, *y),
+                ('H', [x]) => {
+                    let end = (*x, self.at.1);
+                    self.out.push(Segment::Line {
+                        from: point(self.at),
+                        to: point(end),
+                    });
+                    self.at = end;
+                }
+                ('V', [y]) => {
+                    let end = (self.at.0, *y);
+                    self.out.push(Segment::Line {
+                        from: point(self.at),
+                        to: point(end),
+                    });
+                    self.at = end;
+                }
+                ('A', [rx, ry, rotation, large, sweep, x, y]) => {
+                    self.out.push(Segment::Arc {
+                        from: point(self.at),
+                        to: point((*x, *y)),
+                        flags: [
+                            hundredths(*rx),
+                            hundredths(*ry),
+                            hundredths(*rotation),
+                            hundredths(*large),
+                            hundredths(*sweep),
+                        ],
+                    });
+                    self.at = (*x, *y);
+                }
+                // `Z` closes a subpath whose ends already meet: nothing to add.
+                _ => {}
+            }
+            self.numbers.clear();
+        }
+    }
+
+    /// A path's segments, sorted so two paths of one shape compare equal.
+    fn segments(d: &str) -> Vec<Segment> {
+        PathReader::read(d)
+    }
+
+    /// The table the editor draws its border around, and the half-pixel inset
+    /// the stroke sits at — the two numbers that tie the border to the panel.
+    fn table_rect() -> Rect {
+        Rect::new(10.0, 20.0, 200.0, 34.0)
+    }
+
+    /// Where the border is stroked: the panel's rect, half a pixel in, at the
+    /// panel's radius less that inset. Corner centres come out at the panel's
+    /// own (8.0 - 0.5 + 0.5), so the two outlines are concentric.
+    fn border_rect(rect: Rect) -> Rect {
+        rect.inset(0.5)
+    }
+
+    fn all_edges() -> TableLines {
+        TableLines {
+            top: true,
+            bottom: true,
+            left: true,
+            right: true,
+            horizontal: true,
+            vertical: true,
+        }
+    }
+
+    /// With every edge switched on the border is the panel's own outline: same
+    /// edges, same corners, same way round. This is the shape the reader saw
+    /// before, and the one a partial border has to stay on.
+    #[test]
+    fn all_four_edges_draw_the_panel_own_outline() {
+        let rect = table_rect();
+        let outline = rounded_rect_path(border_rect(rect), 7.5);
+        let border = table_border_path(border_rect(rect), 7.5, all_edges());
+        assert_eq!(
+            segments(&outline).len(),
+            8,
+            "four edges and four corners, read whole"
+        );
+        assert_eq!(
+            segments(&border),
+            segments(&outline),
+            "border {border}\noutline {outline}"
+        );
+    }
+
+    /// Every combination, including the one that used to square off: each
+    /// drawn edge and corner lies exactly on the panel's rounded outline, and
+    /// none of the omitted edges is drawn.
+    #[test]
+    fn every_edge_combination_stays_on_the_panel_outline() {
+        let rect = table_rect();
+        let outline = segments(&rounded_rect_path(border_rect(rect), 7.5));
+        for case in 0..16u8 {
+            let lines = TableLines {
+                top: case & 1 != 0,
+                bottom: case & 2 != 0,
+                left: case & 4 != 0,
+                right: case & 8 != 0,
+                horizontal: true,
+                vertical: true,
+            };
+            let border = table_border_path(rect.inset(0.5), 7.5, lines);
+            let drawn = segments(&border);
+            // One run per enabled edge, plus a corner wherever two enabled
+            // edges meet: the count is what says the path was read at all.
+            let seams = [0b0101u8, 0b1001, 0b0110, 0b1010]
+                .iter()
+                .filter(|pair| case & *pair == **pair)
+                .count();
+            assert_eq!(
+                drawn.len(),
+                case.count_ones() as usize + seams,
+                "case {case} draws its edges and their seams: {border}"
+            );
+            for segment in drawn {
+                assert!(
+                    outline.contains(&segment),
+                    "case {case} draws {segment:?}, which is not on the panel's outline: {border}"
+                );
+            }
+        }
+    }
 }
