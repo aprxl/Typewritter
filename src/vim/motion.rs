@@ -8,7 +8,7 @@
 //! here — moving between *visual* lines needs pixels, so the shell applies
 //! them through the layout's `line_up`/`line_down`.
 
-use crate::document::{Block, Document, Inline};
+use crate::document::{Block, Document, FlatPos, Inline};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Motion {
@@ -62,23 +62,30 @@ fn inline_text(run: &Inline) -> String {
     }
 }
 
-fn inline_len(run: &Inline) -> usize {
-    crate::document::flat_len(run)
-}
-
-/// The block's flat text — its runs' strings concatenated.
+/// The block's flat text — one char per flat position, a table row's cells
+/// included. A cell's flat space is its runs plus one position per line
+/// break, and `cell_text` joins those lines with exactly that one `\n`, so
+/// concatenating the cells gives a row the same flat text prose has. One
+/// char-per-position is what lets `0`/`a`/`f`/`t` be a single code path for
+/// prose and for a row.
 fn block_text(block: &Block) -> String {
-    block.inlines().iter().map(inline_text).collect()
+    match block {
+        Block::TableRow { cells, .. } => cells.iter().map(crate::document::cell_text).collect(),
+        block => block.inlines().iter().map(inline_text).collect(),
+    }
 }
 
+/// Flat length of a block, its cells included — the model's one flat-length
+/// rule (`Block::flat_len`), so this reader can never drift from the caret
+/// arithmetic that addresses the same positions.
 fn block_len(block: &Block) -> usize {
-    block_text(block).chars().count()
+    block.flat_len()
 }
 
 fn table_cell_text(doc: &Document) -> String {
-    // A cell's flat space is its runs plus one position per line break, and
-    // `cell_text` joins the lines with exactly one `\n` each — so a char index
-    // into this string is a cell-flat offset.
+    // A cell's flat text. Word motion is cell-local (a cell is a scope it
+    // must not leave), so this is the one reader that reaches into a cell
+    // directly; every positional read goes through `block_text` instead.
     crate::document::cell_text(&doc.scope()[doc.caret.block].cells()[doc.caret.inline])
 }
 
@@ -137,42 +144,24 @@ fn class_at(doc: &Document, block: usize, flat: usize) -> Option<CharClass> {
         .and_then(class)
 }
 
-/// The caret as a `(block, flat)` pair, clamped into bounds.
+/// The caret as a `(block, flat)` pair, clamped into bounds. The model owns
+/// this conversion (`Document::caret_position`), so a table row — whose flat
+/// space is its cells — is the same read as prose.
 fn caret_pos(doc: &Document) -> (usize, usize) {
-    let caret = doc.caret;
-    let block = &doc.scope()[caret.block];
-    let runs = block.inlines();
-    let inline = caret.inline.min(runs.len().saturating_sub(1));
-    let prefix: usize = runs[..inline].iter().map(inline_len).sum();
-    let offset = caret.offset.min(block_len(block) - prefix);
-    let flat = (prefix + offset).min(block_len(block));
-    (caret.block, flat)
+    let position = doc.caret_position();
+    (position.block, position.offset)
 }
 
-/// Places the caret at `(block, flat)` — the model's `set_caret` does the
-/// clamping and the style-before context rule. `flat` past the block's end
-/// clamps to it (the block always has ≥1 run).
+/// Places the caret at `(block, flat)` — the model's `set_flat_position`
+/// does the clamping, the style-before context rule and the flat-to-unit
+/// split, so a row's flat position becomes its `(cell, cell-offset)` for
+/// free. `flat` past the block's end clamps to it (the block always has
+/// ≥1 run).
 fn set_pos(doc: &mut Document, block: usize, flat: usize) {
-    let len = block_len(&doc.scope()[block]);
-    if len == 0 {
-        doc.set_caret(block, 0, 0);
-        return;
-    }
-    let flat = flat.min(len);
-    let runs = doc.scope()[block].inlines();
-    let mut acc = 0;
-    for (i, run) in runs.iter().enumerate() {
-        let run_len = inline_len(run);
-        if flat < acc + run_len {
-            doc.set_caret(block, i, flat - acc);
-            return;
-        }
-        acc += run_len;
-    }
-    // Flat landed exactly at the end of the last run.
-    let last = runs.len() - 1;
-    let last_len = inline_len(&runs[last]);
-    doc.set_caret(block, last, last_len);
+    doc.set_flat_position(FlatPos {
+        block,
+        offset: flat,
+    });
 }
 
 /// One character forward, stepping onto the next block when the current one
@@ -309,25 +298,13 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
                 }
             }
         }
+        // One logical character right, clamped to the block's end — the
+        // model's `move_right` would cross into the next block, which `a`
+        // must not do at the end of a line. A row's flat space includes its
+        // cells, so this is the same step in prose and in a cell.
         Motion::Append => {
-            if doc.in_table() {
-                let len = table_cell_text(doc).chars().count();
-                doc.set_caret(
-                    doc.caret.block,
-                    doc.caret.inline,
-                    doc.caret.offset.saturating_add(1).min(len),
-                );
-                return;
-            }
-            // One logical character right, clamped to the block's end —
-            // `move_right` would cross into the next block, which `a` must
-            // not do at the end of a line.
             let (block, flat) = caret_pos(doc);
-            set_pos(
-                doc,
-                block,
-                flat.saturating_add(1).min(block_len(&doc.scope()[block])),
-            );
+            set_pos(doc, block, flat.saturating_add(1));
         }
         Motion::Up | Motion::Down => {}
         Motion::WordForward => {
@@ -335,39 +312,39 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
                 for _ in 0..count {
                     table_word_forward(doc);
                 }
-                return;
+            } else {
+                let mut pos = caret_pos(doc);
+                for _ in 0..count {
+                    pos = word_forward(doc, pos);
+                }
+                set_pos(doc, pos.0, pos.1);
             }
-            let mut pos = caret_pos(doc);
-            for _ in 0..count {
-                pos = word_forward(doc, pos);
-            }
-            set_pos(doc, pos.0, pos.1);
         }
         Motion::WordBack => {
             if doc.in_table() {
                 for _ in 0..count {
                     table_word_back(doc);
                 }
-                return;
+            } else {
+                let mut pos = caret_pos(doc);
+                for _ in 0..count {
+                    pos = word_back(doc, pos);
+                }
+                set_pos(doc, pos.0, pos.1);
             }
-            let mut pos = caret_pos(doc);
-            for _ in 0..count {
-                pos = word_back(doc, pos);
-            }
-            set_pos(doc, pos.0, pos.1);
         }
         Motion::WordEnd => {
             if doc.in_table() {
                 for _ in 0..count {
                     table_word_end(doc);
                 }
-                return;
+            } else {
+                let mut pos = caret_pos(doc);
+                for _ in 0..count {
+                    pos = word_end(doc, pos);
+                }
+                set_pos(doc, pos.0, pos.1);
             }
-            let mut pos = caret_pos(doc);
-            for _ in 0..count {
-                pos = word_end(doc, pos);
-            }
-            set_pos(doc, pos.0, pos.1);
         }
         Motion::LineStart => {
             if doc.in_table() {
@@ -381,12 +358,12 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
                 let text = table_cell_text(doc);
                 let offset = text.chars().take_while(|c| c.is_whitespace()).count();
                 doc.set_caret(doc.caret.block, doc.caret.inline, offset);
-                return;
+            } else {
+                let (block, _) = caret_pos(doc);
+                let text = block_text(&doc.scope()[block]);
+                let col = text.chars().take_while(|c| c.is_whitespace()).count();
+                set_pos(doc, block, col);
             }
-            let (block, _) = caret_pos(doc);
-            let text = block_text(&doc.scope()[block]);
-            let col = text.chars().take_while(|c| c.is_whitespace()).count();
-            set_pos(doc, block, col);
         }
         Motion::LineEnd => {
             if doc.in_table() {
@@ -419,23 +396,6 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
             set_pos(doc, block, 0);
         }
         Motion::FindForward(target) => {
-            if doc.in_table() {
-                let text: Vec<char> = table_cell_text(doc).chars().collect();
-                let mut offset = doc.caret.offset.min(text.len());
-                for _ in 0..count {
-                    if let Some(found) = text
-                        .iter()
-                        .enumerate()
-                        .skip(offset.saturating_add(1))
-                        .find(|(_, c)| **c == target)
-                        .map(|(index, _)| index)
-                    {
-                        offset = found;
-                    }
-                }
-                doc.set_caret(doc.caret.block, doc.caret.inline, offset);
-                return;
-            }
             let mut pos = caret_pos(doc);
             for _ in 0..count {
                 let text = block_text(&doc.scope()[pos.0]);
@@ -451,23 +411,6 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
             set_pos(doc, pos.0, pos.1);
         }
         Motion::TillForward(target) => {
-            if doc.in_table() {
-                let text: Vec<char> = table_cell_text(doc).chars().collect();
-                let mut offset = doc.caret.offset.min(text.len());
-                for _ in 0..count {
-                    if let Some(found) = text
-                        .iter()
-                        .enumerate()
-                        .skip(offset.saturating_add(1))
-                        .find(|(_, c)| **c == target)
-                        .map(|(index, _)| index)
-                    {
-                        offset = found.saturating_sub(1);
-                    }
-                }
-                doc.set_caret(doc.caret.block, doc.caret.inline, offset);
-                return;
-            }
             let mut pos = caret_pos(doc);
             for _ in 0..count {
                 let text = block_text(&doc.scope()[pos.0]);
@@ -483,23 +426,6 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
             set_pos(doc, pos.0, pos.1);
         }
         Motion::FindBack(target) => {
-            if doc.in_table() {
-                let text: Vec<char> = table_cell_text(doc).chars().collect();
-                let mut offset = doc.caret.offset.min(text.len());
-                for _ in 0..count {
-                    if let Some(found) = text[..offset]
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find(|(_, c)| **c == target)
-                        .map(|(index, _)| index)
-                    {
-                        offset = found;
-                    }
-                }
-                doc.set_caret(doc.caret.block, doc.caret.inline, offset);
-                return;
-            }
             let mut pos = caret_pos(doc);
             for _ in 0..count {
                 let text: Vec<char> = block_text(&doc.scope()[pos.0]).chars().collect();
@@ -515,23 +441,6 @@ pub fn apply(doc: &mut Document, motion: Motion, count: usize) {
             set_pos(doc, pos.0, pos.1);
         }
         Motion::TillBack(target) => {
-            if doc.in_table() {
-                let text: Vec<char> = table_cell_text(doc).chars().collect();
-                let mut offset = doc.caret.offset.min(text.len());
-                for _ in 0..count {
-                    if let Some(found) = text[..offset]
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find(|(_, c)| **c == target)
-                        .map(|(index, _)| index)
-                    {
-                        offset = (found + 1).min(text.len());
-                    }
-                }
-                doc.set_caret(doc.caret.block, doc.caret.inline, offset);
-                return;
-            }
             let mut pos = caret_pos(doc);
             for _ in 0..count {
                 let text: Vec<char> = block_text(&doc.scope()[pos.0]).chars().collect();
@@ -731,5 +640,41 @@ mod tests {
         // is offset 3 — landing on 4 proves the motion read the note, not the
         // body, even though both live at block 0.
         assert_eq!(pos(&d), (0, 4));
+    }
+
+    #[test]
+    fn cell_positional_motions_read_the_cells_flat_text() {
+        // `a`, `f`, `t`, `F` and `T` are positional reads of the block's
+        // flat space. A row's flat space is its cells, so they now run
+        // through the generic arm with no per-table branch: the search
+        // crosses cell boundaries exactly as it crosses a run boundary.
+        let mut d = Document::new(Path::new("notes/table.md"));
+        d.insert_table();
+        d.insert_text("one two");
+        d.set_caret(0, 0, 0);
+
+        apply(&mut d, Motion::Append, 1);
+        assert_eq!(
+            (d.caret.inline, d.caret.offset),
+            (0, 1),
+            "a steps one char right"
+        );
+
+        apply(&mut d, Motion::FindForward('t'), 1);
+        assert_eq!((d.caret.inline, d.caret.offset), (0, 4), "f lands on the t");
+
+        apply(&mut d, Motion::TillForward('o'), 1);
+        assert_eq!(
+            (d.caret.inline, d.caret.offset),
+            (0, 5),
+            "t stops before the o"
+        );
+
+        apply(&mut d, Motion::FindBack('n'), 1);
+        assert_eq!(
+            (d.caret.inline, d.caret.offset),
+            (0, 1),
+            "F walks back to the n"
+        );
     }
 }
