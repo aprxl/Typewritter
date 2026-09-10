@@ -59,12 +59,11 @@ fn inline_text(run: &Inline) -> String {
     match run {
         Inline::Text(text) => text.text.clone(),
         Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => "\u{FFFC}".into(),
-        Inline::TableCell(contents) => contents.iter().map(inline_text).collect(),
     }
 }
 
 fn inline_len(run: &Inline) -> usize {
-    inline_text(run).chars().count()
+    crate::document::flat_len(run)
 }
 
 /// The block's flat text — its runs' strings concatenated.
@@ -77,7 +76,10 @@ fn block_len(block: &Block) -> usize {
 }
 
 fn table_cell_text(doc: &Document) -> String {
-    inline_text(&doc.scope()[doc.caret.block].inlines()[doc.caret.inline])
+    // A cell's flat space is its runs plus one position per line break, and
+    // `cell_text` joins the lines with exactly one `\n` each — so a char index
+    // into this string is a cell-flat offset.
+    crate::document::cell_text(&doc.scope()[doc.caret.block].cells()[doc.caret.inline])
 }
 
 fn table_word_forward(doc: &mut Document) {
@@ -141,10 +143,7 @@ fn caret_pos(doc: &Document) -> (usize, usize) {
     let block = &doc.scope()[caret.block];
     let runs = block.inlines();
     let inline = caret.inline.min(runs.len().saturating_sub(1));
-    let prefix: usize = runs[..inline]
-        .iter()
-        .map(inline_len)
-        .sum();
+    let prefix: usize = runs[..inline].iter().map(inline_len).sum();
     let offset = caret.offset.min(block_len(block) - prefix);
     let flat = (prefix + offset).min(block_len(block));
     (caret.block, flat)

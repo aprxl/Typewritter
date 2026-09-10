@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::{
     Block, Caret, Document, FlatPos, FlatRange, Inline, ListMarker, Style, fold_region_end,
-    math_layout, outline,
+    math_layout, outline, table,
 };
 use crate::theme::{self, TextStyle};
 
@@ -513,7 +513,6 @@ pub fn advance(
             let display = number.unwrap_or_default();
             measure(display, &eq_ref_style(display, scale))
         }
-        Inline::TableCell(_) => unreachable!("table-cell wrappers are not laid out as runs"),
     };
     let box_pad = if style.badge {
         theme::BADGE_PAD * 2.0 * scale
@@ -799,7 +798,6 @@ fn table_cell_layout(
                         Some(expression.ascent + expression.descent + MATH_LEADING * scale)
                     }
                     Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
-                    Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
                 })
                 .fold(0.0, f32::max);
             let height = (TABLE_TEXT_LINE_HEIGHT * scale).max(content_height);
@@ -815,12 +813,8 @@ fn table_cell_layout(
         .collect()
 }
 
-fn table_cell_block(cell: &Inline) -> Block {
-    Block::Paragraph(
-        cell.table_cell_contents()
-            .expect("table rows contain table-cell wrappers")
-            .to_vec(),
-    )
+fn table_cell_block(cell: &table::Cell) -> Block {
+    Block::Paragraph(cell.runs().to_vec())
 }
 
 fn table_cell_height(lines: &[VisLine]) -> f32 {
@@ -879,8 +873,8 @@ fn table_layout_for(
             row == first || matches!(blocks.get(row), Some(Block::TableRow { first: false, .. }))
         })
         .count();
-    let columns = blocks[first].inlines().len();
-    let settings = settings.clone().normalized(columns, rows);
+    let columns = blocks[first].cells().len();
+    let settings = (**settings).clone().normalized(columns, rows);
     let mut tracks = Vec::with_capacity(columns);
     let mut used = 0.0;
     for (column, share) in settings.column_shares.iter().enumerate() {
@@ -893,13 +887,12 @@ fn table_layout_for(
         used += track;
     }
     let cells = blocks[index]
-        .inlines()
+        .cells()
         .iter()
         .enumerate()
         .map(|(column, cell)| {
             table_cell_layout(
-                cell.table_cell_contents()
-                    .expect("table rows contain table-cell wrappers"),
+                cell.runs(),
                 (tracks[column] - TABLE_CELL_PAD * 2.0 * scale).max(1.0),
                 scale,
                 measure,
@@ -1124,9 +1117,6 @@ pub fn layout_blocks(
                                     )
                                 }
                                 Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
-                                Inline::TableCell(_) => {
-                                    unreachable!("table-cell wrappers use table layout")
-                                }
                             }
                         })
                         .fold(0.0, f32::max);
@@ -1256,7 +1246,6 @@ fn run_text(run: &Inline) -> &str {
         Inline::Math(_) => "\u{FFFC}",
         Inline::Note(_) => "\u{FFFC}",
         Inline::EqRef(_) => "\u{FFFC}",
-        Inline::TableCell(_) => unreachable!("table-cell wrappers must be flattened first"),
     }
 }
 
@@ -1278,7 +1267,6 @@ fn run_style(run: &Inline) -> Style {
         Inline::Math(_) => Style::PLAIN,
         Inline::Note(_) => Style::PLAIN,
         Inline::EqRef(_) => Style::PLAIN,
-        Inline::TableCell(_) => unreachable!("table-cell wrappers must be flattened first"),
     }
 }
 
@@ -1745,7 +1733,7 @@ impl DocLayout {
             let cell = caret.inline.min(table.columns.len().saturating_sub(1));
             let left: f32 = table.columns.iter().take(cell).sum();
             let inset = TABLE_CELL_PAD * self.scale;
-            let cell_block = table_cell_block(&self.source[caret.block].inlines()[cell]);
+            let cell_block = table_cell_block(&self.source[caret.block].cells()[cell]);
             let lines = &table.cells[cell];
             let line_index = table_cell_line_of_flat(lines, caret.offset);
             let line = &lines[line_index];
@@ -1812,7 +1800,7 @@ impl DocLayout {
                 left += width;
             }
             let target = (x - left - TABLE_CELL_PAD * self.scale).max(0.0);
-            let cell_block = table_cell_block(&self.source[block_idx].inlines()[cell]);
+            let cell_block = table_cell_block(&self.source[block_idx].cells()[cell]);
             let lines = &table.cells[cell];
             let content_top = self.blocks[block_idx].y
                 + (table.row_height - table_cell_height(lines)).max(0.0) * 0.5;
@@ -1885,8 +1873,7 @@ impl DocLayout {
             let cell = self.table_cell_at(x, y)?;
             let left: f32 = table.columns.iter().take(cell.column).sum();
             let inset = TABLE_CELL_PAD * self.scale;
-            let wrapper = &self.source[block_idx].inlines()[cell.column];
-            let cell_block = table_cell_block(wrapper);
+            let cell_block = table_cell_block(&self.source[block_idx].cells()[cell.column]);
             let lines = &table.cells[cell.column];
             let content_top = self.blocks[block_idx].y
                 + (table.row_height - table_cell_height(lines)).max(0.0) * 0.5;
@@ -1896,15 +1883,9 @@ impl DocLayout {
             let line = &lines[line_index];
             let local_x = x - left - inset;
             let baseline = content_top + line.y + line.height * 0.5;
-            let cell_base: usize = self.source[block_idx].inlines()[..cell.column]
+            let cell_base: usize = self.source[block_idx].cells()[..cell.column]
                 .iter()
-                .map(|cell| {
-                    cell.table_cell_contents()
-                        .expect("table rows contain table-cell wrappers")
-                        .iter()
-                        .map(|run| run_text(run).chars().count())
-                        .sum::<usize>()
-                })
+                .map(table::Cell::flat_len)
                 .sum();
             let mut advance_x = 0.0;
             for segment in &line.segments {
@@ -2477,8 +2458,7 @@ impl DocLayout {
             let cell = self.table_cell_at(x, y)?;
             let left: f32 = table.columns.iter().take(cell.column).sum();
             let inset = TABLE_CELL_PAD * self.scale;
-            let wrapper = &self.source[block_idx].inlines()[cell.column];
-            let cell_block = table_cell_block(wrapper);
+            let cell_block = table_cell_block(&self.source[block_idx].cells()[cell.column]);
             let lines = &table.cells[cell.column];
             let content_top = self.blocks[block_idx].y
                 + (table.row_height - table_cell_height(lines)).max(0.0) * 0.5;
@@ -2501,15 +2481,9 @@ impl DocLayout {
                         && local.1 >= -bounds.descent
                         && local.1 <= bounds.ascent
                     {
-                        let offset = self.source[block_idx].inlines()[..cell.column]
+                        let offset = self.source[block_idx].cells()[..cell.column]
                             .iter()
-                            .map(|cell| {
-                                cell.table_cell_contents()
-                                    .expect("table rows contain table-cell wrappers")
-                                    .iter()
-                                    .map(|run| run_text(run).chars().count())
-                                    .sum::<usize>()
-                            })
+                            .map(table::Cell::flat_len)
                             .sum::<usize>()
                             + cell_block.inlines()[..segment.inline]
                                 .iter()

@@ -255,9 +255,6 @@ fn parse_inline(s: &str) -> Vec<Inline> {
                                 Inline::Math(list) => runs.push(Inline::Math(list)),
                                 Inline::Note(label) => runs.push(Inline::Note(label)),
                                 Inline::EqRef(label) => runs.push(Inline::EqRef(label)),
-                                Inline::TableCell(_) => {
-                                    unreachable!("inline parsing never creates table-cell wrappers")
-                                }
                             }
                         }
                         i = cl + 2;
@@ -523,7 +520,7 @@ fn table_divider_columns(line: &str) -> Option<usize> {
     .then_some(cells.len())
 }
 
-fn table_cells(cells: Vec<String>) -> Vec<Inline> {
+fn table_cells(cells: Vec<String>) -> Vec<table::Cell> {
     cells
         .into_iter()
         .map(|text| {
@@ -534,7 +531,7 @@ fn table_cells(cells: Vec<String>) -> Vec<Inline> {
                     style: Style::PLAIN,
                 }));
             }
-            Inline::TableCell(contents)
+            table::Cell::from_runs(contents)
         })
         .collect()
 }
@@ -553,15 +550,15 @@ fn table_rows(blocks: &[Block], first: usize) -> usize {
 
 fn apply_table_settings(blocks: &mut [Block], first: usize, settings: table::TableSettings) {
     let rows = table_rows(blocks, first);
-    let columns = blocks[first].inlines().len();
-    let settings = settings.normalized(columns, rows);
+    let columns = blocks[first].cells().len();
+    let shared = std::sync::Arc::new(settings.normalized(columns, rows));
     for row in &mut blocks[first..first + rows] {
         if let Block::TableRow {
             settings: row_settings,
             ..
         } = row
         {
-            *row_settings = settings.clone();
+            *row_settings = std::sync::Arc::clone(&shared);
         }
     }
 }
@@ -624,11 +621,13 @@ fn table_metadata(settings: &table::TableSettings) -> String {
     )
 }
 
-fn serialize_table_cell(cell: &Inline) -> String {
-    let Inline::TableCell(contents) = cell else {
-        unreachable!("table rows contain table-cell wrappers")
-    };
-    serialize_runs(contents).replace('|', "\\|")
+fn serialize_table_cell(cell: &table::Cell) -> String {
+    cell.lines()
+        .iter()
+        .map(|line| serialize_runs(line))
+        .collect::<Vec<_>>()
+        .join("<br>")
+        .replace('|', "\\|")
 }
 
 /// Build a `Document` from Markdown text. `path` only seeds `Document`'s
@@ -679,10 +678,15 @@ pub fn parse(path: &Path, text: &str) -> Document {
                     .expect("open table starts on a table row")
                     .clone()
                     .normalized(columns, rows);
+                let shared = std::sync::Arc::clone(
+                    blocks[first]
+                        .table_settings_arc()
+                        .expect("open table starts on a table row"),
+                );
                 blocks.push(Block::TableRow {
                     cells: table_cells(cells),
                     first: false,
-                    settings: settings.clone(),
+                    settings: shared,
                 });
                 apply_table_settings(&mut blocks, first, settings);
                 continue;
@@ -777,7 +781,7 @@ pub fn parse(path: &Path, text: &str) -> Document {
             && let Some(cells) = parse_table_cells(&para[0], Some(columns))
         {
             para.clear();
-            let settings = table::TableSettings::new(columns, 1);
+            let settings = std::sync::Arc::new(table::TableSettings::new(columns, 1));
             let first = blocks.len();
             blocks.push(Block::TableRow {
                 cells: table_cells(cells),
@@ -981,7 +985,6 @@ fn serialize_runs(runs: &[Inline]) -> String {
         Inline::Math(list) => format!("${}$", math_notation::print(list)),
         Inline::Note(label) => format!("[^{label}]"),
         Inline::EqRef(label) => format!("@{label}"),
-        Inline::TableCell(_) => unreachable!("serialize table-cell contents, not the wrapper"),
     };
     let mut out = String::new();
     let mut i = 0;
@@ -1059,7 +1062,7 @@ fn serialize_plain(doc: &Document) -> String {
                 ..
             } => {
                 let first_table_row = &doc.body()[i];
-                let columns = first_table_row.inlines().len();
+                let columns = first_table_row.cells().len();
                 let mut end = i + 1;
                 while matches!(
                     doc.body().get(end),
@@ -1068,10 +1071,10 @@ fn serialize_plain(doc: &Document) -> String {
                     end += 1;
                 }
                 let rows = end - i;
-                let settings = settings.clone().normalized(columns, rows);
+                let settings = (**settings).clone().normalized(columns, rows);
                 let write_row = |out: &mut String, row: &Block| {
                     out.push('|');
-                    for cell in row.inlines() {
+                    for cell in row.cells() {
                         out.push(' ');
                         out.push_str(&serialize_table_cell(cell));
                         out.push_str(" |");
@@ -1440,7 +1443,7 @@ mod tests {
         assert!(document.body().iter().all(Block::is_table));
         assert!(document.body()[0].table_first());
         assert_eq!(
-            super::super::table_cell_text(&document.body()[1].inlines()[0]),
+            super::super::cell_text(&document.body()[1].cells()[0]),
             "a|b"
         );
         let settings = document.body()[0].table_settings().unwrap();
@@ -1471,14 +1474,11 @@ mod tests {
     fn a_formatted_table_cell_remains_one_structural_cell_on_disk() {
         let text = "| **Left** | Right |\n| --- | --- |\n<!-- typewritter-table v1 lines=111111 cols=0.500000,0.500000 rows=38.00 -->\n";
         let document = parse(Path::new("table.md"), text);
-        let Inline::TableCell(contents) = &document.body()[0].inlines()[0] else {
-            panic!("a table cell keeps one structural wrapper")
-        };
-        let [Inline::Text(cell)] = contents.as_slice() else {
+        let [Inline::Text(cell)] = document.body()[0].cells()[0].runs() else {
             panic!("the formatted cell contains one text run")
         };
         assert!(cell.style.bold);
-        assert_eq!(document.body()[0].inlines().len(), 2);
+        assert_eq!(document.body()[0].cells().len(), 2);
         assert_eq!(serialize(&document), text);
     }
 
@@ -1487,10 +1487,10 @@ mod tests {
         let text = "| $x/2$ | Right |\n| --- | --- |\n<!-- typewritter-table v1 lines=111111 cols=0.500000,0.500000 rows=38.00 -->\n";
         let document = parse(Path::new("table.md"), text);
         assert!(matches!(
-            &document.body()[0].inlines()[0],
-            Inline::TableCell(contents) if matches!(contents.as_slice(), [Inline::Math(_)])
+            document.body()[0].cells()[0].runs(),
+            [Inline::Math(_)]
         ));
-        assert_eq!(document.body()[0].inlines().len(), 2);
+        assert_eq!(document.body()[0].cells().len(), 2);
         assert_eq!(serialize(&document), text);
         assert_eq!(
             parse(Path::new("table.md"), &serialize(&document)).body(),
@@ -1502,10 +1502,10 @@ mod tests {
     fn mixed_table_cell_formatting_and_math_round_trip_in_one_cell() {
         let text = "| **bold** plain $x$ tail | Right |\n| --- | --- |\n<!-- typewritter-table v1 lines=111111 cols=0.500000,0.500000 rows=38.00 -->\n";
         let document = parse(Path::new("table.md"), text);
-        let Inline::TableCell(contents) = &document.body()[0].inlines()[0] else {
-            panic!("the first structural cell remains wrapped")
-        };
-        assert!(matches!(&contents[0], Inline::Text(text) if text.text == "bold" && text.style.bold));
+        let contents = document.body()[0].cells()[0].runs();
+        assert!(
+            matches!(&contents[0], Inline::Text(text) if text.text == "bold" && text.style.bold)
+        );
         assert!(contents.iter().any(|run| matches!(run, Inline::Math(_))));
         assert_eq!(serialize(&document), text);
         assert_eq!(
