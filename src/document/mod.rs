@@ -1136,6 +1136,18 @@ impl Document {
             text.push_str(&self.block_range_text(block, from, to));
             if block != end.block {
                 text.push('\n');
+                // A header row is only a row until its divider follows it: a
+                // copy of the header plus the rows under it must read back as
+                // a table, not a stack of unrelated pipe rows.
+                if self.scope()[block].table_first()
+                    && matches!(
+                        self.scope().get(block + 1),
+                        Some(Block::TableRow { first: false, .. })
+                    )
+                {
+                    text.push_str(&self.table_row_divider(block));
+                    text.push('\n');
+                }
             }
         }
         text
@@ -1147,8 +1159,16 @@ impl Document {
     /// `from`/`to` stay aligned with every other flat offset. Prose is escaped
     /// so the result is the same notation `markdown::serialize` writes to
     /// disk: a literal `$` becomes `\$`, which cannot reopen math on the way
-    /// back in.
+    /// back in. A table row is the one exception: its text form is the whole
+    /// GFM pipe line its cells make, since a slice of a row is not Markdown.
     fn block_range_text(&self, block: usize, from: usize, to: usize) -> String {
+        // A row's text form is one GFM pipe line: its cells rebuilt the way
+        // `markdown::serialize` writes them, so a copied row parses back
+        // into the same cells. A slice of a row is not valid Markdown, so a
+        // partial range still copies the whole row.
+        if self.scope()[block].is_table() {
+            return self.table_row_markdown(block);
+        }
         let mut out = String::new();
         let mut cursor = 0;
         for run in block_runs(&self.scope()[block]) {

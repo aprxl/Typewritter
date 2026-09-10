@@ -5,8 +5,9 @@
 //! arithmetic — lines, flat offsets, run positions — lives on
 //! [`super::table::Cell`] itself.
 
+use super::math_notation;
 use super::table;
-use super::{Block, Document, Focus, TableDirection};
+use super::{BadgeColor, Block, Document, Focus, Inline, Style, TableDirection};
 use super::{flat_len, placeholder_if_empty, slice_inline_runs, table_row};
 
 /// The extent of one table in the block stream. `first` and `end` are the
@@ -508,6 +509,163 @@ impl Document {
     }
 }
 
+impl Document {
+    /// One table row as the GFM line `markdown::serialize` would write:
+    /// `| a | b |`. Each cell is its lines joined with `<br>`, a literal `|`
+    /// escaped, math written `$…$` and styles carrying their Markdown
+    /// markers, so a copied row parses back into the same cells.
+    pub(crate) fn table_row_markdown(&self, block: usize) -> String {
+        let Some(row) = self.scope().get(block).filter(|row| row.is_table()) else {
+            return String::new();
+        };
+        let mut out = String::from("|");
+        for cell in row.cells() {
+            out.push(' ');
+            out.push_str(&cell_markdown(cell));
+            out.push_str(" |");
+        }
+        out
+    }
+
+    /// The Markdown divider row of the table whose header is `block` —
+    /// `| --- | --- |` — carrying its per-column alignment. A copy of a
+    /// header row together with the rows under it needs it to read back as a
+    /// table rather than a stack of unrelated pipe rows.
+    pub(crate) fn table_row_divider(&self, block: usize) -> String {
+        let Some(settings) = self.scope().get(block).and_then(Block::table_settings) else {
+            return String::new();
+        };
+        let mut out = String::from("|");
+        for align in &settings.align {
+            out.push(' ');
+            out.push_str(match align {
+                table::ColumnAlign::None => "---",
+                table::ColumnAlign::Left => ":---",
+                table::ColumnAlign::Centre => ":---:",
+                table::ColumnAlign::Right => "---:",
+            });
+            out.push_str(" |");
+        }
+        out
+    }
+
+    /// The text of the cell the caret sits in, if it is in a table. Read
+    /// before a cell-clearing edit so the yank register can carry what the
+    /// edit removed.
+    pub fn caret_cell_text(&self) -> Option<String> {
+        if !self.in_table() {
+            return None;
+        }
+        let block = self.caret.block.min(self.scope().len().saturating_sub(1));
+        let cells = self.scope().get(block)?.cells();
+        if cells.is_empty() {
+            return None;
+        }
+        let cell = self.caret.inline.min(cells.len() - 1);
+        Some(super::cell_text(&cells[cell]))
+    }
+}
+
+/// One cell as its on-disk Markdown: lines joined with `<br>`, a literal
+/// `<br` escaped, a literal `|` escaped exactly as
+/// `markdown::serialize_table_cell` writes it.
+fn cell_markdown(cell: &table::Cell) -> String {
+    cell.lines()
+        .iter()
+        .map(|line| runs_markdown(line).replace("<br", "\\<br"))
+        .collect::<Vec<_>>()
+        .join("<br>")
+        .replace('|', "\\|")
+}
+
+/// A line's runs in Markdown: text escaped then wrapped in its style markers,
+/// math as `$…$`, and one shared `==…==` over a stretch of marked runs.
+fn runs_markdown(runs: &[Inline]) -> String {
+    let one = |run: &Inline, style: Style| match run {
+        Inline::Text(t) => {
+            if style.is_boxed() {
+                wrap_markdown(style, &t.text)
+            } else {
+                wrap_markdown(style, &escape_markdown(&t.text))
+            }
+        }
+        Inline::Math(list) => format!("${}$", math_notation::print(list)),
+        Inline::Note(label) => format!("[^{label}]"),
+        Inline::EqRef(label) => format!("@{label}"),
+    };
+    let mut out = String::new();
+    let mut i = 0;
+    while i < runs.len() {
+        if !runs[i].style().highlight {
+            out.push_str(&one(&runs[i], runs[i].style()));
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while runs.get(end + 1).is_some_and(|run| run.style().highlight) {
+            end += 1;
+        }
+        out.push_str("==");
+        for run in &runs[i..=end] {
+            out.push_str(&one(
+                run,
+                Style {
+                    highlight: false,
+                    ..run.style()
+                },
+            ));
+        }
+        out.push_str("==");
+        i = end + 1;
+    }
+    out
+}
+
+/// Wrap one run's text in the marker for its style, the same spellings
+/// `markdown::parse` reads back.
+fn wrap_markdown(style: Style, escaped: &str) -> String {
+    if style.code {
+        format!("`{escaped}`")
+    } else if style.badge {
+        match style.badge_color {
+            BadgeColor::Orange => format!("[[{escaped}]]"),
+            BadgeColor::Blue => format!("[[blue|{escaped}]]"),
+            BadgeColor::Green => format!("[[green|{escaped}]]"),
+            BadgeColor::Purple => format!("[[purple|{escaped}]]"),
+        }
+    } else if style.bold && style.italic {
+        format!("***{escaped}***")
+    } else if style.bold {
+        format!("**{escaped}**")
+    } else if style.italic {
+        format!("*{escaped}*")
+    } else {
+        escaped.to_string()
+    }
+}
+
+/// Escape the characters `markdown::parse` would read as notation, matching
+/// `markdown::escape_run_text`.
+fn escape_markdown(text: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '*' => out.push_str("\\*"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            '=' | '[' if chars.get(i + 1) == Some(&c) => {
+                out.push('\\');
+                out.push(c);
+            }
+            '[' if chars.get(i + 1) == Some(&'^') => out.push_str("\\["),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -808,5 +966,44 @@ mod tests {
             before.iter().zip(&after_all).any(|((_, a), (_, b))| a != b),
             "a document-wide prune must be detectable, or this test is silent"
         );
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use std::path::Path;
+
+    use crate::document::Document;
+    use crate::document::markdown::parse;
+
+    fn path() -> &'static Path {
+        Path::new("table.md")
+    }
+
+    /// Copy a whole-block range with the operator path the shell uses.
+    fn copy(document: &Document, first: usize, last: usize) -> String {
+        document.range_text(document.line_range(first, last))
+    }
+
+    #[test]
+    fn a_copied_header_row_is_a_gfm_line_that_reparses_to_the_same_cells() {
+        let document = parse(path(), "| **A** | $x$ |\n| --- | --- |\n| a | b |\n");
+        let copied = copy(&document, 0, 0);
+        assert_eq!(copied, "| **A** | $x$ |");
+        let back = parse(path(), &format!("{copied}\n| --- | --- |"));
+        assert_eq!(back.body()[0].cells(), document.body()[0].cells());
+    }
+
+    #[test]
+    fn a_copied_whole_table_reparses_to_the_same_table() {
+        let text = "| **A** | $x$ |\n| :--- | ---: |\n| a\\|b<br>c | d |\n";
+        let document = parse(path(), text);
+        let copied = copy(&document, 0, 1);
+        assert_eq!(
+            copied,
+            "| **A** | $x$ |\n| :--- | ---: |\n| a\\|b<br>c | d |"
+        );
+        let back = parse(path(), &copied);
+        assert_eq!(back.body(), document.body());
     }
 }
