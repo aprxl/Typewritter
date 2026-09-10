@@ -5,8 +5,9 @@
 //! arithmetic — lines, flat offsets, run positions — lives on
 //! [`super::table::Cell`] itself.
 
+use super::math_notation;
 use super::table;
-use super::{Block, Document, Focus, TableDirection};
+use super::{BadgeColor, Block, Document, FlatPos, Focus, Inline, Style, TableDirection};
 use super::{flat_len, placeholder_if_empty, slice_inline_runs, table_row};
 
 /// The extent of one table in the block stream. `first` and `end` are the
@@ -508,6 +509,280 @@ impl Document {
     }
 }
 
+impl Document {
+    /// One table row as the GFM line `markdown::serialize` would write:
+    /// `| a | b |`. Each cell is its lines joined with `<br>`, a literal `|`
+    /// escaped, math written `$…$` and styles carrying their Markdown
+    /// markers, so a copied row parses back into the same cells.
+    pub(crate) fn table_row_markdown(&self, block: usize) -> String {
+        let Some(row) = self.scope().get(block).filter(|row| row.is_table()) else {
+            return String::new();
+        };
+        let mut out = String::from("|");
+        for cell in row.cells() {
+            out.push(' ');
+            out.push_str(&cell_markdown(cell));
+            out.push_str(" |");
+        }
+        out
+    }
+
+    /// The Markdown divider row of the table whose header is `block` —
+    /// `| --- | --- |` — carrying its per-column alignment. A copy of a
+    /// header row together with the rows under it needs it to read back as a
+    /// table rather than a stack of unrelated pipe rows.
+    pub(crate) fn table_row_divider(&self, block: usize) -> String {
+        let Some(settings) = self.scope().get(block).and_then(Block::table_settings) else {
+            return String::new();
+        };
+        let mut out = String::from("|");
+        for align in &settings.align {
+            out.push(' ');
+            out.push_str(match align {
+                table::ColumnAlign::None => "---",
+                table::ColumnAlign::Left => ":---",
+                table::ColumnAlign::Centre => ":---:",
+                table::ColumnAlign::Right => "---:",
+            });
+            out.push_str(" |");
+        }
+        out
+    }
+
+    /// `(row, cell, from, to)` for every cell a range covers, named in that
+    /// cell's own flat space, when both ends of the range lie inside one and
+    /// the same table. `None` otherwise, so a range that mixes a table with
+    /// prose keeps the block-wise behaviour and never splices prose into a
+    /// row.
+    pub(crate) fn table_range_cells(
+        &self,
+        start: FlatPos,
+        end: FlatPos,
+    ) -> Option<Vec<(usize, usize, usize, usize)>> {
+        if (start.block, start.offset) >= (end.block, end.offset) {
+            return None;
+        }
+        let first = self.table_bounds(start.block)?;
+        let last = self.table_bounds(end.block)?;
+        if first.first != last.first || first.end != last.end {
+            return None;
+        }
+        let mut cells = Vec::new();
+        for row in start.block..=end.block {
+            let from = if row == start.block { start.offset } else { 0 };
+            let to = if row == end.block {
+                end.offset
+            } else {
+                self.block_len(row)
+            };
+            cells.extend(
+                self.table_cells_in_range(row, from, to)
+                    .into_iter()
+                    .map(|(cell, from, to)| (row, cell, from, to)),
+            );
+        }
+        Some(cells)
+    }
+
+    /// The runs a cell-flat `[from, to)` window covers, line by line — a cell
+    /// is a container, so a range reaching into it maps through its lines
+    /// rather than assuming one.
+    pub(crate) fn cell_slice_runs(
+        &self,
+        row: usize,
+        cell: usize,
+        from: usize,
+        to: usize,
+    ) -> Vec<Inline> {
+        let mut out = Vec::new();
+        let mut line_start = 0;
+        for line in self.scope()[row].cells()[cell].lines() {
+            let len: usize = line.iter().map(flat_len).sum();
+            let start = from.saturating_sub(line_start).min(len);
+            let end = to.saturating_sub(line_start).min(len);
+            if start < end {
+                out.extend(slice_inline_runs(line, start, end));
+            }
+            line_start += len + 1;
+        }
+        out
+    }
+
+    /// Applies `f` to every run a cell-flat `[from, to)` window covers, line
+    /// by line, rebuilding only the lines it reaches. The mutating mirror of
+    /// [`Self::cell_slice_runs`].
+    pub(crate) fn style_cell_slice(
+        cell: &mut table::Cell,
+        from: usize,
+        to: usize,
+        mut f: impl FnMut(&mut Inline),
+    ) {
+        if from >= to {
+            return;
+        }
+        let mut line_start = 0;
+        for line in cell.lines_mut() {
+            let len: usize = line.iter().map(flat_len).sum();
+            let start = from.saturating_sub(line_start).min(len);
+            let end = to.saturating_sub(line_start).min(len);
+            if start < end {
+                let mut rebuilt = slice_inline_runs(line, 0, start);
+                let mut selected = slice_inline_runs(line, start, end);
+                for run in &mut selected {
+                    f(run);
+                }
+                rebuilt.extend(selected);
+                rebuilt.extend(slice_inline_runs(line, end, len));
+                *line = rebuilt;
+            }
+            line_start += len + 1;
+        }
+    }
+
+    /// Removes the runs a cell-flat `[from, to)` window covers, line by
+    /// line, folding the covered lines into one when the window spans a line
+    /// break. The removal mirror of [`Self::style_cell_slice`].
+    pub(crate) fn clear_cell_slice(cell: &mut table::Cell, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let (start_line, start_offset) = cell.position(from);
+        let (end_line, end_offset) = cell.position(to);
+        if start_line == end_line {
+            let runs = cell.lines()[start_line].clone();
+            let len: usize = runs.iter().map(flat_len).sum();
+            let mut rebuilt = slice_inline_runs(&runs, 0, start_offset);
+            rebuilt.extend(slice_inline_runs(&runs, end_offset, len));
+            cell.lines_mut()[start_line] = placeholder_if_empty(rebuilt);
+            return;
+        }
+        let first = cell.lines()[start_line].clone();
+        let last = cell.lines()[end_line].clone();
+        let last_len: usize = last.iter().map(flat_len).sum();
+        let mut joined = slice_inline_runs(&first, 0, start_offset);
+        joined.extend(slice_inline_runs(&last, end_offset, last_len));
+        let joined = placeholder_if_empty(joined);
+        cell.lines_mut()[start_line] = joined;
+        cell.lines_mut().drain(start_line + 1..=end_line);
+    }
+
+    /// The text of the cell the caret sits in, if it is in a table. Read
+    /// before a cell-clearing edit so the yank register can carry what the
+    /// edit removed.
+    pub fn caret_cell_text(&self) -> Option<String> {
+        if !self.in_table() {
+            return None;
+        }
+        let block = self.caret.block.min(self.scope().len().saturating_sub(1));
+        let cells = self.scope().get(block)?.cells();
+        if cells.is_empty() {
+            return None;
+        }
+        let cell = self.caret.inline.min(cells.len() - 1);
+        Some(super::cell_text(&cells[cell]))
+    }
+}
+
+/// One cell as its on-disk Markdown: lines joined with `<br>`, a literal
+/// `<br` escaped, a literal `|` escaped exactly as
+/// `markdown::serialize_table_cell` writes it.
+fn cell_markdown(cell: &table::Cell) -> String {
+    cell.lines()
+        .iter()
+        .map(|line| runs_markdown(line).replace("<br", "\\<br"))
+        .collect::<Vec<_>>()
+        .join("<br>")
+        .replace('|', "\\|")
+}
+
+/// A line's runs in Markdown: text escaped then wrapped in its style markers,
+/// math as `$…$`, and one shared `==…==` over a stretch of marked runs.
+fn runs_markdown(runs: &[Inline]) -> String {
+    let one = |run: &Inline, style: Style| match run {
+        Inline::Text(t) => {
+            if style.is_boxed() {
+                wrap_markdown(style, &t.text)
+            } else {
+                wrap_markdown(style, &escape_markdown(&t.text))
+            }
+        }
+        Inline::Math(list) => format!("${}$", math_notation::print(list)),
+        Inline::Note(label) => format!("[^{label}]"),
+        Inline::EqRef(label) => format!("@{label}"),
+    };
+    let mut out = String::new();
+    let mut i = 0;
+    while i < runs.len() {
+        if !runs[i].style().highlight {
+            out.push_str(&one(&runs[i], runs[i].style()));
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while runs.get(end + 1).is_some_and(|run| run.style().highlight) {
+            end += 1;
+        }
+        out.push_str("==");
+        for run in &runs[i..=end] {
+            out.push_str(&one(
+                run,
+                Style {
+                    highlight: false,
+                    ..run.style()
+                },
+            ));
+        }
+        out.push_str("==");
+        i = end + 1;
+    }
+    out
+}
+
+/// Wrap one run's text in the marker for its style, the same spellings
+/// `markdown::parse` reads back.
+fn wrap_markdown(style: Style, escaped: &str) -> String {
+    if style.code {
+        format!("`{escaped}`")
+    } else if style.badge {
+        match style.badge_color {
+            BadgeColor::Orange => format!("[[{escaped}]]"),
+            BadgeColor::Blue => format!("[[blue|{escaped}]]"),
+            BadgeColor::Green => format!("[[green|{escaped}]]"),
+            BadgeColor::Purple => format!("[[purple|{escaped}]]"),
+        }
+    } else if style.bold && style.italic {
+        format!("***{escaped}***")
+    } else if style.bold {
+        format!("**{escaped}**")
+    } else if style.italic {
+        format!("*{escaped}*")
+    } else {
+        escaped.to_string()
+    }
+}
+
+/// Escape the characters `markdown::parse` would read as notation, matching
+/// `markdown::escape_run_text`.
+fn escape_markdown(text: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '*' => out.push_str("\\*"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            '=' | '[' if chars.get(i + 1) == Some(&c) => {
+                out.push('\\');
+                out.push(c);
+            }
+            '[' if chars.get(i + 1) == Some(&'^') => out.push_str("\\["),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -807,6 +1082,155 @@ mod tests {
         assert!(
             before.iter().zip(&after_all).any(|((_, a), (_, b))| a != b),
             "a document-wide prune must be detectable, or this test is silent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use std::path::Path;
+
+    use crate::document::markdown::parse;
+    use crate::document::{Block, Document, FlatRange, Style, cell_text};
+
+    fn path() -> &'static Path {
+        Path::new("table.md")
+    }
+
+    /// Copy a whole-block range with the operator path the shell uses.
+    fn copy(document: &Document, first: usize, last: usize) -> String {
+        document.range_text(document.line_range(first, last))
+    }
+
+    fn table_document() -> Document {
+        let mut document = Document::new(path());
+        document.insert_table();
+        document
+    }
+
+    #[test]
+    fn a_newline_pasted_into_a_cell_becomes_two_cell_lines() {
+        let mut document = table_document();
+        document.insert_text("a\nb");
+        assert_eq!(document.body().len(), 2, "the row is not duplicated");
+        assert!(document.body().iter().all(Block::is_table));
+        let cell = &document.body()[0].cells()[0];
+        assert_eq!(cell.lines().len(), 2);
+        assert_eq!(cell_text(cell), "a\nb");
+    }
+
+    #[test]
+    fn a_newline_outside_a_table_keeps_its_meaning() {
+        let mut document = Document::new(path());
+        document.insert_text("a\nb");
+        assert_eq!(document.body().len(), 1, "a soft wrap stays one block");
+        assert_eq!(document.block_text(0), "a\nb");
+    }
+
+    #[test]
+    fn a_copied_header_row_is_a_gfm_line_that_reparses_to_the_same_cells() {
+        let document = parse(path(), "| **A** | $x$ |\n| --- | --- |\n| a | b |\n");
+        let copied = copy(&document, 0, 0);
+        assert_eq!(copied, "| **A** | $x$ |");
+        let back = parse(path(), &format!("{copied}\n| --- | --- |"));
+        assert_eq!(back.body()[0].cells(), document.body()[0].cells());
+    }
+
+    #[test]
+    fn a_copied_whole_table_reparses_to_the_same_table() {
+        let text = "| **A** | $x$ |\n| :--- | ---: |\n| a\\|b<br>c | d |\n";
+        let document = parse(path(), text);
+        let copied = copy(&document, 0, 1);
+        assert_eq!(
+            copied,
+            "| **A** | $x$ |\n| :--- | ---: |\n| a\\|b<br>c | d |"
+        );
+        let back = parse(path(), &copied);
+        assert_eq!(back.body(), document.body());
+    }
+
+    /// Whether every run of a cell carries bold.
+    fn bold_of(document: &Document, row: usize, cell: usize) -> bool {
+        document.body()[row].cells()[cell]
+            .lines()
+            .iter()
+            .flat_map(|line| line.iter())
+            .all(|run| run.style().bold)
+    }
+
+    fn fill(document: &mut Document, row: usize, cell: usize, text: &str) {
+        document.set_caret(row, cell, 0);
+        document.insert_text(text);
+    }
+
+    fn bold() -> Style {
+        Style {
+            bold: true,
+            ..Style::PLAIN
+        }
+    }
+
+    #[test]
+    fn a_copied_row_carries_boxed_styles_back_to_the_same_cells() {
+        let document = parse(path(), "| `c` | [[B]] |\n| --- | --- |\n| x | y |\n");
+        let copied = copy(&document, 0, 0);
+        assert_eq!(copied, "| `c` | [[B]] |");
+        let back = parse(path(), &format!("{copied}\n| --- | --- |"));
+        assert_eq!(back.body()[0].cells(), document.body()[0].cells());
+    }
+
+    #[test]
+    fn a_style_range_across_two_cells_of_a_row_styles_both() {
+        let mut document = table_document();
+        fill(&mut document, 0, 0, "a");
+        fill(&mut document, 0, 1, "b");
+        let range = FlatRange::new(
+            document.position(0, 0),
+            document.position(0, document.block_len(0)),
+        );
+        document.toggle_style_range(range, bold());
+        assert!(bold_of(&document, 0, 0), "the first cell is styled");
+        assert!(bold_of(&document, 0, 1), "so is the second");
+    }
+
+    #[test]
+    fn a_cross_row_style_range_styles_every_covered_cell() {
+        let mut document = table_document();
+        fill(&mut document, 0, 0, "a");
+        fill(&mut document, 0, 1, "b");
+        fill(&mut document, 1, 0, "c");
+        fill(&mut document, 1, 1, "d");
+        let range = FlatRange::new(
+            document.position(0, 0),
+            document.position(1, document.block_len(1)),
+        );
+        document.toggle_style_range(range, bold());
+        for (row, cell) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            assert!(bold_of(&document, row, cell), "cell {row}.{cell} is styled");
+        }
+    }
+
+    #[test]
+    fn a_style_range_spanning_a_table_and_prose_leaves_the_grid_intact() {
+        let mut document = parse(path(), "| A | B |\n| --- | --- |\n| a | b |\n\nafter\n");
+        document.set_caret(0, 0, 0);
+        let range = FlatRange::new(
+            document.position(0, 0),
+            document.position(2, document.block_len(2)),
+        );
+        document.toggle_style_range(range, bold());
+        let body = document.body();
+        assert!(
+            body[0].is_table() && body[1].is_table(),
+            "the grid survives"
+        );
+        assert_eq!(body[0].cells().len(), 2);
+        assert_eq!(cell_text(&body[1].cells()[0]), "a");
+        assert!(!bold_of(&document, 1, 0), "the table part is left alone");
+        let paragraph = body[2].inlines();
+        assert!(
+            paragraph.iter().all(|run| run.style().bold),
+            "the prose part is styled"
         );
     }
 }

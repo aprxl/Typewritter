@@ -1136,6 +1136,18 @@ impl Document {
             text.push_str(&self.block_range_text(block, from, to));
             if block != end.block {
                 text.push('\n');
+                // A header row is only a row until its divider follows it: a
+                // copy of the header plus the rows under it must read back as
+                // a table, not a stack of unrelated pipe rows.
+                if self.scope()[block].table_first()
+                    && matches!(
+                        self.scope().get(block + 1),
+                        Some(Block::TableRow { first: false, .. })
+                    )
+                {
+                    text.push_str(&self.table_row_divider(block));
+                    text.push('\n');
+                }
             }
         }
         text
@@ -1147,8 +1159,16 @@ impl Document {
     /// `from`/`to` stay aligned with every other flat offset. Prose is escaped
     /// so the result is the same notation `markdown::serialize` writes to
     /// disk: a literal `$` becomes `\$`, which cannot reopen math on the way
-    /// back in.
+    /// back in. A table row is the one exception: its text form is the whole
+    /// GFM pipe line its cells make, since a slice of a row is not Markdown.
     fn block_range_text(&self, block: usize, from: usize, to: usize) -> String {
+        // A row's text form is one GFM pipe line: its cells rebuilt the way
+        // `markdown::serialize` writes them, so a copied row parses back
+        // into the same cells. A slice of a row is not valid Markdown, so a
+        // partial range still copies the whole row.
+        if self.scope()[block].is_table() {
+            return self.table_row_markdown(block);
+        }
         let mut out = String::new();
         let mut cursor = 0;
         for run in block_runs(&self.scope()[block]) {
@@ -1245,8 +1265,10 @@ impl Document {
             return None;
         }
 
-        if start.block == end.block && self.scope()[start.block].is_table() {
-            let cells = self.table_cells_in_range(start.block, start.offset, end.offset);
+        // Both ends inside one table (same row or spanning rows): the range
+        // is answered per cell, so a formatting command over several cells
+        // reaches all of them rather than only a single row.
+        if let Some(cells) = self.table_range_cells(start, end) {
             if cells.is_empty() {
                 return None;
             }
@@ -1256,24 +1278,20 @@ impl Document {
                     badge: !mask.code && mask.badge,
                     ..Style::PLAIN
                 };
-                return Some(cells.iter().all(|&(cell, from, to)| {
-                    slice_inline_runs(self.scope()[start.block].cells()[cell].runs(), from, to)
-                        .iter()
-                        .all(|run| {
-                            let style = run.style();
-                            if boxed.badge {
-                                style.badge
-                            } else {
-                                style == boxed
-                            }
-                        })
+                return Some(cells.iter().all(|&(row, cell, from, to)| {
+                    self.cell_slice_runs(row, cell, from, to).iter().all(|run| {
+                        let style = run.style();
+                        if boxed.badge {
+                            style.badge
+                        } else {
+                            style == boxed
+                        }
+                    })
                 }));
             }
             let eligible = cells
                 .iter()
-                .flat_map(|&(cell, from, to)| {
-                    slice_inline_runs(self.scope()[start.block].cells()[cell].runs(), from, to)
-                })
+                .flat_map(|&(row, cell, from, to)| self.cell_slice_runs(row, cell, from, to))
                 .filter(|run| !run.style().is_boxed())
                 .collect::<Vec<_>>();
             return (!eligible.is_empty())
@@ -1349,6 +1367,18 @@ impl Document {
             return false;
         }
 
+        if let Some(cells) = self.table_range_cells(start, end) {
+            let mut selected = false;
+            let mut active = true;
+            for (row, cell, from, to) in cells {
+                for run in self.cell_slice_runs(row, cell, from, to) {
+                    selected = true;
+                    active &= run.style().badge && run.style().badge_color == color;
+                }
+            }
+            return selected && active;
+        }
+
         let mut selected = false;
         let mut active = true;
         for block in start.block..=end.block {
@@ -1381,18 +1411,14 @@ impl Document {
             return;
         }
 
-        if start.block == end.block && self.scope()[start.block].is_table() {
-            let cells = self.table_cells_in_range(start.block, start.offset, end.offset);
+        if let Some(cells) = self.table_range_cells(start, end) {
             let Some(active) = self.style_range_status(range, mask) else {
                 return;
             };
             let boxed = mask.code || mask.badge;
-            for (cell, from, to) in cells {
-                let original = self.scope()[start.block].cells()[cell].runs();
-                let len: usize = original.iter().map(flat_len).sum();
-                let mut contents = slice_inline_runs(original, 0, from);
-                let mut selected = slice_inline_runs(original, from, to);
-                for run in &mut selected {
+            for (row, cell, from, to) in cells {
+                let row_cells = self.scope_mut()[row].cells_mut().expect("table row");
+                Self::style_cell_slice(&mut row_cells[cell], from, to, |run| {
                     let style = run.style();
                     let target = if boxed {
                         if active {
@@ -1419,12 +1445,7 @@ impl Document {
                         }
                     };
                     run.set_style(target);
-                }
-                contents.extend(selected);
-                contents.extend(slice_inline_runs(original, to, len));
-                self.scope_mut()[start.block]
-                    .cells_mut()
-                    .expect("table row")[cell] = table::Cell::from_runs(contents);
+                });
             }
             self.dirty = true;
             self.enforce();
@@ -1530,27 +1551,18 @@ impl Document {
             return;
         }
 
-        if start.block == end.block && self.scope()[start.block].is_table() {
-            let cells = self.table_cells_in_range(start.block, start.offset, end.offset);
+        if let Some(cells) = self.table_range_cells(start, end) {
             let mut changed = false;
-            for (cell, from, to) in cells {
-                let original = self.scope()[start.block].cells()[cell].runs();
-                let len: usize = original.iter().map(flat_len).sum();
-                let mut contents = slice_inline_runs(original, 0, from);
-                let mut selected = slice_inline_runs(original, from, to);
-                for run in &mut selected {
+            for (row, cell, from, to) in cells {
+                let row_cells = self.scope_mut()[row].cells_mut().expect("table row");
+                Self::style_cell_slice(&mut row_cells[cell], from, to, |run| {
                     let mut style = run.style();
                     if style.badge && style.badge_color != color {
                         style.badge_color = color;
                         run.set_style(style);
                         changed = true;
                     }
-                }
-                contents.extend(selected);
-                contents.extend(slice_inline_runs(original, to, len));
-                self.scope_mut()[start.block]
-                    .cells_mut()
-                    .expect("table row")[cell] = table::Cell::from_runs(contents);
+                });
             }
             if changed {
                 self.dirty = true;
@@ -1672,40 +1684,41 @@ impl Document {
         }
     }
 
-    /// Delete range and leave caret at its start. Returns deleted text for the
-    /// unnamed yank buffer.
-    pub fn delete_range(&mut self, range: FlatRange) -> String {
+    /// Delete range and leave caret at its start. Returns the deleted text
+    /// for the unnamed yank buffer, or `None` when the document refuses the
+    /// range — a table range that would collapse the grid — so the caller
+    /// leaves the register untouched rather than clearing it.
+    pub fn delete_range(&mut self, range: FlatRange) -> Option<String> {
         let range = range.normalized();
         let start = self.position(range.start.block, range.start.offset);
         let end = self.position(range.end.block, range.end.offset);
         if (start.block, start.offset) >= (end.block, end.offset) {
-            return String::new();
+            return None;
+        }
+        if start.block != end.block
+            && (start.block..=end.block).any(|block| self.scope()[block].is_table())
+        {
+            // A cross-row character range cannot collapse table blocks into
+            // each other without deleting tracks. Keep the grid intact; row
+            // removal remains an explicit popup action.
+            return None;
         }
         let deleted = self.range_text(FlatRange::new(start, end));
         if start.block == end.block && self.scope()[start.block].is_table() {
             let (landing_cell, landing_offset) = self.flat_to_pos(start.block, start.offset);
             for (cell, from, to) in self.table_cells_in_range(start.block, start.offset, end.offset)
             {
-                let original = self.scope()[start.block].cells()[cell].runs();
-                let len: usize = original.iter().map(flat_len).sum();
-                let mut contents = slice_inline_runs(original, 0, from);
-                contents.extend(slice_inline_runs(original, to, len));
-                self.scope_mut()[start.block]
+                let row_cells = self.scope_mut()[start.block]
                     .cells_mut()
-                    .expect("table row")[cell] = table::Cell::from_runs(contents);
+                    .expect("table row");
+                Self::clear_cell_slice(&mut row_cells[cell], from, to);
             }
             self.enforce();
             let landing_offset =
                 landing_offset.min(self.scope()[start.block].cells()[landing_cell].flat_len());
             self.set_caret(start.block, landing_cell, landing_offset);
             self.dirty = true;
-            return deleted;
-        }
-        if (start.block..=end.block).any(|block| self.scope()[block].is_table()) {
-            // A cross-row character range cannot collapse table blocks into
-            // each other without deleting tracks. Keep the grid intact; row
-            // removal remains an explicit popup action.
-            return String::new();
+            return Some(deleted);
         }
         if start.block == end.block {
             let block = self.scope()[start.block].clone();
@@ -1726,25 +1739,27 @@ impl Document {
         self.dirty = true;
         self.set_flat_position(start);
         self.enforce();
-        deleted
+        Some(deleted)
     }
 
     pub fn replace_range(&mut self, range: FlatRange, text: &str) -> String {
-        let deleted = self.delete_range(range);
+        let deleted = self.delete_range(range).unwrap_or_default();
         self.set_flat_position(range.normalized().start);
         self.insert_text(text);
         deleted
     }
 
-    /// Delete complete logical blocks, as used by visual-line mode.
-    pub fn delete_lines(&mut self, first: usize, last: usize) -> String {
+    /// Delete complete logical blocks, as used by visual-line mode. Returns
+    /// the deleted text for the yank register, or `None` when a table row is
+    /// in the way and the document refuses rather than destroying the grid.
+    pub fn delete_lines(&mut self, first: usize, last: usize) -> Option<String> {
         if self.scope().is_empty() {
-            return String::new();
+            return None;
         }
         let first = first.min(self.scope().len() - 1);
         let last = last.min(self.scope().len() - 1).max(first);
         if (first..=last).any(|block| self.scope()[block].is_table()) {
-            return String::new();
+            return None;
         }
         let deleted = (first..=last)
             .map(|block| self.block_text(block))
@@ -1760,11 +1775,11 @@ impl Document {
         self.caret.style = Style::PLAIN;
         self.dirty = true;
         self.enforce();
-        deleted
+        Some(deleted)
     }
 
     pub fn open_change(&mut self, range: FlatRange) -> String {
-        self.delete_range(range)
+        self.delete_range(range).unwrap_or_default()
     }
 
     pub fn text_object_range(&self, object: TextObject) -> Option<FlatRange> {
@@ -2420,88 +2435,17 @@ impl Document {
             return;
         }
         if self.scope()[b].is_table() {
-            let cell = self.caret.inline;
-            let flat = self.caret.offset;
-            let style = self.caret.style;
-            let at = self.scope()[b].cells()[cell].run_at(flat);
-            let (run, offset) = (at.run, at.offset);
-            let contents =
-                &mut self.scope_mut()[b].cells_mut().expect("table row")[cell].lines_mut()[at.line];
-            let placeholder = contents.len() == 1 && contents[0].text().is_empty();
-            let current_len = flat_len(&contents[run]);
-            let left_style = if offset > 0 {
-                merge_style(&contents[run])
-            } else if run > 0 {
-                merge_style(&contents[run - 1])
-            } else {
-                None
-            };
-            let right_style = if offset < current_len {
-                merge_style(&contents[run])
-            } else if run + 1 < contents.len() {
-                merge_style(&contents[run + 1])
-            } else {
-                None
-            };
-            if placeholder {
-                let value = contents[0].text_mut().expect("a table placeholder is text");
-                value.push_str(text);
-                contents[0].set_style(style);
-            } else if left_style == Some(style) {
-                if offset > 0 {
-                    insert_str(
-                        contents[run]
-                            .text_mut()
-                            .expect("a prose merge target is text"),
-                        offset,
-                        text,
-                    );
-                } else {
-                    contents[run - 1]
-                        .text_mut()
-                        .expect("a prose merge target is text")
-                        .push_str(text);
-                }
-            } else if right_style == Some(style) {
-                if offset < current_len {
-                    insert_str(
-                        contents[run]
-                            .text_mut()
-                            .expect("a prose merge target is text"),
-                        offset,
-                        text,
-                    );
-                } else {
-                    insert_str(
-                        contents[run + 1]
-                            .text_mut()
-                            .expect("a prose merge target is text"),
-                        0,
-                        text,
-                    );
-                }
-            } else {
-                let (prefix, suffix) = split_run(contents.remove(run), offset);
-                contents.splice(
-                    run..run,
-                    [
-                        prefix,
-                        Inline::Text(Text {
-                            text: text.to_string(),
-                            style,
-                        }),
-                        suffix,
-                    ],
-                );
+            // A newline in incoming text is a cell line break, never a raw
+            // `\n` inside a cell: each segment lands on its own line and the
+            // row stays one GFM row.
+            let mut segments = text.split('\n');
+            if let Some(first) = segments.next() {
+                self.insert_cell_text(first);
             }
-            self.caret.offset = flat + text.chars().count();
-            self.dirty = true;
-            self.enforce_block(b);
-            self.caret.inline = cell;
-            self.caret.offset = self
-                .caret
-                .offset
-                .min(self.scope()[b].cells()[cell].flat_len());
+            for segment in segments {
+                self.split_cell_line();
+                self.insert_cell_text(segment);
+            }
             return;
         }
         let s = if self.scope()[b].is_code() {
@@ -2600,6 +2544,101 @@ impl Document {
         let (ni, no) = self.flat_to_pos(b, target.min(self.block_flat_len(b)));
         self.caret.inline = ni;
         self.caret.offset = no;
+    }
+
+    /// Inserts literal text into the caret's table cell at the caret,
+    /// splitting or merging runs exactly as the prose path does. This is one
+    /// segment of a paste: a `\n` never reaches here — the caller has already
+    /// turned it into a cell line break — so a cell holds no raw newline and
+    /// the row stays one GFM row.
+    fn insert_cell_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.clamp_caret();
+        let b = self.caret.block;
+        let cell = self.caret.inline;
+        let flat = self.caret.offset;
+        let style = self.caret.style;
+        let at = self.scope()[b].cells()[cell].run_at(flat);
+        let (run, offset) = (at.run, at.offset);
+        let contents =
+            &mut self.scope_mut()[b].cells_mut().expect("table row")[cell].lines_mut()[at.line];
+        let placeholder = contents.len() == 1 && contents[0].text().is_empty();
+        let current_len = flat_len(&contents[run]);
+        let left_style = if offset > 0 {
+            merge_style(&contents[run])
+        } else if run > 0 {
+            merge_style(&contents[run - 1])
+        } else {
+            None
+        };
+        let right_style = if offset < current_len {
+            merge_style(&contents[run])
+        } else if run + 1 < contents.len() {
+            merge_style(&contents[run + 1])
+        } else {
+            None
+        };
+        if placeholder {
+            let value = contents[0].text_mut().expect("a table placeholder is text");
+            value.push_str(text);
+            contents[0].set_style(style);
+        } else if left_style == Some(style) {
+            if offset > 0 {
+                insert_str(
+                    contents[run]
+                        .text_mut()
+                        .expect("a prose merge target is text"),
+                    offset,
+                    text,
+                );
+            } else {
+                contents[run - 1]
+                    .text_mut()
+                    .expect("a prose merge target is text")
+                    .push_str(text);
+            }
+        } else if right_style == Some(style) {
+            if offset < current_len {
+                insert_str(
+                    contents[run]
+                        .text_mut()
+                        .expect("a prose merge target is text"),
+                    offset,
+                    text,
+                );
+            } else {
+                insert_str(
+                    contents[run + 1]
+                        .text_mut()
+                        .expect("a prose merge target is text"),
+                    0,
+                    text,
+                );
+            }
+        } else {
+            let (prefix, suffix) = split_run(contents.remove(run), offset);
+            contents.splice(
+                run..run,
+                [
+                    prefix,
+                    Inline::Text(Text {
+                        text: text.to_string(),
+                        style,
+                    }),
+                    suffix,
+                ],
+            );
+        }
+        self.caret.offset = flat + text.chars().count();
+        self.dirty = true;
+        self.enforce_block(b);
+        self.caret.inline = cell;
+        self.caret.offset = self
+            .caret
+            .offset
+            .min(self.scope()[b].cells()[cell].flat_len());
     }
 
     /// Inserts inline Markdown that this app produced, reading `$…$` back as
@@ -6012,16 +6051,18 @@ mod tests {
             Block::Paragraph(vec![plain_run("ab"), bold_run("cd")]),
             Block::Paragraph(vec![plain_run("ef")]),
         ];
-        let deleted = d.delete_range(FlatRange::new(
-            FlatPos {
-                block: 0,
-                offset: 1,
-            },
-            FlatPos {
-                block: 1,
-                offset: 1,
-            },
-        ));
+        let deleted = d
+            .delete_range(FlatRange::new(
+                FlatPos {
+                    block: 0,
+                    offset: 1,
+                },
+                FlatPos {
+                    block: 1,
+                    offset: 1,
+                },
+            ))
+            .expect("a prose range is deletable");
         assert_eq!(deleted, "bcd\ne");
         assert_eq!(text_of_block(&d, 0), "af");
         assert_eq!(d.body().len(), 1);
@@ -6468,7 +6509,7 @@ mod tests {
 
         // Delete the anchor labelled "1" — its note is dropped with it, so
         // "1" is free again and the next insert reclaims it.
-        d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
+        let _ = d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
         assert_eq!(d.notes.len(), 2);
         assert_eq!(d.insert_sidenote(), Some("1".into()));
     }
@@ -6482,7 +6523,7 @@ mod tests {
         assert_eq!(d.notes.len(), 1);
         assert_eq!(d.block_text(0), format!("{ATOM}note"));
 
-        d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
+        let _ = d.delete_range(FlatRange::new(d.position(0, 0), d.position(0, 1)));
         assert!(d.notes.is_empty(), "deleting the anchor drops the note");
         assert_eq!(d.block_text(0), "note");
     }
