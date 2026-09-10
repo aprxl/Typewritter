@@ -7,9 +7,16 @@
 use std::path::{Path, PathBuf};
 
 use crate::document::{
-    BadgeColor, Block, Document, FlatRange, Focus, ListMarker, Style, fold_owner_of, math,
-    math_conversion, table,
+    BadgeColor, Block, Document, FlatRange, Focus, ListMarker, Style, flat_len, fold_owner_of,
+    math, math_conversion, table,
 };
+
+/// What a Backspace/Delete at a cell boundary resolves to: fold the blank
+/// neighbouring column away, or leave the key to the document's own edit.
+enum Boundary {
+    Fold(usize),
+    Nothing,
+}
 
 pub struct Tab {
     pub document: Document,
@@ -702,6 +709,234 @@ impl Tabs {
         let mut moved = false;
         self.touch(|doc| moved = doc.table_move(direction));
         moved
+    }
+
+    /// Enter inside a table cell. At the end of the cell's last line the
+    /// caret steps to the next cell — appending a fresh row after the last
+    /// cell of the last row, the gesture a reader fills a table with —
+    /// while anywhere else on the line it splits the cell line at the
+    /// caret. Returns whether the caret was in a table at all, so the
+    /// caller knows whether the document's own `newline` still applies.
+    pub fn enter_in_table(&mut self) -> bool {
+        enum Plan {
+            Split,
+            Next,
+            Append,
+        }
+        let plan = {
+            let Some(tab) = self.active() else {
+                return false;
+            };
+            let document = &tab.document;
+            let block = document.caret.block;
+            let Some(range) = document.table_bounds(block) else {
+                return false;
+            };
+            let cell = document.caret.inline.min(range.columns.saturating_sub(1));
+            let contents = &document.scope()[block].cells()[cell];
+            let (line, offset) = contents.position(document.caret.offset);
+            let line_len: usize = contents.lines()[line].iter().map(flat_len).sum();
+            if offset == line_len && line + 1 == contents.lines().len() {
+                if block + 1 == range.end && cell + 1 == range.columns {
+                    Plan::Append
+                } else {
+                    Plan::Next
+                }
+            } else {
+                Plan::Split
+            }
+        };
+        match plan {
+            Plan::Split => {
+                self.edit(|doc| {
+                    doc.split_cell_line();
+                });
+            }
+            Plan::Next => {
+                self.touch(|doc| {
+                    doc.table_tab(false);
+                });
+            }
+            Plan::Append => {
+                self.edit(|doc| {
+                    let block = doc.caret.block;
+                    let Some(range) = doc.table_bounds(block) else {
+                        return;
+                    };
+                    if doc.insert_table_row(block, range.rows - 1) {
+                        // The new row lands at the table's now-former end.
+                        doc.set_caret(range.end, 0, 0);
+                    }
+                });
+            }
+        }
+        true
+    }
+
+    /// Backspace inside a table: fold an all-blank column away when the
+    /// caret sits at the very start of a cell, and defer to the document's
+    /// own backspace (cell-line join, atom, character) everywhere else.
+    /// Returns whether the caret was in a table.
+    pub fn backspace_in_table(&mut self) -> bool {
+        match self.cell_boundary(false) {
+            None => false,
+            Some(Boundary::Fold(column)) => {
+                self.edit(|doc| {
+                    let block = doc.caret.block;
+                    doc.remove_table_column(block, column);
+                });
+                true
+            }
+            Some(Boundary::Nothing) => {
+                self.edit(Document::backspace);
+                true
+            }
+        }
+    }
+
+    /// Delete inside a table: the mirror of [`Self::backspace_in_table`],
+    /// folding an all-blank column away when the caret sits at the end of a
+    /// cell, and deferring to the document's own forward delete otherwise.
+    pub fn delete_in_table(&mut self) -> bool {
+        match self.cell_boundary(true) {
+            None => false,
+            Some(Boundary::Fold(column)) => {
+                self.edit(|doc| {
+                    let block = doc.caret.block;
+                    doc.remove_table_column(block, column);
+                });
+                true
+            }
+            Some(Boundary::Nothing) => {
+                self.edit(Document::delete_forward);
+                true
+            }
+        }
+    }
+
+    /// Tab and Shift-Tab through a table's cells in row-major order. Past
+    /// the last cell — or before the first, backwards — the caret leaves
+    /// the table instead of wrapping: onto the neighbouring block when
+    /// there is one, into a fresh paragraph otherwise. Returns whether the
+    /// caret was in a table.
+    pub fn table_tab_or_exit(&mut self, backwards: bool) -> bool {
+        let leaves = {
+            let Some(tab) = self.active() else {
+                return false;
+            };
+            let document = &tab.document;
+            let block = document.caret.block;
+            let Some(range) = document.table_bounds(block) else {
+                return false;
+            };
+            let row = block - range.first;
+            let cell = document.caret.inline.min(range.columns.saturating_sub(1));
+            if backwards {
+                row == 0 && cell == 0
+            } else {
+                row + 1 == range.rows && cell + 1 == range.columns
+            }
+        };
+        if leaves {
+            self.leave_table(backwards);
+        } else {
+            self.touch(|doc| {
+                doc.table_tab(backwards);
+            });
+        }
+        true
+    }
+
+    /// Step the caret out of the table: to the neighbouring block when
+    /// there is one, otherwise to a paragraph opened in its place.
+    fn leave_table(&mut self, backwards: bool) {
+        let target = {
+            let Some(tab) = self.active() else {
+                return;
+            };
+            let document = &tab.document;
+            let block = document.caret.block;
+            let Some(range) = document.table_bounds(block) else {
+                return;
+            };
+            if backwards {
+                range.first.checked_sub(1)
+            } else {
+                (range.end < document.scope().len()).then_some(range.end)
+            }
+        };
+        match target {
+            Some(block) => self.touch(|doc| doc.set_caret(block, 0, 0)),
+            None => self.edit(|doc| {
+                if backwards {
+                    doc.open_above();
+                } else {
+                    doc.open_below();
+                }
+            }),
+        }
+    }
+
+    /// Insert a blank row directly above `row`. The model inserts *after*
+    /// an index, so this is "after the row before"; nothing may precede the
+    /// header row, so a caret on the first row leaves the table unchanged.
+    pub fn table_row_above(&mut self, block: usize, row: usize) -> bool {
+        if row == 0 {
+            return false;
+        }
+        self.insert_table_row(block, row - 1)
+    }
+
+    /// Insert a blank column directly left of `column`, the same way:
+    /// "after the column before". The first column has no predecessor to
+    /// insert after, so it is left unchanged.
+    pub fn table_column_left(&mut self, block: usize, column: usize) -> bool {
+        if column == 0 {
+            return false;
+        }
+        self.insert_table_column(block, column - 1)
+    }
+
+    /// Where a Backspace/Delete at a cell boundary will land. `Fold(column)`
+    /// means the caret is at the very edge of its cell and the column on the
+    /// far side is blank in every row, so it can be folded away without
+    /// losing a character; `Nothing` means the caret is in a table but the
+    /// document's own edit owns the key; `None` means no table at all.
+    fn cell_boundary(&self, forward: bool) -> Option<Boundary> {
+        let tab = self.active()?;
+        let document = &tab.document;
+        let block = document.caret.block;
+        let range = document.table_bounds(block)?;
+        let cell = document.caret.inline.min(range.columns.saturating_sub(1));
+        let contents = &document.scope()[block].cells()[cell];
+        let (line, offset) = contents.position(document.caret.offset);
+        let at_edge = if forward {
+            let line_len: usize = contents.lines()[line].iter().map(flat_len).sum();
+            offset == line_len && line + 1 == contents.lines().len()
+        } else {
+            offset == 0 && line == 0
+        };
+        if !at_edge
+            || if forward {
+                cell + 1 >= range.columns
+            } else {
+                cell == 0
+            }
+        {
+            return Some(Boundary::Nothing);
+        }
+        let neighbour = if forward { cell + 1 } else { cell - 1 };
+        let blank = (range.first..range.end).all(|row| {
+            document.scope()[row]
+                .cells()
+                .get(neighbour)
+                .is_some_and(table::Cell::is_blank)
+        });
+        if blank {
+            Some(Boundary::Fold(neighbour))
+        } else {
+            Some(Boundary::Nothing)
+        }
     }
 
     /// Tags or untags the math block the caret sits in. A content change, so
@@ -1849,5 +2084,203 @@ mod tests {
             body_before.as_slice(),
             "the body is byte-for-byte identical"
         );
+    }
+
+    /// A tab whose body is a freshly inserted 2x2 table, caret in cell 0.
+    fn table_tabs(tag: &str) -> Tabs {
+        let path = temp_file(tag, "");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        tabs.insert_table();
+        tabs
+    }
+
+    fn table_shape(tabs: &Tabs) -> (usize, usize) {
+        let document = &tabs.active().unwrap().document;
+        let range = document.table_bounds(0).expect("a table at block 0");
+        (range.rows, range.columns)
+    }
+
+    fn cell_at(tabs: &Tabs, block: usize, cell: usize) -> &crate::document::table::Cell {
+        &tabs.active().unwrap().document.body()[block].cells()[cell]
+    }
+
+    fn caret(tabs: &Tabs) -> (usize, usize, usize) {
+        let caret = tabs.active().unwrap().document.caret;
+        (caret.block, caret.inline, caret.offset)
+    }
+
+    #[test]
+    fn table_helpers_decline_when_the_caret_is_not_in_a_table() {
+        let path = temp_file("tblnone", "hello");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        assert!(!tabs.enter_in_table());
+        assert!(!tabs.backspace_in_table());
+        assert!(!tabs.delete_in_table());
+        assert!(!tabs.table_tab_or_exit(false));
+    }
+
+    #[test]
+    fn enter_inside_a_cell_line_splits_it() {
+        let mut tabs = table_tabs("tblsplit");
+        tabs.type_text("alpha");
+        tabs.touch(|doc| doc.set_caret(0, 0, 2));
+        assert!(tabs.enter_in_table());
+        assert_eq!(cell_at(&tabs, 0, 0).lines().len(), 2);
+        assert_eq!(crate::document::cell_text(cell_at(&tabs, 0, 0)), "al\npha");
+        assert_eq!(caret(&tabs), (0, 0, 3));
+        assert_eq!(table_shape(&tabs), (2, 2), "Enter alone never adds a row");
+    }
+
+    #[test]
+    fn enter_at_the_end_of_a_cell_steps_to_the_next_one() {
+        let mut tabs = table_tabs("tblnext");
+        assert_eq!(
+            caret(&tabs),
+            (0, 0, 0),
+            "an empty cell ends where it starts"
+        );
+        assert!(tabs.enter_in_table());
+        assert_eq!(caret(&tabs), (0, 1, 0));
+        assert_eq!(table_shape(&tabs), (2, 2));
+    }
+
+    #[test]
+    fn enter_at_the_last_cell_appends_a_row_and_lands_in_its_first_cell() {
+        let mut tabs = table_tabs("tblappend");
+        tabs.touch(|doc| doc.set_caret(1, 1, 0));
+        assert!(tabs.enter_in_table());
+        assert_eq!(table_shape(&tabs), (3, 2), "a row was appended");
+        assert_eq!(caret(&tabs), (2, 0, 0));
+        assert!(cell_at(&tabs, 2, 0).is_blank(), "the new row is blank");
+    }
+
+    #[test]
+    fn enter_at_the_last_cell_of_a_middle_row_steps_down_a_row() {
+        let mut tabs = table_tabs("tblmid");
+        tabs.touch(|doc| doc.set_caret(1, 1, 0));
+        assert!(tabs.enter_in_table());
+        assert_eq!(table_shape(&tabs), (3, 2));
+        // Row 1 is no longer the last, so its last cell steps down a row.
+        tabs.touch(|doc| doc.set_caret(1, 1, 0));
+        assert!(tabs.enter_in_table());
+        assert_eq!(caret(&tabs), (2, 0, 0));
+        assert_eq!(table_shape(&tabs), (3, 2), "no extra row this time");
+    }
+
+    #[test]
+    fn backspace_at_a_cell_start_folds_an_empty_column_away() {
+        let mut tabs = table_tabs("tblbs");
+        tabs.touch(|doc| doc.set_caret(0, 1, 0));
+        assert!(tabs.backspace_in_table());
+        assert_eq!(table_shape(&tabs), (2, 1), "the blank column is gone");
+        assert_eq!(caret(&tabs), (0, 0, 0));
+    }
+
+    #[test]
+    fn backspace_at_a_cell_start_keeps_a_column_that_holds_text() {
+        let mut tabs = table_tabs("tblbsc");
+        tabs.type_text("x"); // cell (0, 0)
+        tabs.touch(|doc| doc.set_caret(0, 1, 0));
+        assert!(tabs.backspace_in_table());
+        assert_eq!(table_shape(&tabs), (2, 2), "content is never deleted");
+        assert_eq!(crate::document::cell_text(cell_at(&tabs, 0, 0)), "x");
+    }
+
+    #[test]
+    fn backspace_inside_a_cell_still_deletes_one_character() {
+        let mut tabs = table_tabs("tblbschar");
+        tabs.type_text("ab");
+        assert_eq!(caret(&tabs), (0, 0, 2));
+        assert!(tabs.backspace_in_table());
+        assert_eq!(crate::document::cell_text(cell_at(&tabs, 0, 0)), "a");
+        assert_eq!(table_shape(&tabs), (2, 2));
+    }
+
+    #[test]
+    fn delete_at_a_cell_end_folds_an_empty_column_away() {
+        let mut tabs = table_tabs("tbldel");
+        assert_eq!(
+            caret(&tabs),
+            (0, 0, 0),
+            "an empty cell ends where it starts"
+        );
+        assert!(tabs.delete_in_table());
+        assert_eq!(table_shape(&tabs), (2, 1));
+    }
+
+    #[test]
+    fn delete_at_a_cell_end_keeps_a_column_that_holds_text() {
+        let mut tabs = table_tabs("tbldelc");
+        tabs.touch(|doc| doc.set_caret(0, 1, 0));
+        tabs.type_text("y"); // cell (0, 1)
+        tabs.touch(|doc| doc.set_caret(0, 0, 0));
+        assert!(tabs.delete_in_table());
+        assert_eq!(table_shape(&tabs), (2, 2), "content is never deleted");
+        assert_eq!(crate::document::cell_text(cell_at(&tabs, 0, 1)), "y");
+    }
+
+    #[test]
+    fn tab_cycles_cells_and_then_leaves_the_table_downward() {
+        let mut tabs = table_tabs("tbltab");
+        assert!(tabs.table_tab_or_exit(false));
+        assert_eq!(caret(&tabs), (0, 1, 0), "row-major cycling");
+        assert!(tabs.table_tab_or_exit(false));
+        assert_eq!(caret(&tabs), (1, 0, 0), "on to the next row");
+        assert!(tabs.table_tab_or_exit(false));
+        assert_eq!(caret(&tabs), (1, 1, 0), "the last cell");
+        assert!(tabs.table_tab_or_exit(false));
+        let document = &tabs.active().unwrap().document;
+        assert_eq!(document.body().len(), 3, "a paragraph opened below");
+        assert_eq!(document.caret.block, 2);
+        assert!(
+            !document.body()[2].is_table(),
+            "the caret is out of the grid"
+        );
+    }
+
+    #[test]
+    fn shift_tab_at_the_first_cell_leaves_the_table_upward() {
+        let mut tabs = table_tabs("tbltabup");
+        assert!(tabs.table_tab_or_exit(true));
+        let document = &tabs.active().unwrap().document;
+        assert_eq!(document.caret.block, 0, "landed above the table");
+        assert!(!document.body()[0].is_table());
+    }
+
+    #[test]
+    fn tab_into_an_existing_block_below_never_opens_a_paragraph() {
+        let mut tabs = table_tabs("tbltab2");
+        tabs.open_below(); // the model places a paragraph after the table
+        assert_eq!(tabs.active().unwrap().document.body().len(), 3);
+        tabs.touch(|doc| doc.set_caret(1, 1, 0));
+        assert!(tabs.table_tab_or_exit(false));
+        let document = &tabs.active().unwrap().document;
+        assert_eq!(document.body().len(), 3, "no second paragraph");
+        assert_eq!(document.caret.block, 2);
+    }
+
+    #[test]
+    fn insert_row_above_lands_above_the_carets_row_and_declines_on_the_header() {
+        let mut tabs = table_tabs("tblabove");
+        tabs.touch(|doc| doc.set_caret(1, 1, 0));
+        tabs.enter_in_table(); // three rows now
+        assert_eq!(table_shape(&tabs).0, 3);
+        tabs.touch(|doc| doc.set_caret(1, 0, 0));
+        assert!(tabs.table_row_above(0, 1));
+        assert_eq!(table_shape(&tabs).0, 4);
+        assert!(!tabs.table_row_above(0, 0), "nothing precedes the header");
+        assert_eq!(table_shape(&tabs).0, 4);
+    }
+
+    #[test]
+    fn insert_column_left_lands_left_of_the_carets_column_and_declines_first() {
+        let mut tabs = table_tabs("tblleft");
+        tabs.touch(|doc| doc.set_caret(0, 1, 0));
+        assert!(tabs.table_column_left(0, 1));
+        assert_eq!(table_shape(&tabs).1, 3);
+        assert!(!tabs.table_column_left(0, 0));
+        assert_eq!(table_shape(&tabs).1, 3);
     }
 }

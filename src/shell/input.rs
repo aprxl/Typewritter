@@ -54,9 +54,21 @@ use super::{
 fn apply_insert_event(docs: &mut Tabs, event: &InsertEvent) {
     match event {
         InsertEvent::Text(c) => docs.type_text(&c.to_string()),
-        InsertEvent::Backspace => docs.backspace(),
-        InsertEvent::Delete => docs.delete_forward(),
-        InsertEvent::Enter => docs.newline(),
+        InsertEvent::Backspace => {
+            if !docs.backspace_in_table() {
+                docs.backspace();
+            }
+        }
+        InsertEvent::Delete => {
+            if !docs.delete_in_table() {
+                docs.delete_forward();
+            }
+        }
+        InsertEvent::Enter => {
+            if !docs.enter_in_table() {
+                docs.newline();
+            }
+        }
         InsertEvent::SetHeading(level) => docs.set_heading(Some(*level)),
         InsertEvent::SetEmphasis { bold, italic } => {
             docs.touch(|doc| doc.set_emphasis(*bold, *italic));
@@ -515,6 +527,86 @@ impl Shell {
             self.sidenotes.set_open(true);
             focus_note(&mut self.docs.borrow_mut(), index);
         }
+    }
+
+    /// The table the caret sits in, as `(first_row_block, row, column)`.
+    /// `None` when the caret is not on a table, so every table command is a
+    /// no-op on prose rather than acting on the wrong block.
+    fn caret_table(&self) -> Option<(usize, usize, usize)> {
+        let docs = self.docs.borrow();
+        let tab = docs.active()?;
+        let document = &tab.document;
+        let block = document.caret.block;
+        let range = document.table_bounds(block)?;
+        let column = document.caret.inline.min(range.columns.saturating_sub(1));
+        Some((range.first, block - range.first, column))
+    }
+
+    /// `table.row_below`: a blank row under the caret's row.
+    pub(super) fn table_insert_row_below(&mut self) {
+        if let Some((first, row, _)) = self.caret_table() {
+            self.docs.borrow_mut().insert_table_row(first, row);
+        }
+    }
+
+    /// `table.row_above`: a blank row over the caret's row.
+    pub(super) fn table_insert_row_above(&mut self) {
+        if let Some((first, row, _)) = self.caret_table() {
+            self.docs.borrow_mut().table_row_above(first, row);
+        }
+    }
+
+    /// `table.row_delete`: remove the caret's row (a one-row table stays).
+    pub(super) fn table_delete_row(&mut self) {
+        if let Some((first, row, _)) = self.caret_table() {
+            self.docs.borrow_mut().remove_table_row(first, row);
+        }
+    }
+
+    /// `table.column_right`: a blank column right of the caret's column.
+    pub(super) fn table_insert_column_right(&mut self) {
+        if let Some((first, _, column)) = self.caret_table() {
+            self.docs.borrow_mut().insert_table_column(first, column);
+        }
+    }
+
+    /// `table.column_left`: a blank column left of the caret's column.
+    pub(super) fn table_insert_column_left(&mut self) {
+        if let Some((first, _, column)) = self.caret_table() {
+            self.docs.borrow_mut().table_column_left(first, column);
+        }
+    }
+
+    /// `table.column_delete`: remove the caret's column (a one-column table
+    /// stays).
+    pub(super) fn table_delete_column(&mut self) {
+        if let Some((first, _, column)) = self.caret_table() {
+            self.docs.borrow_mut().remove_table_column(first, column);
+        }
+    }
+
+    /// `table.card`: raise the table card for the caret's cell — the very
+    /// same `open_table_lines` a Normal-mode click calls, anchored to the
+    /// caret's band so the keyboard and the mouse share one card geometry.
+    pub(super) fn open_table_card(&mut self) {
+        let Some((first, row, column)) = self.caret_table() else {
+            return;
+        };
+        let rect = self.layout.rect(self.text_column);
+        let width = Editor::content_width(rect);
+        let (caret, scroll) = {
+            let docs = self.docs.borrow();
+            let Some(tab) = docs.active() else {
+                return;
+            };
+            (tab.document.caret, docs.editor_scroll)
+        };
+        let band = self.current_layout(width).caret_band(caret);
+        let anchor = (
+            Editor::content_x(rect),
+            rect.y + editor::TOP + band.0 - scroll,
+        );
+        self.open_table_lines(first, row, column, anchor);
     }
 
     fn open_table_lines(&mut self, first: usize, row: usize, column: usize, anchor: (f32, f32)) {
@@ -1184,7 +1276,9 @@ impl Shell {
             return;
         }
 
-        if input.is_key_typed(KeyCode::Tab) && self.docs.borrow_mut().table_tab(input.shift()) {
+        if input.is_key_typed(KeyCode::Tab)
+            && self.docs.borrow_mut().table_tab_or_exit(input.shift())
+        {
             self.insert_shortcuts.reset();
             self.goal_x = None;
             return;
@@ -1260,18 +1354,32 @@ impl Shell {
             if input.is_key_typed(KeyCode::Backspace) {
                 self.insert_shortcuts.reset();
                 let _ = self.vim.key_extended(Key::Backspace);
-                self.docs.borrow_mut().backspace();
+                // Inside a table the cell edge folds a blank neighbour away;
+                // everywhere else this is the document's own backspace.
+                let mut docs = self.docs.borrow_mut();
+                if !docs.backspace_in_table() {
+                    docs.backspace();
+                }
+                drop(docs);
                 self.insert_repeat.push(super::InsertEvent::Backspace);
             }
             if input.is_key_typed(KeyCode::Delete) {
                 self.insert_shortcuts.reset();
-                self.docs.borrow_mut().delete_forward();
+                let mut docs = self.docs.borrow_mut();
+                if !docs.delete_in_table() {
+                    docs.delete_forward();
+                }
+                drop(docs);
                 self.insert_repeat.push(super::InsertEvent::Delete);
             }
             if input.is_key_typed(KeyCode::Enter) {
                 self.insert_shortcuts.reset();
                 let _ = self.vim.key_extended(Key::Enter);
-                self.docs.borrow_mut().newline();
+                // Enter fills a table: at a cell's end it steps on, and past
+                // the last cell it opens a row; on a cell line it splits it.
+                if !self.docs.borrow_mut().enter_in_table() {
+                    self.docs.borrow_mut().newline();
+                }
                 self.insert_repeat.push(super::InsertEvent::Enter);
             }
         }
@@ -1397,7 +1505,9 @@ impl Shell {
 
     /// Normal and command modes consume resolved characters one at a time.
     fn edit_frame_normal(&mut self, input: &Input) {
-        if input.is_key_typed(KeyCode::Tab) && self.docs.borrow_mut().table_tab(input.shift()) {
+        if input.is_key_typed(KeyCode::Tab)
+            && self.docs.borrow_mut().table_tab_or_exit(input.shift())
+        {
             self.goal_x = None;
             return;
         }
@@ -1443,8 +1553,17 @@ impl Shell {
             self.apply(action);
         }
         if input.is_key_typed(KeyCode::Enter) {
-            let action = self.vim.key_extended(Key::Enter);
-            self.apply(action);
+            // A cell's Enter means the same thing in both modes, but only
+            // from a clean Normal state: a live search, command line or
+            // visual selection keeps Enter for what vim is already doing.
+            let filled = self.search.is_none()
+                && self.vim.visual_mode().is_none()
+                && !self.vim.command_active()
+                && self.docs.borrow_mut().enter_in_table();
+            if !filled {
+                let action = self.vim.key_extended(Key::Enter);
+                self.apply(action);
+            }
         }
         if input.is_key_pressed(KeyCode::Escape) {
             // Escape pops one level in Normal mode too: leaving a focused

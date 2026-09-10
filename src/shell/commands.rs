@@ -59,6 +59,11 @@ fn key_label(key: KeyCode) -> &'static str {
         KeyCode::KeyC => "C",
         KeyCode::KeyX => "X",
         KeyCode::KeyV => "V",
+        KeyCode::KeyH => "H",
+        KeyCode::KeyJ => "J",
+        KeyCode::KeyK => "K",
+        KeyCode::KeyL => "L",
+        KeyCode::KeyT => "T",
         KeyCode::Digit1 => "1",
         KeyCode::Digit2 => "2",
         KeyCode::Digit3 => "3",
@@ -444,6 +449,80 @@ pub const COMMANDS: &[Command] = &[
         group: "Format",
         chord: None,
         run: |shell| shell.docs.borrow_mut().insert_table(),
+    },
+    // The table's structure, reachable without a mouse. `Ctrl+J`/`Ctrl+K`
+    // add a row below/above (vim's down/up), `Ctrl+H`/`Ctrl+L` add a column
+    // left/right; Shift on the row/column axis deletes it. `Ctrl+T` raises
+    // the same card a Normal-mode click does, for the caret's own cell.
+    Command {
+        id: "table.card",
+        title: "Table card…",
+        group: "Format",
+        chord: Some(Chord {
+            mods: CTRL,
+            key: KeyCode::KeyT,
+        }),
+        run: |shell| shell.open_table_card(),
+    },
+    Command {
+        id: "table.row_below",
+        title: "Insert row below",
+        group: "Format",
+        chord: Some(Chord {
+            mods: CTRL,
+            key: KeyCode::KeyJ,
+        }),
+        run: |shell| shell.table_insert_row_below(),
+    },
+    Command {
+        id: "table.row_above",
+        title: "Insert row above",
+        group: "Format",
+        chord: Some(Chord {
+            mods: CTRL,
+            key: KeyCode::KeyK,
+        }),
+        run: |shell| shell.table_insert_row_above(),
+    },
+    Command {
+        id: "table.row_delete",
+        title: "Delete row",
+        group: "Format",
+        chord: Some(Chord {
+            mods: CTRL_SHIFT,
+            key: KeyCode::KeyK,
+        }),
+        run: |shell| shell.table_delete_row(),
+    },
+    Command {
+        id: "table.column_right",
+        title: "Insert column right",
+        group: "Format",
+        chord: Some(Chord {
+            mods: CTRL,
+            key: KeyCode::KeyL,
+        }),
+        run: |shell| shell.table_insert_column_right(),
+    },
+    Command {
+        id: "table.column_left",
+        title: "Insert column left",
+        group: "Format",
+        chord: Some(Chord {
+            mods: CTRL,
+            key: KeyCode::KeyH,
+        }),
+        run: |shell| shell.table_insert_column_left(),
+    },
+    Command {
+        id: "table.column_delete",
+        title: "Delete column",
+        group: "Format",
+        chord: Some(Chord {
+            mods: CTRL_SHIFT,
+            key: KeyCode::KeyL,
+        }),
+        run: |shell| shell.table_delete_column(),
     },
     Command {
         // One command for both directions: a tagged equation loses its tag,
@@ -1264,6 +1343,55 @@ mod tests {
                 .iter()
                 .any(|entry| entry.id == "note.edit")
         );
+    }
+
+    #[test]
+    fn table_commands_all_appear_in_the_palette_and_share_no_chord() {
+        let table_ids: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|command| command.id.starts_with("table."))
+            .map(|command| command.id)
+            .collect();
+        assert_eq!(
+            table_ids,
+            vec![
+                "table.card",
+                "table.row_below",
+                "table.row_above",
+                "table.row_delete",
+                "table.column_right",
+                "table.column_left",
+                "table.column_delete",
+            ]
+        );
+        let palette: Vec<&str> = palette_commands().iter().map(|c| c.id).collect();
+        let editor: Vec<&str> = editor_commands().iter().map(|c| c.id).collect();
+        for id in &table_ids {
+            assert!(
+                palette.contains(id),
+                "{id} is not reachable from the leader palette"
+            );
+            assert!(
+                editor.contains(id),
+                "{id} is not reachable from the slash menu"
+            );
+            let command = COMMANDS.iter().find(|command| command.id == *id).unwrap();
+            let chord = command.chord.expect("every table command has a chord");
+            assert!(
+                chord.mods.control_key(),
+                "{id} must carry at least Ctrl so it cannot shadow a bare vim key"
+            );
+        }
+        // No two bound commands may answer the same chord: the first match
+        // in `matching` would silently win for both.
+        let mut labels: Vec<String> = COMMANDS
+            .iter()
+            .filter_map(|command| command.chord.map(|chord| chord.label()))
+            .collect();
+        let bound = labels.len();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(labels.len(), bound, "two commands share a chord");
     }
 
     #[test]
