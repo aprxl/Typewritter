@@ -1265,8 +1265,10 @@ impl Document {
             return None;
         }
 
-        if start.block == end.block && self.scope()[start.block].is_table() {
-            let cells = self.table_cells_in_range(start.block, start.offset, end.offset);
+        // Both ends inside one table (same row or spanning rows): the range
+        // is answered per cell, so a formatting command over several cells
+        // reaches all of them rather than only a single row.
+        if let Some(cells) = self.table_range_cells(start, end) {
             if cells.is_empty() {
                 return None;
             }
@@ -1276,24 +1278,20 @@ impl Document {
                     badge: !mask.code && mask.badge,
                     ..Style::PLAIN
                 };
-                return Some(cells.iter().all(|&(cell, from, to)| {
-                    slice_inline_runs(self.scope()[start.block].cells()[cell].runs(), from, to)
-                        .iter()
-                        .all(|run| {
-                            let style = run.style();
-                            if boxed.badge {
-                                style.badge
-                            } else {
-                                style == boxed
-                            }
-                        })
+                return Some(cells.iter().all(|&(row, cell, from, to)| {
+                    self.cell_slice_runs(row, cell, from, to).iter().all(|run| {
+                        let style = run.style();
+                        if boxed.badge {
+                            style.badge
+                        } else {
+                            style == boxed
+                        }
+                    })
                 }));
             }
             let eligible = cells
                 .iter()
-                .flat_map(|&(cell, from, to)| {
-                    slice_inline_runs(self.scope()[start.block].cells()[cell].runs(), from, to)
-                })
+                .flat_map(|&(row, cell, from, to)| self.cell_slice_runs(row, cell, from, to))
                 .filter(|run| !run.style().is_boxed())
                 .collect::<Vec<_>>();
             return (!eligible.is_empty())
@@ -1369,6 +1367,18 @@ impl Document {
             return false;
         }
 
+        if let Some(cells) = self.table_range_cells(start, end) {
+            let mut selected = false;
+            let mut active = true;
+            for (row, cell, from, to) in cells {
+                for run in self.cell_slice_runs(row, cell, from, to) {
+                    selected = true;
+                    active &= run.style().badge && run.style().badge_color == color;
+                }
+            }
+            return selected && active;
+        }
+
         let mut selected = false;
         let mut active = true;
         for block in start.block..=end.block {
@@ -1401,18 +1411,14 @@ impl Document {
             return;
         }
 
-        if start.block == end.block && self.scope()[start.block].is_table() {
-            let cells = self.table_cells_in_range(start.block, start.offset, end.offset);
+        if let Some(cells) = self.table_range_cells(start, end) {
             let Some(active) = self.style_range_status(range, mask) else {
                 return;
             };
             let boxed = mask.code || mask.badge;
-            for (cell, from, to) in cells {
-                let original = self.scope()[start.block].cells()[cell].runs();
-                let len: usize = original.iter().map(flat_len).sum();
-                let mut contents = slice_inline_runs(original, 0, from);
-                let mut selected = slice_inline_runs(original, from, to);
-                for run in &mut selected {
+            for (row, cell, from, to) in cells {
+                let row_cells = self.scope_mut()[row].cells_mut().expect("table row");
+                Self::style_cell_slice(&mut row_cells[cell], from, to, |run| {
                     let style = run.style();
                     let target = if boxed {
                         if active {
@@ -1439,12 +1445,7 @@ impl Document {
                         }
                     };
                     run.set_style(target);
-                }
-                contents.extend(selected);
-                contents.extend(slice_inline_runs(original, to, len));
-                self.scope_mut()[start.block]
-                    .cells_mut()
-                    .expect("table row")[cell] = table::Cell::from_runs(contents);
+                });
             }
             self.dirty = true;
             self.enforce();
@@ -1550,27 +1551,18 @@ impl Document {
             return;
         }
 
-        if start.block == end.block && self.scope()[start.block].is_table() {
-            let cells = self.table_cells_in_range(start.block, start.offset, end.offset);
+        if let Some(cells) = self.table_range_cells(start, end) {
             let mut changed = false;
-            for (cell, from, to) in cells {
-                let original = self.scope()[start.block].cells()[cell].runs();
-                let len: usize = original.iter().map(flat_len).sum();
-                let mut contents = slice_inline_runs(original, 0, from);
-                let mut selected = slice_inline_runs(original, from, to);
-                for run in &mut selected {
+            for (row, cell, from, to) in cells {
+                let row_cells = self.scope_mut()[row].cells_mut().expect("table row");
+                Self::style_cell_slice(&mut row_cells[cell], from, to, |run| {
                     let mut style = run.style();
                     if style.badge && style.badge_color != color {
                         style.badge_color = color;
                         run.set_style(style);
                         changed = true;
                     }
-                }
-                contents.extend(selected);
-                contents.extend(slice_inline_runs(original, to, len));
-                self.scope_mut()[start.block]
-                    .cells_mut()
-                    .expect("table row")[cell] = table::Cell::from_runs(contents);
+                });
             }
             if changed {
                 self.dirty = true;

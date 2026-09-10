@@ -7,7 +7,7 @@
 
 use super::math_notation;
 use super::table;
-use super::{BadgeColor, Block, Document, Focus, Inline, Style, TableDirection};
+use super::{BadgeColor, Block, Document, FlatPos, Focus, Inline, Style, TableDirection};
 use super::{flat_len, placeholder_if_empty, slice_inline_runs, table_row};
 
 /// The extent of one table in the block stream. `first` and `end` are the
@@ -549,6 +549,96 @@ impl Document {
         out
     }
 
+    /// `(row, cell, from, to)` for every cell a range covers, named in that
+    /// cell's own flat space, when both ends of the range lie inside one and
+    /// the same table. `None` otherwise, so a range that mixes a table with
+    /// prose keeps the block-wise behaviour and never splices prose into a
+    /// row.
+    pub(crate) fn table_range_cells(
+        &self,
+        start: FlatPos,
+        end: FlatPos,
+    ) -> Option<Vec<(usize, usize, usize, usize)>> {
+        if (start.block, start.offset) >= (end.block, end.offset) {
+            return None;
+        }
+        let first = self.table_bounds(start.block)?;
+        let last = self.table_bounds(end.block)?;
+        if first.first != last.first || first.end != last.end {
+            return None;
+        }
+        let mut cells = Vec::new();
+        for row in start.block..=end.block {
+            let from = if row == start.block { start.offset } else { 0 };
+            let to = if row == end.block {
+                end.offset
+            } else {
+                self.block_len(row)
+            };
+            cells.extend(
+                self.table_cells_in_range(row, from, to)
+                    .into_iter()
+                    .map(|(cell, from, to)| (row, cell, from, to)),
+            );
+        }
+        Some(cells)
+    }
+
+    /// The runs a cell-flat `[from, to)` window covers, line by line — a cell
+    /// is a container, so a range reaching into it maps through its lines
+    /// rather than assuming one.
+    pub(crate) fn cell_slice_runs(
+        &self,
+        row: usize,
+        cell: usize,
+        from: usize,
+        to: usize,
+    ) -> Vec<Inline> {
+        let mut out = Vec::new();
+        let mut line_start = 0;
+        for line in self.scope()[row].cells()[cell].lines() {
+            let len: usize = line.iter().map(flat_len).sum();
+            let start = from.saturating_sub(line_start).min(len);
+            let end = to.saturating_sub(line_start).min(len);
+            if start < end {
+                out.extend(slice_inline_runs(line, start, end));
+            }
+            line_start += len + 1;
+        }
+        out
+    }
+
+    /// Applies `f` to every run a cell-flat `[from, to)` window covers, line
+    /// by line, rebuilding only the lines it reaches. The mutating mirror of
+    /// [`Self::cell_slice_runs`].
+    pub(crate) fn style_cell_slice(
+        cell: &mut table::Cell,
+        from: usize,
+        to: usize,
+        mut f: impl FnMut(&mut Inline),
+    ) {
+        if from >= to {
+            return;
+        }
+        let mut line_start = 0;
+        for line in cell.lines_mut() {
+            let len: usize = line.iter().map(flat_len).sum();
+            let start = from.saturating_sub(line_start).min(len);
+            let end = to.saturating_sub(line_start).min(len);
+            if start < end {
+                let mut rebuilt = slice_inline_runs(line, 0, start);
+                let mut selected = slice_inline_runs(line, start, end);
+                for run in &mut selected {
+                    f(run);
+                }
+                rebuilt.extend(selected);
+                rebuilt.extend(slice_inline_runs(line, end, len));
+                *line = rebuilt;
+            }
+            line_start += len + 1;
+        }
+    }
+
     /// Removes the runs a cell-flat `[from, to)` window covers, line by
     /// line, folding the covered lines into one when the window spans a line
     /// break. The removal mirror of [`Self::style_cell_slice`].
@@ -1001,7 +1091,7 @@ mod clip_tests {
     use std::path::Path;
 
     use crate::document::markdown::parse;
-    use crate::document::{Block, Document, cell_text};
+    use crate::document::{Block, Document, FlatRange, Style, cell_text};
 
     fn path() -> &'static Path {
         Path::new("table.md")
@@ -1057,5 +1147,90 @@ mod clip_tests {
         );
         let back = parse(path(), &copied);
         assert_eq!(back.body(), document.body());
+    }
+
+    /// Whether every run of a cell carries bold.
+    fn bold_of(document: &Document, row: usize, cell: usize) -> bool {
+        document.body()[row].cells()[cell]
+            .lines()
+            .iter()
+            .flat_map(|line| line.iter())
+            .all(|run| run.style().bold)
+    }
+
+    fn fill(document: &mut Document, row: usize, cell: usize, text: &str) {
+        document.set_caret(row, cell, 0);
+        document.insert_text(text);
+    }
+
+    fn bold() -> Style {
+        Style {
+            bold: true,
+            ..Style::PLAIN
+        }
+    }
+
+    #[test]
+    fn a_copied_row_carries_boxed_styles_back_to_the_same_cells() {
+        let document = parse(path(), "| `c` | [[B]] |\n| --- | --- |\n| x | y |\n");
+        let copied = copy(&document, 0, 0);
+        assert_eq!(copied, "| `c` | [[B]] |");
+        let back = parse(path(), &format!("{copied}\n| --- | --- |"));
+        assert_eq!(back.body()[0].cells(), document.body()[0].cells());
+    }
+
+    #[test]
+    fn a_style_range_across_two_cells_of_a_row_styles_both() {
+        let mut document = table_document();
+        fill(&mut document, 0, 0, "a");
+        fill(&mut document, 0, 1, "b");
+        let range = FlatRange::new(
+            document.position(0, 0),
+            document.position(0, document.block_len(0)),
+        );
+        document.toggle_style_range(range, bold());
+        assert!(bold_of(&document, 0, 0), "the first cell is styled");
+        assert!(bold_of(&document, 0, 1), "so is the second");
+    }
+
+    #[test]
+    fn a_cross_row_style_range_styles_every_covered_cell() {
+        let mut document = table_document();
+        fill(&mut document, 0, 0, "a");
+        fill(&mut document, 0, 1, "b");
+        fill(&mut document, 1, 0, "c");
+        fill(&mut document, 1, 1, "d");
+        let range = FlatRange::new(
+            document.position(0, 0),
+            document.position(1, document.block_len(1)),
+        );
+        document.toggle_style_range(range, bold());
+        for (row, cell) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            assert!(bold_of(&document, row, cell), "cell {row}.{cell} is styled");
+        }
+    }
+
+    #[test]
+    fn a_style_range_spanning_a_table_and_prose_leaves_the_grid_intact() {
+        let mut document = parse(path(), "| A | B |\n| --- | --- |\n| a | b |\n\nafter\n");
+        document.set_caret(0, 0, 0);
+        let range = FlatRange::new(
+            document.position(0, 0),
+            document.position(2, document.block_len(2)),
+        );
+        document.toggle_style_range(range, bold());
+        let body = document.body();
+        assert!(
+            body[0].is_table() && body[1].is_table(),
+            "the grid survives"
+        );
+        assert_eq!(body[0].cells().len(), 2);
+        assert_eq!(cell_text(&body[1].cells()[0]), "a");
+        assert!(!bold_of(&document, 1, 0), "the table part is left alone");
+        let paragraph = body[2].inlines();
+        assert!(
+            paragraph.iter().all(|run| run.style().bold),
+            "the prose part is styled"
+        );
     }
 }
