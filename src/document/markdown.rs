@@ -509,15 +509,27 @@ fn parse_table_cells(line: &str, columns: Option<usize>) -> Option<Vec<String>> 
     }
 }
 
-/// The Markdown delimiter row which makes a pipe row a table header.
-fn table_divider_columns(line: &str) -> Option<usize> {
+/// The Markdown delimiter row which makes a pipe row a table header, with
+/// each column's alignment — `---`, `:--`, `--:`, `:-:`.
+fn table_divider_columns(line: &str) -> Option<Vec<table::ColumnAlign>> {
     let cells = parse_table_cells(line, None)?;
-    (!cells.is_empty()
-        && cells.iter().all(|cell| {
-            let cell = cell.trim_matches(':');
-            cell.len() >= 3 && cell.chars().all(|ch| ch == '-')
-        }))
-    .then_some(cells.len())
+    if cells.is_empty() {
+        return None;
+    }
+    let mut aligns = Vec::with_capacity(cells.len());
+    for cell in &cells {
+        let dashes = cell.trim_matches(':');
+        if dashes.len() < 3 || !dashes.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        aligns.push(match (cell.starts_with(':'), cell.ends_with(':')) {
+            (true, true) => table::ColumnAlign::Centre,
+            (true, false) => table::ColumnAlign::Left,
+            (false, true) => table::ColumnAlign::Right,
+            (false, false) => table::ColumnAlign::None,
+        });
+    }
+    Some(aligns)
 }
 
 /// The length of an unescaped `<br>` / `<br/>` at `i`, any case, or `None`
@@ -606,7 +618,18 @@ fn table_rows(blocks: &[Block], first: usize) -> usize {
 fn apply_table_settings(blocks: &mut [Block], first: usize, settings: table::TableSettings) {
     let rows = table_rows(blocks, first);
     let columns = blocks[first].cells().len();
-    let shared = std::sync::Arc::new(settings.normalized(columns, rows));
+    let mut settings = settings.normalized(columns, rows);
+    // The metadata comment carries geometry, not alignment: the divider row
+    // owns the alignment, so keep what the header already parsed.
+    if settings
+        .align
+        .iter()
+        .all(|align| *align == table::ColumnAlign::None)
+        && let Some(existing) = blocks[first].table_settings()
+    {
+        settings.align = existing.align.clone();
+    }
+    let shared = std::sync::Arc::new(settings);
     for row in &mut blocks[first..first + rows] {
         if let Block::TableRow {
             settings: row_settings,
@@ -654,6 +677,8 @@ fn parse_table_metadata(line: &str) -> Option<table::TableSettings> {
         lines: lines?,
         column_shares: columns?,
         row_heights: rows?,
+        // Alignment is the divider row's, not the comment's.
+        align: Vec::new(),
     })
 }
 
@@ -833,12 +858,15 @@ pub fn parse(path: &Path, text: &str) -> Document {
         // The delimiter row claims the one pending pipe row as a table
         // header. We do this before ordinary paragraph parsing, so a table
         // is recognised even though the streaming parser has no look-ahead.
-        if let Some(columns) = table_divider_columns(line)
+        if let Some(aligns) = table_divider_columns(line)
             && para.len() == 1
-            && let Some(cells) = parse_table_cells(&para[0], Some(columns))
+            && let Some(cells) = parse_table_cells(&para[0], Some(aligns.len()))
         {
             para.clear();
-            let settings = std::sync::Arc::new(table::TableSettings::new(columns, 1));
+            let columns = aligns.len();
+            let mut settings = table::TableSettings::new(columns, 1);
+            settings.align = aligns;
+            let settings = std::sync::Arc::new(settings);
             let first = blocks.len();
             blocks.push(Block::TableRow {
                 cells: table_cells(cells),
@@ -1140,8 +1168,15 @@ fn serialize_plain(doc: &Document) -> String {
                 write_row(&mut out, first_table_row);
                 out.push('\n');
                 out.push('|');
-                for _ in 0..columns {
-                    out.push_str(" --- |");
+                for align in &settings.align {
+                    out.push(' ');
+                    out.push_str(match align {
+                        table::ColumnAlign::None => "---",
+                        table::ColumnAlign::Left => ":---",
+                        table::ColumnAlign::Centre => ":---:",
+                        table::ColumnAlign::Right => "---:",
+                    });
+                    out.push_str(" |");
                 }
                 for row in &doc.body()[i + 1..end] {
                     out.push('\n');

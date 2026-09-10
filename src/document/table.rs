@@ -285,6 +285,16 @@ impl TableLines {
     }
 }
 
+/// One column's GFM alignment: the `:` positions of the divider row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ColumnAlign {
+    #[default]
+    None,
+    Left,
+    Centre,
+    Right,
+}
+
 /// The saved, reader-controlled dimensions for a table. Column widths are
 /// shares, so a table always fills the editable measure after a window resize.
 /// Row heights are logical pixels and therefore retain the rhythm the reader
@@ -294,6 +304,9 @@ pub struct TableSettings {
     pub lines: TableLines,
     pub column_shares: Vec<f32>,
     pub row_heights: Vec<f32>,
+    /// Per-column alignment, read from the divider row on disk and written
+    /// back to it. Not part of the metadata comment: the Markdown owns it.
+    pub align: Vec<ColumnAlign>,
 }
 
 impl TableSettings {
@@ -303,6 +316,7 @@ impl TableSettings {
             lines: TableLines::default(),
             column_shares: vec![1.0 / columns as f32; columns],
             row_heights: vec![DEFAULT_ROW_HEIGHT; rows.max(1)],
+            align: vec![ColumnAlign::None; columns],
         }
     }
 
@@ -323,6 +337,9 @@ impl TableSettings {
             for share in &mut self.column_shares {
                 *share /= total;
             }
+        }
+        if self.align.len() != columns {
+            self.align = vec![ColumnAlign::None; columns];
         }
         if self.row_heights.len() != rows {
             self.row_heights.resize(rows, DEFAULT_ROW_HEIGHT);

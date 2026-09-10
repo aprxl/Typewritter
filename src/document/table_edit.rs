@@ -99,6 +99,29 @@ mod tests {
     }
 
     #[test]
+    fn column_alignment_survives_a_save() {
+        let path = Path::new("table.md");
+        let text = "| A | B | C | D |\n| :--- | ---: | :---: | --- |\n| a | b | c | d |\n\
+                    <!-- typewritter-table v1 lines=111111 cols=0.250000,0.250000,0.250000,0.250000 rows=38.00,38.00 -->\n";
+        let document = parse(path, text);
+        assert_eq!(
+            document.body()[0].table_settings().unwrap().align,
+            vec![
+                crate::document::table::ColumnAlign::Left,
+                crate::document::table::ColumnAlign::Right,
+                crate::document::table::ColumnAlign::Centre,
+                crate::document::table::ColumnAlign::None,
+            ]
+        );
+        assert_eq!(
+            serialize(&document),
+            text,
+            "alignment is not silently dropped"
+        );
+        assert_eq!(parse(path, &serialize(&document)).body(), document.body());
+    }
+
+    #[test]
     fn a_two_line_cell_round_trips_through_disk() {
         let path = Path::new("table.md");
         let text = "| A | B |\n| --- | --- |\n| one<br>two | x |\n\
