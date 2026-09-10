@@ -1,8 +1,512 @@
 //! Structural table edits.
 //!
-//! A table is a run of `Block::TableRow` blocks; every edit here is a
+//! A table is a run of `Block::TableRow` blocks, and every edit here is a
 //! document-level operation on that run and its shared settings. Cell-level
-//! arithmetic (lines, flat offsets) lives on [`table::Cell`] itself.
+//! arithmetic — lines, flat offsets, run positions — lives on
+//! [`super::table::Cell`] itself.
+
+use super::table;
+use super::{Block, Document, Focus, TableDirection};
+use super::{flat_len, placeholder_if_empty, slice_inline_runs, table_row};
+
+/// The extent of one table in the block stream. `first` and `end` are the
+/// half-open row range; `rows` and `columns` are its shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TableRange {
+    pub first: usize,
+    pub end: usize,
+    pub rows: usize,
+    pub columns: usize,
+}
+
+impl Document {
+    /// Move through table cells in row-major order. The last cell wraps to
+    /// the first (and vice versa for Shift-Tab), which is the useful cycling
+    /// behaviour while filling in a small layout table.
+    pub fn table_tab(&mut self, backwards: bool) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        let Some(range) = self.table_bounds(block) else {
+            return false;
+        };
+        let (first, end, columns) = (range.first, range.end, range.columns);
+        let row = block - first;
+        let cell = self.caret.inline.min(columns.saturating_sub(1));
+        let total = (end - first) * columns;
+        let current = row * columns + cell;
+        let next = if backwards {
+            (current + total - 1) % total
+        } else {
+            (current + 1) % total
+        };
+        let next_block = first + next / columns;
+        let next_cell = next % columns;
+        self.set_caret(next_block, next_cell, 0);
+        true
+    }
+
+    /// Navigate the table grid in the arrow's physical direction. Horizontal
+    /// movement keeps character-level editing inside a cell, then crosses a
+    /// cell boundary; vertical movement preserves the character offset.
+    pub fn table_move(&mut self, direction: TableDirection) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        let Some(range) = self.table_bounds(block) else {
+            return false;
+        };
+        let (first, end, columns) = (range.first, range.end, range.columns);
+        let cell = self.caret.inline.min(columns.saturating_sub(1));
+        let offset = self.caret.offset;
+        let len = self.scope()[block].cells()[cell].flat_len();
+        match direction {
+            TableDirection::Left if offset > 0 => {
+                self.set_caret(block, cell, offset - 1);
+                true
+            }
+            TableDirection::Left if cell > 0 => {
+                let previous = cell - 1;
+                let end = self.scope()[block].cells()[previous].flat_len();
+                self.set_caret(block, previous, end);
+                true
+            }
+            TableDirection::Right if offset < len => {
+                self.set_caret(block, cell, offset + 1);
+                true
+            }
+            TableDirection::Right if cell + 1 < columns => {
+                self.set_caret(block, cell + 1, 0);
+                true
+            }
+            TableDirection::Up if block > first => {
+                let target = block - 1;
+                let target_len = self.scope()[target].cells()[cell].flat_len();
+                self.set_caret(target, cell, offset.min(target_len));
+                true
+            }
+            TableDirection::Down if block + 1 < end => {
+                let target = block + 1;
+                let target_len = self.scope()[target].cells()[cell].flat_len();
+                self.set_caret(target, cell, offset.min(target_len));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Enter inside a table cell: split the cell's current line at the
+    /// caret's own line offset. The break costs one flat position, so the
+    /// caret lands on the new line by moving one past its insert point.
+    /// Returns whether a line was split.
+    pub fn split_cell_line(&mut self) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        if !self.scope()[block].is_table() {
+            return false;
+        }
+        let cell = self.caret.inline;
+        let flat = self.caret.offset;
+        let (line, offset) = self.scope()[block].cells()[cell].position(flat);
+        let (head, tail) = {
+            let runs = self.scope()[block].cells()[cell].lines()[line].as_slice();
+            let len: usize = runs.iter().map(flat_len).sum();
+            (
+                slice_inline_runs(runs, 0, offset),
+                slice_inline_runs(runs, offset, len),
+            )
+        };
+        let contents = &mut self.scope_mut()[block].cells_mut().expect("table row")[cell];
+        let lines = contents.lines_mut();
+        lines[line] = placeholder_if_empty(head);
+        lines.insert(line + 1, placeholder_if_empty(tail));
+        self.caret.offset = flat + 1;
+        self.dirty = true;
+        self.enforce();
+        true
+    }
+
+    /// Backspace at the start of a cell line: fold it onto the line above,
+    /// leaving the caret at the junction. On the first line of a cell (and
+    /// at the start of a cell) nothing is joined. Returns whether a line was
+    /// joined.
+    pub fn join_cell_line(&mut self) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        if !self.scope()[block].is_table() {
+            return false;
+        }
+        let cell = self.caret.inline;
+        let flat = self.caret.offset;
+        let (line, offset) = self.scope()[block].cells()[cell].position(flat);
+        if offset != 0 || line == 0 {
+            return false;
+        }
+        self.merge_cell_line(cell, line - 1);
+        self.caret.offset = flat - 1;
+        self.dirty = true;
+        self.enforce();
+        true
+    }
+
+    /// Delete at the end of a cell line: fold the next line onto this one,
+    /// leaving the caret at the junction. On the last line of a cell nothing
+    /// is joined. Returns whether a line was joined.
+    pub fn join_cell_line_forward(&mut self) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        if !self.scope()[block].is_table() {
+            return false;
+        }
+        let cell = self.caret.inline;
+        let flat = self.caret.offset;
+        let (line, offset) = self.scope()[block].cells()[cell].position(flat);
+        let line_len: usize = self.scope()[block].cells()[cell].lines()[line]
+            .iter()
+            .map(flat_len)
+            .sum();
+        if offset != line_len || line + 1 >= self.scope()[block].cells()[cell].lines().len() {
+            return false;
+        }
+        self.merge_cell_line(cell, line);
+        self.caret.offset = flat;
+        self.dirty = true;
+        self.enforce();
+        true
+    }
+
+    /// Fold the cell line after `line` onto `line` — the one geometric core
+    /// of both joins. The caret is left where the caller put it; `enforce`
+    /// clamps it into the joined line.
+    fn merge_cell_line(&mut self, cell: usize, line: usize) {
+        let block = self.caret.block;
+        let mut joined = self.scope()[block].cells()[cell].lines()[line].clone();
+        joined.extend_from_slice(&self.scope()[block].cells()[cell].lines()[line + 1]);
+        let contents = &mut self.scope_mut()[block].cells_mut().expect("table row")[cell];
+        contents.lines_mut()[line] = joined;
+        contents.lines_mut().remove(line + 1);
+    }
+
+    /// Inserts the standard two-by-two table below the caret (or replaces an
+    /// empty paragraph) and starts typing in its first cell.
+    pub fn insert_table(&mut self) {
+        self.clamp_caret();
+        if matches!(self.focus, Focus::Note(_)) {
+            return;
+        }
+        let block = self.caret.block;
+        if self.scope()[block].is_table() {
+            return;
+        }
+        let settings = std::sync::Arc::new(table::TableSettings::new(2, 2));
+        let rows = [
+            table_row(2, true, std::sync::Arc::clone(&settings)),
+            table_row(2, false, settings),
+        ];
+        let first = if self.block_flat_len(block) == 0 && !self.scope()[block].is_table() {
+            self.scope_mut().splice(block..=block, rows);
+            block
+        } else {
+            self.scope_mut().splice(block + 1..block + 1, rows);
+            block + 1
+        };
+        self.dirty = true;
+        self.enforce();
+        self.set_caret(first, 0, 0);
+    }
+
+    /// Toggle one grid stroke for the table containing `block`.
+    pub fn toggle_table_line(&mut self, block: usize, line: table::GridLine) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some(range) = self.table_bounds(block) else {
+            return false;
+        };
+        let (first, end, columns) = (range.first, range.end, range.columns);
+        let rows = end - first;
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        settings.lines.toggle(line);
+        self.set_table_settings(first, end, std::sync::Arc::new(settings));
+        self.dirty = true;
+        true
+    }
+
+    /// Drag the divider after column `divider`, transferring width only to
+    /// its right-hand neighbour so the editable table width remains fixed.
+    pub fn resize_table_column(&mut self, block: usize, divider: usize, delta_share: f32) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some(range) = self.table_bounds(block) else {
+            return false;
+        };
+        let (first, end, columns) = (range.first, range.end, range.columns);
+        if divider + 1 >= columns || !delta_share.is_finite() {
+            return false;
+        }
+        let rows = end - first;
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        let left = settings.column_shares[divider];
+        let right = settings.column_shares[divider + 1];
+        let delta = delta_share.clamp(
+            table::MIN_COLUMN_SHARE - left,
+            right - table::MIN_COLUMN_SHARE,
+        );
+        if delta == 0.0 {
+            return false;
+        }
+        settings.column_shares[divider] += delta;
+        settings.column_shares[divider + 1] -= delta;
+        self.set_table_settings(first, end, std::sync::Arc::new(settings));
+        self.dirty = true;
+        true
+    }
+
+    /// Drag the divider below row `divider`, transferring height to the row
+    /// under it while retaining the table's total height.
+    pub fn resize_table_row(&mut self, block: usize, divider: usize, delta: f32) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some(range) = self.table_bounds(block) else {
+            return false;
+        };
+        let (first, end, columns) = (range.first, range.end, range.columns);
+        let rows = end - first;
+        if divider + 1 >= rows || !delta.is_finite() {
+            return false;
+        }
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        let top = settings.row_heights[divider];
+        let bottom = settings.row_heights[divider + 1];
+        let delta = delta.clamp(table::MIN_ROW_HEIGHT - top, bottom - table::MIN_ROW_HEIGHT);
+        if delta == 0.0 {
+            return false;
+        }
+        settings.row_heights[divider] += delta;
+        settings.row_heights[divider + 1] -= delta;
+        self.set_table_settings(first, end, std::sync::Arc::new(settings));
+        self.dirty = true;
+        true
+    }
+
+    /// Insert a blank row immediately after `row` in the table containing
+    /// `block`. The table card always acts on the row the reader clicked, so
+    /// no secondary table selection state can go stale.
+    pub fn insert_table_row(&mut self, block: usize, row: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some(range) = self.table_bounds(block) else {
+            return false;
+        };
+        let (first, end, columns) = (range.first, range.end, range.columns);
+        let rows = end - first;
+        let index = row.min(rows.saturating_sub(1)) + 1;
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        settings
+            .row_heights
+            .insert(index, table::DEFAULT_ROW_HEIGHT);
+        let settings = std::sync::Arc::new(settings);
+        self.scope_mut().insert(
+            first + index,
+            table_row(columns, false, std::sync::Arc::clone(&settings)),
+        );
+        self.set_table_settings(first, end + 1, settings);
+        if self.caret.block >= first + index {
+            self.caret.block += 1;
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Remove the selected row. A one-row table keeps its final row: a table
+    /// is still a table with empty cells, while deleting its last row would
+    /// silently turn a local layout block into unrelated prose.
+    pub fn remove_table_row(&mut self, block: usize, row: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some(range) = self.table_bounds(block) else {
+            return false;
+        };
+        let (first, end, columns) = (range.first, range.end, range.columns);
+        let rows = end - first;
+        if rows <= 1 {
+            return false;
+        }
+        let index = row.min(rows - 1);
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        settings.row_heights.remove(index);
+        self.scope_mut().remove(first + index);
+        if index == 0 {
+            // The next physical row becomes the Markdown table's anchor.
+            // Without promoting it, serialisation would see a continuation
+            // row without a table start and turn the surviving grid into
+            // prose on disk.
+            if let Block::TableRow { first: marker, .. } = &mut self.scope_mut()[first] {
+                *marker = true;
+            }
+        }
+        self.set_table_settings(first, end - 1, std::sync::Arc::new(settings));
+        if self.caret.block > first + index {
+            self.caret.block -= 1;
+        } else if self.caret.block == first + index {
+            let target = (first + index).min(end - 2);
+            self.set_caret(target, self.caret.inline, self.caret.offset);
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Insert a blank column immediately after `column`, splitting that
+    /// column's share in two so the table remains full-width and does not
+    /// visibly jump when its shape changes.
+    pub fn insert_table_column(&mut self, block: usize, column: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some(range) = self.table_bounds(block) else {
+            return false;
+        };
+        let (first, end, columns) = (range.first, range.end, range.columns);
+        let rows = end - first;
+        let previous = column.min(columns.saturating_sub(1));
+        let index = previous + 1;
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        let share = settings.column_shares[previous] * 0.5;
+        settings.column_shares[previous] -= share;
+        settings.column_shares.insert(index, share);
+        for row in &mut self.scope_mut()[first..end] {
+            if let Some(cells) = row.cells_mut() {
+                cells.insert(index, table::Cell::new());
+            }
+        }
+        self.set_table_settings(first, end, std::sync::Arc::new(settings));
+        if (first..end).contains(&self.caret.block) && self.caret.inline >= index {
+            self.caret.inline += 1;
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Remove the selected column, giving its width to a surviving neighbour
+    /// and preserving the final column as the table's irreducible cell.
+    pub fn remove_table_column(&mut self, block: usize, column: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some(range) = self.table_bounds(block) else {
+            return false;
+        };
+        let (first, end, columns) = (range.first, range.end, range.columns);
+        if columns <= 1 {
+            return false;
+        }
+        let rows = end - first;
+        let index = column.min(columns - 1);
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        let share = settings.column_shares.remove(index);
+        let recipient = if index == 0 { 0 } else { index - 1 };
+        settings.column_shares[recipient] += share;
+        for row in &mut self.scope_mut()[first..end] {
+            if let Some(cells) = row.cells_mut() {
+                cells.remove(index);
+            }
+        }
+        self.set_table_settings(first, end, std::sync::Arc::new(settings));
+        if (first..end).contains(&self.caret.block) {
+            if self.caret.inline > index {
+                self.caret.inline -= 1;
+            } else if self.caret.inline == index {
+                self.caret.inline = index.min(columns - 2);
+                self.caret.offset = self
+                    .caret
+                    .offset
+                    .min(self.scope()[self.caret.block].cells()[self.caret.inline].flat_len());
+            }
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// The extent of the table containing `block`: its first and last row
+    /// indices, its row count, and its column count.
+    pub fn table_bounds(&self, block: usize) -> Option<TableRange> {
+        if !self.scope().get(block).is_some_and(Block::is_table) {
+            return None;
+        }
+        let mut first = block;
+        while first > 0
+            && matches!(
+                self.scope().get(first),
+                Some(Block::TableRow { first: false, .. })
+            )
+        {
+            first -= 1;
+        }
+        if !self.scope().get(first).is_some_and(Block::table_first) {
+            return None;
+        }
+        let mut end = first + 1;
+        while matches!(
+            self.scope().get(end),
+            Some(Block::TableRow { first: false, .. })
+        ) {
+            end += 1;
+        }
+        Some(TableRange {
+            first,
+            end,
+            rows: end - first,
+            columns: self.scope()[first].cells().len(),
+        })
+    }
+
+    fn set_table_settings(
+        &mut self,
+        first: usize,
+        end: usize,
+        settings: std::sync::Arc<table::TableSettings>,
+    ) {
+        for row in &mut self.scope_mut()[first..end] {
+            if let Block::TableRow {
+                settings: row_settings,
+                ..
+            } = row
+            {
+                *row_settings = std::sync::Arc::clone(&settings);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
