@@ -134,6 +134,11 @@ pub(super) fn plain(doc: &Document) -> Document {
         .iter_mut()
         .chain(doc.notes.iter_mut().flat_map(|note| &mut note.body))
     {
+        // A table row's content is its cells, not a run list, and nothing
+        // inside a cell can carry a code annotation.
+        if block.is_table() {
+            continue;
+        }
         for run in block.inlines_mut() {
             if let Inline::Text(text) = run {
                 text.style.syntax = CodeStyle::PLAIN;

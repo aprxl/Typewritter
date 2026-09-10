@@ -16,9 +16,7 @@ use crate::components::editor::{
 };
 use crate::components::sidenotes;
 use crate::document::decoration::{self, Painted};
-use crate::document::layout::{
-    self, DocLayout, NUMBER_GUTTER, NUMBER_SIZE, TABLE_CELL_PAD,
-};
+use crate::document::layout::{self, DocLayout, NUMBER_GUTTER, NUMBER_SIZE, TABLE_CELL_PAD};
 use crate::document::{ATOM, Block, Inline, code, math_layout, math_paint};
 use crate::layout::Rect;
 use crate::renderer::{Color, Rounding};
@@ -331,22 +329,21 @@ fn table_row(
         Rounding::NONE,
     );
     let mut left = 0.0;
-    for (column, wrapper) in layout.source[piece.block].inlines().iter().enumerate() {
+    let cell_source = &layout.source[piece.block];
+    for (column, cell) in cell_source.cells().iter().enumerate() {
         let inset = TABLE_CELL_PAD * layout.scale;
-        let contents = wrapper
-            .table_cell_contents()
-            .expect("table rows contain table-cell wrappers");
-        let cell_block = Block::Paragraph(contents.to_vec());
         let lines = &table.cells[column];
         let content_height: f32 = lines.iter().map(|line| line.height).sum();
         let content_top = top + (height - content_height).max(0.0) * 0.5;
         for line in lines {
+            let logical = &cell.lines()[line.cell_line.min(cell.lines().len() - 1)];
+            let cell_block = Block::Paragraph(logical.to_vec());
             let line_top = content_top + line.y;
             let baseline = line_top + line.height * 0.5;
-            let mut cursor = left + inset;
+            let mut cursor = left + inset + line.x;
             let mut pieces = Vec::with_capacity(line.segments.len());
             for segment in &line.segments {
-                let run = &contents[segment.inline];
+                let run = &logical[segment.inline];
                 let text: String = match run {
                     Inline::Text(text) => text
                         .text
@@ -358,15 +355,11 @@ fn table_row(
                     Inline::Note(_) | Inline::EqRef(_) => {
                         segment.number.clone().unwrap_or_default()
                     }
-                    Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
                 };
-                let advance = segment.advance(
-                    run,
-                    &text,
-                    &cell_block,
-                    layout.scale,
-                    &|text, style| canvas.measure(text, style),
-                );
+                let advance =
+                    segment.advance(run, &text, &cell_block, layout.scale, &|text, style| {
+                        canvas.measure(text, style)
+                    });
                 match run {
                     Inline::Math(list) => {
                         let expression =
@@ -388,7 +381,6 @@ fn table_row(
                         theme::LEFT,
                     ),
                     Inline::Text(_) => {}
-                    Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
                 }
                 pieces.push(decoration::piece(
                     text,
@@ -410,7 +402,7 @@ fn table_row(
                 layout.scale,
             );
             for ((text, _, at, _), segment) in pieces.iter().zip(&line.segments) {
-                if matches!(contents[segment.inline], Inline::Text(_)) {
+                if matches!(logical[segment.inline], Inline::Text(_)) {
                     canvas.draw_text(
                         text,
                         (*at, baseline),
@@ -522,7 +514,6 @@ fn line(
             // what the author stored — carried on the segment so the drawing
             // and `advance` read one value.
             Inline::Note(_) | Inline::EqRef(_) => segment.number.clone().unwrap_or_default(),
-            Inline::TableCell(_) => unreachable!("table rows use table_row"),
         };
         let width = segment.advance(run, &text, kind, layout.scale, &|text, style| {
             canvas.measure(text, style)
@@ -567,7 +558,6 @@ fn line(
                 let style = layout::eq_ref_style(&text, layout.scale);
                 canvas.draw_text(&text, (cursor, baseline), &style, theme::LEFT);
             }
-            Inline::TableCell(_) => unreachable!("table rows use table_row"),
         }
         pieces.push(decoration::piece(
             text,

@@ -13,7 +13,7 @@ use crate::document::layout::{
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_layout::{self, MathBox};
 use crate::document::math_paint;
-use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style};
+use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style, flat_len, table};
 use crate::layout::Rect;
 use crate::renderer::{Layer, PathPaint, Rounding, ShaderEffect};
 use crate::theme::{self, TextStyle};
@@ -276,48 +276,29 @@ impl Editor {
                 .as_ref()
                 .expect("table row must have table layout");
             let mut left = x;
-            for (column, wrapper) in self.layout.source[row].inlines().iter().enumerate() {
+            let cell_source = &self.layout.source[row];
+            for (column, cell) in cell_source.cells().iter().enumerate() {
                 let inset = TABLE_CELL_PAD * self.layout.scale;
-                let contents = wrapper
-                    .table_cell_contents()
-                    .expect("table rows contain table-cell wrappers");
-                let cell_block = Block::Paragraph(contents.to_vec());
                 let lines = &row_table.cells[column];
                 let content_height: f32 = lines.iter().map(|line| line.height).sum();
                 let content_top = row_top + (block.height - content_height).max(0.0) * 0.5;
-                let cell_base: usize = self.layout.source[row].inlines()[..column]
+                let cell_base: usize = cell_source.cells()[..column]
                     .iter()
-                    .map(|cell| {
-                        cell.table_cell_contents()
-                            .expect("table rows contain table-cell wrappers")
-                            .iter()
-                            .map(|run| match run {
-                                Inline::Text(text) => text.text.chars().count(),
-                                Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => 1,
-                                Inline::TableCell(_) => {
-                                    unreachable!("nested table cells are invalid")
-                                }
-                            })
-                            .sum::<usize>()
-                    })
+                    .map(table::Cell::flat_len)
                     .sum();
                 for line in lines {
+                    // A wrapped visual line belongs to one logical line of the
+                    // cell: its runs are that line's, and its cell-flat start
+                    // comes from the cell's own line arithmetic.
+                    let logical = &cell.lines()[line.cell_line.min(cell.lines().len() - 1)];
+                    let cell_block = Block::Paragraph(logical.to_vec());
                     let top = content_top + line.y;
                     let baseline = top + line.height * 0.5;
-                    let mut cursor = left + inset;
+                    let mut cursor = left + inset + line.x;
                     let mut pieces = Vec::with_capacity(line.segments.len());
                     for segment in &line.segments {
-                        let run = &contents[segment.inline];
-                        let run_start: usize = contents[..segment.inline]
-                            .iter()
-                            .map(|run| match run {
-                                Inline::Text(text) => text.text.chars().count(),
-                                Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => 1,
-                                Inline::TableCell(_) => {
-                                    unreachable!("nested table cells are invalid")
-                                }
-                            })
-                            .sum();
+                        let run = &logical[segment.inline];
+                        let run_start = cell.run_start(line.cell_line, segment.inline);
                         let text: String = match run {
                             Inline::Text(text) => text
                                 .text
@@ -329,7 +310,6 @@ impl Editor {
                             Inline::Note(_) | Inline::EqRef(_) => {
                                 segment.number.clone().unwrap_or_default()
                             }
-                            Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
                         };
                         let width = segment.advance(
                             run,
@@ -463,7 +443,7 @@ impl Editor {
                         }
                     }
                     for ((text, _, at, _), segment) in pieces.iter().zip(&line.segments) {
-                        if !matches!(contents[segment.inline], Inline::Text(_)) {
+                        if !matches!(logical[segment.inline], Inline::Text(_)) {
                             continue;
                         }
                         theme::draw(
@@ -564,20 +544,10 @@ impl Editor {
         let range = selection.normalized();
         for bi in first..end {
             let block = &self.layout.blocks[bi];
-            let table_len = self.layout.source[bi]
-                .inlines()
+            let table_len: usize = self.layout.source[bi]
+                .cells()
                 .iter()
-                .map(|cell| {
-                    cell.table_cell_contents()
-                        .expect("table rows contain table-cell wrappers")
-                        .iter()
-                        .map(|run| match run {
-                            Inline::Text(text) => text.text.chars().count(),
-                            Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => 1,
-                            Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
-                        })
-                        .sum::<usize>()
-                })
+                .map(table::Cell::flat_len)
                 .sum();
             let from = if range.start.block == bi {
                 range.start.offset
@@ -612,22 +582,12 @@ impl Editor {
 
             let mut left = x;
             let mut cell_start = 0;
+            let cell_source = &self.layout.source[bi];
             for (cell, width) in table.columns.iter().enumerate() {
-                let wrapper = &self.layout.source[bi].inlines()[cell];
-                let contents = wrapper
-                    .table_cell_contents()
-                    .expect("table rows contain table-cell wrappers");
-                let cell_len: usize = contents
-                    .iter()
-                    .map(|run| match run {
-                        Inline::Text(text) => text.text.chars().count(),
-                        Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => 1,
-                        Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
-                    })
-                    .sum();
+                let source_cell = &cell_source.cells()[cell];
+                let cell_len = source_cell.flat_len();
                 let cell_end = cell_start + cell_len;
                 if from < cell_end && to > cell_start {
-                    let cell_block = Block::Paragraph(contents.to_vec());
                     let lines = &self.layout.tables[bi]
                         .as_ref()
                         .expect("table row must have table layout")
@@ -635,19 +595,13 @@ impl Editor {
                     let content_height: f32 = lines.iter().map(|line| line.height).sum();
                     let content_top = top + (block.height - content_height).max(0.0) * 0.5;
                     for line in lines {
-                        let mut cursor = left + TABLE_CELL_PAD * self.layout.scale;
+                        let logical =
+                            &source_cell.lines()[line.cell_line.min(source_cell.lines().len() - 1)];
+                        let cell_block = Block::Paragraph(logical.to_vec());
+                        let mut cursor = left + TABLE_CELL_PAD * self.layout.scale + line.x;
                         for segment in &line.segments {
-                            let run = &contents[segment.inline];
-                            let run_start: usize = contents[..segment.inline]
-                                .iter()
-                                .map(|run| match run {
-                                    Inline::Text(text) => text.text.chars().count(),
-                                    Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => 1,
-                                    Inline::TableCell(_) => {
-                                        unreachable!("nested table cells are invalid")
-                                    }
-                                })
-                                .sum();
+                            let run = &logical[segment.inline];
+                            let run_start = source_cell.run_start(line.cell_line, segment.inline);
                             let text: String = match run {
                                 Inline::Text(text) => text
                                     .text
@@ -658,9 +612,6 @@ impl Editor {
                                 Inline::Math(_) => ATOM.to_string(),
                                 Inline::Note(_) | Inline::EqRef(_) => {
                                     segment.number.clone().unwrap_or_default()
-                                }
-                                Inline::TableCell(_) => {
-                                    unreachable!("nested table cells are invalid")
                                 }
                             };
                             let advance = segment.advance(
@@ -678,10 +629,8 @@ impl Editor {
                                 if matches!(run, Inline::Text(_)) {
                                     let style =
                                         layout::table_text_style(segment.style, self.layout.scale);
-                                    let prefix: String = text
-                                        .chars()
-                                        .take(selected_start - segment_start)
-                                        .collect();
+                                    let prefix: String =
+                                        text.chars().take(selected_start - segment_start).collect();
                                     let selected: String = text
                                         .chars()
                                         .skip(selected_start - segment_start)
@@ -1142,7 +1091,6 @@ impl Component for Editor {
                         // spelling when nothing resolves.
                         Inline::Note(_) => segment.number.clone().unwrap_or_default(),
                         Inline::EqRef(_) => segment.number.clone().unwrap_or_default(),
-                        Inline::TableCell(_) => unreachable!("table rows use draw_table"),
                     };
                     let width =
                         segment.advance(run, &text, kind, self.layout.scale, &|text, style| {
@@ -1189,13 +1137,7 @@ impl Component for Editor {
                             && *selected_offset
                                 == kind.inlines()[..segment.inline]
                                     .iter()
-                                    .map(|run| match run {
-                                        Inline::Text(text) => text.text.chars().count(),
-                                        Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => 1,
-                                        Inline::TableCell(_) => {
-                                            unreachable!("table rows use draw_table")
-                                        }
-                                    })
+                                    .map(flat_len)
                                     .sum::<usize>()
                         {
                             draw_math_selection(
@@ -1220,15 +1162,7 @@ impl Component for Editor {
                                 && *offset
                                     == kind.inlines()[..segment.inline]
                                         .iter()
-                                        .map(|run| match run {
-                                            Inline::Text(text) => text.text.chars().count(),
-                                            Inline::Math(_)
-                                            | Inline::Note(_)
-                                            | Inline::EqRef(_) => 1,
-                                            Inline::TableCell(_) => {
-                                                unreachable!("table rows use draw_table")
-                                            }
-                                        })
+                                        .map(flat_len)
                                         .sum::<usize>()
                             {
                                 draw_math_selection(
@@ -1428,43 +1362,21 @@ impl Component for Editor {
 
         // The caret's glyph context, for Normal mode's block.
         let caret_char = caret.and_then(|caret| {
-            self.layout
-                .source
-                .get(caret.block)
-                .and_then(|b| b.inlines().get(caret.inline))
-                .and_then(|run| match run {
+            let block = self.layout.source.get(caret.block)?;
+            if block.is_table() {
+                let cell = block.cells().get(caret.inline)?;
+                let at = cell.run_at(caret.offset);
+                match cell.lines().get(at.line).and_then(|line| line.get(at.run)) {
+                    Some(Inline::Text(t)) => t.text.chars().nth(at.offset),
+                    Some(Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_)) => Some(ATOM),
+                    None => None,
+                }
+            } else {
+                match block.inlines().get(caret.inline)? {
                     Inline::Text(t) => t.text.chars().nth(caret.offset),
-                    Inline::Math(_) => Some(ATOM),
-                    Inline::Note(_) => Some(ATOM),
-                    Inline::EqRef(_) => Some(ATOM),
-                    Inline::TableCell(contents) => {
-                        let mut offset = caret.offset;
-                        let mut found = None;
-                        for run in contents {
-                            let len = match run {
-                                Inline::Text(text) => text.text.chars().count(),
-                                Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => 1,
-                                Inline::TableCell(_) => {
-                                    unreachable!("nested table cells are invalid")
-                                }
-                            };
-                            if offset < len {
-                                found = match run {
-                                    Inline::Text(text) => text.text.chars().nth(offset),
-                                    Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => {
-                                        Some(ATOM)
-                                    }
-                                    Inline::TableCell(_) => {
-                                        unreachable!("nested table cells are invalid")
-                                    }
-                                };
-                                break;
-                            }
-                            offset = offset.saturating_sub(len);
-                        }
-                        found
-                    }
-                })
+                    Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => Some(ATOM),
+                }
+            }
         });
         let screen_x = x + caret_x;
         let screen_y = content + caret_baseline - self.scroll;
@@ -1682,7 +1594,6 @@ impl Editor {
                 Inline::Math(_) => ATOM.to_string(),
                 Inline::Note(_) => ATOM.to_string(),
                 Inline::EqRef(_) => ATOM.to_string(),
-                Inline::TableCell(_) => unreachable!("table rows use table selection drawing"),
             };
             if flat >= cursor + segment.len {
                 x += segment.advance(run, &text, block, scale, &|text, style| {
@@ -2059,7 +1970,6 @@ mod tests {
             Inline::Math(list) => math_layout::layout(list, 0, 1.0, &measure).width,
             Inline::Text(_) => unreachable!(),
             Inline::Note(_) | Inline::EqRef(_) => unreachable!(),
-            Inline::TableCell(_) => unreachable!(),
         };
         assert_eq!(width, box_width);
         assert!(width > measure(&atom, &TextStyle::sans(17.5, theme::ink())));

@@ -179,6 +179,7 @@ mod tests {
                     x: 0.0,
                     height,
                     segments: Vec::new(),
+                    cell_line: 0,
                 }],
                 height,
                 hidden: None,
@@ -209,6 +210,7 @@ mod tests {
                 x: 0.0,
                 height,
                 segments: Vec::new(),
+                cell_line: 0,
             })
             .collect();
         let total = lines.len() as f32 * height;

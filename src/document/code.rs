@@ -250,26 +250,9 @@ pub fn block_extent(blocks: &[Block], at: usize) -> std::ops::RangeInclusive<usi
 }
 
 pub fn colors(blocks: &[Block]) -> Vec<Vec<Option<Ink>>> {
-    fn flat_len(run: &Inline) -> usize {
-        match run {
-            Inline::Text(text) => text.text.chars().count(),
-            Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => 1,
-            Inline::TableCell(contents) => contents.iter().map(flat_len).sum(),
-        }
-    }
-
     let mut colors: Vec<Vec<Option<Ink>>> = blocks
         .iter()
-        .map(|block| {
-            vec![
-                None;
-                block
-                    .inlines()
-                    .iter()
-                    .map(flat_len)
-                    .sum()
-            ]
-        })
+        .map(|block| vec![None; block.flat_len()])
         .collect();
     let mut block = 0;
     while block < blocks.len() {

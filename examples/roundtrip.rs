@@ -31,25 +31,12 @@ fn main() {
         if matches!(block, Block::Math { .. }) {
             math += 1;
         }
-        for run in block.inlines() {
+        for run in typewritter::document::block_runs(block) {
             match run {
                 Inline::Math(_) => inline_math += 1,
                 Inline::Note(_) => notes += 1,
                 Inline::EqRef(_) => refs += 1,
                 Inline::Text(_) => {}
-                Inline::TableCell(contents) => {
-                    for run in contents {
-                        match run {
-                            Inline::Math(_) => inline_math += 1,
-                            Inline::Note(_) => notes += 1,
-                            Inline::EqRef(_) => refs += 1,
-                            Inline::Text(_) => {}
-                            Inline::TableCell(_) => {
-                                unreachable!("nested table cells are invalid")
-                            }
-                        }
-                    }
-                }
             }
         }
     }

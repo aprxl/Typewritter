@@ -56,10 +56,7 @@ struct IndexedRun {
     offset: usize,
 }
 
-fn searchable_runs(
-    run: &crate::document::Inline,
-    tag_prefix: &str,
-) -> Vec<(usize, String)> {
+fn searchable_runs(run: &crate::document::Inline, tag_prefix: &str) -> Vec<(usize, String)> {
     match run {
         crate::document::Inline::Text(text) => {
             vec![(text.text.chars().count(), text.text.clone())]
@@ -74,10 +71,6 @@ fn searchable_runs(
         )],
         crate::document::Inline::Note(_) => vec![(1, String::new())],
         crate::document::Inline::EqRef(label) => vec![(1, format!("@{label}"))],
-        crate::document::Inline::TableCell(contents) => contents
-            .iter()
-            .flat_map(|run| searchable_runs(run, tag_prefix))
-            .collect(),
     }
 }
 
@@ -106,7 +99,7 @@ impl SearchIndex {
                     _ => String::new(),
                 };
                 let mut offset = 0usize;
-                for run in block.inlines() {
+                for run in crate::document::block_runs(block) {
                     for (chars, text) in searchable_runs(run, &tag_prefix) {
                         runs.push(IndexedRun {
                             path: file.path.clone(),
