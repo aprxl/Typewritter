@@ -39,6 +39,11 @@ impl Cell {
         Self { lines: vec![runs] }
     }
 
+    /// A cell holding `lines`, one entry per logical line.
+    pub fn from_lines(lines: Vec<Vec<Inline>>) -> Self {
+        Self { lines }
+    }
+
     /// The cell's first line — the whole cell while it holds one line, which
     /// is what every single-line consumer wants.
     pub fn runs(&self) -> &[Inline] {
@@ -157,7 +162,8 @@ impl Cell {
 
     /// Style of the char before cell-flat `flat`.
     pub fn style_before(&self, flat: usize) -> Option<Style> {
-        flat.checked_sub(1).and_then(|position| self.style_at(position))
+        flat.checked_sub(1)
+            .and_then(|position| self.style_at(position))
     }
 
     /// Whether the cell holds nothing but whitespace.

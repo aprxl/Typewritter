@@ -520,18 +520,73 @@ fn table_divider_columns(line: &str) -> Option<usize> {
     .then_some(cells.len())
 }
 
+/// The length of an unescaped `<br>` / `<br/>` at `i`, any case, or `None`
+/// when this `<` opens something else.
+fn cell_break_at(chars: &[char], i: usize) -> Option<usize> {
+    if chars.get(i) != Some(&'<') {
+        return None;
+    }
+    match (chars.get(i + 1), chars.get(i + 2)) {
+        (Some(b), Some(r)) if b.eq_ignore_ascii_case(&'b') && r.eq_ignore_ascii_case(&'r') => {}
+        _ => return None,
+    }
+    match chars.get(i + 3) {
+        Some('>') => Some(4),
+        Some('/') if chars.get(i + 4) == Some(&'>') => Some(5),
+        _ => None,
+    }
+}
+
+/// Split a cell's text into its lines on an unescaped `<br>` — the spelling
+/// a multi-line cell writes on disk. `\<br>` is the literal text `<br>`: the
+/// backslash is kept for `parse_inline` to collapse.
+fn split_cell_breaks(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut lines = vec![String::new()];
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            lines.last_mut().expect("a cell has a line").push('\\');
+            if i + 1 < chars.len() {
+                lines
+                    .last_mut()
+                    .expect("a cell has a line")
+                    .push(chars[i + 1]);
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(len) = cell_break_at(&chars, i) {
+            lines.push(String::new());
+            i += len;
+            continue;
+        }
+        lines.last_mut().expect("a cell has a line").push(chars[i]);
+        i += 1;
+    }
+    lines
+}
+
 fn table_cells(cells: Vec<String>) -> Vec<table::Cell> {
     cells
         .into_iter()
         .map(|text| {
-            let mut contents = parse_inline(&text);
-            if contents.is_empty() {
-                contents.push(Inline::Text(Text {
-                    text: unescape(&text.chars().collect::<Vec<_>>()),
-                    style: Style::PLAIN,
-                }));
-            }
-            table::Cell::from_runs(contents)
+            let lines = split_cell_breaks(&text)
+                .into_iter()
+                .map(|line| {
+                    let mut contents = parse_inline(&line);
+                    if contents.is_empty() {
+                        contents.push(Inline::Text(Text {
+                            text: unescape(&line.chars().collect::<Vec<_>>()),
+                            style: Style::PLAIN,
+                        }));
+                    }
+                    contents
+                })
+                .collect();
+            table::Cell::from_lines(lines)
         })
         .collect()
 }
@@ -624,7 +679,9 @@ fn table_metadata(settings: &table::TableSettings) -> String {
 fn serialize_table_cell(cell: &table::Cell) -> String {
     cell.lines()
         .iter()
-        .map(|line| serialize_runs(line))
+        // A literal `<br` in the text would read back as a line break, so it
+        // is escaped; the cells' own line breaks are joined after.
+        .map(|line| serialize_runs(line).replace("<br", "\\<br"))
         .collect::<Vec<_>>()
         .join("<br>")
         .replace('|', "\\|")

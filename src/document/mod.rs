@@ -20,6 +20,7 @@ pub mod math_style;
 pub mod math_symbols;
 pub mod outline;
 pub mod table;
+pub mod table_edit;
 
 /// Flat-text stand-in for one opaque math atom.
 pub const ATOM: char = '\u{FFFC}';
@@ -591,6 +592,18 @@ fn list_block(marker: ListMarker) -> Block {
             style: Style::PLAIN,
         })],
     }
+}
+
+/// A line always holds at least one run. An empty side of a cell-line split
+/// keeps the same placeholder every other empty line uses.
+fn placeholder_if_empty(mut runs: Vec<Inline>) -> Vec<Inline> {
+    if runs.is_empty() {
+        runs.push(Inline::Text(Text {
+            text: String::new(),
+            style: Style::PLAIN,
+        }));
+    }
+    runs
 }
 
 /// The marker an item created below `marker` carries: bullets and tasks
@@ -2350,6 +2363,98 @@ impl Document {
         }
     }
 
+    /// Enter inside a table cell: split the cell's current line at the
+    /// caret's own line offset. The break costs one flat position, so the
+    /// caret lands on the new line by moving one past its insert point.
+    /// Returns whether a line was split.
+    pub fn split_cell_line(&mut self) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        if !self.scope()[block].is_table() {
+            return false;
+        }
+        let cell = self.caret.inline;
+        let flat = self.caret.offset;
+        let (line, offset) = self.scope()[block].cells()[cell].position(flat);
+        let (head, tail) = {
+            let runs = self.scope()[block].cells()[cell].lines()[line].as_slice();
+            let len: usize = runs.iter().map(flat_len).sum();
+            (
+                slice_inline_runs(runs, 0, offset),
+                slice_inline_runs(runs, offset, len),
+            )
+        };
+        let contents = &mut self.scope_mut()[block].cells_mut().expect("table row")[cell];
+        let lines = contents.lines_mut();
+        lines[line] = placeholder_if_empty(head);
+        lines.insert(line + 1, placeholder_if_empty(tail));
+        self.caret.offset = flat + 1;
+        self.dirty = true;
+        self.enforce();
+        true
+    }
+
+    /// Backspace at the start of a cell line: fold it onto the line above,
+    /// leaving the caret at the junction. On the first line of a cell (and
+    /// at the start of a cell) nothing is joined. Returns whether a line was
+    /// joined.
+    pub fn join_cell_line(&mut self) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        if !self.scope()[block].is_table() {
+            return false;
+        }
+        let cell = self.caret.inline;
+        let flat = self.caret.offset;
+        let (line, offset) = self.scope()[block].cells()[cell].position(flat);
+        if offset != 0 || line == 0 {
+            return false;
+        }
+        self.merge_cell_line(cell, line - 1);
+        self.caret.offset = flat - 1;
+        self.dirty = true;
+        self.enforce();
+        true
+    }
+
+    /// Delete at the end of a cell line: fold the next line onto this one,
+    /// leaving the caret at the junction. On the last line of a cell nothing
+    /// is joined. Returns whether a line was joined.
+    pub fn join_cell_line_forward(&mut self) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        if !self.scope()[block].is_table() {
+            return false;
+        }
+        let cell = self.caret.inline;
+        let flat = self.caret.offset;
+        let (line, offset) = self.scope()[block].cells()[cell].position(flat);
+        let line_len: usize = self.scope()[block].cells()[cell].lines()[line]
+            .iter()
+            .map(flat_len)
+            .sum();
+        if offset != line_len || line + 1 >= self.scope()[block].cells()[cell].lines().len() {
+            return false;
+        }
+        self.merge_cell_line(cell, line);
+        self.caret.offset = flat;
+        self.dirty = true;
+        self.enforce();
+        true
+    }
+
+    /// Fold the cell line after `line` onto `line` — the one geometric core
+    /// of both joins. The caret is left where the caller put it; `enforce`
+    /// clamps it into the joined line.
+    fn merge_cell_line(&mut self, cell: usize, line: usize) {
+        let block = self.caret.block;
+        let mut joined = self.scope()[block].cells()[cell].lines()[line].clone();
+        joined.extend_from_slice(&self.scope()[block].cells()[cell].lines()[line + 1]);
+        let contents = &mut self.scope_mut()[block].cells_mut().expect("table row")[cell];
+        contents.lines_mut()[line] = joined;
+        contents.lines_mut().remove(line + 1);
+    }
+
     /// Inserts the standard two-by-two table below the caret (or replaces an
     /// empty paragraph) and starts typing in its first cell.
     pub fn insert_table(&mut self) {
@@ -2945,6 +3050,9 @@ impl Document {
         let o = self.caret.offset;
         let before = self.caret_flat(b);
         if self.scope()[b].is_table() {
+            if self.join_cell_line() {
+                return;
+            }
             if o == 0 {
                 return;
             }
@@ -3087,6 +3195,9 @@ impl Document {
         let i = self.caret.inline;
         let o = self.caret.offset;
         if self.scope()[b].is_table() {
+            if self.join_cell_line_forward() {
+                return;
+            }
             let li = self.scope()[b].cells()[i].flat_len();
             if o >= li {
                 return;
@@ -3197,9 +3308,9 @@ impl Document {
         let i = self.caret.inline;
         let o = self.caret.offset;
         if self.scope()[b].is_table() {
-            // Markdown table cells cannot contain paragraph breaks. More
-            // importantly, Enter must not be a hidden row-creation command:
-            // table structure belongs exclusively to the direct popup.
+            // Enter breaks the cell's line, never the row: table structure
+            // belongs to the explicit structural commands.
+            self.split_cell_line();
             return;
         }
         // A list item continues itself: Enter below an item opens the next
@@ -7009,8 +7120,15 @@ mod tests {
         d.insert_divider();
         d.insert_math_block();
         d.insert_table();
-        d.newline();
         assert_eq!(d.body(), original);
+        // Enter is a cell edit, not a block command: it splits the cell's
+        // own line and leaves every row and track exactly as it was.
+        d.newline();
+        assert!(d.body().iter().all(Block::is_table));
+        assert_eq!(d.body().len(), 2);
+        assert!(d.body().iter().all(|row| row.cells().len() == 2));
+        assert_eq!(d.body()[0].cells()[0].lines().len(), 2);
+        assert_eq!(d.body()[1].cells()[0].lines().len(), 1);
 
         d.open_above();
         assert!(matches!(d.body()[0], Block::Paragraph(_)));
