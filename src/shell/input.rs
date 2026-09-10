@@ -543,6 +543,14 @@ impl Shell {
     }
 
     /// `table.row_below`: a blank row under the caret's row.
+    /// `table.delete`: remove the caret's whole table. The register keeps its
+    /// Markdown, so the delete is recoverable with a paste.
+    pub(super) fn table_delete(&mut self) {
+        if let Some((first, _, _)) = self.caret_table() {
+            self.docs.borrow_mut().delete_table(first);
+        }
+    }
+
     pub(super) fn table_insert_row_below(&mut self) {
         if let Some((first, row, _)) = self.caret_table() {
             self.docs.borrow_mut().insert_table_row(first, row);
@@ -737,8 +745,20 @@ impl Shell {
                     table_lines::TableAction::RemoveColumn => {
                         docs.remove_table_column(first, column);
                     }
+                    table_lines::TableAction::DeleteTable => {
+                        docs.delete_table(first);
+                    }
                 }
             }
+        }
+        // The table a delete removed is gone, so the card goes with it; every
+        // other action re-reads the row it belongs to.
+        if matches!(
+            target,
+            table_lines::TableHit::Action(table_lines::TableAction::DeleteTable)
+        ) {
+            self.close_table_lines();
+            return;
         }
         self.refresh_table_lines();
     }

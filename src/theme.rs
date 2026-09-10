@@ -13,6 +13,7 @@ use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
 use crate::document::BadgeColor;
 use crate::document::math_style::MathHue;
+use crate::document::table::TableLines;
 use crate::layout::Rect;
 use crate::renderer::{
     Alignment, Color, Font, FontParameters, GradientDirection, HorizontalAlign, Layer, LineCap,
@@ -834,6 +835,71 @@ pub fn rounded_rect_path(rect: Rect, radius: f32) -> String {
     )
 }
 
+/// The SVG path data for a table's border: the enabled edges of the same
+/// rounded rectangle [`rounded_rect_path`] traces, so a table whose reader
+/// switched an edge off still follows the shape of the rounded panel behind it
+/// instead of collapsing into a square. A corner curves only where the two
+/// edges that meet there are both drawn — a lone edge ends on the flat part of
+/// the rectangle rather than hooking into empty space.
+pub fn table_border_path(rect: Rect, radius: f32, lines: TableLines) -> String {
+    let r = radius.max(0.0).min(rect.width / 2.0).min(rect.height / 2.0);
+    let (x, y) = rect.position();
+    let right_edge = rect.right();
+    let bottom_edge = rect.bottom();
+    let (mx, tx) = (x + r, right_edge - r);
+    let (ty, by) = (y + r, bottom_edge - r);
+    let arc = |from: (f32, f32), to: (f32, f32)| {
+        format!("M{} {} A{r} {r} 0 0 1 {} {} ", from.0, from.1, to.0, to.1)
+    };
+    let mut d = String::new();
+    if lines.top {
+        d.push_str(&format!("M{mx} {y} H{tx} "));
+    }
+    if lines.bottom {
+        d.push_str(&format!("M{tx} {bottom_edge} H{mx} "));
+    }
+    if lines.left {
+        d.push_str(&format!("M{x} {by} V{ty} "));
+    }
+    if lines.right {
+        d.push_str(&format!("M{right_edge} {ty} V{by} "));
+    }
+    if lines.top && lines.left {
+        d.push_str(&arc((x, ty), (mx, y)));
+    }
+    if lines.top && lines.right {
+        d.push_str(&arc((tx, y), (right_edge, ty)));
+    }
+    if lines.bottom && lines.right {
+        d.push_str(&arc((right_edge, by), (tx, bottom_edge)));
+    }
+    if lines.bottom && lines.left {
+        d.push_str(&arc((mx, bottom_edge), (x, by)));
+    }
+    d.trim_end().to_string()
+}
+
+/// Stroke a table's border — [`table_border_path`] through a layer, the way
+/// [`rounded_outline`] strokes a whole rounded rectangle.
+pub fn table_border(
+    layer: &Layer,
+    rect: Rect,
+    radius: f32,
+    width: f32,
+    color: Color,
+    lines: TableLines,
+) {
+    let d = table_border_path(rect, radius, lines);
+    if d.is_empty() {
+        return;
+    }
+    let mut pen = Stroke::new(color, width);
+    pen.join = LineJoin::Round;
+    layer
+        .draw_path(&d, (0.0, 0.0), PathPaint::Stroke(pen))
+        .expect("table_border_path generates its own path data");
+}
+
 /// The hover surface every interactive row and button shares: one tint, one
 /// opacity curve, so nothing in the interface highlights differently from
 /// anything else. A weight of zero draws nothing at all.
@@ -1122,6 +1188,63 @@ mod tests {
             Rect::new(0.0, 0.0, 30.0, 24.0),
             0.0
         )));
+    }
+    /// Every combination of table edges, because a path that fails to parse
+    /// panics at draw time and the editor strokes this one on every frame a
+    /// table is on screen.
+    #[test]
+    fn the_table_border_path_parses_for_every_edge_combination() {
+        fn parses(d: &str) -> bool {
+            if d.is_empty() {
+                return true;
+            }
+            let mut parser = lyon_extra::parser::PathParser::new();
+            let mut builder = lyon::path::Path::builder();
+            let mut source = lyon_extra::parser::Source::new(d.chars());
+            parser
+                .parse(
+                    &lyon_extra::parser::ParserOptions::DEFAULT,
+                    &mut source,
+                    &mut builder,
+                )
+                .is_ok()
+        }
+        let card = Rect::new(10.0, 20.0, 200.0, 34.0);
+        // The four border edges as bits; the interior flags a table also
+        // carries play no part in its outline.
+        let edges = |case: u8| TableLines {
+            top: case & 1 != 0,
+            bottom: case & 2 != 0,
+            left: case & 4 != 0,
+            right: case & 8 != 0,
+            horizontal: true,
+            vertical: true,
+        };
+        for case in 0..16u8 {
+            let lines = edges(case);
+            for rect in [
+                card,
+                Rect::new(0.0, 0.0, 40.0, 2.0),
+                Rect::new(0.0, 0.0, 8.0, 8.0),
+            ] {
+                let d = table_border_path(rect, 7.5, lines);
+                assert!(parses(&d), "case {case} on {rect:?} produced {d:?}");
+            }
+        }
+        // No edges is nothing to stroke, not an empty path.
+        assert!(table_border_path(card, 7.5, edges(0)).is_empty());
+        // One edge is a straight run, with no corner to curve.
+        let lone = table_border_path(card, 7.5, edges(1));
+        assert!(!lone.contains('A'), "a lone edge curves nowhere: {lone}");
+        // Two edges that meet curve the corner between them.
+        let corner = table_border_path(card, 7.5, edges(5));
+        assert_eq!(corner.matches('A').count(), 1, "one corner: {corner}");
+        // Opposite edges never meet, so they never curve.
+        let rails = table_border_path(card, 7.5, edges(3));
+        assert!(!rails.contains('A'), "parallel edges meet nowhere: {rails}");
+        // All four is the same shape the background draws: four corners.
+        let closed = table_border_path(card, 7.5, edges(15));
+        assert_eq!(closed.matches('A').count(), 4, "four corners: {closed}");
     }
 
     /// The palette a widget reads has to be the one that was set, or a

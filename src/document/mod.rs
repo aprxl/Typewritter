@@ -1698,10 +1698,39 @@ impl Document {
         if start.block != end.block
             && (start.block..=end.block).any(|block| self.scope()[block].is_table())
         {
-            // A cross-row character range cannot collapse table blocks into
-            // each other without deleting tracks. Keep the grid intact; row
-            // removal remains an explicit popup action.
-            return None;
+            // A cross-row range cannot fold a row into prose without losing
+            // the grid, so every covered block is cleared where it stands: the
+            // selected characters go, a table keeps its cells. Nothing in the
+            // selection is skipped — which is what refusing the whole range
+            // used to do, silently, for the prose beside the table too.
+            let deleted = self.range_text(FlatRange::new(start, end));
+            for block in start.block..=end.block {
+                let from = if block == start.block {
+                    start.offset
+                } else {
+                    0
+                };
+                let to = if block == end.block {
+                    end.offset
+                } else {
+                    self.block_len(block)
+                };
+                if self.scope()[block].is_table() {
+                    for (cell, from, to) in self.table_cells_in_range(block, from, to) {
+                        let row_cells = self.scope_mut()[block].cells_mut().expect("table row");
+                        Self::clear_cell_slice(&mut row_cells[cell], from, to);
+                    }
+                } else {
+                    let original = self.scope()[block].clone();
+                    let mut runs = self.slice_runs(block, 0, from);
+                    runs.extend(self.slice_runs(block, to, self.block_len(block)));
+                    self.scope_mut()[block] = Self::block_with_runs(&original, runs);
+                }
+            }
+            self.dirty = true;
+            self.set_flat_position(start);
+            self.enforce();
+            return Some(deleted);
         }
         let deleted = self.range_text(FlatRange::new(start, end));
         if start.block == end.block && self.scope()[start.block].is_table() {
@@ -1758,14 +1787,22 @@ impl Document {
         }
         let first = first.min(self.scope().len() - 1);
         let last = last.min(self.scope().len() - 1).max(first);
-        if (first..=last).any(|block| self.scope()[block].is_table()) {
-            return None;
-        }
         let deleted = (first..=last)
-            .map(|block| self.block_text(block))
+            .map(|block| self.yank_text(block))
             .collect::<Vec<_>>()
             .join("\n");
+        // A table row is a line like any other, so a row selection removes rows
+        // — the whole table when every row is selected. Two things follow from
+        // deleting rows as blocks rather than one at a time, and both have to
+        // happen here: the surviving rows' settings lose the removed rows'
+        // heights, and a row left without a header above it becomes the
+        // table's own anchor.
+        let plans = self.table_settings_after_removing_blocks(first, last);
         self.scope_mut().drain(first..=last);
+        self.promote_orphaned_table_row(first);
+        for (start, rows, settings) in plans {
+            self.set_table_settings(start, start + rows, std::sync::Arc::new(settings));
+        }
         if self.scope().is_empty() {
             self.scope_mut().push(empty_block());
         }
@@ -1959,6 +1996,79 @@ impl Document {
     }
 
     // ---- internal geometry helpers --------------------------------------
+
+    /// One block's text as the register carries it: a table row in the GFM pipe
+    /// form, so pasting a deleted row back rebuilds the grid rather than
+    /// splicing its cells into prose.
+    fn yank_text(&self, block: usize) -> String {
+        if self.scope()[block].is_table() {
+            self.table_row_markdown(block)
+        } else {
+            self.block_text(block)
+        }
+    }
+
+    /// The settings a table is owed once `first..=last` has been deleted, in
+    /// the numbering that follows the delete: `row_heights` holds one entry per
+    /// row, so a removed row takes its entry with it. A table wholly inside the
+    /// range needs nothing — nothing of it survives to read the list back.
+    fn table_settings_after_removing_blocks(
+        &self,
+        first: usize,
+        last: usize,
+    ) -> Vec<(usize, usize, table::TableSettings)> {
+        let mut plans = Vec::new();
+        let mut block = first;
+        while block <= last && block < self.scope().len() {
+            if !self.scope()[block].is_table() {
+                block += 1;
+                continue;
+            }
+            let Some(range) = self.table_bounds(block) else {
+                break;
+            };
+            let (start, end) = (range.first, range.end);
+            let (from, to) = (first.max(start), (last + 1).min(end));
+            if from > start || to < end {
+                let settings = self.scope()[start]
+                    .table_settings()
+                    .expect("table bounds names a table")
+                    .clone()
+                    .normalized(range.columns, end - start);
+                let mut heights = settings.row_heights;
+                heights.drain(from - start..to - start);
+                plans.push((
+                    if start < first { start } else { first },
+                    end - start - (to - from),
+                    table::TableSettings {
+                        row_heights: heights,
+                        ..settings
+                    },
+                ));
+            }
+            block = end;
+        }
+        plans
+    }
+
+    /// After a block-level removal at `at`, a table row left without a row
+    /// above it becomes the table's own first row: a continuation row with no
+    /// table start would serialize as prose.
+    fn promote_orphaned_table_row(&mut self, at: usize) {
+        if !matches!(
+            self.scope().get(at),
+            Some(Block::TableRow { first: false, .. })
+        ) {
+            return;
+        }
+        if at > 0 && self.scope()[at - 1].is_table() {
+            // Still under a header: a continuation row is where it belongs.
+            return;
+        }
+        if let Block::TableRow { first, .. } = &mut self.scope_mut()[at] {
+            *first = true;
+        }
+    }
 
     pub(crate) fn block_flat_len(&self, block: usize) -> usize {
         self.scope()[block].flat_len()

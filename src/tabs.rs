@@ -713,6 +713,24 @@ impl Tabs {
         changed
     }
 
+    /// Remove the table the caret sits in, whole. Its Markdown goes to the
+    /// register, so a grid deleted by mistake can be pasted back.
+    pub fn delete_table(&mut self, block: usize) -> bool {
+        let mut removed = None;
+        self.edit(|doc| removed = doc.delete_table(block));
+        match removed {
+            Some(text) => {
+                if !text.is_empty()
+                    && let Some(tab) = self.active_mut()
+                {
+                    tab.yank = text;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn table_tab(&mut self, backwards: bool) -> bool {
         let mut moved = false;
         self.touch(|doc| moved = doc.table_tab(backwards));
@@ -2315,13 +2333,29 @@ mod clip_yank_tests {
     const TABLE: &str = "| A | B |\n| --- | --- |\n| a | b |\n";
 
     #[test]
-    fn a_refused_table_delete_leaves_the_yank_register_intact() {
-        let mut tabs = tabs_with("refused", TABLE);
+    fn a_table_delete_takes_the_rows_and_puts_them_in_the_register() {
+        let mut tabs = tabs_with("table-delete", TABLE);
         tabs.set_yank("keep me".to_string());
-        // Two whole rows: the document refuses rather than destroying the grid.
+        // Both rows: a table row is a line like any other, so the rows go and
+        // the register keeps them as Markdown — a grid is recoverable.
         tabs.delete_lines(0, 1);
-        assert_eq!(tabs.yank(), Some("keep me"));
-        // A cross-row character range is refused for the same reason.
+        let yank = tabs.yank().expect("a delete that removed rows yanks them");
+        assert!(yank.contains("| A | B |"), "the rows as Markdown: {yank}");
+        assert!(
+            tabs.active()
+                .unwrap()
+                .document
+                .body()
+                .iter()
+                .all(|block| !block.is_table()),
+            "both rows are gone"
+        );
+    }
+
+    #[test]
+    fn a_cross_row_character_range_clears_in_place_instead_of_refusing() {
+        let mut tabs = tabs_with("table-range", TABLE);
+        tabs.set_yank("keep me".to_string());
         tabs.delete_range(FlatRange::new(
             crate::document::FlatPos {
                 block: 0,
@@ -2332,7 +2366,6 @@ mod clip_yank_tests {
                 offset: 0,
             },
         ));
-        assert_eq!(tabs.yank(), Some("keep me"));
         assert!(
             tabs.active()
                 .unwrap()
@@ -2340,7 +2373,12 @@ mod clip_yank_tests {
                 .body()
                 .iter()
                 .all(Block::is_table),
-            "the grid is intact"
+            "the grid survives a characterwise delete"
+        );
+        assert!(
+            tabs.yank().is_some_and(|text| text != "keep me"),
+            "and the range is not refused: {:?}",
+            tabs.yank()
         );
     }
 

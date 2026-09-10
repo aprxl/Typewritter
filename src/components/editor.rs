@@ -48,6 +48,15 @@ const MATH_SELECTION_ROUNDING: Rounding = Rounding::uniform(4.0);
 /// not as a second object under it.
 const GLOW_SPREAD: f32 = 1.0;
 const GLOW_ALPHA: f32 = 0.45;
+
+/// Corner radius of a table's panel. Its border is stroked half a pixel inside
+/// the panel's edge ([`TABLE_BORDER_INSET`]), so the two roundings come from
+/// this one number: the border follows the panel's corners instead of squaring
+/// them off.
+const TABLE_RADIUS: f32 = 8.0;
+const TABLE_BORDER_INSET: f32 = 0.5;
+/// The panel is the table's own background; every grid stroke is a hairline.
+const TABLE_BORDER_WIDTH: f32 = 1.0;
 pub const GLOW_RADIUS: f32 = 2.5;
 /// Truncate a segment's drawing to this many characters before shaping it —
 /// a single pathological line must cost the same as a normal one, not
@@ -221,7 +230,7 @@ impl Editor {
             (x, top),
             (width, bottom - top),
             theme::fade(theme::alt(), 0.78),
-            Rounding::uniform(8.0),
+            Rounding::uniform(TABLE_RADIUS),
         );
 
         if let Some(caret) = self.caret
@@ -469,30 +478,17 @@ impl Editor {
         }
 
         let line = theme::border();
-        let complete_outline =
-            table.lines.top && table.lines.bottom && table.lines.left && table.lines.right;
-        if complete_outline {
-            theme::rounded_outline(
-                layer,
-                Rect::new(x, top, width, bottom - top).inset(0.5),
-                7.5,
-                1.0,
-                line.clone(),
-            );
-        } else {
-            if table.lines.top {
-                theme::rule(layer, (x, top), width, 1.0, line.clone());
-            }
-            if table.lines.bottom {
-                theme::rule(layer, (x, bottom), width, 1.0, line.clone());
-            }
-            if table.lines.left {
-                theme::vertical_rule(layer, (x, top), bottom - top, 1.0, line.clone());
-            }
-            if table.lines.right {
-                theme::vertical_rule(layer, (x + width, top), bottom - top, 1.0, line.clone());
-            }
-        }
+        // The border traces the panel's own rounded rectangle and omits the
+        // edges the reader switched off, so a partially outlined table keeps
+        // the panel's corners instead of collapsing into a square.
+        theme::table_border(
+            layer,
+            Rect::new(x, top, width, bottom - top).inset(TABLE_BORDER_INSET),
+            TABLE_RADIUS - TABLE_BORDER_INSET,
+            TABLE_BORDER_WIDTH,
+            line.clone(),
+            table.lines,
+        );
         if table.lines.vertical {
             let mut edge = x;
             for width in table

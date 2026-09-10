@@ -465,6 +465,16 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.open_table_card(),
     },
     Command {
+        id: "table.delete",
+        title: "Delete table",
+        group: "Format",
+        chord: Some(Chord {
+            mods: CTRL_SHIFT,
+            key: KeyCode::KeyT,
+        }),
+        run: |shell| shell.table_delete(),
+    },
+    Command {
         id: "table.row_below",
         title: "Insert row below",
         group: "Format",
@@ -1356,6 +1366,7 @@ mod tests {
             table_ids,
             vec![
                 "table.card",
+                "table.delete",
                 "table.row_below",
                 "table.row_above",
                 "table.row_delete",

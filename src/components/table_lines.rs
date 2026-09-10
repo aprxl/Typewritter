@@ -11,7 +11,9 @@ use crate::theme::{self, TextStyle};
 use crate::ui::{Component, Context, Dirty, Hover};
 
 const CARD_WIDTH: f32 = 218.0;
-const CARD_HEIGHT: f32 = 240.0;
+/// Tall enough for the grid picker, the row and column controls, and the
+/// destructive control beneath them.
+const CARD_HEIGHT: f32 = 265.0;
 const GRID: f32 = 96.0;
 const HIT: f32 = 11.0;
 const PAD: f32 = 16.0;
@@ -25,6 +27,8 @@ pub enum TableAction {
     RemoveRow,
     InsertColumn,
     RemoveColumn,
+    /// The whole table, not a row or a column of it.
+    DeleteTable,
 }
 
 /// Every direct target in the card. The shell consumes this instead of
@@ -71,6 +75,17 @@ fn control_row(card: Rect, column: bool) -> Rect {
     )
 }
 
+/// The destructive control's row: full width, under the row and column
+/// controls, so it is the last thing the eye reaches in the card.
+fn delete_row(card: Rect) -> Rect {
+    Rect::new(
+        card.x + PAD,
+        control_row(card, true).bottom() + 10.0,
+        (card.width - PAD * 2.0).max(0.0),
+        ROW_HEIGHT,
+    )
+}
+
 fn action_rect(card: Rect, action: TableAction) -> Rect {
     let row = control_row(
         card,
@@ -82,6 +97,9 @@ fn action_rect(card: Rect, action: TableAction) -> Rect {
     let x = match action {
         TableAction::InsertRow | TableAction::InsertColumn => row.right() - BUTTON,
         TableAction::RemoveRow | TableAction::RemoveColumn => row.right() - BUTTON * 2.0 - 4.0,
+        // The destructive control is a full-width row of its own rather than a
+        // button in the row and column pairs.
+        TableAction::DeleteTable => return delete_row(card),
     };
     Rect::new(x, row.y + (row.height - BUTTON) * 0.5, BUTTON, BUTTON)
 }
@@ -122,6 +140,7 @@ pub fn hit_at(card: Rect, point: (f32, f32)) -> Option<TableHit> {
             TableAction::RemoveRow,
             TableAction::InsertColumn,
             TableAction::RemoveColumn,
+            TableAction::DeleteTable,
         ]
         .into_iter()
         .find(|action| action_rect(card, *action).contains(point))
@@ -130,10 +149,11 @@ pub fn hit_at(card: Rect, point: (f32, f32)) -> Option<TableHit> {
 }
 
 /// Every keyboard-reachable target in the card, in the order Tab walks
-/// them: the six grid strokes, then the four structural buttons. Each
-/// target's geometry comes from the same `line_at`/`action_rect` the mouse
-/// hit-test reads, so the two paths cannot describe different controls.
-pub const TARGETS: [TableHit; 10] = [
+/// them: the six grid strokes, the four structural buttons, then the
+/// destructive one. Each target's geometry comes from the same
+/// `line_at`/`action_rect` the mouse hit-test reads, so the two paths cannot
+/// describe different controls.
+pub const TARGETS: [TableHit; 11] = [
     TableHit::Line(GridLine::Top),
     TableHit::Line(GridLine::Bottom),
     TableHit::Line(GridLine::Left),
@@ -144,6 +164,7 @@ pub const TARGETS: [TableHit; 10] = [
     TableHit::Action(TableAction::RemoveRow),
     TableHit::Action(TableAction::InsertColumn),
     TableHit::Action(TableAction::RemoveColumn),
+    TableHit::Action(TableAction::DeleteTable),
 ];
 
 /// The target after `current` in [`TARGETS`], wrapping at both ends. `None`
@@ -210,6 +231,50 @@ impl TableLinesMenu {
         Self::new(TableLines::default(), (0.0, 0.0), 0, 0, 0, 0)
     }
 
+    /// The card's one destructive control. It takes the whole table, so it is
+    /// drawn apart from the row and column pairs and wears the palette's
+    /// warning role rather than the neutral button ink.
+    fn draw_delete(&self, layer: &Layer, card: Rect) {
+        let rect = delete_row(card);
+        let hit = TableHit::Action(TableAction::DeleteTable);
+        let hovered = self.hover == Some(hit);
+        let focused = self.focus == Some(hit);
+        if hovered {
+            theme::hover_fill(layer, rect, self.hover_fade.value());
+        }
+        layer.draw_rectangle(
+            rect.position(),
+            rect.size(),
+            theme::fade(theme::alt(), 0.72),
+            Rounding::uniform(6.0),
+        );
+        theme::rounded_outline(
+            layer,
+            rect.inset(0.5),
+            5.5,
+            if focused { 1.5 } else { 1.0 },
+            if focused {
+                theme::accent()
+            } else {
+                theme::border()
+            },
+        );
+        theme::draw(
+            layer,
+            "Delete table",
+            (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5),
+            &TextStyle::sans(
+                11.5,
+                if hovered || focused {
+                    theme::warning()
+                } else {
+                    theme::dim()
+                },
+            ),
+            theme::CENTER,
+        );
+    }
+
     fn draw_control(&self, layer: &Layer, card: Rect, column: bool) {
         let row = control_row(card, column);
         let count = if column { self.columns } else { self.rows };
@@ -258,6 +323,8 @@ impl TableLinesMenu {
             let glyph = match action {
                 TableAction::InsertRow | TableAction::InsertColumn => "+",
                 TableAction::RemoveRow | TableAction::RemoveColumn => "−",
+                // Never one of this pair: [`Self::draw_delete`] paints it.
+                TableAction::DeleteTable => continue,
             };
             theme::draw(
                 layer,
@@ -420,6 +487,7 @@ impl Component for TableLinesMenu {
         );
         self.draw_control(layer, card, false);
         self.draw_control(layer, card, true);
+        self.draw_delete(layer, card);
     }
 }
 
@@ -505,6 +573,38 @@ mod tests {
             };
             assert_eq!(hit, Some(target), "{target:?} has its own hit test");
         }
+    }
+
+    /// The destructive control is the last thing in the card, reachable by
+    /// mouse and by Tab, and the card is tall enough to hold it — the height
+    /// constant is part of the geometry, so it is asserted rather than eyeballed.
+    #[test]
+    fn the_delete_row_lies_under_the_controls_inside_the_card() {
+        let card = card_anchored(Rect::new(0.0, 0.0, 400.0, 400.0), (80.0, 80.0));
+        let rect = delete_row(card);
+        assert_eq!(
+            hit_at(
+                card,
+                (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5)
+            ),
+            Some(TableHit::Action(TableAction::DeleteTable))
+        );
+        for action in [
+            TableAction::InsertRow,
+            TableAction::RemoveRow,
+            TableAction::InsertColumn,
+            TableAction::RemoveColumn,
+        ] {
+            let button = action_rect(card, action);
+            assert!(
+                button.bottom() <= rect.y,
+                "{action:?} sits above the destructive row"
+            );
+        }
+        assert!(
+            rect.bottom() + PAD <= card.bottom(),
+            "the card is tall enough for every control it draws"
+        );
     }
 
     #[test]

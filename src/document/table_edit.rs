@@ -491,7 +491,7 @@ impl Document {
         })
     }
 
-    fn set_table_settings(
+    pub(crate) fn set_table_settings(
         &mut self,
         first: usize,
         end: usize,
@@ -781,6 +781,40 @@ fn escape_markdown(text: &str) -> String {
         }
     }
     out
+}
+
+impl Document {
+    /// Remove the whole table containing `block`, and hand its Markdown back so
+    /// the register keeps what the grid held — a delete that destroys a table
+    /// has to be recoverable, and the rows are what a paste needs to rebuild
+    /// it. Refuses (`None`) when `block` is not a table row. A document emptied
+    /// by the removal keeps one empty paragraph, like any other block delete.
+    pub fn delete_table(&mut self, block: usize) -> Option<String> {
+        let range = self.table_bounds(block)?;
+        let mut markdown = String::new();
+        for row in range.first..range.end {
+            if row > range.first {
+                markdown.push('\n');
+            }
+            markdown.push_str(&self.table_row_markdown(row));
+            if row == range.first {
+                markdown.push('\n');
+                markdown.push_str(&self.table_row_divider(row));
+            }
+        }
+        self.scope_mut().drain(range.first..range.end);
+        if self.scope().is_empty() {
+            self.scope_mut().push(super::empty_block());
+        }
+        self.caret.block = range.first.min(self.scope().len() - 1);
+        self.caret.inline = 0;
+        self.caret.offset = 0;
+        self.caret.style = Style::PLAIN;
+        self.math = None;
+        self.dirty = true;
+        self.enforce();
+        Some(markdown)
+    }
 }
 
 #[cfg(test)]
@@ -1232,5 +1266,172 @@ mod clip_tests {
             paragraph.iter().all(|run| run.style().bold),
             "the prose part is styled"
         );
+    }
+}
+
+/// Removing a table — whole, by rows, or through a selection that reaches into
+/// one. A table row is a line like any other, so nothing about a table may make
+/// a delete silently do less than it says.
+#[cfg(test)]
+mod delete_tests {
+    use std::path::Path;
+
+    use crate::document::markdown::{parse, serialize};
+    use crate::document::{Block, Document, FlatRange, cell_text};
+
+    fn path() -> &'static Path {
+        Path::new("table.md")
+    }
+
+    /// The table's first row block. Derived, never counted by hand: the header
+    /// is a block and the divider row is not.
+    fn first_row(d: &Document) -> usize {
+        d.body()
+            .iter()
+            .position(Block::is_table)
+            .expect("the document holds a table")
+    }
+
+    fn last_row(d: &Document) -> usize {
+        first_row(d) + d.body().iter().filter(|block| block.is_table()).count() - 1
+    }
+
+    fn rows(d: &Document) -> Vec<String> {
+        d.body()
+            .iter()
+            .filter(|block| block.is_table())
+            .map(|row| {
+                row.cells()
+                    .iter()
+                    .map(cell_text)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    }
+
+    /// A math cell and an empty one, beside plain text: the shapes a reader
+    /// actually writes.
+    fn document() -> Document {
+        parse(path(), "| A | B |\n| --- | --- |\n| $x$ | two |\n| a | |\n")
+    }
+
+    #[test]
+    fn deleting_a_table_removes_every_row_and_keeps_its_markdown() {
+        let mut d = document();
+        let first = first_row(&d);
+        let markdown = d.delete_table(first).expect("the caret's table goes");
+        assert!(
+            d.body().iter().all(|block| !block.is_table()),
+            "no rows survive"
+        );
+        assert_eq!(d.body().len(), 1, "one empty paragraph holds the place");
+        assert_eq!(d.block_len(0), 0);
+        // What the register keeps rebuilds the table it destroyed.
+        assert!(
+            markdown.contains("| $x$ | two |"),
+            "math as notation: {markdown}"
+        );
+        assert!(markdown.contains("| --- | --- |"), "divider: {markdown}");
+        let again = parse(path(), &format!("{markdown}\n"));
+        assert!(again.body().iter().all(Block::is_table));
+        assert_eq!(rows(&again).len(), 3, "header and two data rows");
+    }
+
+    #[test]
+    fn deleting_a_table_from_a_document_with_neighbours_leaves_them() {
+        let mut d = parse(
+            path(),
+            "before\n\n| A | B |\n| --- | --- |\n| a | b |\n\nafter\n",
+        );
+        let first = first_row(&d);
+        let markdown = d.delete_table(first).expect("the table goes");
+        assert!(markdown.contains("| A | B |"), "header in the register");
+        assert_eq!(d.body().len(), 2);
+        assert_eq!(d.block_text(0), "before");
+        assert_eq!(d.block_text(1), "after");
+        assert_eq!(d.caret.block, first, "caret lands on the table's place");
+    }
+
+    #[test]
+    fn a_line_wise_delete_over_a_whole_table_removes_it() {
+        let mut d = parse(
+            path(),
+            "before\n\n| A | B |\n| --- | --- |\n| a | b |\n| c | d |\n\nafter\n",
+        );
+        let (first, last) = (first_row(&d), last_row(&d));
+        // The `V`-over-a-table case that used to delete nothing at all.
+        let deleted = d
+            .delete_lines(first, last)
+            .expect("the selection is not empty");
+        assert!(
+            deleted.contains("| A | B |"),
+            "rows yank as Markdown: {deleted}"
+        );
+        assert!(d.body().iter().all(|block| !block.is_table()));
+        assert_eq!(d.body().len(), 2, "the prose closes up over the table");
+        assert_eq!(d.block_text(0), "before");
+        assert_eq!(d.block_text(1), "after");
+    }
+
+    #[test]
+    fn a_line_wise_delete_of_a_header_row_promotes_the_row_below_it() {
+        let mut d = document();
+        let first = first_row(&d);
+        d.delete_lines(first, first).expect("the header goes");
+        assert_eq!(rows(&d).len(), 2, "two data rows survive");
+        assert!(d.body()[first].table_first(), "the next row anchors");
+        let saved = serialize(&d);
+        assert!(
+            saved.starts_with("| $x$ | two |\n| --- | --- |"),
+            "still a table on disk: {saved}"
+        );
+        assert_eq!(parse(path(), &saved).body(), d.body(), "and it reads back");
+    }
+
+    #[test]
+    fn a_line_wise_delete_over_a_row_and_prose_removes_both() {
+        let mut d = parse(
+            path(),
+            "before\n\n| A | B |\n| --- | --- |\n| a | b |\n\nafter\n",
+        );
+        let last = last_row(&d);
+        // The last data row plus the paragraph under it.
+        let deleted = d.delete_lines(last, last + 1).expect("not empty");
+        assert!(deleted.contains("| a | b |"), "the row is in the register");
+        assert!(deleted.ends_with("after"), "and the prose: {deleted}");
+        assert_eq!(rows(&d).len(), 1, "the header row is left");
+        assert_eq!(d.body().len(), 2, "before and the surviving header");
+    }
+
+    #[test]
+    fn a_characterwise_delete_spanning_a_table_and_prose_clears_both() {
+        let mut d = parse(path(), "| A | B |\n| --- | --- |\n| a | b |\n\nafter\n");
+        let last = last_row(&d);
+        // From the start of the last row's first cell into the prose below: the
+        // range that used to be refused, deleting nothing anywhere.
+        let range = FlatRange::new(d.position(last, 0), d.position(last + 1, 3));
+        let deleted = d.delete_range(range).expect("the range is not empty");
+        assert!(deleted.contains('a'), "the row's text is in the register");
+        assert!(deleted.contains("aft"), "and the prose: {deleted}");
+        assert!(
+            d.body()[0].is_table() && d.body()[last].is_table(),
+            "the grid survives"
+        );
+        // The range runs on into the prose, so the rest of the row lies inside
+        // it: both cells go, and only the grid survives.
+        assert_eq!(cell_text(&d.body()[last].cells()[0]), "");
+        assert_eq!(cell_text(&d.body()[last].cells()[1]), "");
+        assert_eq!(d.block_text(last + 1), "er", "the prose keeps its tail");
+    }
+
+    #[test]
+    fn a_characterwise_delete_inside_one_row_still_keeps_the_grid() {
+        let mut d = document();
+        let last = last_row(&d);
+        let range = FlatRange::new(d.position(last, 0), d.position(last, 2));
+        d.delete_range(range).expect("the range is not empty");
+        assert_eq!(d.body()[last].cells().len(), 2, "the cells stay");
+        assert_eq!(cell_text(&d.body()[last].cells()[0]), "");
     }
 }
