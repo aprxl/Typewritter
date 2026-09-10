@@ -436,6 +436,10 @@ struct TableLinesState {
     row: usize,
     column: usize,
     anchor: (f32, f32),
+    /// The keyboard's card cursor. It lives here, not in the widget, so a
+    /// snapshot-recreating refresh keeps it — the same rule the hover pill
+    /// follows. Seeded `None` on every open, whatever raised the card.
+    focus: Option<crate::components::table_lines::TableHit>,
 }
 
 /// A live resize carries the exact divider and the last pointer position.

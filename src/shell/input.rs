@@ -617,6 +617,9 @@ impl Shell {
             row,
             column,
             anchor,
+            // A clicked card and a keyboard-raised one start with no lit
+            // target: the keyboard cursor is seeded identically either way.
+            focus: None,
         });
         self.refresh_table_lines();
     }
@@ -637,14 +640,17 @@ impl Shell {
                     })
                     .count();
                 let columns = body.first().map_or(0, |block| block.inlines().len());
-                Some(crate::components::TableLinesMenu::new(
-                    settings.lines,
-                    state.anchor,
-                    state.row.min(rows.saturating_sub(1)),
-                    state.column.min(columns.saturating_sub(1)),
-                    rows,
-                    columns,
-                ))
+                Some(
+                    crate::components::TableLinesMenu::new(
+                        settings.lines,
+                        state.anchor,
+                        state.row.min(rows.saturating_sub(1)),
+                        state.column.min(columns.saturating_sub(1)),
+                        rows,
+                        columns,
+                    )
+                    .with_focus(state.focus),
+                )
             })
         });
         self.regions[self.table_lines_region].set_component(Box::new(
@@ -662,6 +668,34 @@ impl Shell {
             self.close_table_lines();
             return;
         }
+        // The keyboard walks the very targets the pointer hit-tests: Tab and
+        // the arrows move the lit target, Enter or Space works it. This is
+        // how the grid picker and the structural buttons are reached with
+        // no mouse at all.
+        let step = if input.is_key_typed(KeyCode::ArrowLeft) || input.is_key_typed(KeyCode::ArrowUp)
+        {
+            Some(false)
+        } else if input.is_key_typed(KeyCode::ArrowRight) || input.is_key_typed(KeyCode::ArrowDown)
+        {
+            Some(true)
+        } else if input.is_key_typed(KeyCode::Tab) {
+            Some(!input.shift())
+        } else {
+            None
+        };
+        if let Some(forward) = step {
+            if let Some(state) = self.table_lines.as_mut() {
+                state.focus = table_lines::step_focus(state.focus, forward);
+            }
+            self.refresh_table_lines();
+            return;
+        }
+        if input.is_key_typed(KeyCode::Enter) || input.is_key_typed(KeyCode::Space) {
+            if let Some(target) = self.table_lines.as_ref().and_then(|state| state.focus) {
+                self.activate_table_lines(target);
+            }
+            return;
+        }
         if !input.is_mouse_pressed(MouseButton::Left) || !input.is_cursor_in_window() {
             return;
         }
@@ -671,31 +705,42 @@ impl Shell {
         };
         let card = table_lines::card_anchored(viewport, state.anchor);
         match table_lines::hit_at(card, point) {
-            Some(table_lines::TableHit::Line(line)) => {
-                self.docs.borrow_mut().toggle_table_line(state.first, line);
-                self.refresh_table_lines();
+            Some(hit) => self.activate_table_lines(hit),
+            None => self.close_table_lines(),
+        }
+    }
+
+    /// Work one card target. The click path and the keyboard path both land
+    /// here, so a target cannot mean two things depending on how it was
+    /// reached.
+    fn activate_table_lines(&mut self, target: table_lines::TableHit) {
+        let Some(state) = self.table_lines.as_ref() else {
+            return;
+        };
+        let (first, row, column) = (state.first, state.row, state.column);
+        match target {
+            table_lines::TableHit::Line(line) => {
+                self.docs.borrow_mut().toggle_table_line(first, line);
             }
-            Some(table_lines::TableHit::Action(action)) => {
+            table_lines::TableHit::Action(action) => {
                 let mut docs = self.docs.borrow_mut();
                 match action {
                     table_lines::TableAction::InsertRow => {
-                        docs.insert_table_row(state.first, state.row);
+                        docs.insert_table_row(first, row);
                     }
                     table_lines::TableAction::RemoveRow => {
-                        docs.remove_table_row(state.first, state.row);
+                        docs.remove_table_row(first, row);
                     }
                     table_lines::TableAction::InsertColumn => {
-                        docs.insert_table_column(state.first, state.column);
+                        docs.insert_table_column(first, column);
                     }
                     table_lines::TableAction::RemoveColumn => {
-                        docs.remove_table_column(state.first, state.column);
+                        docs.remove_table_column(first, column);
                     }
                 }
-                drop(docs);
-                self.refresh_table_lines();
             }
-            None => self.close_table_lines(),
         }
+        self.refresh_table_lines();
     }
 
     /// Update a live table divider drag. The delta uses the last point, not
