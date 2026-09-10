@@ -176,14 +176,12 @@ fn prose_markdown(paragraphs: usize) -> String {
 
 /// The one place this harness looks inside a cell, for the sanity line under
 /// the typing cases. The table model is being refactored (a cell becomes a
-/// container of lines and `Inline` loses its wrapping variant); when that
-/// lands this function is the only one here that has to change — everything
-/// measured goes through the public methods above it.
+/// A row's first cell, read through the container shape: a cell owns its lines,
+/// so this is the one place here that names it.
 fn first_cell_text(row: &Block) -> String {
-    row.inlines()
+    row.cells()
         .first()
-        .and_then(Inline::table_cell_contents)
-        .map(|runs| runs.iter().map(run_text).collect())
+        .map(|cell| cell.runs().iter().map(run_text).collect())
         .unwrap_or_default()
 }
 
@@ -242,10 +240,8 @@ fn paint_table(doc_layout: &DocLayout, first: usize, scroll: f32, viewport_heigh
         let row_table = doc_layout.tables[row]
             .as_ref()
             .expect("table row must have table layout");
-        for (column, wrapper) in doc_layout.source[row].inlines().iter().enumerate() {
-            let contents = wrapper
-                .table_cell_contents()
-                .expect("table rows contain table-cell wrappers");
+        for (column, cell) in doc_layout.source[row].cells().iter().enumerate() {
+            let contents = cell.runs();
             let cell_block = Block::Paragraph(contents.to_vec());
             black_box(&cell_block);
             for line in &row_table.cells[column] {
