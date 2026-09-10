@@ -2039,13 +2039,118 @@ impl Document {
         }
     }
 
-    /// Enforces the invariants: non-empty blocks, every block has ≥1 run,
-    /// no empty run outside the placeholder, caret in bounds.
+    /// Enforces the invariants over the whole document: non-empty blocks,
+    /// every block has ≥1 run, no empty run outside the placeholder, caret
+    /// in bounds. Structural and document-level edits — a block inserted or
+    /// removed, a range spanning blocks, a file just loaded — use this;
+    /// every content edit uses [`Self::enforce_block`] instead.
     pub(crate) fn enforce(&mut self) {
         self.prune_runs();
         self.renumber_ordered_runs();
         self.clamp_caret();
         debug_assert!(self.invariants_hold());
+    }
+
+    /// Enforces the same invariants for the one block an edit touched, plus
+    /// the ordered run that block belongs to. A keystroke inside a cell must
+    /// not walk — or rebuild a single `Vec` of — any other block.
+    pub(crate) fn enforce_block(&mut self, block: usize) {
+        self.prune_block_at(block);
+        self.renumber_ordered_from(block);
+        self.clamp_caret();
+        // An edit that removed the last anchor leaves a note nothing points
+        // at; the guard makes this free for a document that has none.
+        self.drop_unanchored_notes();
+        debug_assert!(self.invariants_hold());
+    }
+
+    /// Repairs one block, in the scope the caret is in.
+    fn prune_block_at(&mut self, block: usize) {
+        match self.focus {
+            Focus::Body => {
+                if let Some(block) = self.body.get_mut(block) {
+                    prune_block(block);
+                }
+            }
+            Focus::Note(i) => {
+                if let Some(note) = self.notes.get_mut(i)
+                    && let Some(block) = note.body.get_mut(block)
+                {
+                    prune_block(block);
+                }
+            }
+        }
+    }
+
+    /// Renumbers the ordered run `block` belongs to — or, when the edit just
+    /// took `block` out of the list, the run that starts right after it. The
+    /// rest of the document keeps whatever ordinals it already had.
+    fn renumber_ordered_from(&mut self, block: usize) {
+        fn is_item(block: &Block) -> bool {
+            matches!(
+                block,
+                Block::ListItem {
+                    marker: ListMarker::Number(_),
+                    ..
+                }
+            )
+        }
+        let blocks = match self.focus {
+            Focus::Body => &mut self.body,
+            Focus::Note(i) => match self.notes.get_mut(i) {
+                Some(note) => &mut note.body,
+                None => return,
+            },
+        };
+        if block >= blocks.len() {
+            return;
+        }
+        let mut at = if is_item(&blocks[block]) {
+            let mut first = block;
+            while first > 0 && is_item(&blocks[first - 1]) {
+                first -= 1;
+            }
+            first
+        } else {
+            block + 1
+        };
+        let mut ord = 0u32;
+        while at < blocks.len() {
+            let Block::ListItem {
+                marker: ListMarker::Number(n),
+                ..
+            } = &mut blocks[at]
+            else {
+                break;
+            };
+            ord += 1;
+            *n = ord;
+            at += 1;
+        }
+    }
+
+    /// Drops a note whose anchor an edit removed: a body nothing points at
+    /// cannot be seen or reached. A note that never had an anchor — a stray
+    /// definition loaded from disk — is kept, because an edit may not
+    /// discard it.
+    fn drop_unanchored_notes(&mut self) {
+        if self.notes.iter().all(|note| !note.anchored) {
+            return;
+        }
+        fn anchored(blocks: &[Block], label: &str) -> bool {
+            blocks.iter().any(|block| {
+                block.cells().iter().any(|cell| {
+                    cell.all_runs()
+                        .any(|run| matches!(run, Inline::Note(l) if l == label))
+                }) || block
+                    .inlines()
+                    .iter()
+                    .any(|run| matches!(run, Inline::Note(l) if l == label))
+            })
+        }
+        let body = &self.body;
+        self.notes
+            .retain(|note| !note.anchored || anchored(body, &note.label));
     }
 
     /// Ordered items are numbered 1,2,3… across each consecutive run; a
@@ -2090,21 +2195,7 @@ impl Document {
             }
         }
 
-        // An anchor the reader deleted leaves its note unreachable — a body
-        // nothing points at cannot be seen or reached, so keep it only for
-        // notes that never had an anchor to begin with (loaded from disk as
-        // a stray definition), which an edit is not allowed to discard.
-        let anchored: Vec<&str> = self
-            .body
-            .iter()
-            .flat_map(Block::inlines)
-            .filter_map(|run| match run {
-                Inline::Note(label) => Some(label.as_str()),
-                _ => None,
-            })
-            .collect();
-        self.notes
-            .retain(|note| !note.anchored || anchored.contains(&note.label.as_str()));
+        self.drop_unanchored_notes();
 
         if match self.focus {
             Focus::Body => true,
@@ -2405,7 +2496,7 @@ impl Document {
             }
             self.caret.offset = flat + text.chars().count();
             self.dirty = true;
-            self.enforce();
+            self.enforce_block(b);
             self.caret.inline = cell;
             self.caret.offset = self
                 .caret
@@ -2505,7 +2596,7 @@ impl Document {
         // would otherwise corrupt the caret).
         let target = flat + len;
         self.dirty = true;
-        self.enforce();
+        self.enforce_block(b);
         let (ni, no) = self.flat_to_pos(b, target.min(self.block_flat_len(b)));
         self.caret.inline = ni;
         self.caret.offset = no;
@@ -2543,7 +2634,7 @@ impl Document {
             contents.splice(at.run..at.run, replacement);
             self.caret.offset = flat + inserted;
             self.dirty = true;
-            self.enforce();
+            self.enforce_block(block);
             return;
         }
         let s = self.caret.style;
@@ -2561,7 +2652,7 @@ impl Document {
         self.scope_mut()[b].inlines_mut().splice(i..i, runs);
         let target = flat + inserted;
         self.dirty = true;
-        self.enforce();
+        self.enforce_block(b);
         let (ni, no) = self.flat_to_pos(b, target.min(self.block_flat_len(b)));
         self.caret.inline = ni;
         self.caret.offset = no;
@@ -2604,7 +2695,7 @@ impl Document {
             }
             self.caret.offset -= 1;
             self.dirty = true;
-            self.enforce();
+            self.enforce_block(b);
             return;
         }
         let math_inline = if o > 0 && matches!(self.scope()[b].inlines()[i], Inline::Math(_)) {
@@ -2673,13 +2764,13 @@ impl Document {
             let content = std::mem::take(self.scope_mut()[b].inlines_mut());
             self.scope_mut()[b] = Block::Paragraph(content);
             self.dirty = true;
-            self.enforce();
+            self.enforce_block(b);
             self.refresh_context();
             return;
         } else if b > 0 {
             self.merge_into_previous();
             self.dirty = true;
-            self.enforce();
+            self.enforce_block(self.caret.block);
             self.refresh_context();
             return;
         } else {
@@ -2688,7 +2779,7 @@ impl Document {
         // One char vanished before the caret: it sits exactly one char back.
         let target = before.saturating_sub(1);
         self.dirty = true;
-        self.enforce();
+        self.enforce_block(b);
         let (ni, no) = self.flat_to_pos(b, target.min(self.block_flat_len(b)));
         self.caret.inline = ni;
         self.caret.offset = no;
@@ -2746,7 +2837,7 @@ impl Document {
                 );
             }
             self.dirty = true;
-            self.enforce();
+            self.enforce_block(b);
             return;
         }
         let runs = self.scope()[b].inlines();
@@ -2801,7 +2892,7 @@ impl Document {
             return; // end of document
         }
         self.dirty = true;
-        self.enforce();
+        self.enforce_block(b);
         self.refresh_context();
     }
 
@@ -2845,7 +2936,7 @@ impl Document {
                 if self.block_flat_len(b) == 0 {
                     self.scope_mut()[b] = empty_block();
                     self.dirty = true;
-                    self.enforce();
+                    self.enforce_block(b);
                     return;
                 }
                 Some(continued(marker))
@@ -2885,7 +2976,8 @@ impl Document {
         // would hide it opens instead of swallowing the caret.
         self.reveal_block(b + 1);
         // Style context preserved: you keep typing in the same style.
-        self.enforce();
+        self.enforce_block(b);
+        self.enforce_block(b + 1);
     }
 
     /// vim `x`: delete the char at the caret's flat position — the char under
@@ -2921,7 +3013,7 @@ impl Document {
                 );
             }
             self.dirty = true;
-            self.enforce();
+            self.enforce_block(b);
             return;
         }
         let flat = self.caret_flat(b);
@@ -2944,7 +3036,7 @@ impl Document {
             remove_char_at(runs[i].text_mut().expect("non-math run is text"), o);
         }
         self.dirty = true;
-        self.enforce();
+        self.enforce_block(b);
         self.refresh_context();
     }
 
@@ -3409,7 +3501,7 @@ impl Document {
             self.caret.style = Style::PLAIN;
             self.math = Some(math::MathCursor::default());
             self.dirty = true;
-            self.enforce();
+            self.enforce_block(b);
             return;
         }
         let flat = self.caret_flat(b);
@@ -3418,7 +3510,7 @@ impl Document {
             .inlines_mut()
             .splice(i..i, [prefix, Inline::Math(Vec::new()), suffix]);
         self.dirty = true;
-        self.enforce();
+        self.enforce_block(b);
         let (inline, offset) = self.flat_to_pos(b, flat);
         self.set_caret(b, inline, offset);
         self.math = Some(math::MathCursor::default());
@@ -3462,7 +3554,7 @@ impl Document {
             self.math = None;
             self.caret.style = Style::PLAIN;
             self.dirty = true;
-            self.enforce();
+            self.enforce_block(b);
             return true;
         }
         match self.scope()[b].inlines().get(i) {
@@ -3475,7 +3567,7 @@ impl Document {
         self.scope_mut()[b].inlines_mut().remove(i);
         self.math = None;
         self.dirty = true;
-        self.enforce();
+        self.enforce_block(b);
         let (inline, offset) = self.flat_to_pos(b, flat);
         self.set_caret(b, inline, offset);
         true

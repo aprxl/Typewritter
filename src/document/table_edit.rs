@@ -120,7 +120,7 @@ impl Document {
         lines.insert(line + 1, placeholder_if_empty(tail));
         self.caret.offset = flat + 1;
         self.dirty = true;
-        self.enforce();
+        self.enforce_block(block);
         true
     }
 
@@ -143,7 +143,7 @@ impl Document {
         self.merge_cell_line(cell, line - 1);
         self.caret.offset = flat - 1;
         self.dirty = true;
-        self.enforce();
+        self.enforce_block(block);
         true
     }
 
@@ -169,7 +169,7 @@ impl Document {
         self.merge_cell_line(cell, line);
         self.caret.offset = flat;
         self.dirty = true;
-        self.enforce();
+        self.enforce_block(block);
         true
     }
 
@@ -514,7 +514,7 @@ mod tests {
 
     use crate::document::layout;
     use crate::document::markdown::{parse, serialize};
-    use crate::document::{Block, Document, Inline, cell_text};
+    use crate::document::{Block, Document, Inline, ListMarker, cell_text};
     use crate::theme::TextStyle;
 
     /// Deterministic text width: half the font size per character.
@@ -747,5 +747,66 @@ mod tests {
         assert_eq!(cell.lines().len(), 2);
         assert!(cell.lines()[0].iter().all(|run| !run.text().is_empty()));
         assert_eq!(serialize(&back), text);
+    }
+
+    /// Every run vector of the document, named so a change can be located:
+    /// a block's own runs, or each cell line's.
+    fn run_pointers(document: &Document) -> Vec<(String, *const Inline)> {
+        let mut pointers = Vec::new();
+        for (index, block) in document.body().iter().enumerate() {
+            match block {
+                Block::TableRow { cells, .. } => {
+                    for (column, cell) in cells.iter().enumerate() {
+                        for (line, runs) in cell.lines().iter().enumerate() {
+                            pointers.push((format!("{index}.{column}.{line}"), runs.as_ptr()));
+                        }
+                    }
+                }
+                block => pointers.push((index.to_string(), block.inlines().as_ptr())),
+            }
+        }
+        pointers
+    }
+
+    #[test]
+    fn editing_a_cell_leaves_every_other_block_untouched() {
+        let mut document = table();
+        document.insert_text("seed");
+        document.set_caret(0, 1, 0);
+        document.insert_text("second");
+        // A paragraph and an ordered list after the table: a document-wide
+        // prune rebuilds both of their run vectors.
+        document.open_below();
+        document.insert_text("prose");
+        document.open_below();
+        document.set_list(Some(ListMarker::Number(1)));
+        document.insert_text("one");
+        document.set_caret(0, 1, 0);
+
+        let before = run_pointers(&document);
+        document.insert_text("!");
+        let after = run_pointers(&document);
+
+        assert_eq!(cell_text(&document.body()[0].cells()[1]), "!second");
+        assert_eq!(before.len(), after.len(), "the shape did not change");
+        for ((key, before), (_, after)) in before.iter().zip(&after) {
+            if key == "0.1.0" {
+                continue;
+            }
+            assert_eq!(
+                before, after,
+                "block {key} was rebuilt by the edit, not just the touched cell"
+            );
+        }
+
+        // That guard only means something if a document-wide prune does move
+        // those pointers: prove the comparison can see one.
+        let mut probe = document.clone();
+        probe.enforce();
+        let after_all = run_pointers(&probe);
+        assert!(
+            before.iter().zip(&after_all).any(|((_, a), (_, b))| a != b),
+            "a document-wide prune must be detectable, or this test is silent"
+        );
     }
 }
