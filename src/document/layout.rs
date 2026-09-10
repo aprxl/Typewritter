@@ -1429,9 +1429,12 @@ fn code_span_bounds(kind: &Block, runs: &[Inline], inline: usize) -> (usize, usi
     (start, end)
 }
 
-/// Character count of a block, counting opaque atoms as one.
+/// Flat length of a block, counting an opaque atom as one position and a table
+/// row as its cells. `Block::flat_len` is the model's own rule; this exists so
+/// the callers that read a block's own space go through it instead of a run
+/// list, which a table row does not have.
 fn block_flat_len(block: &Block) -> usize {
-    runs_flat_len(block.inlines())
+    block.flat_len()
 }
 
 /// Character count of a run list, counting opaque atoms as one.
@@ -1439,16 +1442,18 @@ fn runs_flat_len(runs: &[Inline]) -> usize {
     runs.iter().map(|run| run_text(run).chars().count()).sum()
 }
 
+/// Block-flat offset of a caret.
+///
+/// The unit is a run in prose and a CELL in a table row — the same arithmetic
+/// `Document::caret_flat` uses, and the reason it cannot read a row's run list:
+/// a table row's content is its cells, so `Block::inlines` is empty for one and
+/// indexing it panicked (`caret_band` on a freshly loaded table).
 fn flat_of_caret(source: &[Block], caret: Caret) -> usize {
     source.get(caret.block).map_or(0, |block| {
-        let runs = block.inlines();
-        let inline = caret.inline.min(runs.len().saturating_sub(1));
-        let prefix: usize = runs[..inline]
-            .iter()
-            .map(|r| run_text(r).chars().count())
-            .sum();
-        let offset = caret.offset.min(run_text(&runs[inline]).chars().count());
-        (prefix + offset).min(block_flat_len(block))
+        let unit = caret.inline.min(block.unit_count().saturating_sub(1));
+        let prefix: usize = (0..unit).map(|unit| block.unit_len(unit)).sum();
+        let offset = caret.offset.min(block.unit_len(unit));
+        (prefix + offset).min(block.flat_len())
     })
 }
 
@@ -4863,6 +4868,58 @@ mod tests {
             };
             let (x, y, _) = laid.caret_pos(caret, &fake_measure);
             assert_eq!(laid.hit(x, y, &fake_measure), caret);
+        }
+    }
+
+    /// Every caret reader asked about a table row.
+    ///
+    /// A table row's content is its cells, so `Block::inlines` is empty for one
+    /// and any reader that indexes a block's run list panics. This is the
+    /// regression for the crash on opening a note whose FIRST block is a table
+    /// (`~/Notes/tables.md`, a math cell beside an empty one): `caret_band` —
+    /// the scroll-follow the shell runs on the first frame of a freshly opened
+    /// tab — read the row's run list and indexed it.
+    #[test]
+    fn every_caret_reader_survives_a_table_document() {
+        let d = crate::document::markdown::parse(
+            std::path::Path::new("notes/tables.md"),
+            "| $1/2$ |  |\n| --- | --- |\n|  |  |\n",
+        );
+        let laid = layout(&d, 800.0, &fake_measure);
+        assert_eq!(d.body().len(), 2);
+        for block in 0..d.body().len() {
+            assert!(
+                laid.tables[block].is_some(),
+                "every table row has table layout"
+            );
+            let row_top = laid.blocks[block].y;
+            let row_bottom = row_top + laid.blocks[block].height;
+            for cell in 0..d.body()[block].cells().len() {
+                for offset in [0usize, 1] {
+                    let caret = Caret {
+                        block,
+                        inline: cell,
+                        offset,
+                        style: Style::PLAIN,
+                    };
+                    // The row's own band, not a line of some run list.
+                    assert_eq!(laid.caret_band(caret), (row_top, row_bottom));
+                    let (x, y, height) = laid.caret_pos(caret, &fake_measure);
+                    assert!(height > 0.0 && x >= 0.0 && y >= row_top);
+                    if offset == 0 {
+                        assert_eq!(laid.hit(x, y, &fake_measure), caret);
+                    } else {
+                        let _ = laid.hit(x, y, &fake_measure);
+                    }
+                    let _ = laid.hit_context(x, y, &fake_measure);
+                    let _ = laid.line_up(caret, x, &fake_measure);
+                    let _ = laid.line_down(caret, x, &fake_measure);
+                    let _ = laid.table_cell_at(x, y);
+                    let _ = laid.table_resize_at(x, y, 2.0);
+                    let _ = laid.fold_chevron_at(x, y, &fake_measure);
+                    let _ = laid.fold_indicator_at(y);
+                }
+            }
         }
     }
 }
