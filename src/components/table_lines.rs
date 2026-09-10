@@ -129,6 +129,36 @@ pub fn hit_at(card: Rect, point: (f32, f32)) -> Option<TableHit> {
     })
 }
 
+/// Every keyboard-reachable target in the card, in the order Tab walks
+/// them: the six grid strokes, then the four structural buttons. Each
+/// target's geometry comes from the same `line_at`/`action_rect` the mouse
+/// hit-test reads, so the two paths cannot describe different controls.
+pub const TARGETS: [TableHit; 10] = [
+    TableHit::Line(GridLine::Top),
+    TableHit::Line(GridLine::Bottom),
+    TableHit::Line(GridLine::Left),
+    TableHit::Line(GridLine::Right),
+    TableHit::Line(GridLine::Horizontal),
+    TableHit::Line(GridLine::Vertical),
+    TableHit::Action(TableAction::InsertRow),
+    TableHit::Action(TableAction::RemoveRow),
+    TableHit::Action(TableAction::InsertColumn),
+    TableHit::Action(TableAction::RemoveColumn),
+];
+
+/// The target after `current` in [`TARGETS`], wrapping at both ends. `None`
+/// starts at the first target (forward) or the last (backward).
+pub fn step_focus(current: Option<TableHit>, forward: bool) -> Option<TableHit> {
+    let index = current.and_then(|hit| TARGETS.iter().position(|target| *target == hit));
+    let next = match (index, forward) {
+        (Some(index), true) => (index + 1) % TARGETS.len(),
+        (Some(index), false) => (index + TARGETS.len() - 1) % TARGETS.len(),
+        (None, true) => 0,
+        (None, false) => TARGETS.len() - 1,
+    };
+    Some(TARGETS[next])
+}
+
 pub struct TableLinesMenu {
     lines: TableLines,
     anchor: (f32, f32),
@@ -136,6 +166,10 @@ pub struct TableLinesMenu {
     column: usize,
     rows: usize,
     columns: usize,
+    /// The keyboard's own cursor. It is shell-owned and seeded to `None`
+    /// for every open, so a keyboard-raised card and a clicked one start in
+    /// the same state; the pointer's `hover` stays independent of it.
+    focus: Option<TableHit>,
     hover: Option<TableHit>,
     hover_fade: Hover,
     dirty: Dirty,
@@ -157,10 +191,19 @@ impl TableLinesMenu {
             column,
             rows,
             columns,
+            focus: None,
             hover: None,
             hover_fade: Hover::new(),
             dirty: Dirty::new(),
         }
+    }
+
+    /// The keyboard cursor the shell feeds in on each refresh. Not a
+    /// separate construction path: the card is built exactly as before and
+    /// this only states which target is lit.
+    pub fn with_focus(mut self, focus: Option<TableHit>) -> Self {
+        self.focus = focus;
+        self
     }
 
     pub fn closed() -> Self {
@@ -194,13 +237,24 @@ impl TableLinesMenu {
             if hovered {
                 theme::hover_fill(layer, rect, self.hover_fade.value());
             }
+            let focused = self.focus == Some(TableHit::Action(action));
             layer.draw_rectangle(
                 rect.position(),
                 rect.size(),
                 theme::fade(theme::alt(), 0.72),
                 Rounding::uniform(6.0),
             );
-            theme::rounded_outline(layer, rect.inset(0.5), 5.5, 1.0, theme::border());
+            theme::rounded_outline(
+                layer,
+                rect.inset(0.5),
+                5.5,
+                if focused { 1.5 } else { 1.0 },
+                if focused {
+                    theme::accent()
+                } else {
+                    theme::border()
+                },
+            );
             let glyph = match action {
                 TableAction::InsertRow | TableAction::InsertColumn => "+",
                 TableAction::RemoveRow | TableAction::RemoveColumn => "−",
@@ -213,7 +267,7 @@ impl TableLinesMenu {
                     16.0,
                     if !available {
                         theme::faint()
-                    } else if hovered {
+                    } else if hovered || focused {
                         theme::accent()
                     } else {
                         theme::ink()
@@ -298,17 +352,18 @@ impl Component for TableLinesMenu {
         let grid = grid(card);
         let mid_x = grid.x + grid.width * 0.5;
         let mid_y = grid.y + grid.height * 0.5;
+        let lit = |hit: TableHit| self.hover == Some(hit) || self.focus == Some(hit);
         let stroke = |line: GridLine| {
             if self.lines.enabled(line) {
                 theme::accent()
-            } else if self.hover == Some(TableHit::Line(line)) {
+            } else if lit(TableHit::Line(line)) {
                 theme::fade(theme::accent(), 0.7)
             } else {
                 theme::faint()
             }
         };
         let thickness = |line: GridLine| {
-            if self.lines.enabled(line) || self.hover == Some(TableHit::Line(line)) {
+            if self.lines.enabled(line) || lit(TableHit::Line(line)) {
                 2.5
             } else {
                 1.0
@@ -394,6 +449,62 @@ mod tests {
             line_at(card, (grid.x + grid.width * 0.5, grid.y + 20.0)),
             Some(GridLine::Vertical)
         );
+    }
+
+    #[test]
+    fn tab_walks_every_target_once_and_wraps_at_both_ends() {
+        let mut focus = None;
+        let mut seen = Vec::new();
+        for _ in 0..TARGETS.len() {
+            focus = step_focus(focus, true);
+            seen.push(focus.unwrap());
+        }
+        assert_eq!(seen, TARGETS.to_vec(), "forward walks the whole card");
+        assert_eq!(
+            step_focus(focus, true),
+            Some(TARGETS[0]),
+            "wraps at the end"
+        );
+        assert_eq!(
+            step_focus(None, false),
+            Some(TARGETS[TARGETS.len() - 1]),
+            "backward starts at the end"
+        );
+        assert_eq!(
+            step_focus(Some(TARGETS[0]), false),
+            Some(TARGETS[TARGETS.len() - 1]),
+            "backward wraps at the start"
+        );
+    }
+
+    /// A point that hit-tests as `line` on the painted grid.
+    fn point_on_line(card: Rect, line: GridLine) -> (f32, f32) {
+        let grid = grid(card);
+        match line {
+            GridLine::Top => (grid.x + 30.0, grid.y),
+            GridLine::Bottom => (grid.x + 30.0, grid.bottom()),
+            GridLine::Left => (grid.x, grid.y + 30.0),
+            GridLine::Right => (grid.right(), grid.y + 30.0),
+            GridLine::Horizontal => (grid.x + 20.0, grid.y + grid.height * 0.5),
+            GridLine::Vertical => (grid.x + grid.width * 0.5, grid.y + 20.0),
+        }
+    }
+
+    #[test]
+    fn every_keyboard_target_is_the_mouse_target_at_its_own_geometry() {
+        let card = card_anchored(Rect::new(0.0, 0.0, 400.0, 400.0), (80.0, 80.0));
+        for target in TARGETS {
+            let hit = match target {
+                TableHit::Line(line) => {
+                    line_at(card, point_on_line(card, line)).map(TableHit::Line)
+                }
+                TableHit::Action(action) => {
+                    let rect = action_rect(card, action);
+                    hit_at(card, (rect.x + 2.0, rect.y + 2.0))
+                }
+            };
+            assert_eq!(hit, Some(target), "{target:?} has its own hit test");
+        }
     }
 
     #[test]
