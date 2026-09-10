@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::document::{
     BadgeColor, Block, Document, FlatRange, Focus, ListMarker, Style, fold_owner_of, math,
-    math_conversion,
+    math_conversion, table,
 };
 
 pub struct Tab {
@@ -646,6 +646,64 @@ impl Tabs {
         self.edit(Document::insert_math_block);
     }
 
+    pub fn insert_table(&mut self) {
+        self.edit(Document::insert_table);
+    }
+
+    pub fn toggle_table_line(&mut self, block: usize, line: table::GridLine) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.toggle_table_line(block, line));
+        changed
+    }
+
+    pub fn resize_table_column(&mut self, block: usize, divider: usize, delta: f32) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.resize_table_column(block, divider, delta));
+        changed
+    }
+
+    pub fn resize_table_row(&mut self, block: usize, divider: usize, delta: f32) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.resize_table_row(block, divider, delta));
+        changed
+    }
+
+    pub fn insert_table_row(&mut self, block: usize, row: usize) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.insert_table_row(block, row));
+        changed
+    }
+
+    pub fn remove_table_row(&mut self, block: usize, row: usize) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.remove_table_row(block, row));
+        changed
+    }
+
+    pub fn insert_table_column(&mut self, block: usize, column: usize) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.insert_table_column(block, column));
+        changed
+    }
+
+    pub fn remove_table_column(&mut self, block: usize, column: usize) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.remove_table_column(block, column));
+        changed
+    }
+
+    pub fn table_tab(&mut self, backwards: bool) -> bool {
+        let mut moved = false;
+        self.touch(|doc| moved = doc.table_tab(backwards));
+        moved
+    }
+
+    pub fn table_move(&mut self, direction: crate::document::TableDirection) -> bool {
+        let mut moved = false;
+        self.touch(|doc| moved = doc.table_move(direction));
+        moved
+    }
+
     /// Tags or untags the math block the caret sits in. A content change, so
     /// it goes through `edit` and promotes a preview.
     pub fn toggle_math_tag(&mut self) {
@@ -709,12 +767,13 @@ impl Tabs {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         address: &math::NodeAddress,
         role: math::SymbolRole,
     ) -> bool {
         let mut changed = false;
         self.edit(|doc| {
-            changed = doc.set_math_node_role_at(block, inline, address, role);
+            changed = doc.set_math_node_role_at(block, inline, offset, address, role);
         });
         changed
     }
@@ -723,12 +782,13 @@ impl Tabs {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         address: &math::NodeAddress,
         variant: &str,
     ) -> bool {
         let mut changed = false;
         self.edit(|doc| {
-            changed = doc.set_math_node_variant_at(block, inline, address, variant);
+            changed = doc.set_math_node_variant_at(block, inline, offset, address, variant);
         });
         changed
     }
@@ -737,12 +797,13 @@ impl Tabs {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         address: &math::NodeAddress,
         open: char,
     ) -> bool {
         let mut changed = false;
         self.edit(|doc| {
-            changed = doc.set_math_group_delimiter_at(block, inline, address, open);
+            changed = doc.set_math_group_delimiter_at(block, inline, offset, address, open);
         });
         changed
     }
@@ -751,12 +812,13 @@ impl Tabs {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         address: &math::NodeAddress,
         kind: math::AccentKind,
     ) -> bool {
         let mut changed = false;
         self.edit(|doc| {
-            changed = doc.set_math_accent_kind_at(block, inline, address, kind);
+            changed = doc.set_math_accent_kind_at(block, inline, offset, address, kind);
         });
         changed
     }
@@ -765,12 +827,13 @@ impl Tabs {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         address: &math::NodeAddress,
         kind: math::BigOp,
     ) -> bool {
         let mut changed = false;
         self.edit(|doc| {
-            changed = doc.set_math_big_op_kind_at(block, inline, address, kind);
+            changed = doc.set_math_big_op_kind_at(block, inline, offset, address, kind);
         });
         changed
     }
@@ -812,8 +875,14 @@ impl Tabs {
         entered
     }
 
-    pub fn enter_math_at(&mut self, block: usize, inline: usize, cursor: math::MathCursor) {
-        self.touch(|doc| doc.enter_math_at(block, inline, cursor));
+    pub fn enter_math_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        offset: usize,
+        cursor: math::MathCursor,
+    ) {
+        self.touch(|doc| doc.enter_math_at(block, inline, offset, cursor));
     }
 
     pub fn math_slot_next(&mut self) -> bool {
@@ -849,8 +918,8 @@ impl Tabs {
         self.active().is_some_and(|tab| tab.document.math.is_some())
     }
 
-    /// Flip bold/italic on the pending context. Caret-only — never promotes
-    /// a preview tab (a bold/italic toggle doesn't touch content).
+    /// Flip bold/italic on the pending context. Caret-only — typed content
+    /// takes the selected style without rewriting what came before it.
     pub fn toggle_bold(&mut self) {
         self.touch(Document::toggle_bold);
     }
@@ -1580,6 +1649,7 @@ mod tests {
         let caret = tabs.active().unwrap().document.caret;
 
         assert!(tabs.set_math_node_role_at(
+            0,
             0,
             0,
             &math::NodeAddress {

@@ -494,6 +494,21 @@ impl Finder {
                         }
                         crate::document::Inline::Note(_) => String::new(),
                         crate::document::Inline::EqRef(label) => format!("@{label}"),
+                        crate::document::Inline::TableCell(contents) => contents
+                            .iter()
+                            .map(|run| match run {
+                                crate::document::Inline::Text(text) => text.text.clone(),
+                                crate::document::Inline::Math(list) => format!(
+                                    "${}$",
+                                    crate::document::math_notation::print(list)
+                                ),
+                                crate::document::Inline::Note(_) => String::new(),
+                                crate::document::Inline::EqRef(label) => format!("@{label}"),
+                                crate::document::Inline::TableCell(_) => {
+                                    unreachable!("nested table cells are invalid")
+                                }
+                            })
+                            .collect(),
                     })
                     .collect::<String>()
             })

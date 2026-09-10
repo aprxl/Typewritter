@@ -439,6 +439,13 @@ pub const COMMANDS: &[Command] = &[
         run: |shell| shell.docs.borrow_mut().insert_math_block(),
     },
     Command {
+        id: "format.table",
+        title: "Table",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.docs.borrow_mut().insert_table(),
+    },
+    Command {
         // One command for both directions: a tagged equation loses its tag,
         // an untagged one gains the next free `#eq:N`. The numbers on the
         // page are derived at layout time in document order, so nothing

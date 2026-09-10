@@ -37,6 +37,20 @@ pub enum Prompt {
     /// only thing an export gets to decide (`PDF.md` §2), so it is the only
     /// thing this asks. Enter goes on to the file dialog.
     ExportPdf { dark: bool },
+    /// A Ctrl-brush selection holding more than prose, with a format about
+    /// to be applied to it. A text style reaches the words and nothing
+    /// else, so the card says how far it will get before it gets there,
+    /// and Enter applies it to exactly those words.
+    MixedFormat {
+        /// The bar cell that was pressed, re-run on confirm.
+        command: &'static str,
+        /// What that cell is called, for the sentence the card writes.
+        label: &'static str,
+        /// Selected words the format lands on.
+        words: usize,
+        /// Selected targets it leaves alone.
+        skipped: usize,
+    },
 }
 
 impl Prompt {
@@ -46,6 +60,7 @@ impl Prompt {
             Self::NewFolder { .. } => "New folder",
             Self::DeleteNote { .. } => "Delete note",
             Self::ExportPdf { .. } => "Export as PDF",
+            Self::MixedFormat { .. } => "Mixed selection",
         }
     }
 
@@ -55,6 +70,7 @@ impl Prompt {
             Self::NewFolder { .. } => "Create",
             Self::DeleteNote { .. } => "Delete",
             Self::ExportPdf { .. } => "Export",
+            Self::MixedFormat { .. } => "Apply to text",
         }
     }
 
@@ -64,6 +80,7 @@ impl Prompt {
             Self::NewFolder { .. } => "Enter creates · Esc cancels",
             Self::DeleteNote { .. } => "Enter deletes · Esc cancels",
             Self::ExportPdf { .. } => "Space switches · Enter exports · Esc cancels",
+            Self::MixedFormat { .. } => "Enter applies · Esc cancels",
         }
     }
 }
@@ -210,6 +227,26 @@ impl Dialog {
         }
     }
 
+    /// A card that only has something to say: a lead line in the reading
+    /// size, and the consequence under it in the quiet one. Both centred,
+    /// on the rhythm the named prompts put their field on.
+    fn draw_message(&self, layer: &Layer, card: Rect, ea: f32, lead: &str, note: &str) {
+        theme::draw(
+            layer,
+            lead,
+            (card.x + card.width / 2.0, card.y + 82.0),
+            &TextStyle::sans(16.0, theme::fade(theme::ink(), ea)),
+            theme::CENTER,
+        );
+        theme::draw(
+            layer,
+            note,
+            (card.x + card.width / 2.0, card.y + 108.0),
+            &TextStyle::sans(13.5, theme::fade(theme::dim(), ea)),
+            theme::CENTER,
+        );
+    }
+
     /// The palette row: what the switch is called, what it changes, and the
     /// pill itself.
     ///
@@ -351,22 +388,28 @@ impl Component for Dialog {
             Prompt::NewNote { input, caret } | Prompt::NewFolder { input, caret } => {
                 self.draw_field(layer, card, input, *caret)
             }
-            Prompt::DeleteNote { name } => {
-                theme::draw(
-                    layer,
-                    name,
-                    (card.x + card.width / 2.0, card.y + 82.0),
-                    &TextStyle::sans(16.0, theme::fade(theme::ink(), ea)),
-                    theme::CENTER,
-                );
-                theme::draw(
-                    layer,
-                    "is deleted from disk. This cannot be undone.",
-                    (card.x + card.width / 2.0, card.y + 108.0),
-                    &TextStyle::sans(13.5, theme::fade(theme::dim(), ea)),
-                    theme::CENTER,
-                );
-            }
+            Prompt::DeleteNote { name } => self.draw_message(
+                layer,
+                card,
+                ea,
+                name,
+                "is deleted from disk. This cannot be undone.",
+            ),
+            Prompt::MixedFormat {
+                label,
+                words,
+                skipped,
+                ..
+            } => self.draw_message(
+                layer,
+                card,
+                ea,
+                &format!(
+                    "{label} applies to {words} of {} selected items.",
+                    words + skipped
+                ),
+                "Math, code and badges take no text styling.",
+            ),
             // `rect` and not `card`: the switch is hit-tested from the
             // viewport, so it is drawn from the viewport too, and the two
             // cannot drift.
@@ -383,9 +426,10 @@ impl Component for Dialog {
 
         let (confirm, cancel) = buttons(rect);
         let accent = match prompt {
-            Prompt::NewNote { .. } | Prompt::NewFolder { .. } | Prompt::ExportPdf { .. } => {
-                theme::accent()
-            }
+            Prompt::NewNote { .. }
+            | Prompt::NewFolder { .. }
+            | Prompt::ExportPdf { .. }
+            | Prompt::MixedFormat { .. } => theme::accent(),
             // A destructive default deserves a different colour from the
             // one the whole interface uses for "this is where you are".
             Prompt::DeleteNote { .. } => theme::structure(),

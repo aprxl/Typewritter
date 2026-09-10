@@ -19,6 +19,7 @@ pub mod math_paint;
 pub mod math_style;
 pub mod math_symbols;
 pub mod outline;
+pub mod table;
 
 /// Flat-text stand-in for one opaque math atom.
 pub const ATOM: char = '\u{FFFC}';
@@ -106,6 +107,17 @@ pub enum Block {
         first: bool,
         lang: Option<String>,
     }, // one line of a fenced code block
+    /// One visual row of a table. All rows in a contiguous group carry the
+    /// same settings copy so any row remains independently recoverable after
+    /// a partial external edit; document operations update the group together.
+    /// Each entry is an [`Inline::TableCell`] container. The container keeps
+    /// the grid position stable while its contents use the same rich inline
+    /// runs as prose.
+    TableRow {
+        cells: Vec<Inline>,
+        first: bool,
+        settings: table::TableSettings,
+    },
     /// One list item. Items are flat blocks; nested lists are out of scope.
     ListItem {
         marker: ListMarker,
@@ -137,6 +149,10 @@ pub enum Inline {
     /// referenced equation's number on the page. Opaque like an anchor: one
     /// flat position, deleted as a whole, never split mid-label.
     EqRef(String),
+    /// One table cell containing ordinary rich inline runs. The wrapper is
+    /// structural: `Caret::inline` names the cell while `Caret::offset`
+    /// addresses the flattened contents inside it.
+    TableCell(Vec<Inline>),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -267,6 +283,7 @@ impl Block {
                 content: inlines, ..
             } => inlines,
             Block::CodeLine { content, .. } => content,
+            Block::TableRow { cells, .. } => cells,
         }
     }
 
@@ -282,6 +299,7 @@ impl Block {
                 content: inlines, ..
             } => inlines,
             Block::CodeLine { content, .. } => content,
+            Block::TableRow { cells, .. } => cells,
         }
     }
 
@@ -303,6 +321,21 @@ impl Block {
 
     pub fn is_code(&self) -> bool {
         matches!(self, Block::CodeLine { .. })
+    }
+
+    pub fn is_table(&self) -> bool {
+        matches!(self, Block::TableRow { .. })
+    }
+
+    pub fn table_first(&self) -> bool {
+        matches!(self, Block::TableRow { first: true, .. })
+    }
+
+    pub fn table_settings(&self) -> Option<&table::TableSettings> {
+        match self {
+            Block::TableRow { settings, .. } => Some(settings),
+            _ => None,
+        }
     }
 }
 
@@ -347,6 +380,9 @@ impl Inline {
             Inline::Math(_) => "\u{FFFC}",
             Inline::Note(_) => "\u{FFFC}",
             Inline::EqRef(_) => "\u{FFFC}",
+            Inline::TableCell(_) => {
+                unreachable!("table cell text must be flattened through its contents")
+            }
         }
     }
 
@@ -360,6 +396,7 @@ impl Inline {
             Inline::Note(_) => None,
             // A reference's label is fixed by the equation it points at.
             Inline::EqRef(_) => None,
+            Inline::TableCell(_) => None,
         }
     }
 
@@ -369,6 +406,7 @@ impl Inline {
             Inline::Math(_) => Style::PLAIN,
             Inline::Note(_) => Style::PLAIN,
             Inline::EqRef(_) => Style::PLAIN,
+            Inline::TableCell(_) => Style::PLAIN,
         }
     }
 
@@ -378,6 +416,21 @@ impl Inline {
             Inline::Math(_) => {}
             Inline::Note(_) => {}
             Inline::EqRef(_) => {}
+            Inline::TableCell(_) => {}
+        }
+    }
+
+    pub fn table_cell_contents(&self) -> Option<&[Inline]> {
+        match self {
+            Inline::TableCell(contents) => Some(contents),
+            _ => None,
+        }
+    }
+
+    pub fn table_cell_contents_mut(&mut self) -> Option<&mut Vec<Inline>> {
+        match self {
+            Inline::TableCell(contents) => Some(contents),
+            _ => None,
         }
     }
 }
@@ -389,6 +442,71 @@ fn run_len(run: &Inline) -> usize {
         Inline::Math(_) => 1,
         Inline::Note(_) => 1,
         Inline::EqRef(_) => 1,
+        Inline::TableCell(contents) => contents.iter().map(run_len).sum(),
+    }
+}
+
+fn table_cell_runs(cell: &Inline) -> &[Inline] {
+    cell.table_cell_contents()
+        .expect("table rows contain table-cell wrappers")
+}
+
+fn table_cell_runs_mut(cell: &mut Inline) -> &mut Vec<Inline> {
+    cell.table_cell_contents_mut()
+        .expect("table rows contain table-cell wrappers")
+}
+
+fn table_cell_text(cell: &Inline) -> String {
+    table_cell_runs(cell)
+        .iter()
+        .map(Inline::text)
+        .collect()
+}
+
+fn table_cell_flat_to_run(cell: &Inline, flat: usize) -> (usize, usize) {
+    let runs = table_cell_runs(cell);
+    let mut position = 0;
+    for (index, run) in runs.iter().enumerate() {
+        let len = run_len(run);
+        if flat < position + len {
+            return (index, flat - position);
+        }
+        position += len;
+    }
+    let last = runs.len().saturating_sub(1);
+    (last, run_len(&runs[last]))
+}
+
+fn table_cell_run_start(cell: &Inline, run: usize) -> usize {
+    table_cell_runs(cell)[..run].iter().map(run_len).sum()
+}
+
+fn table_cell_style_at(cell: &Inline, flat: usize) -> Option<Style> {
+    let mut position = 0;
+    for run in table_cell_runs(cell) {
+        let len = run_len(run);
+        if flat < position + len {
+            return Some(run.style());
+        }
+        position += len;
+    }
+    None
+}
+
+fn table_cell_style_before(cell: &Inline, flat: usize) -> Option<Style> {
+    flat.checked_sub(1)
+        .and_then(|position| table_cell_style_at(cell, position))
+}
+
+fn block_content_runs(block: &Block) -> Vec<&Inline> {
+    if block.is_table() {
+        block
+            .inlines()
+            .iter()
+            .flat_map(table_cell_runs)
+            .collect()
+    } else {
+        block.inlines().iter().collect()
     }
 }
 
@@ -399,6 +517,7 @@ fn merge_style(run: &Inline) -> Option<Style> {
         Inline::Math(_) => None,
         Inline::Note(_) => None,
         Inline::EqRef(_) => None,
+        Inline::TableCell(_) => None,
     }
 }
 
@@ -438,6 +557,35 @@ fn math_block() -> Block {
     }
 }
 
+/// A physical arrow direction while a table cell owns the cursor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TableDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// A text table cell. Keeping each cell to one inline atom is what lets `Tab`
+/// name cells even when two adjacent cells are both empty or use the same
+/// text style. Cells may also hold one math atom; see `insert_inline_math`.
+fn table_cell(text: String) -> Inline {
+    Inline::TableCell(vec![Inline::Text(Text {
+        text,
+        style: Style::PLAIN,
+    })])
+}
+
+fn table_row(columns: usize, first: bool, settings: table::TableSettings) -> Block {
+    Block::TableRow {
+        cells: (0..columns.max(1))
+            .map(|_| table_cell(String::new()))
+            .collect(),
+        first,
+        settings,
+    }
+}
+
 /// A list item's placeholder: one empty run under its own marker, so an
 /// item you emptied stays an item until Enter (or Backspace) takes it out
 /// of the list.
@@ -462,12 +610,57 @@ fn continued(marker: ListMarker) -> ListMarker {
     }
 }
 
+fn prune_table_cell(cell: &mut Inline) {
+    let Some(contents) = cell.table_cell_contents_mut() else {
+        *cell = table_cell(String::new());
+        return;
+    };
+    let runs = std::mem::take(contents);
+    let mut merged = Vec::with_capacity(runs.len());
+    for run in runs {
+        if matches!(run, Inline::TableCell(_)) || run.text().is_empty() {
+            continue;
+        }
+        match (merged.last_mut(), run) {
+            (Some(Inline::Text(previous)), Inline::Text(current))
+                if previous.style == current.style =>
+            {
+                previous.text.push_str(&current.text);
+            }
+            (_, run) => merged.push(run),
+        }
+    }
+    if merged.is_empty() {
+        merged.push(Inline::Text(Text {
+            text: String::new(),
+            style: Style::PLAIN,
+        }));
+    }
+    *contents = merged;
+}
+
 /// Repair one block's runs: drop empty runs, merge equal adjacent prose runs,
 /// demote a rule or display atom that gained prose, and turn an emptied block
 /// into a placeholder of its own kind. Shared by the document's blocks and
 /// every note body, so invariants hold in every scope rather than only where
 /// the caret is.
 fn prune_block(block: &mut Block) {
+    // Cell wrappers are structural positions and are never merged or
+    // discarded. Their contents, however, use the same run cleanup as prose.
+    if let Block::TableRow {
+        cells,
+        settings: _,
+        first: _,
+    } = block
+    {
+        if cells.is_empty() {
+            cells.push(table_cell(String::new()));
+        }
+        for cell in cells {
+            prune_table_cell(cell);
+        }
+        return;
+    }
     let syntax = block
         .inlines()
         .first()
@@ -526,6 +719,19 @@ fn prune_block(block: &mut Block) {
                 first: *first,
                 lang: lang.clone(),
             },
+            Block::TableRow {
+                cells,
+                first,
+                settings,
+            } => Block::TableRow {
+                cells: if cells.is_empty() {
+                    vec![table_cell(String::new())]
+                } else {
+                    cells.clone()
+                },
+                first: *first,
+                settings: settings.clone(),
+            },
             Block::Divider(_) => divider_block(),
             Block::Math { .. } => math_block(),
             Block::ListItem { marker, .. } => list_block(*marker),
@@ -548,6 +754,37 @@ fn insert_str(text: &mut String, char_idx: usize, s: &str) {
 fn remove_char_at(text: &mut String, char_idx: usize) {
     let (byte, ch) = text.char_indices().nth(char_idx).unwrap();
     text.replace_range(byte..byte + ch.len_utf8(), "");
+}
+
+fn slice_inline_runs(runs: &[Inline], start: usize, end: usize) -> Vec<Inline> {
+    let mut result = Vec::new();
+    let mut cursor = 0;
+    for run in runs {
+        let run_start = cursor;
+        let run_end = cursor + run_len(run);
+        let from = start.max(run_start).min(run_end);
+        let to = end.max(run_start).min(run_end);
+        if from < to {
+            match run {
+                Inline::Text(text) => {
+                    let value: String = text
+                        .text
+                        .chars()
+                        .skip(from - run_start)
+                        .take(to - from)
+                        .collect();
+                    result.push(Inline::Text(Text {
+                        text: value,
+                        style: text.style,
+                    }));
+                }
+                Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => result.push(run.clone()),
+                Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
+            }
+        }
+        cursor = run_end;
+    }
+    result
 }
 
 /// Splits a run at character offset `at`, keeping the run's style on both
@@ -634,6 +871,7 @@ fn split_run(run: Inline, at: usize) -> (Inline, Inline) {
                 )
             }
         }
+        Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
     }
 }
 
@@ -804,16 +1042,15 @@ impl Document {
     pub fn word_count(&self) -> usize {
         self.body
             .iter()
-            .flat_map(Block::inlines)
+            .flat_map(block_content_runs)
             .map(Inline::text)
             .map(|t| t.split_whitespace().count())
             .sum()
     }
 
     pub fn block_text(&self, block: usize) -> String {
-        self.scope()[block]
-            .inlines()
-            .iter()
+        block_content_runs(&self.scope()[block])
+            .into_iter()
             .map(Inline::text)
             .collect()
     }
@@ -884,7 +1121,7 @@ impl Document {
     fn block_range_text(&self, block: usize, from: usize, to: usize) -> String {
         let mut out = String::new();
         let mut cursor = 0;
-        for run in self.scope()[block].inlines() {
+        for run in block_content_runs(&self.scope()[block]) {
             let run_start = cursor;
             let run_end = cursor + run_len(run);
             let slice_from = from.max(run_start);
@@ -916,6 +1153,7 @@ impl Document {
                         out.push('@');
                         out.push_str(label);
                     }
+                    Inline::TableCell(_) => unreachable!("cell wrappers are flattened above"),
                 }
             }
             cursor = run_end;
@@ -941,12 +1179,84 @@ impl Document {
 
     /// Toggle style flags over selected text. Boxed styles replace all other
     /// styling in the range; non-boxed styles never layer onto boxed runs.
+    fn table_cells_in_range(
+        &self,
+        block: usize,
+        from: usize,
+        to: usize,
+    ) -> Vec<(usize, usize, usize)> {
+        if !self.scope().get(block).is_some_and(Block::is_table) || from >= to {
+            return Vec::new();
+        }
+        let mut start = 0;
+        self.scope()[block]
+            .inlines()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| {
+                let end = start + run_len(cell);
+                let selected = (from < end && to > start).then(|| {
+                    (
+                        index,
+                        from.saturating_sub(start).min(end - start),
+                        to.saturating_sub(start).min(end - start),
+                    )
+                });
+                start = end;
+                selected
+            })
+            .collect()
+    }
+
     fn style_range_status(&self, range: FlatRange, mask: Style) -> Option<bool> {
         let range = range.normalized();
         let start = self.position(range.start.block, range.start.offset);
         let end = self.position(range.end.block, range.end.offset);
         if (start.block, start.offset) >= (end.block, end.offset) {
             return None;
+        }
+
+        if start.block == end.block && self.scope()[start.block].is_table() {
+            let cells = self.table_cells_in_range(start.block, start.offset, end.offset);
+            if cells.is_empty() {
+                return None;
+            }
+            if mask.code || mask.badge {
+                let boxed = Style {
+                    code: mask.code,
+                    badge: !mask.code && mask.badge,
+                    ..Style::PLAIN
+                };
+                return Some(cells.iter().all(|&(cell, from, to)| {
+                    slice_inline_runs(
+                        table_cell_runs(&self.scope()[start.block].inlines()[cell]),
+                        from,
+                        to,
+                    )
+                    .iter()
+                    .all(|run| {
+                        let style = run.style();
+                        if boxed.badge {
+                            style.badge
+                        } else {
+                            style == boxed
+                        }
+                    })
+                }));
+            }
+            let eligible = cells
+                .iter()
+                .flat_map(|&(cell, from, to)| {
+                    slice_inline_runs(
+                        table_cell_runs(&self.scope()[start.block].inlines()[cell]),
+                        from,
+                        to,
+                    )
+                })
+                .filter(|run| !run.style().is_boxed())
+                .collect::<Vec<_>>();
+            return (!eligible.is_empty())
+                .then(|| eligible.iter().all(|run| style_matches(run.style(), mask)));
         }
 
         if mask.code || mask.badge {
@@ -1050,6 +1360,55 @@ impl Document {
             return;
         }
 
+        if start.block == end.block && self.scope()[start.block].is_table() {
+            let cells = self.table_cells_in_range(start.block, start.offset, end.offset);
+            let Some(active) = self.style_range_status(range, mask) else {
+                return;
+            };
+            let boxed = mask.code || mask.badge;
+            for (cell, from, to) in cells {
+                let original = table_cell_runs(&self.scope()[start.block].inlines()[cell]);
+                let len: usize = original.iter().map(run_len).sum();
+                let mut contents = slice_inline_runs(original, 0, from);
+                let mut selected = slice_inline_runs(original, from, to);
+                for run in &mut selected {
+                    let style = run.style();
+                    let target = if boxed {
+                        if active {
+                            Style::PLAIN
+                        } else {
+                            Style {
+                                code: mask.code,
+                                badge: !mask.code && mask.badge,
+                                ..Style::PLAIN
+                            }
+                        }
+                    } else if style.is_boxed() {
+                        style
+                    } else {
+                        Style {
+                            bold: if mask.bold { !active } else { style.bold },
+                            italic: if mask.italic { !active } else { style.italic },
+                            highlight: if mask.highlight {
+                                !active
+                            } else {
+                                style.highlight
+                            },
+                            ..style
+                        }
+                    };
+                    run.set_style(target);
+                }
+                contents.extend(selected);
+                contents.extend(slice_inline_runs(original, to, len));
+                self.scope_mut()[start.block].inlines_mut()[cell] = Inline::TableCell(contents);
+            }
+            self.dirty = true;
+            self.enforce();
+            self.refresh_context();
+            return;
+        }
+
         if mask.code || mask.badge {
             let Some(all_boxed) = self.style_range_status(range, mask) else {
                 return;
@@ -1148,6 +1507,34 @@ impl Document {
             return;
         }
 
+        if start.block == end.block && self.scope()[start.block].is_table() {
+            let cells = self.table_cells_in_range(start.block, start.offset, end.offset);
+            let mut changed = false;
+            for (cell, from, to) in cells {
+                let original = table_cell_runs(&self.scope()[start.block].inlines()[cell]);
+                let len: usize = original.iter().map(run_len).sum();
+                let mut contents = slice_inline_runs(original, 0, from);
+                let mut selected = slice_inline_runs(original, from, to);
+                for run in &mut selected {
+                    let mut style = run.style();
+                    if style.badge && style.badge_color != color {
+                        style.badge_color = color;
+                        run.set_style(style);
+                        changed = true;
+                    }
+                }
+                contents.extend(selected);
+                contents.extend(slice_inline_runs(original, to, len));
+                self.scope_mut()[start.block].inlines_mut()[cell] = Inline::TableCell(contents);
+            }
+            if changed {
+                self.dirty = true;
+                self.enforce();
+                self.refresh_context();
+            }
+            return;
+        }
+
         let mut changed = false;
         for block in start.block..=end.block {
             let from = if block == start.block {
@@ -1204,37 +1591,18 @@ impl Document {
         )
     }
 
+    /// Runs covered by a block-flat range. A table row's runs live in its
+    /// cells, which a block-flat range cannot name, so a row yields nothing:
+    /// the same-block table paths (`table_cells_in_range` and its callers) are
+    /// the only way a range reaches a table. Returning nothing keeps every
+    /// cross-block style pass total — it leaves the grid intact rather than
+    /// splicing prose into a row.
     fn slice_runs(&self, block: usize, start: usize, end: usize) -> Vec<Inline> {
-        let mut result = Vec::new();
-        let mut cursor = 0;
-        for run in self.scope()[block].inlines() {
-            let run_start = cursor;
-            let run_end = cursor + run_len(run);
-            let from = start.max(run_start).min(run_end);
-            let to = end.max(run_start).min(run_end);
-            if from < to {
-                match run {
-                    Inline::Text(t) => {
-                        let value: String = t
-                            .text
-                            .chars()
-                            .skip(from - run_start)
-                            .take(to - from)
-                            .collect();
-                        result.push(Inline::Text(Text {
-                            text: value,
-                            style: t.style,
-                        }));
-                    }
-                    // Slices cover the whole opaque atom or none of it.
-                    Inline::Math(_) => result.push(run.clone()),
-                    Inline::Note(_) => result.push(run.clone()),
-                    Inline::EqRef(_) => result.push(run.clone()),
-                }
-            }
-            cursor = run_end;
+        let block = &self.scope()[block];
+        if block.is_table() {
+            return Vec::new();
         }
-        result
+        slice_inline_runs(block.inlines(), start, end)
     }
 
     fn block_with_runs(block: &Block, mut runs: Vec<Inline>) -> Block {
@@ -1268,6 +1636,10 @@ impl Document {
                 first: *first,
                 lang: lang.clone(),
             },
+            // A row is rebuilt through its cells, never through a run list;
+            // `slice_runs` yields nothing for one, so a row is handed back
+            // exactly as it was rather than spliced into prose.
+            Block::TableRow { .. } => (*block).clone(),
             Block::ListItem { marker, .. } => Block::ListItem {
                 marker: *marker,
                 content: runs,
@@ -1285,6 +1657,30 @@ impl Document {
             return String::new();
         }
         let deleted = self.range_text(FlatRange::new(start, end));
+        if start.block == end.block && self.scope()[start.block].is_table() {
+            let (landing_cell, landing_offset) = self.flat_to_pos(start.block, start.offset);
+            for (cell, from, to) in
+                self.table_cells_in_range(start.block, start.offset, end.offset)
+            {
+                let original = table_cell_runs(&self.scope()[start.block].inlines()[cell]);
+                let len: usize = original.iter().map(run_len).sum();
+                let mut contents = slice_inline_runs(original, 0, from);
+                contents.extend(slice_inline_runs(original, to, len));
+                self.scope_mut()[start.block].inlines_mut()[cell] = Inline::TableCell(contents);
+            }
+            self.enforce();
+            let landing_offset =
+                landing_offset.min(run_len(&self.scope()[start.block].inlines()[landing_cell]));
+            self.set_caret(start.block, landing_cell, landing_offset);
+            self.dirty = true;
+            return deleted;
+        }
+        if (start.block..=end.block).any(|block| self.scope()[block].is_table()) {
+            // A cross-row character range cannot collapse table blocks into
+            // each other without deleting tracks. Keep the grid intact; row
+            // removal remains an explicit popup action.
+            return String::new();
+        }
         if start.block == end.block {
             let block = self.scope()[start.block].clone();
             let runs = self.slice_runs(start.block, 0, start.offset);
@@ -1321,6 +1717,9 @@ impl Document {
         }
         let first = first.min(self.scope().len() - 1);
         let last = last.min(self.scope().len() - 1).max(first);
+        if (first..=last).any(|block| self.scope()[block].is_table()) {
+            return String::new();
+        }
         let deleted = (first..=last)
             .map(|block| self.block_text(block))
             .collect::<Vec<_>>()
@@ -1344,6 +1743,47 @@ impl Document {
 
     pub fn text_object_range(&self, object: TextObject) -> Option<FlatRange> {
         let caret = self.caret_position();
+        if self.in_table() && matches!(object, TextObject::InnerWord | TextObject::AroundWord) {
+            let cell = self.caret.inline;
+            let chars: Vec<char> = table_cell_text(&self.scope()[caret.block].inlines()[cell])
+                .chars()
+                .collect();
+            let local = self.caret.offset;
+            if chars.is_empty() || local >= chars.len() {
+                return None;
+            }
+            let is_word = |c: char| c.is_alphanumeric() || c == '_';
+            let word = is_word(chars[local]);
+            let mut start = local;
+            while start > 0
+                && is_word(chars[start - 1]) == word
+                && !chars[start - 1].is_whitespace()
+            {
+                start -= 1;
+            }
+            let mut end = local + 1;
+            while end < chars.len() && is_word(chars[end]) == word && !chars[end].is_whitespace() {
+                end += 1;
+            }
+            if matches!(object, TextObject::AroundWord) {
+                while end < chars.len() && chars[end].is_whitespace() {
+                    end += 1;
+                }
+                if end == local + 1 {
+                    while start > 0 && chars[start - 1].is_whitespace() {
+                        start -= 1;
+                    }
+                }
+            }
+            let base: usize = self.scope()[caret.block].inlines()[..cell]
+                .iter()
+                .map(run_len)
+                .sum();
+            return Some(FlatRange::new(
+                self.position(caret.block, base + start),
+                self.position(caret.block, base + end),
+            ));
+        }
         let text = self.block_text(caret.block);
         let chars: Vec<char> = text.chars().collect();
         match object {
@@ -1515,7 +1955,11 @@ impl Document {
         for run in runs {
             let len = run_len(run);
             if flat < pos + len {
-                return Some(run.style());
+                return if let Inline::TableCell(_) = run {
+                    table_cell_style_at(run, flat - pos)
+                } else {
+                    Some(run.style())
+                };
             }
             pos += len;
         }
@@ -1554,7 +1998,12 @@ impl Document {
             let inline = self.caret.inline.min(runs.len().saturating_sub(1));
             let len = run_len(&runs[inline]);
             let offset = self.caret.offset.min(len);
-            let is_math = matches!(runs[inline], Inline::Math(_));
+            let is_math = if let Inline::TableCell(_) = &runs[inline] {
+                let (run, _) = table_cell_flat_to_run(&runs[inline], offset);
+                matches!(table_cell_runs(&runs[inline])[run], Inline::Math(_))
+            } else {
+                matches!(runs[inline], Inline::Math(_))
+            };
             (inline, offset, is_math)
         };
         self.caret.inline = inline;
@@ -1600,6 +2049,9 @@ impl Document {
     fn prune_runs(&mut self) {
         let caret_block = self.caret.block.min(self.scope().len().saturating_sub(1));
         let caret_offset = self.caret_flat(caret_block);
+        let table_caret = self.scope()[caret_block]
+            .is_table()
+            .then_some((self.caret.inline, self.caret.offset));
         // The invariant holds in *every* scope, not just where the caret
         // happens to be: a note body left with an empty run would be an
         // invariant only until focus moved elsewhere.
@@ -1633,9 +2085,18 @@ impl Document {
             Focus::Note(index) => index < self.notes.len(),
         } {
             self.caret.block = caret_block;
-            let (inline, offset) = self.flat_to_pos(caret_block, caret_offset);
-            self.caret.inline = inline;
-            self.caret.offset = offset;
+            if let Some((inline, offset)) = table_caret
+                && self.scope()[caret_block].is_table()
+            {
+                self.caret.inline = inline.min(self.scope()[caret_block].inlines().len() - 1);
+                self.caret.offset = offset.min(run_len(
+                    &self.scope()[caret_block].inlines()[self.caret.inline],
+                ));
+            } else {
+                let (inline, offset) = self.flat_to_pos(caret_block, caret_offset);
+                self.caret.inline = inline;
+                self.caret.offset = offset;
+            }
         }
     }
 
@@ -1651,8 +2112,24 @@ impl Document {
             if block.inlines().is_empty() {
                 return false;
             }
+            if block.is_table()
+                && block
+                    .inlines()
+                    .iter()
+                    .any(|cell| !matches!(cell, Inline::TableCell(contents) if !contents.is_empty() && contents.iter().all(|run| !matches!(run, Inline::TableCell(_)))))
+            {
+                return false;
+            }
             for (i, run) in block.inlines().iter().enumerate() {
-                if run.text().is_empty() && (block.inlines().len() > 1 || i != 0) {
+                if block.is_table() {
+                    for (cell_run, content) in table_cell_runs(run).iter().enumerate() {
+                        if content.text().is_empty()
+                            && (table_cell_runs(run).len() > 1 || cell_run != 0)
+                        {
+                            return false;
+                        }
+                    }
+                } else if run.text().is_empty() && (block.inlines().len() > 1 || i != 0) {
                     return false;
                 }
             }
@@ -1685,11 +2162,17 @@ impl Document {
         let runs = self.scope()[block].inlines();
         let i = inline.min(runs.len().saturating_sub(1));
         let len = run_len(&runs[i]);
+        let table_style = self.scope()[block]
+            .is_table()
+            .then(|| table_cell_style_before(&runs[i], offset).unwrap_or(Style::PLAIN));
         self.caret.inline = i;
         self.caret.offset = offset.min(len);
-        self.caret.style = self
-            .style_before(block, self.caret_flat(block))
-            .unwrap_or(Style::PLAIN);
+        self.caret.style = if let Some(style) = table_style {
+            style
+        } else {
+            self.style_before(block, self.caret_flat(block))
+                .unwrap_or(Style::PLAIN)
+        };
     }
 
     pub fn move_right(&mut self) {
@@ -1774,6 +2257,389 @@ impl Document {
         self.caret.style = self.style_before(b, len).unwrap_or(Style::PLAIN);
     }
 
+    /// Whether the caret is currently in a table row.
+    pub fn in_table(&self) -> bool {
+        self.scope()
+            .get(self.caret.block)
+            .is_some_and(Block::is_table)
+    }
+
+    /// Move through table cells in row-major order. The last cell wraps to
+    /// the first (and vice versa for Shift-Tab), which is the useful cycling
+    /// behaviour while filling in a small layout table.
+    pub fn table_tab(&mut self, backwards: bool) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        let Some((first, end)) = self.table_bounds(block) else {
+            return false;
+        };
+        let columns = self.scope()[block].inlines().len();
+        let row = block - first;
+        let cell = self.caret.inline.min(columns.saturating_sub(1));
+        let total = (end - first) * columns;
+        let current = row * columns + cell;
+        let next = if backwards {
+            (current + total - 1) % total
+        } else {
+            (current + 1) % total
+        };
+        let next_block = first + next / columns;
+        let next_cell = next % columns;
+        self.set_caret(next_block, next_cell, 0);
+        true
+    }
+
+    /// Navigate the table grid in the arrow's physical direction. Horizontal
+    /// movement keeps character-level editing inside a cell, then crosses a
+    /// cell boundary; vertical movement preserves the character offset.
+    pub fn table_move(&mut self, direction: TableDirection) -> bool {
+        self.clamp_caret();
+        let block = self.caret.block;
+        let Some((first, end)) = self.table_bounds(block) else {
+            return false;
+        };
+        let columns = self.scope()[block].inlines().len();
+        let cell = self.caret.inline.min(columns.saturating_sub(1));
+        let offset = self.caret.offset;
+        let len = run_len(&self.scope()[block].inlines()[cell]);
+        match direction {
+            TableDirection::Left if offset > 0 => {
+                self.set_caret(block, cell, offset - 1);
+                true
+            }
+            TableDirection::Left if cell > 0 => {
+                let previous = cell - 1;
+                let end = run_len(&self.scope()[block].inlines()[previous]);
+                self.set_caret(block, previous, end);
+                true
+            }
+            TableDirection::Right if offset < len => {
+                self.set_caret(block, cell, offset + 1);
+                true
+            }
+            TableDirection::Right if cell + 1 < columns => {
+                self.set_caret(block, cell + 1, 0);
+                true
+            }
+            TableDirection::Up if block > first => {
+                let target = block - 1;
+                let target_len = run_len(&self.scope()[target].inlines()[cell]);
+                self.set_caret(target, cell, offset.min(target_len));
+                true
+            }
+            TableDirection::Down if block + 1 < end => {
+                let target = block + 1;
+                let target_len = run_len(&self.scope()[target].inlines()[cell]);
+                self.set_caret(target, cell, offset.min(target_len));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Inserts the standard two-by-two table below the caret (or replaces an
+    /// empty paragraph) and starts typing in its first cell.
+    pub fn insert_table(&mut self) {
+        self.clamp_caret();
+        if matches!(self.focus, Focus::Note(_)) {
+            return;
+        }
+        let block = self.caret.block;
+        if self.scope()[block].is_table() {
+            return;
+        }
+        let settings = table::TableSettings::new(2, 2);
+        let rows = [
+            table_row(2, true, settings.clone()),
+            table_row(2, false, settings),
+        ];
+        let first = if self.block_flat_len(block) == 0 && !self.scope()[block].is_table() {
+            self.scope_mut().splice(block..=block, rows);
+            block
+        } else {
+            self.scope_mut().splice(block + 1..block + 1, rows);
+            block + 1
+        };
+        self.dirty = true;
+        self.enforce();
+        self.set_caret(first, 0, 0);
+    }
+
+    /// Toggle one grid stroke for the table containing `block`.
+    pub fn toggle_table_line(&mut self, block: usize, line: table::GridLine) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some((first, end)) = self.table_bounds(block) else {
+            return false;
+        };
+        let columns = self.scope()[first].inlines().len();
+        let rows = end - first;
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        settings.lines.toggle(line);
+        self.set_table_settings(first, end, settings);
+        self.dirty = true;
+        true
+    }
+
+    /// Drag the divider after column `divider`, transferring width only to
+    /// its right-hand neighbour so the editable table width remains fixed.
+    pub fn resize_table_column(&mut self, block: usize, divider: usize, delta_share: f32) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some((first, end)) = self.table_bounds(block) else {
+            return false;
+        };
+        let columns = self.scope()[first].inlines().len();
+        if divider + 1 >= columns || !delta_share.is_finite() {
+            return false;
+        }
+        let rows = end - first;
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        let left = settings.column_shares[divider];
+        let right = settings.column_shares[divider + 1];
+        let delta = delta_share.clamp(
+            table::MIN_COLUMN_SHARE - left,
+            right - table::MIN_COLUMN_SHARE,
+        );
+        if delta == 0.0 {
+            return false;
+        }
+        settings.column_shares[divider] += delta;
+        settings.column_shares[divider + 1] -= delta;
+        self.set_table_settings(first, end, settings);
+        self.dirty = true;
+        true
+    }
+
+    /// Drag the divider below row `divider`, transferring height to the row
+    /// under it while retaining the table's total height.
+    pub fn resize_table_row(&mut self, block: usize, divider: usize, delta: f32) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some((first, end)) = self.table_bounds(block) else {
+            return false;
+        };
+        let rows = end - first;
+        if divider + 1 >= rows || !delta.is_finite() {
+            return false;
+        }
+        let columns = self.scope()[first].inlines().len();
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        let top = settings.row_heights[divider];
+        let bottom = settings.row_heights[divider + 1];
+        let delta = delta.clamp(table::MIN_ROW_HEIGHT - top, bottom - table::MIN_ROW_HEIGHT);
+        if delta == 0.0 {
+            return false;
+        }
+        settings.row_heights[divider] += delta;
+        settings.row_heights[divider + 1] -= delta;
+        self.set_table_settings(first, end, settings);
+        self.dirty = true;
+        true
+    }
+
+    /// Insert a blank row immediately after `row` in the table containing
+    /// `block`. The table card always acts on the row the reader clicked, so
+    /// no secondary table selection state can go stale.
+    pub fn insert_table_row(&mut self, block: usize, row: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some((first, end)) = self.table_bounds(block) else {
+            return false;
+        };
+        let columns = self.scope()[first].inlines().len();
+        let rows = end - first;
+        let index = row.min(rows.saturating_sub(1)) + 1;
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        settings
+            .row_heights
+            .insert(index, table::DEFAULT_ROW_HEIGHT);
+        self.scope_mut()
+            .insert(first + index, table_row(columns, false, settings.clone()));
+        self.set_table_settings(first, end + 1, settings);
+        if self.caret.block >= first + index {
+            self.caret.block += 1;
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Remove the selected row. A one-row table keeps its final row: a table
+    /// is still a table with empty cells, while deleting its last row would
+    /// silently turn a local layout block into unrelated prose.
+    pub fn remove_table_row(&mut self, block: usize, row: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some((first, end)) = self.table_bounds(block) else {
+            return false;
+        };
+        let rows = end - first;
+        if rows <= 1 {
+            return false;
+        }
+        let columns = self.scope()[first].inlines().len();
+        let index = row.min(rows - 1);
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        settings.row_heights.remove(index);
+        self.scope_mut().remove(first + index);
+        if index == 0 {
+            // The next physical row becomes the Markdown table's anchor.
+            // Without promoting it, serialisation would see a continuation
+            // row without a table start and turn the surviving grid into
+            // prose on disk.
+            let Block::TableRow { first: marker, .. } = &mut self.scope_mut()[first] else {
+                unreachable!("a table still has a first row after removing one of many")
+            };
+            *marker = true;
+        }
+        self.set_table_settings(first, end - 1, settings);
+        if self.caret.block > first + index {
+            self.caret.block -= 1;
+        } else if self.caret.block == first + index {
+            let target = (first + index).min(end - 2);
+            self.set_caret(target, self.caret.inline, self.caret.offset);
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Insert a blank column immediately after `column`, splitting that
+    /// column's share in two so the table remains full-width and does not
+    /// visibly jump when its shape changes.
+    pub fn insert_table_column(&mut self, block: usize, column: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some((first, end)) = self.table_bounds(block) else {
+            return false;
+        };
+        let columns = self.scope()[first].inlines().len();
+        let rows = end - first;
+        let previous = column.min(columns.saturating_sub(1));
+        let index = previous + 1;
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        let share = settings.column_shares[previous] * 0.5;
+        settings.column_shares[previous] -= share;
+        settings.column_shares.insert(index, share);
+        for row in &mut self.scope_mut()[first..end] {
+            row.inlines_mut().insert(index, table_cell(String::new()));
+        }
+        self.set_table_settings(first, end, settings);
+        if (first..end).contains(&self.caret.block) && self.caret.inline >= index {
+            self.caret.inline += 1;
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Remove the selected column, giving its width to a surviving neighbour
+    /// and preserving the final column as the table's irreducible cell.
+    pub fn remove_table_column(&mut self, block: usize, column: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let Some((first, end)) = self.table_bounds(block) else {
+            return false;
+        };
+        let columns = self.scope()[first].inlines().len();
+        if columns <= 1 {
+            return false;
+        }
+        let rows = end - first;
+        let index = column.min(columns - 1);
+        let mut settings = self.scope()[first]
+            .table_settings()
+            .expect("table bounds names a table")
+            .clone()
+            .normalized(columns, rows);
+        let share = settings.column_shares.remove(index);
+        let recipient = if index == 0 { 0 } else { index - 1 };
+        settings.column_shares[recipient] += share;
+        for row in &mut self.scope_mut()[first..end] {
+            row.inlines_mut().remove(index);
+        }
+        self.set_table_settings(first, end, settings);
+        if (first..end).contains(&self.caret.block) {
+            if self.caret.inline > index {
+                self.caret.inline -= 1;
+            } else if self.caret.inline == index {
+                self.caret.inline = index.min(columns - 2);
+                self.caret.offset = self.caret.offset.min(run_len(
+                    &self.scope()[self.caret.block].inlines()[self.caret.inline],
+                ));
+            }
+        }
+        self.dirty = true;
+        true
+    }
+
+    fn table_bounds(&self, block: usize) -> Option<(usize, usize)> {
+        if !self.scope().get(block).is_some_and(Block::is_table) {
+            return None;
+        }
+        let mut first = block;
+        while first > 0
+            && matches!(
+                self.scope().get(first),
+                Some(Block::TableRow { first: false, .. })
+            )
+        {
+            first -= 1;
+        }
+        if !self.scope().get(first).is_some_and(Block::table_first) {
+            return None;
+        }
+        let mut end = first + 1;
+        while matches!(
+            self.scope().get(end),
+            Some(Block::TableRow { first: false, .. })
+        ) {
+            end += 1;
+        }
+        Some((first, end))
+    }
+
+    fn set_table_settings(&mut self, first: usize, end: usize, settings: table::TableSettings) {
+        for row in &mut self.scope_mut()[first..end] {
+            if let Block::TableRow {
+                settings: row_settings,
+                ..
+            } = row
+            {
+                *row_settings = settings.clone();
+            }
+        }
+    }
+
     // ---- edits (content changes set `dirty`) ----------------------------
 
     /// Inserts `text` exactly as given. Every keystroke and every paste from
@@ -1806,6 +2672,89 @@ impl Document {
             for c in text.chars() {
                 self.math_insert_char(c);
             }
+            return;
+        }
+        if self.scope()[b].is_table() {
+            let cell = self.caret.inline;
+            let flat = self.caret.offset;
+            let style = self.caret.style;
+            let (run, offset) =
+                table_cell_flat_to_run(&self.scope()[b].inlines()[cell], flat);
+            let contents = table_cell_runs_mut(&mut self.scope_mut()[b].inlines_mut()[cell]);
+            let placeholder = contents.len() == 1 && contents[0].text().is_empty();
+            let current_len = run_len(&contents[run]);
+            let left_style = if offset > 0 {
+                merge_style(&contents[run])
+            } else if run > 0 {
+                merge_style(&contents[run - 1])
+            } else {
+                None
+            };
+            let right_style = if offset < current_len {
+                merge_style(&contents[run])
+            } else if run + 1 < contents.len() {
+                merge_style(&contents[run + 1])
+            } else {
+                None
+            };
+            if placeholder {
+                let value = contents[0]
+                    .text_mut()
+                    .expect("a table placeholder is text");
+                value.push_str(text);
+                contents[0].set_style(style);
+            } else if left_style == Some(style) {
+                if offset > 0 {
+                    insert_str(
+                        contents[run]
+                            .text_mut()
+                            .expect("a prose merge target is text"),
+                        offset,
+                        text,
+                    );
+                } else {
+                    contents[run - 1]
+                        .text_mut()
+                        .expect("a prose merge target is text")
+                        .push_str(text);
+                }
+            } else if right_style == Some(style) {
+                if offset < current_len {
+                    insert_str(
+                        contents[run]
+                            .text_mut()
+                            .expect("a prose merge target is text"),
+                        offset,
+                        text,
+                    );
+                } else {
+                    insert_str(
+                        contents[run + 1]
+                            .text_mut()
+                            .expect("a prose merge target is text"),
+                        0,
+                        text,
+                    );
+                }
+            } else {
+                let (prefix, suffix) = split_run(contents.remove(run), offset);
+                contents.splice(
+                    run..run,
+                    [
+                        prefix,
+                        Inline::Text(Text {
+                            text: text.to_string(),
+                            style,
+                        }),
+                        suffix,
+                    ],
+                );
+            }
+            self.caret.offset = flat + text.chars().count();
+            self.dirty = true;
+            self.enforce();
+            self.caret.inline = cell;
+            self.caret.offset = self.caret.offset.min(run_len(&self.scope()[b].inlines()[cell]));
             return;
         }
         let s = if self.scope()[b].is_code() {
@@ -1922,6 +2871,26 @@ impl Document {
             self.insert_text(text);
             return;
         }
+        if self.scope()[self.caret.block].is_table() {
+            let parsed = inline_runs(text, self.caret.style);
+            let block = self.caret.block;
+            let cell = self.caret.inline;
+            let flat = self.caret.offset;
+            let inserted: usize = parsed.iter().map(run_len).sum();
+            let (run, offset) =
+                table_cell_flat_to_run(&self.scope()[block].inlines()[cell], flat);
+            let contents =
+                table_cell_runs_mut(&mut self.scope_mut()[block].inlines_mut()[cell]);
+            let (prefix, suffix) = split_run(contents.remove(run), offset);
+            let mut replacement = vec![prefix];
+            replacement.extend(parsed);
+            replacement.push(suffix);
+            contents.splice(run..run, replacement);
+            self.caret.offset = flat + inserted;
+            self.dirty = true;
+            self.enforce();
+            return;
+        }
         let s = self.caret.style;
         let b = self.caret.block;
         let i = self.caret.inline;
@@ -1949,6 +2918,37 @@ impl Document {
         let i = self.caret.inline;
         let o = self.caret.offset;
         let before = self.caret_flat(b);
+        if self.scope()[b].is_table() {
+            if o == 0 {
+                return;
+            }
+            let target = o - 1;
+            let (run, offset) =
+                table_cell_flat_to_run(&self.scope()[b].inlines()[i], target);
+            let run_start = table_cell_run_start(&self.scope()[b].inlines()[i], run);
+            if let Inline::Math(list) = &table_cell_runs(&self.scope()[b].inlines()[i])[run] {
+                let end = list.len();
+                self.caret.offset = run_start;
+                self.math = Some(math::MathCursor {
+                    path: Vec::new(),
+                    index: end,
+                });
+                let _ = self.math_backspace();
+                return;
+            }
+            let contents = table_cell_runs_mut(&mut self.scope_mut()[b].inlines_mut()[i]);
+            match &mut contents[run] {
+                Inline::Text(value) => remove_char_at(&mut value.text, offset),
+                Inline::Note(_) | Inline::EqRef(_) => {
+                    contents.remove(run);
+                }
+                Inline::Math(_) | Inline::TableCell(_) => unreachable!("run kind checked above"),
+            }
+            self.caret.offset -= 1;
+            self.dirty = true;
+            self.enforce();
+            return;
+        }
         let math_inline = if o > 0 && matches!(self.scope()[b].inlines()[i], Inline::Math(_)) {
             Some(i)
         } else if o == 0 && i > 0 && matches!(self.scope()[b].inlines()[i - 1], Inline::Math(_)) {
@@ -1963,6 +2963,7 @@ impl Document {
                 Inline::Note(_) | Inline::EqRef(_) => {
                     unreachable!("math target was checked above")
                 }
+                Inline::TableCell(_) => unreachable!("table rows return before this branch"),
             };
             if len > 0 || self.scope()[b].is_math() {
                 self.set_caret(b, inline, 0);
@@ -2062,6 +3063,28 @@ impl Document {
         let o = self.caret.offset;
         let runs = self.scope()[b].inlines();
         let li = run_len(&runs[i]);
+        if self.scope()[b].is_table() {
+            if o >= li {
+                return;
+            }
+            let (run, offset) = table_cell_flat_to_run(&runs[i], o);
+            if matches!(table_cell_runs(&runs[i])[run], Inline::Math(_)) {
+                self.math = Some(math::MathCursor::default());
+                let _ = self.math_delete_forward();
+                return;
+            }
+            let contents = table_cell_runs_mut(&mut self.scope_mut()[b].inlines_mut()[i]);
+            match &mut contents[run] {
+                Inline::Text(value) => remove_char_at(&mut value.text, offset),
+                Inline::Note(_) | Inline::EqRef(_) => {
+                    contents.remove(run);
+                }
+                Inline::Math(_) | Inline::TableCell(_) => unreachable!("run kind checked above"),
+            }
+            self.dirty = true;
+            self.enforce();
+            return;
+        }
         let math_inline = if o < li && matches!(runs[i], Inline::Math(_)) {
             Some(i)
         } else if o == li && i + 1 < runs.len() && matches!(runs[i + 1], Inline::Math(_)) {
@@ -2076,6 +3099,7 @@ impl Document {
                 Inline::Note(_) | Inline::EqRef(_) => {
                     unreachable!("math target was checked above")
                 }
+                Inline::TableCell(_) => unreachable!("table rows return before this branch"),
             };
             if !empty || self.scope()[b].is_math() {
                 self.set_caret(b, inline, 0);
@@ -2142,6 +3166,12 @@ impl Document {
         let b = self.caret.block;
         let i = self.caret.inline;
         let o = self.caret.offset;
+        if self.scope()[b].is_table() {
+            // Markdown table cells cannot contain paragraph breaks. More
+            // importantly, Enter must not be a hidden row-creation command:
+            // table structure belongs exclusively to the direct popup.
+            return;
+        }
         // A list item continues itself: Enter below an item opens the next
         // one of the same kind, and Enter on an empty item is the way out —
         // the empty paragraph you asked for replaces the item.
@@ -2200,6 +3230,34 @@ impl Document {
     pub fn delete_char(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_table() {
+            let cell = self.caret.inline;
+            let offset = self.caret.offset;
+            if offset >= run_len(&self.scope()[b].inlines()[cell]) {
+                return;
+            }
+            let (run, local) =
+                table_cell_flat_to_run(&self.scope()[b].inlines()[cell], offset);
+            if matches!(
+                table_cell_runs(&self.scope()[b].inlines()[cell])[run],
+                Inline::Math(_)
+            ) {
+                self.math = Some(math::MathCursor::default());
+                let _ = self.math_delete_forward();
+                return;
+            }
+            let contents = table_cell_runs_mut(&mut self.scope_mut()[b].inlines_mut()[cell]);
+            match &mut contents[run] {
+                Inline::Text(text) => remove_char_at(&mut text.text, local),
+                Inline::Note(_) | Inline::EqRef(_) => {
+                    contents.remove(run);
+                }
+                Inline::Math(_) | Inline::TableCell(_) => unreachable!("run kind checked above"),
+            }
+            self.dirty = true;
+            self.enforce();
+            return;
+        }
         let flat = self.caret_flat(b);
         if flat >= self.block_flat_len(b) {
             return;
@@ -2230,6 +3288,17 @@ impl Document {
     pub fn delete_line(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_table() {
+            // `dd` clears the current cell; deleting a row is a structural
+            // table edit and is deliberately available only from the popup.
+            let cell = self.caret.inline;
+            self.scope_mut()[b].inlines_mut()[cell] = table_cell(String::new());
+            self.caret.offset = 0;
+            self.caret.style = Style::PLAIN;
+            self.math = None;
+            self.dirty = true;
+            return;
+        }
         if self.scope().len() == 1 {
             self.scope_mut()[0] = empty_block();
             self.caret.block = 0;
@@ -2275,6 +3344,13 @@ impl Document {
     pub fn open_below(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_table() {
+            let (_, end) = self.table_bounds(b).expect("caret is in a table");
+            self.scope_mut().insert(end, empty_block());
+            self.set_caret(end, 0, 0);
+            self.dirty = true;
+            return;
+        }
         self.reveal_block(b + 1);
         let marker = match self.scope()[b] {
             Block::ListItem { marker, .. } => Some(continued(marker)),
@@ -2295,6 +3371,13 @@ impl Document {
     pub fn open_above(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_table() {
+            let (first, _) = self.table_bounds(b).expect("caret is in a table");
+            self.scope_mut().insert(first, empty_block());
+            self.set_caret(first, 0, 0);
+            self.dirty = true;
+            return;
+        }
         self.reveal_block(b);
         let marker = match self.scope()[b] {
             Block::ListItem { marker, .. } => Some(marker),
@@ -2310,7 +3393,17 @@ impl Document {
         self.enforce();
     }
 
-    /// Flip `bold` on the pending context. Not a content edit; no dirty.
+    /// Set the pending bold/italic combination used by the `*`, `**`, and
+    /// `***` insert gestures.
+    pub fn set_emphasis(&mut self, bold: bool, italic: bool) {
+        if self.caret.style.is_boxed() {
+            return;
+        }
+        self.caret.style.bold = bold;
+        self.caret.style.italic = italic;
+    }
+
+    /// Flip `bold` on the pending context.
     pub fn toggle_bold(&mut self) {
         if self.caret.style.is_boxed() {
             return;
@@ -2318,7 +3411,7 @@ impl Document {
         self.caret.style.bold = !self.caret.style.bold;
     }
 
-    /// Flip `italic` on the pending context. Not a content edit; no dirty.
+    /// Flip `italic` on the pending context.
     pub fn toggle_italic(&mut self) {
         if self.caret.style.is_boxed() {
             return;
@@ -2361,6 +3454,9 @@ impl Document {
     pub fn set_code(&mut self, on: bool) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_table() {
+            return;
+        }
         if self.scope()[b].is_code() == on {
             return;
         }
@@ -2395,6 +3491,9 @@ impl Document {
         let Some(current) = self.body.get(block) else {
             return false;
         };
+        if current.is_table() {
+            return false;
+        }
         if current.is_code() == on {
             return false;
         }
@@ -2430,6 +3529,9 @@ impl Document {
     pub fn set_heading(&mut self, level: Option<u8>) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_table() {
+            return;
+        }
         if let Some(level) = level {
             if !(1..=4).contains(&level) {
                 return;
@@ -2485,6 +3587,9 @@ impl Document {
         let Some(current) = self.body.get(block) else {
             return false;
         };
+        if current.is_table() {
+            return false;
+        }
         if matches!((current, level), (Block::Paragraph(_), None))
             || matches!((current, level), (Block::Heading { level: current, .. }, Some(next)) if *current == next)
         {
@@ -2523,6 +3628,9 @@ impl Document {
         }
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_table() {
+            return;
+        }
         if self.scope()[b].is_code() {
             return;
         }
@@ -2597,6 +3705,9 @@ impl Document {
     pub fn insert_divider(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_table() {
+            return;
+        }
         let at = if self.block_flat_len(b) == 0 {
             self.scope_mut()[b] = divider_block();
             b
@@ -2616,6 +3727,18 @@ impl Document {
         let b = self.caret.block;
         let i = self.caret.inline;
         let o = self.caret.offset;
+        if self.scope()[b].is_table() {
+            let (run, offset) = table_cell_flat_to_run(&self.scope()[b].inlines()[i], o);
+            let contents = table_cell_runs_mut(&mut self.scope_mut()[b].inlines_mut()[i]);
+            let (prefix, suffix) = split_run(contents.remove(run), offset);
+            contents.splice(run..run, [prefix, Inline::Math(Vec::new()), suffix]);
+            self.caret.offset = o;
+            self.caret.style = Style::PLAIN;
+            self.math = Some(math::MathCursor::default());
+            self.dirty = true;
+            self.enforce();
+            return;
+        }
         let flat = self.caret_flat(b);
         let (prefix, suffix) = split_run(self.scope_mut()[b].inlines_mut().remove(i), o);
         self.scope_mut()[b]
@@ -2650,6 +3773,21 @@ impl Document {
         if self.scope()[b].is_math() {
             return false;
         }
+        if self.scope()[b].is_table() {
+            let (run, _) = table_cell_flat_to_run(&self.scope()[b].inlines()[i], self.caret.offset);
+            if !matches!(
+                table_cell_runs(&self.scope()[b].inlines()[i]).get(run),
+                Some(Inline::Math(list)) if list.is_empty()
+            ) {
+                return false;
+            }
+            table_cell_runs_mut(&mut self.scope_mut()[b].inlines_mut()[i]).remove(run);
+            self.math = None;
+            self.caret.style = Style::PLAIN;
+            self.dirty = true;
+            self.enforce();
+            return true;
+        }
         match self.scope()[b].inlines().get(i) {
             Some(Inline::Math(list)) if list.is_empty() => {}
             _ => return false,
@@ -2675,6 +3813,9 @@ impl Document {
         // the definition lives in the file's block stream, so there is
         // nowhere honest to place it. `None` reports "did not insert".
         if matches!(self.focus, Focus::Note(_)) {
+            return None;
+        }
+        if self.scope()[self.caret.block].is_table() {
             return None;
         }
         let label = self.next_free_label();
@@ -2720,6 +3861,9 @@ impl Document {
     pub fn insert_math_block(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_table() {
+            return;
+        }
         let at = if self.block_flat_len(b) == 0 {
             self.scope_mut()[b] = math_block();
             b
@@ -2787,23 +3931,40 @@ impl Document {
         self.clamp_caret();
         let block = self.caret.block;
         let inline = self.caret.inline;
+        let table_run = self.scope()[block]
+            .is_table()
+            .then(|| table_cell_flat_to_run(&self.scope()[block].inlines()[inline], self.caret.offset).0);
         // Borrow the atom and the cursor from disjoint fields: `focused_mut`
         // holds all of `self`, so the cursor borrow would not fit alongside.
-        let list = match self.focus {
+        let target = match self.focus {
             Focus::Body => match self.body[block].inlines_mut().get_mut(inline) {
-                Some(Inline::Math(list)) => list,
+                Some(run) => run,
                 _ => {
                     self.math = None;
                     return None;
                 }
             },
             Focus::Note(i) => match self.notes[i].body[block].inlines_mut().get_mut(inline) {
+                Some(run) => run,
+                _ => {
+                    self.math = None;
+                    return None;
+                }
+            },
+        };
+        let list = match (target, table_run) {
+            (Inline::Math(list), None) => list,
+            (Inline::TableCell(contents), Some(run)) => match contents.get_mut(run) {
                 Some(Inline::Math(list)) => list,
                 _ => {
                     self.math = None;
                     return None;
                 }
             },
+            _ => {
+                self.math = None;
+                return None;
+            }
         };
         let cursor = self.math.as_mut()?;
         Some((list, cursor))
@@ -2869,11 +4030,16 @@ impl Document {
     /// geometry and completion queries.
     pub fn focused_math_view(&self) -> Option<(&math::MathList, &math::MathCursor)> {
         let cursor = self.math.as_ref()?;
-        let list = match self.scope()[self.caret.block]
-            .inlines()
-            .get(self.caret.inline)
-        {
-            Some(Inline::Math(list)) => list,
+        let target = self.scope()[self.caret.block].inlines().get(self.caret.inline)?;
+        let list = match target {
+            Inline::Math(list) => list,
+            Inline::TableCell(_) => {
+                let (run, _) = table_cell_flat_to_run(target, self.caret.offset);
+                match table_cell_runs(target).get(run) {
+                    Some(Inline::Math(list)) => list,
+                    _ => return None,
+                }
+            }
             _ => return None,
         };
         Some((list, cursor))
@@ -2883,6 +4049,37 @@ impl Document {
     pub fn math_conversion_query(&self) -> Option<math_conversion::Query> {
         let (list, cursor) = self.focused_math_view()?;
         math_conversion::query_before(list, cursor)
+    }
+
+    /// The addressed node in a rendered expression. `offset` is the
+    /// expression's block-flat start, which disambiguates multiple math
+    /// atoms living in one table cell.
+    pub fn math_node_at(
+        &self,
+        block: usize,
+        inline: usize,
+        offset: usize,
+        address: &math::NodeAddress,
+    ) -> Option<&math::MathNode> {
+        let block_ref = self.body.get(block)?;
+        let target = block_ref.inlines().get(inline)?;
+        let list = match target {
+            Inline::Math(list) => list,
+            Inline::TableCell(contents) => {
+                let cell_base: usize = block_ref.inlines()[..inline].iter().map(run_len).sum();
+                let local = offset.checked_sub(cell_base)?;
+                let (run, within) = table_cell_flat_to_run(target, local);
+                if within != 0 || table_cell_run_start(target, run) != local {
+                    return None;
+                }
+                match contents.get(run) {
+                    Some(Inline::Math(list)) => list,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        math::node_at(list, address)
     }
 
     /// Applies a still-current completion or compact-input rewrite.
@@ -2904,14 +4101,39 @@ impl Document {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         mutation: impl FnOnce(&mut math::MathList) -> bool,
     ) -> bool {
-        let Some(Inline::Math(list)) = self
+        let Some(block_ref) = self.body.get(block) else {
+            return false;
+        };
+        let table_run = if block_ref.is_table() {
+            let Some(cell) = block_ref.inlines().get(inline) else {
+                return false;
+            };
+            let cell_base: usize = block_ref.inlines()[..inline].iter().map(run_len).sum();
+            let Some(local) = offset.checked_sub(cell_base) else {
+                return false;
+            };
+            let (run, within) = table_cell_flat_to_run(cell, local);
+            (within == 0 && table_cell_run_start(cell, run) == local).then_some(run)
+        } else {
+            None
+        };
+        let Some(target) = self
             .body
             .get_mut(block)
             .and_then(|block| block.inlines_mut().get_mut(inline))
         else {
             return false;
+        };
+        let list = match (target, table_run) {
+            (Inline::Math(list), None) => list,
+            (Inline::TableCell(contents), Some(run)) => match contents.get_mut(run) {
+                Some(Inline::Math(list)) => list,
+                _ => return false,
+            },
+            _ => return false,
         };
         let before = list.clone();
         if !mutation(list) || *list == before {
@@ -2926,10 +4148,11 @@ impl Document {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         address: &math::NodeAddress,
         role: math::SymbolRole,
     ) -> bool {
-        self.mutate_math_at(block, inline, |list| {
+        self.mutate_math_at(block, inline, offset, |list| {
             math::set_node_role(list, address, role)
         })
     }
@@ -2938,10 +4161,11 @@ impl Document {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         address: &math::NodeAddress,
         variant: &str,
     ) -> bool {
-        self.mutate_math_at(block, inline, |list| {
+        self.mutate_math_at(block, inline, offset, |list| {
             if math::set_node_variant(list, address, variant) {
                 return true;
             }
@@ -2955,10 +4179,11 @@ impl Document {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         address: &math::NodeAddress,
         open: char,
     ) -> bool {
-        self.mutate_math_at(block, inline, |list| {
+        self.mutate_math_at(block, inline, offset, |list| {
             math::set_group_delimiter(list, address, open)
         })
     }
@@ -2967,10 +4192,11 @@ impl Document {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         address: &math::NodeAddress,
         kind: math::AccentKind,
     ) -> bool {
-        self.mutate_math_at(block, inline, |list| {
+        self.mutate_math_at(block, inline, offset, |list| {
             math::set_accent_kind(list, address, kind)
         })
     }
@@ -2979,10 +4205,11 @@ impl Document {
         &mut self,
         block: usize,
         inline: usize,
+        offset: usize,
         address: &math::NodeAddress,
         kind: math::BigOp,
     ) -> bool {
-        self.mutate_math_at(block, inline, |list| {
+        self.mutate_math_at(block, inline, offset, |list| {
             math::set_big_op_kind(list, address, kind)
         })
     }
@@ -3039,6 +4266,26 @@ impl Document {
     pub fn enter_math_before(&mut self) -> bool {
         self.clamp_caret();
         let block = self.caret.block;
+        if self.scope()[block].is_table() {
+            let cell = self.caret.inline;
+            let flat = self.caret.offset;
+            if flat == 0 {
+                return false;
+            }
+            let (run, _) =
+                table_cell_flat_to_run(&self.scope()[block].inlines()[cell], flat - 1);
+            let list_len = match &table_cell_runs(&self.scope()[block].inlines()[cell])[run] {
+                Inline::Math(list) => list.len(),
+                _ => return false,
+            };
+            self.caret.offset = table_cell_run_start(&self.scope()[block].inlines()[cell], run);
+            self.caret.style = Style::PLAIN;
+            self.math = Some(math::MathCursor {
+                path: Vec::new(),
+                index: list_len,
+            });
+            return true;
+        }
         let flat = self.caret_flat(block);
         if flat == 0 {
             return false;
@@ -3061,6 +4308,24 @@ impl Document {
     pub fn enter_math_after(&mut self) -> bool {
         self.clamp_caret();
         let block = self.caret.block;
+        if self.scope()[block].is_table() {
+            let cell = self.caret.inline;
+            let flat = self.caret.offset;
+            if flat >= run_len(&self.scope()[block].inlines()[cell]) {
+                return false;
+            }
+            let (run, _) = table_cell_flat_to_run(&self.scope()[block].inlines()[cell], flat);
+            if !matches!(
+                table_cell_runs(&self.scope()[block].inlines()[cell])[run],
+                Inline::Math(_)
+            ) {
+                return false;
+            }
+            self.caret.offset = table_cell_run_start(&self.scope()[block].inlines()[cell], run);
+            self.caret.style = Style::PLAIN;
+            self.math = Some(math::MathCursor::default());
+            return true;
+        }
         let flat = self.caret_flat(block);
         if flat >= self.block_flat_len(block) {
             return false;
@@ -3080,19 +4345,40 @@ impl Document {
     /// Enters the atom at `block`/`inline` with an already-resolved
     /// cursor — the click path, where the geometry decided where inside the
     /// expression the cursor goes.
-    pub fn enter_math_at(&mut self, block: usize, inline: usize, mut cursor: math::MathCursor) {
-        if !matches!(
-            self.body
-                .get(block)
-                .and_then(|block| block.inlines().get(inline)),
-            Some(Inline::Math(_))
-        ) {
+    pub fn enter_math_at(
+        &mut self,
+        block: usize,
+        inline: usize,
+        offset: usize,
+        mut cursor: math::MathCursor,
+    ) {
+        let Some(block_ref) = self.body.get(block) else {
             return;
-        }
-        self.set_caret(block, inline, 0);
-        let list = match self.body[self.caret.block].inlines().get(self.caret.inline) {
-            Some(Inline::Math(list)) => list,
-            _ => return,
+        };
+        let local_offset = if block_ref.is_table() {
+            let cell_base: usize = block_ref.inlines()[..inline].iter().map(run_len).sum();
+            let Some(local) = offset.checked_sub(cell_base) else {
+                return;
+            };
+            local
+        } else {
+            0
+        };
+        self.set_caret(block, inline, local_offset);
+        let target = &self.body[self.caret.block].inlines()[self.caret.inline];
+        let list = if let Inline::Math(list) = target {
+            list
+        } else if let Inline::TableCell(contents) = target {
+            let (run, within) = table_cell_flat_to_run(target, local_offset);
+            if within != 0 || table_cell_run_start(target, run) != local_offset {
+                return;
+            }
+            match contents.get(run) {
+                Some(Inline::Math(list)) => list,
+                _ => return,
+            }
+        } else {
+            return;
         };
         math::clamp(list, &mut cursor);
         self.math = Some(cursor);
@@ -3102,7 +4388,21 @@ impl Document {
         self.clamp_caret();
         let block = self.caret.block;
         let inline = self.caret.inline;
-        if !matches!(
+        if self.scope()[block].is_table() {
+            let (run, _) =
+                table_cell_flat_to_run(&self.scope()[block].inlines()[inline], self.caret.offset);
+            if !matches!(
+                table_cell_runs(&self.scope()[block].inlines()[inline]).get(run),
+                Some(Inline::Math(_))
+            ) {
+                self.math = None;
+                return;
+            }
+            self.math = None;
+            self.caret.offset += offset;
+            self.refresh_context();
+            return;
+        } else if !matches!(
             self.scope()[block].inlines().get(inline),
             Some(Inline::Math(_))
         ) {
@@ -3213,7 +4513,10 @@ mod tests {
         {
             assert!(!block.inlines().is_empty());
             for (i, run) in block.inlines().iter().enumerate() {
-                assert!(!(run.text().is_empty() && (block.inlines().len() > 1 || i != 0)));
+                assert!(
+                    block.is_table()
+                        || !(run.text().is_empty() && (block.inlines().len() > 1 || i != 0))
+                );
             }
         }
         for note in &d.notes {
@@ -4463,7 +5766,7 @@ mod tests {
             index: usize::MAX,
         };
 
-        d.enter_math_at(0, 0, cursor.clone());
+        d.enter_math_at(0, 0, 0, cursor.clone());
 
         assert_eq!(
             d.math,
@@ -4535,7 +5838,7 @@ mod tests {
             index,
         };
 
-        assert!(d.set_math_node_variant_at(0, 1, &at(0), "bold"));
+        assert!(d.set_math_node_variant_at(0, 1, 6, &at(0), "bold"));
         assert!(matches!(
             &d.body()[0].inlines()[1],
             Inline::Math(list)
@@ -4545,10 +5848,10 @@ mod tests {
                     ..
                 } if variant == "bold")
         ));
-        assert!(d.set_math_node_role_at(0, 1, &at(0), math::SymbolRole::Constant));
-        assert!(d.set_math_group_delimiter_at(0, 1, &at(1), '['));
-        assert!(d.set_math_accent_kind_at(0, 1, &at(2), math::AccentKind::Dot));
-        assert!(d.set_math_big_op_kind_at(0, 1, &at(3), math::BigOp::ContourIntegral));
+        assert!(d.set_math_node_role_at(0, 1, 6, &at(0), math::SymbolRole::Constant));
+        assert!(d.set_math_group_delimiter_at(0, 1, 6, &at(1), '['));
+        assert!(d.set_math_accent_kind_at(0, 1, 6, &at(2), math::AccentKind::Dot));
+        assert!(d.set_math_big_op_kind_at(0, 1, 6, &at(3), math::BigOp::ContourIntegral));
         assert!(d.is_dirty());
         assert_eq!(d.caret, caret);
         assert!(d.math.is_none());
@@ -4566,13 +5869,13 @@ mod tests {
         ));
 
         d.dirty = false;
-        assert!(!d.set_math_node_role_at(0, 1, &at(0), math::SymbolRole::Constant));
-        assert!(!d.set_math_node_variant_at(0, 1, &at(0), "bold"));
-        assert!(!d.set_math_group_delimiter_at(0, 1, &at(1), '['));
-        assert!(!d.set_math_accent_kind_at(0, 1, &at(2), math::AccentKind::Dot));
-        assert!(!d.set_math_big_op_kind_at(0, 1, &at(3), math::BigOp::ContourIntegral));
-        assert!(!d.set_math_node_variant_at(0, 1, &at(4), "missing"));
-        assert!(!d.set_math_node_role_at(9, 9, &at(0), math::SymbolRole::Variable));
+        assert!(!d.set_math_node_role_at(0, 1, 6, &at(0), math::SymbolRole::Constant));
+        assert!(!d.set_math_node_variant_at(0, 1, 6, &at(0), "bold"));
+        assert!(!d.set_math_group_delimiter_at(0, 1, 6, &at(1), '['));
+        assert!(!d.set_math_accent_kind_at(0, 1, 6, &at(2), math::AccentKind::Dot));
+        assert!(!d.set_math_big_op_kind_at(0, 1, 6, &at(3), math::BigOp::ContourIntegral));
+        assert!(!d.set_math_node_variant_at(0, 1, 6, &at(4), "missing"));
+        assert!(!d.set_math_node_role_at(9, 9, 0, &at(0), math::SymbolRole::Variable));
         assert!(!d.is_dirty());
         assert_eq!(d.caret, caret);
         assert!(matches!(
@@ -4590,7 +5893,7 @@ mod tests {
             index: 0,
         };
 
-        assert!(d.set_math_node_variant_at(0, 0, &address, "bold"));
+        assert!(d.set_math_node_variant_at(0, 0, 0, &address, "bold"));
         let Inline::Math(list) = &d.body()[0].inlines()[0] else {
             panic!("the targeted inline stays math");
         };
@@ -5451,5 +6754,186 @@ mod tests {
         assert_eq!(d.insert_sidenote(), None);
         assert_eq!(d.notes.len(), 1, "no note inside a note");
         assert_eq!(text_of_block(&d, 0), format!("{ATOM}body"));
+    }
+
+    #[test]
+    fn table_cells_keep_their_positions_through_typing_and_navigation() {
+        let mut d = doc();
+        d.insert_table();
+        assert_eq!(d.body().len(), 2);
+        assert!(d.body().iter().all(Block::is_table));
+        assert_eq!(d.body()[0].inlines().len(), 2);
+        assert!(d.body()[0].table_first());
+        assert!(!d.body()[1].table_first());
+
+        d.insert_text("left");
+        d.table_tab(false);
+        assert_eq!((d.caret.block, d.caret.inline, d.caret.offset), (0, 1, 0));
+        d.insert_text("right");
+        assert_eq!(d.block_text(0), "leftright");
+        assert_eq!(table_cell_text(&d.body()[0].inlines()[0]), "left");
+        assert_eq!(table_cell_text(&d.body()[0].inlines()[1]), "right");
+
+        d.table_move(TableDirection::Down);
+        assert_eq!((d.caret.block, d.caret.inline), (1, 1));
+        d.set_caret(1, 1, 0);
+        d.table_move(TableDirection::Left);
+        assert_eq!(d.caret.inline, 0);
+        d.table_tab(true);
+        assert_eq!((d.caret.block, d.caret.inline), (0, 1));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn table_line_and_track_edits_update_the_whole_group() {
+        let mut d = doc();
+        d.insert_table();
+        assert!(d.toggle_table_line(0, table::GridLine::Top));
+        assert!(d.resize_table_column(0, 0, 0.1));
+        assert!(d.resize_table_row(0, 0, 4.0));
+        let first = d.body()[0].table_settings().unwrap();
+        let second = d.body()[1].table_settings().unwrap();
+        assert_eq!(first, second);
+        assert!(!first.lines.top);
+        assert!(first.column_shares[0] > first.column_shares[1]);
+        assert!(first.row_heights[0] > first.row_heights[1]);
+
+        d.set_caret(0, 0, 0);
+        d.newline();
+        assert_eq!(
+            d.body().len(),
+            2,
+            "Enter does not create a hidden table row"
+        );
+        assert!(d.insert_table_row(0, 0));
+        assert_eq!(d.body().len(), 3);
+        assert!(d.body().iter().all(Block::is_table));
+        assert_eq!(d.body()[0].table_settings().unwrap().row_heights.len(), 3);
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn table_card_can_add_and_remove_tracks_without_losing_its_shape() {
+        let mut d = doc();
+        d.insert_table();
+        assert!(d.insert_table_row(0, 0));
+        assert!(d.insert_table_column(0, 0));
+        assert_eq!(d.body().len(), 3);
+        assert!(d.body().iter().all(|row| row.inlines().len() == 3));
+        let settings = d.body()[0].table_settings().unwrap();
+        assert_eq!(settings.row_heights.len(), 3);
+        assert_eq!(settings.column_shares.len(), 3);
+        assert!((settings.column_shares.iter().sum::<f32>() - 1.0).abs() < 0.0001);
+
+        assert!(d.remove_table_row(0, 0));
+        assert!(d.remove_table_column(0, 1));
+        assert_eq!(d.body().len(), 2);
+        assert!(d.body()[0].table_first());
+        assert!(d.body().iter().all(|row| row.inlines().len() == 2));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn formatting_a_table_word_preserves_its_cell_boundary() {
+        let mut d = doc();
+        d.insert_table();
+        d.insert_text("alpha");
+        let bold = Style {
+            bold: true,
+            ..Style::PLAIN
+        };
+        let range = FlatRange::new(d.position(0, 1), d.position(0, 4));
+        d.toggle_style_range(range, bold);
+        assert_eq!(d.body()[0].inlines().len(), 2);
+        assert!(table_cell_runs(&d.body()[0].inlines()[0])
+            .iter()
+            .any(|run| run.style().bold));
+        assert!(d.style_range_is_active(range, bold));
+        d.toggle_style_range(range, bold);
+        assert!(table_cell_runs(&d.body()[0].inlines()[0])
+            .iter()
+            .all(|run| !run.style().bold));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn leaving_bold_in_a_table_preserves_the_bold_text_already_typed() {
+        let mut d = doc();
+        d.insert_table();
+        d.set_emphasis(true, false);
+        d.insert_text("bold");
+        d.set_emphasis(false, false);
+        d.insert_text(" plain");
+
+        let contents = table_cell_runs(&d.body()[0].inlines()[0]);
+        assert!(matches!(&contents[0], Inline::Text(text) if text.text == "bold" && text.style.bold));
+        assert!(matches!(&contents[1], Inline::Text(text) if text.text == " plain" && text.style == Style::PLAIN));
+        assert_eq!(table_cell_text(&d.body()[0].inlines()[0]), "bold plain");
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn an_empty_table_cell_can_hold_editable_math() {
+        let mut d = doc();
+        d.insert_table();
+        d.insert_inline_math();
+        d.math_insert_char('x');
+        assert!(d.math.is_some());
+        assert!(matches!(
+            table_cell_runs(&d.body()[0].inlines()[0]),
+            [Inline::Math(_)]
+        ));
+        assert_eq!(d.body()[0].inlines().len(), 2);
+        assert_eq!(d.body()[1].inlines().len(), 2);
+
+        d.math_exit_after();
+        d.insert_inline_math();
+        assert!(d.math.is_some(), "the math cell can be re-entered");
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn block_commands_cannot_break_a_table_group() {
+        let mut d = doc();
+        d.insert_table();
+        let original = d.body().to_vec();
+        d.set_heading(Some(1));
+        d.set_code(true);
+        d.set_list(Some(ListMarker::Bullet));
+        d.insert_divider();
+        d.insert_math_block();
+        d.insert_table();
+        d.newline();
+        assert_eq!(d.body(), original);
+
+        d.open_above();
+        assert!(matches!(d.body()[0], Block::Paragraph(_)));
+        assert!(d.body()[1].table_first());
+
+        let mut below = doc();
+        below.insert_table();
+        below.open_below();
+        assert!(matches!(below.body()[2], Block::Paragraph(_)));
+        assert_eq!(below.caret.block, 2);
+        assert_invariants(&d);
+        assert_invariants(&below);
+    }
+
+    #[test]
+    fn backspace_and_line_delete_never_remove_table_tracks() {
+        let mut d = doc();
+        d.insert_table();
+        d.insert_text("cell");
+        d.set_caret(0, 0, 0);
+        d.backspace();
+        assert_eq!(table_cell_text(&d.body()[0].inlines()[0]), "cell");
+        assert_eq!(d.body().len(), 2);
+        assert!(d.body().iter().all(|row| row.inlines().len() == 2));
+
+        d.delete_line();
+        assert_eq!(table_cell_text(&d.body()[0].inlines()[0]), "");
+        assert_eq!(d.body().len(), 2);
+        assert!(d.body().iter().all(|row| row.inlines().len() == 2));
+        assert_invariants(&d);
     }
 }

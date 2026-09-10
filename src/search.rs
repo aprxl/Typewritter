@@ -56,6 +56,31 @@ struct IndexedRun {
     offset: usize,
 }
 
+fn searchable_runs(
+    run: &crate::document::Inline,
+    tag_prefix: &str,
+) -> Vec<(usize, String)> {
+    match run {
+        crate::document::Inline::Text(text) => {
+            vec![(text.text.chars().count(), text.text.clone())]
+        }
+        crate::document::Inline::Math(list) => vec![(
+            1,
+            format!(
+                "{}${}$",
+                tag_prefix,
+                crate::document::math_notation::print(list)
+            ),
+        )],
+        crate::document::Inline::Note(_) => vec![(1, String::new())],
+        crate::document::Inline::EqRef(label) => vec![(1, format!("@{label}"))],
+        crate::document::Inline::TableCell(contents) => contents
+            .iter()
+            .flat_map(|run| searchable_runs(run, tag_prefix))
+            .collect(),
+    }
+}
+
 /// Parsed vault content reused across finder query changes. Building the
 /// index performs filesystem I/O once; ranking a new query only scans these
 /// in-memory runs.
@@ -82,29 +107,16 @@ impl SearchIndex {
                 };
                 let mut offset = 0usize;
                 for run in block.inlines() {
-                    let (chars, text) = match run {
-                        crate::document::Inline::Text(t) => {
-                            (t.text.chars().count(), t.text.clone())
-                        }
-                        crate::document::Inline::Math(list) => (
-                            1,
-                            format!(
-                                "{}${}$",
-                                tag_prefix,
-                                crate::document::math_notation::print(list)
-                            ),
-                        ),
-                        crate::document::Inline::Note(_) => (1, String::new()),
-                        crate::document::Inline::EqRef(label) => (1, format!("@{label}")),
-                    };
-                    runs.push(IndexedRun {
-                        path: file.path.clone(),
-                        name: file.name.clone(),
-                        text,
-                        block: block_index,
-                        offset,
-                    });
-                    offset += chars;
+                    for (chars, text) in searchable_runs(run, &tag_prefix) {
+                        runs.push(IndexedRun {
+                            path: file.path.clone(),
+                            name: file.name.clone(),
+                            text,
+                            block: block_index,
+                            offset,
+                        });
+                        offset += chars;
+                    }
                 }
             }
         }
@@ -255,28 +267,13 @@ pub fn search_document(
         };
         let mut offset = 0usize;
         for run in b.inlines() {
-            let text = match run {
-                crate::document::Inline::Text(t) => t.text.clone(),
-                crate::document::Inline::Math(list) => {
-                    format!(
-                        "{}${}$",
-                        tag_prefix,
-                        crate::document::math_notation::print(list)
-                    )
+            for (chars, text) in searchable_runs(run, &tag_prefix) {
+                if let Some((_, indices)) = matcher.fuzzy_indices(&text, query) {
+                    let start = chars_min_prefix(&text, indices[0]);
+                    hits.push((text, block, offset + start));
                 }
-                crate::document::Inline::Note(_) => String::new(),
-                crate::document::Inline::EqRef(label) => format!("@{label}"),
-            };
-            if let Some((_, indices)) = matcher.fuzzy_indices(&text, query) {
-                let start = chars_min_prefix(&text, indices[0]);
-                hits.push((text, block, offset + start));
+                offset += chars;
             }
-            offset += match run {
-                crate::document::Inline::Text(t) => t.text.chars().count(),
-                crate::document::Inline::Math(_) => 1,
-                crate::document::Inline::Note(_) => 1,
-                crate::document::Inline::EqRef(_) => 1,
-            };
         }
     }
     hits

@@ -56,6 +56,16 @@ pub const GAP_HEADING: f32 = 30.0;
 pub const GAP_AFTER_HEADING: f32 = 12.0;
 /// Space below a rule — tighter than a paragraph's, for the same reason.
 pub const GAP_DIVIDER: f32 = 8.0;
+/// Insets shared by text, the cell caret, and table hit testing.
+pub const TABLE_CELL_PAD: f32 = 12.0;
+/// Vertical breathing room inside a table cell. Horizontal padding is larger
+/// because columns need an obvious editable gutter; vertical padding simply
+/// keeps wrapped lines from grazing a grid stroke.
+pub const TABLE_CELL_VERTICAL_PAD: f32 = 6.0;
+/// The baseline-to-baseline rhythm for wrapped table text. It is tighter than
+/// prose's block band while still leaving an easy-to-hit line in a layout
+/// table.
+pub const TABLE_TEXT_LINE_HEIGHT: f32 = 24.0;
 /// Space below a list item that has another item right after it — tighter
 /// than a paragraph's, because the items are one thought. The last item of
 /// a run keeps the full paragraph gap below it.
@@ -111,6 +121,7 @@ pub const ANCHOR_RISE: f32 = 6.0;
 /// A run of a visual line that came from one source run, covering exactly
 /// `[start, start + len)` chars of it. Ranges on a line are contiguous and
 /// exact — no gaps, no overlaps — which is what makes caret math trivial.
+#[derive(Clone, Debug)]
 pub struct Segment {
     /// Space before/after the label; only the outside edges of inline code reserve it.
     pub padding: (f32, f32),
@@ -159,6 +170,7 @@ impl Segment {
 }
 
 /// One visual line: a contiguous slice of the source block's flat text.
+#[derive(Clone, Debug)]
 pub struct VisLine {
     /// Top of the line, relative to content top.
     pub y: f32,
@@ -196,6 +208,38 @@ pub struct BlockLayout {
     pub indicator: Option<FoldIndicator>,
 }
 
+/// The measured tracks for one table row. It is duplicated per row in the
+/// layout snapshot so painting, hit-testing, drag handles, and the caret all
+/// read one geometry without reaching back into the live document.
+#[derive(Clone, Debug)]
+pub struct TableLayout {
+    pub first: usize,
+    pub row: usize,
+    pub columns: Vec<f32>,
+    pub row_height: f32,
+    /// Wrapped inline layout for each cell, with y coordinates local to the
+    /// cell's content box and segment indices addressing its inner runs.
+    pub cells: Vec<Vec<VisLine>>,
+    pub lines: super::table::TableLines,
+}
+
+/// A draggable internal table divider, named by the tracks it separates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TableResize {
+    Column { first: usize, divider: usize },
+    Row { first: usize, divider: usize },
+}
+
+/// The stable coordinate of one table cell. It is named from the table's
+/// first row, not from a transient caret, so a Normal-mode table card can
+/// safely add or remove tracks after the click that opened it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableCell {
+    pub first: usize,
+    pub row: usize,
+    pub column: usize,
+}
+
 /// One sidenote anchor: where it is, and the number the reader sees.
 pub struct Anchor {
     /// The block and inline run the anchor occupies.
@@ -219,6 +263,8 @@ pub struct Anchor {
 pub struct DocLayout {
     /// The visual blocks, one per source block.
     pub blocks: Vec<BlockLayout>,
+    /// Table geometry aligned with [`Self::blocks`].
+    pub tables: Vec<Option<TableLayout>>,
     /// Total content height, for scroll bounds.
     pub height: f32,
     /// How much smaller than the page this layout is set: every text size
@@ -251,6 +297,9 @@ pub enum ContextHit {
     Math {
         block: usize,
         inline: usize,
+        /// Block-flat start of the atom. In a table `inline` names the cell,
+        /// so this also identifies one of several expressions in that cell.
+        offset: usize,
         node: Option<NodeAddress>,
     },
 }
@@ -293,7 +342,7 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
             theme::ink(),
         )
         .bold(),
-        Block::Paragraph(_) | Block::Divider(_) | Block::Math { .. } => {
+        Block::Paragraph(_) | Block::Divider(_) | Block::Math { .. } | Block::TableRow { .. } => {
             TextStyle::sans(17.5 * scale, theme::ink())
         }
         // A done task's text is dimmed: the drawn strike through it says
@@ -313,6 +362,82 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
         base = base.italic();
     }
     base
+}
+
+/// A visible portion of one table cell's text, with its source offset. Table
+/// rows are structural blocks rather than prose runs, so this small layout
+/// primitive gives painting, hit-testing, and the caret one wrapped geometry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableTextLine {
+    pub start: usize,
+    pub text: String,
+}
+
+/// The text style for a table cell. Unlike a prose block it has no heading
+/// context, but it still honours the reader's normal formatting controls.
+pub fn table_text_style(style: Style, scale: f32) -> TextStyle {
+    if style.badge {
+        return TextStyle::mono(
+            theme::BADGE_SIZE * scale,
+            theme::badge_ink(style.badge_color),
+        )
+        .tracked(0.1);
+    }
+    let mut result = if style.code {
+        TextStyle::mono(17.5 * scale, theme::ink())
+    } else {
+        TextStyle::sans(17.5 * scale, theme::ink())
+    };
+    if style.bold {
+        result = result.bold();
+    }
+    if style.italic {
+        result = result.italic();
+    }
+    result
+}
+
+/// Character-wrap one cell to its usable track width. It deliberately breaks
+/// long unspaced text too: a spreadsheet-like cell must grow vertically,
+/// never silently paint past its right edge or discard what the reader typed.
+pub fn table_text_lines(
+    text: &str,
+    style: &TextStyle,
+    max_width: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> Vec<TableTextLine> {
+    if text.is_empty() {
+        return vec![TableTextLine {
+            start: 0,
+            text: String::new(),
+        }];
+    }
+    let max_width = max_width.max(1.0);
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut current = String::new();
+    for ch in text.chars() {
+        let mut next = current.clone();
+        next.push(ch);
+        if !current.is_empty() && measure(&next, style) > max_width {
+            lines.push(TableTextLine {
+                start,
+                text: std::mem::take(&mut current),
+            });
+            start += lines
+                .last()
+                .expect("line was just pushed")
+                .text
+                .chars()
+                .count();
+        }
+        current.push(ch);
+    }
+    lines.push(TableTextLine {
+        start,
+        text: current,
+    });
+    lines
 }
 
 /// The raised number an anchor draws with. The size matches the heading's
@@ -388,6 +513,7 @@ pub fn advance(
             let display = number.unwrap_or_default();
             measure(display, &eq_ref_style(display, scale))
         }
+        Inline::TableCell(_) => unreachable!("table-cell wrappers are not laid out as runs"),
     };
     let box_pad = if style.badge {
         theme::BADGE_PAD * 2.0 * scale
@@ -420,15 +546,71 @@ fn piece_width(
 /// edge; invisible and scissor-clipped). Ranges stay contiguous, which is
 /// what keeps caret math exact. A word wider than the column overhangs on
 /// its own line rather than vanishing.
+/// The part of one piece a wrapped line covers. A piece that fits is covered
+/// whole; a piece wider than the measure on its own is covered in as many
+/// chunks as it takes, so nothing is ever painted through the edge of the
+/// line (or the column) it was wrapped into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunk {
+    /// Index into the piece list.
+    pub piece: usize,
+    /// Char offset within the run the piece came from, so a chunk maps
+    /// straight onto a [`Segment`].
+    pub start: usize,
+    /// Char count.
+    pub len: usize,
+}
+
+impl Chunk {
+    /// Whether the chunk covers its whole piece.
+    fn whole(&self, pieces: &[Piece]) -> bool {
+        let piece = &pieces[self.piece];
+        self.start == piece.start && self.len == piece.len
+    }
+
+    /// The chunk's own text, sliced out of the piece's text.
+    fn text(&self, pieces: &[Piece]) -> String {
+        let piece = &pieces[self.piece];
+        piece
+            .text
+            .chars()
+            .skip(self.start - piece.start)
+            .take(self.len)
+            .collect()
+    }
+}
+
+/// The widest prefix of `text` that fits `budget`, counted in characters.
+/// Always at least one character — a glyph wider than the line it is wrapped
+/// into still has to land somewhere — and never more than the text itself.
+fn fitting_prefix(
+    text: &str,
+    budget: f32,
+    style: &TextStyle,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> usize {
+    let mut best = 0;
+    let mut prefix = String::new();
+    for (count, ch) in text.chars().enumerate() {
+        prefix.push(ch);
+        if measure(&prefix, style) > budget {
+            break;
+        }
+        best = count + 1;
+    }
+    best.max(1).min(text.chars().count())
+}
+
 fn wrap(
     pieces: &[Piece],
     block: &Block,
     width: f32,
     scale: f32,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
-) -> Vec<Vec<usize>> {
-    let mut lines = Vec::new();
-    let mut current: Vec<usize> = Vec::new();
+    split_overlong: bool,
+) -> Vec<Vec<Chunk>> {
+    let mut lines: Vec<Vec<Chunk>> = Vec::new();
+    let mut current: Vec<Chunk> = Vec::new();
     let mut cursor = 0.0f32;
     let mut first = true;
 
@@ -436,26 +618,61 @@ fn wrap(
         let code = piece.style.code && !block.is_code();
         let continues_code = current
             .last()
-            .is_some_and(|&previous| pieces[previous].style.code);
+            .is_some_and(|chunk| pieces[chunk.piece].style.code);
+        let style = text_style(block, piece.style, scale);
         let base = piece_width(piece, block, scale, measure);
-        let mut word_width = base
-            + if code && !continues_code {
+        // Inline code reserves its chip's margin on the outside edge only, so
+        // a piece that follows code on the same line measures narrower.
+        let padding = |continues: bool| {
+            if code && !continues {
                 INLINE_CODE_SPACE * 2.0 * scale
             } else {
                 0.0
-            };
+            }
+        };
+        let mut word_width = base + padding(continues_code);
         if !piece.space && !first && cursor + word_width > width {
             lines.push(std::mem::take(&mut current));
             cursor = 0.0;
-            word_width = base
-                + if code {
-                    INLINE_CODE_SPACE * 2.0 * scale
-                } else {
-                    0.0
-                };
+            word_width = base + padding(false);
         }
-        current.push(i);
-        cursor += word_width;
+        let mut local = 0;
+        while local < piece.len {
+            // Prose keeps an over-wide word whole on its own line; a table
+            // cell cannot — a track is narrower than a word often enough that
+            // the text would paint over its neighbour. Every line a split word
+            // lands on is filled from the measure again, or the tail of the
+            // word would spill across the rest of the cell in one chunk.
+            let take = if !split_overlong || word_width <= width - cursor {
+                piece.len - local
+            } else {
+                fitting_prefix(
+                    &piece.text.chars().skip(local).collect::<String>(),
+                    width - cursor,
+                    &style,
+                    measure,
+                )
+            };
+            let len = take.min(piece.len - local).max(1);
+            let chunk = Chunk {
+                piece: i,
+                start: piece.start + local,
+                len,
+            };
+            let chunk_width = chunk_width(&chunk, pieces, block, scale, measure);
+            cursor += if local == 0 {
+                chunk_width + padding(continues_code)
+            } else {
+                chunk_width
+            };
+            current.push(chunk);
+            local += len;
+            if local < piece.len {
+                lines.push(std::mem::take(&mut current));
+                cursor = 0.0;
+                first = false;
+            }
+        }
         if !piece.space {
             first = false;
         }
@@ -467,6 +684,22 @@ fn wrap(
         lines.push(Vec::new());
     }
     lines
+}
+
+/// Width of one chunk: the piece's own advance when the chunk covers all of
+/// it, otherwise the measured width of the slice it covers.
+fn chunk_width(
+    chunk: &Chunk,
+    pieces: &[Piece],
+    block: &Block,
+    scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> f32 {
+    let piece = &pieces[chunk.piece];
+    if chunk.whole(pieces) {
+        return piece_width(piece, block, scale, measure);
+    }
+    measure(&chunk.text(pieces), &text_style(block, piece.style, scale))
 }
 
 fn tokens(
@@ -505,19 +738,19 @@ fn tokens(
 
 /// Merge a line's piece indices into segments, folding together adjacent
 /// pieces from the same run so the output is one segment per source stretch.
-fn segments_for(pieces: &[Piece], line: &[usize], block: &Block) -> Vec<Segment> {
+fn segments_for(pieces: &[Piece], line: &[Chunk], block: &Block) -> Vec<Segment> {
     let mut segs: Vec<Segment> = Vec::new();
-    for &i in line {
-        let p = &pieces[i];
+    for chunk in line {
+        let p = &pieces[chunk.piece];
         match segs.last_mut() {
-            Some(s) if s.inline == p.inline && s.start + s.len == p.start => {
-                s.len += p.len;
+            Some(s) if s.inline == p.inline && s.start + s.len == chunk.start => {
+                s.len += chunk.len;
             }
             _ => segs.push(Segment {
                 padding: (0.0, 0.0),
                 inline: p.inline,
-                start: p.start,
-                len: p.len,
+                start: chunk.start,
+                len: chunk.len,
                 style: p.style,
                 number: p.number.clone(),
             }),
@@ -543,6 +776,151 @@ fn segments_for(pieces: &[Piece], line: &[usize], block: &Block) -> Vec<Segment>
 /// [`layout_blocks`] — a whole document is just its body at scale `1.0`.
 pub fn layout(doc: &Document, width: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) -> DocLayout {
     layout_blocks(doc.body(), width, 1.0, measure)
+}
+
+fn table_cell_layout(
+    contents: &[Inline],
+    width: f32,
+    scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> Vec<VisLine> {
+    let block = Block::Paragraph(contents.to_vec());
+    let pieces = tokens(&block, 0, &HashMap::new());
+    let grouped = wrap(&pieces, &block, width, scale, measure, true);
+    let mut y = 0.0;
+    grouped
+        .iter()
+        .map(|line_pieces| {
+            let content_height = line_pieces
+                .iter()
+                .filter_map(|&piece| match &contents[pieces[piece.piece].inline] {
+                    Inline::Math(list) => {
+                        let expression = math_layout::layout(list, 0, scale, measure);
+                        Some(expression.ascent + expression.descent + MATH_LEADING * scale)
+                    }
+                    Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
+                    Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
+                })
+                .fold(0.0, f32::max);
+            let height = (TABLE_TEXT_LINE_HEIGHT * scale).max(content_height);
+            let line = VisLine {
+                y,
+                x: 0.0,
+                height,
+                segments: segments_for(&pieces, line_pieces, &block),
+            };
+            y += height;
+            line
+        })
+        .collect()
+}
+
+fn table_cell_block(cell: &Inline) -> Block {
+    Block::Paragraph(
+        cell.table_cell_contents()
+            .expect("table rows contain table-cell wrappers")
+            .to_vec(),
+    )
+}
+
+fn table_cell_height(lines: &[VisLine]) -> f32 {
+    lines.iter().map(|line| line.height).sum()
+}
+
+fn table_cell_line_start(lines: &[VisLine], line: usize) -> usize {
+    lines[..line]
+        .iter()
+        .flat_map(|line| &line.segments)
+        .map(|segment| segment.len)
+        .sum()
+}
+
+fn table_cell_line_of_flat(lines: &[VisLine], flat: usize) -> usize {
+    let mut start = 0;
+    for (index, line) in lines.iter().enumerate() {
+        let end = start
+            + line
+                .segments
+                .iter()
+                .map(|segment| segment.len)
+                .sum::<usize>();
+        if flat < end || index + 1 == lines.len() {
+            return index;
+        }
+        start = end;
+    }
+    0
+}
+
+fn table_layout_for(
+    blocks: &[Block],
+    index: usize,
+    width: f32,
+    scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> Option<TableLayout> {
+    let Block::TableRow { settings, .. } = blocks.get(index)? else {
+        return None;
+    };
+    let mut first = index;
+    while first > 0
+        && matches!(
+            blocks.get(first),
+            Some(Block::TableRow { first: false, .. })
+        )
+    {
+        first -= 1;
+    }
+    if !blocks.get(first).is_some_and(Block::table_first) {
+        return None;
+    }
+    let rows = (first..blocks.len())
+        .take_while(|&row| {
+            row == first || matches!(blocks.get(row), Some(Block::TableRow { first: false, .. }))
+        })
+        .count();
+    let columns = blocks[first].inlines().len();
+    let settings = settings.clone().normalized(columns, rows);
+    let mut tracks = Vec::with_capacity(columns);
+    let mut used = 0.0;
+    for (column, share) in settings.column_shares.iter().enumerate() {
+        let track = if column + 1 == columns {
+            (width - used).max(0.0)
+        } else {
+            (width * *share).max(0.0)
+        };
+        tracks.push(track);
+        used += track;
+    }
+    let cells = blocks[index]
+        .inlines()
+        .iter()
+        .enumerate()
+        .map(|(column, cell)| {
+            table_cell_layout(
+                cell.table_cell_contents()
+                    .expect("table rows contain table-cell wrappers"),
+                (tracks[column] - TABLE_CELL_PAD * 2.0 * scale).max(1.0),
+                scale,
+                measure,
+            )
+        })
+        .collect::<Vec<_>>();
+    let row_height = cells
+        .iter()
+        .map(|lines| {
+            lines.iter().map(|line| line.height).sum::<f32>()
+                + TABLE_CELL_VERTICAL_PAD * 2.0 * scale
+        })
+        .fold(settings.row_heights[index - first] * scale, f32::max);
+    Some(TableLayout {
+        first,
+        row: index - first,
+        columns: tracks,
+        row_height,
+        cells,
+        lines: settings.lines,
+    })
 }
 
 /// Lays out a slice of blocks — a whole document's body, or one note's body —
@@ -622,6 +1000,7 @@ pub fn layout_blocks(
     }
 
     let mut laid = Vec::with_capacity(blocks.len());
+    let mut tables = Vec::with_capacity(blocks.len());
     let mut y = 0.0f32;
     let mut first_block = true;
     // The gap the previous block already contributed below itself. A display
@@ -654,6 +1033,7 @@ pub fn layout_blocks(
                         width,
                         scale,
                         measure,
+                        false,
                     )
                     .len();
                     laid.push(BlockLayout {
@@ -663,6 +1043,7 @@ pub fn layout_blocks(
                         hidden: Some(owner),
                         indicator: None,
                     });
+                    tables.push(None);
                 }
             }
         }
@@ -681,6 +1062,8 @@ pub fn layout_blocks(
         y += gap_above;
         first_block = false;
 
+        let table = table_layout_for(blocks, source_index, width, scale, measure);
+
         let base_line_height = match block {
             Block::Heading { level: 1, .. } => LINE_H1 * scale,
             Block::Heading { level: 2, .. } => LINE_H2 * scale,
@@ -693,6 +1076,12 @@ pub fn layout_blocks(
                 };
                 let expression = math_layout::layout(list, 0, scale, measure);
                 expression.ascent + expression.descent + MATH_PAD * 2.0 * scale
+            }
+            Block::TableRow { .. } => {
+                table
+                    .as_ref()
+                    .expect("table row must have table layout")
+                    .row_height
             }
             Block::Heading { .. } | Block::Paragraph(_) | Block::CodeLine { .. } => {
                 LINE_BODY * scale
@@ -708,35 +1097,51 @@ pub fn layout_blocks(
             Block::ListItem { .. } => LIST_INDENT * scale,
             _ => 0.0,
         };
-        let pieces = tokens(block, source_index, &number_of);
-        let grouped = wrap(&pieces, block, width - indent, scale, measure);
-        let mut line_y = y;
-        let lines = grouped
-            .iter()
-            .map(|line_pieces| {
-                let content_height = line_pieces
-                    .iter()
-                    .filter_map(
-                        |&piece_index| match &block.inlines()[pieces[piece_index].inline] {
-                            Inline::Math(list) => {
-                                let expression = math_layout::layout(list, 0, scale, measure);
-                                Some(expression.ascent + expression.descent + MATH_LEADING * scale)
+        let lines = if table.is_some() {
+            vec![VisLine {
+                y,
+                x: 0.0,
+                height: base_line_height,
+                segments: Vec::new(),
+            }]
+        } else {
+            let pieces = tokens(block, source_index, &number_of);
+            let grouped = wrap(&pieces, block, width - indent, scale, measure, false);
+            let mut line_y = y;
+            grouped
+                .iter()
+                .map(|line_pieces| {
+                    let content_height = line_pieces
+                        .iter()
+                        .filter_map(|&piece_index| {
+                            match &block.inlines()[pieces[piece_index.piece].inline] {
+                                Inline::Math(list) => {
+                                    let expression = math_layout::layout(list, 0, scale, measure);
+                                    Some(
+                                        expression.ascent
+                                            + expression.descent
+                                            + MATH_LEADING * scale,
+                                    )
+                                }
+                                Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
+                                Inline::TableCell(_) => {
+                                    unreachable!("table-cell wrappers use table layout")
+                                }
                             }
-                            Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
-                        },
-                    )
-                    .fold(0.0, f32::max);
-                let height = base_line_height.max(content_height);
-                let line = VisLine {
-                    y: line_y,
-                    x: indent,
-                    height,
-                    segments: segments_for(&pieces, line_pieces, block),
-                };
-                line_y += height;
-                line
-            })
-            .collect::<Vec<_>>();
+                        })
+                        .fold(0.0, f32::max);
+                    let height = base_line_height.max(content_height);
+                    let line = VisLine {
+                        y: line_y,
+                        x: indent,
+                        height,
+                        segments: segments_for(&pieces, line_pieces, block),
+                    };
+                    line_y += height;
+                    line
+                })
+                .collect::<Vec<_>>()
+        };
 
         // VisLine heights are content-driven, so later lines start after the
         // actual height of every earlier line rather than a copied constant.
@@ -760,13 +1165,20 @@ pub fn layout_blocks(
             hidden: None,
             indicator,
         });
+        tables.push(table);
         y += height;
 
-        let gap_after = if block.is_code()
+        let grouped_with_next = (block.is_table()
             && matches!(
                 blocks.get(source_index + 1),
-                Some(Block::CodeLine { first: false, .. })
-            ) {
+                Some(Block::TableRow { first: false, .. })
+            ))
+            || (block.is_code()
+                && matches!(
+                    blocks.get(source_index + 1),
+                    Some(Block::CodeLine { first: false, .. })
+                ));
+        let gap_after = if grouped_with_next {
             0.0
         } else if block.is_math() {
             GAP_MATH * scale
@@ -807,6 +1219,7 @@ pub fn layout_blocks(
 
     DocLayout {
         blocks: laid,
+        tables,
         source: blocks.to_vec(),
         code_colors: super::code::colors(blocks),
         height: y,
@@ -843,7 +1256,20 @@ fn run_text(run: &Inline) -> &str {
         Inline::Math(_) => "\u{FFFC}",
         Inline::Note(_) => "\u{FFFC}",
         Inline::EqRef(_) => "\u{FFFC}",
+        Inline::TableCell(_) => unreachable!("table-cell wrappers must be flattened first"),
     }
+}
+
+/// A block's characters the way a [`FlatRange`] offset indexes them: every
+/// run's text end to end, with a math atom, a note, or an equation
+/// reference standing in as the one object-replacement character it
+/// occupies.
+pub fn flat_chars(block: &Block) -> Vec<char> {
+    block
+        .inlines()
+        .iter()
+        .flat_map(|run| run_text(run).chars())
+        .collect()
 }
 
 fn run_style(run: &Inline) -> Style {
@@ -852,6 +1278,7 @@ fn run_style(run: &Inline) -> Style {
         Inline::Math(_) => Style::PLAIN,
         Inline::Note(_) => Style::PLAIN,
         Inline::EqRef(_) => Style::PLAIN,
+        Inline::TableCell(_) => unreachable!("table-cell wrappers must be flattened first"),
     }
 }
 
@@ -1222,12 +1649,123 @@ impl DocLayout {
         (x >= bx && x <= bx + w && y >= by && y <= by + h).then_some(block_idx)
     }
 
+    /// The first row of the table containing this point. Normal-mode clicks
+    /// use this to open the grid-line selector rather than a text menu.
+    pub fn table_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.table_cell_at(x, y).map(|cell| cell.first)
+    }
+
+    /// The table cell containing a point, if any. Its geometry is shared by
+    /// the context click routing and the structural controls in the card.
+    pub fn table_cell_at(&self, x: f32, y: f32) -> Option<TableCell> {
+        let block = block_of_y(self, y);
+        let table = self.tables.get(block)?.as_ref()?;
+        let layout = self.blocks.get(block)?;
+        if x < 0.0
+            || x > table.columns.iter().sum::<f32>()
+            || y < layout.y
+            || y > layout.y + layout.height
+        {
+            return None;
+        }
+        let mut edge = 0.0;
+        let mut column = table.columns.len().saturating_sub(1);
+        for (index, width) in table.columns.iter().enumerate() {
+            edge += width;
+            if x <= edge {
+                column = index;
+                break;
+            }
+        }
+        Some(TableCell {
+            first: table.first,
+            row: table.row,
+            column,
+        })
+    }
+
+    /// The internal track divider under a point. Outer borders are styling,
+    /// so only dividers with a neighbour resize a row or column.
+    pub fn table_resize_at(&self, x: f32, y: f32, tolerance: f32) -> Option<TableResize> {
+        // A boundary belongs to the following block in `block_of_y`, but a
+        // row divider belongs to the row above it. Check both neighbours so
+        // its hit target stays continuous across that half-open seam.
+        let below = block_of_y(self, y);
+        for block in [below, below.saturating_sub(1)] {
+            let Some(table) = self.tables.get(block).and_then(Option::as_ref) else {
+                continue;
+            };
+            let Some(layout) = self.blocks.get(block) else {
+                continue;
+            };
+            if y < layout.y - tolerance || y > layout.y + layout.height + tolerance {
+                continue;
+            }
+            let rows = (table.first..self.source.len())
+                .take_while(|&row| {
+                    row == table.first
+                        || matches!(
+                            self.source.get(row),
+                            Some(Block::TableRow { first: false, .. })
+                        )
+                })
+                .count();
+            if table.row + 1 < rows && (y - (layout.y + layout.height)).abs() <= tolerance {
+                return Some(TableResize::Row {
+                    first: table.first,
+                    divider: table.row,
+                });
+            }
+            let mut edge = 0.0;
+            for (divider, width) in table
+                .columns
+                .iter()
+                .enumerate()
+                .take(table.columns.len() - 1)
+            {
+                edge += width;
+                if (x - edge).abs() <= tolerance {
+                    return Some(TableResize::Column {
+                        first: table.first,
+                        divider,
+                    });
+                }
+            }
+        }
+        None
+    }
+
     /// (x, baseline-y, line-height) of a model caret, relative to content top.
     pub fn caret_pos(
         &self,
         caret: Caret,
         measure: &dyn Fn(&str, &TextStyle) -> f32,
     ) -> (f32, f32, f32) {
+        if let Some(table) = self.tables.get(caret.block).and_then(Option::as_ref) {
+            let cell = caret.inline.min(table.columns.len().saturating_sub(1));
+            let left: f32 = table.columns.iter().take(cell).sum();
+            let inset = TABLE_CELL_PAD * self.scale;
+            let cell_block = table_cell_block(&self.source[caret.block].inlines()[cell]);
+            let lines = &table.cells[cell];
+            let line_index = table_cell_line_of_flat(lines, caret.offset);
+            let line = &lines[line_index];
+            let line_start = table_cell_line_start(lines, line_index);
+            let x = x_of_flat(
+                &cell_block,
+                line,
+                line_start,
+                caret.offset,
+                self.scale,
+                measure,
+            );
+            let content_top = self.blocks[caret.block].y
+                + (table.row_height - table_cell_height(lines)).max(0.0) * 0.5;
+            return (
+                left + inset + x,
+                content_top + line.y + line.height * 0.5,
+                line.height,
+            );
+        }
         let flat = flat_of_caret(&self.source, caret);
         let block = &self.source[caret.block];
         let layout_block = &self.blocks[caret.block];
@@ -1263,6 +1801,61 @@ impl DocLayout {
                 style: Style::PLAIN,
             };
         }
+        if let Some(table) = self.tables.get(block_idx).and_then(Option::as_ref) {
+            let mut left = 0.0;
+            let mut cell = table.columns.len().saturating_sub(1);
+            for (index, width) in table.columns.iter().enumerate() {
+                if x < left + *width {
+                    cell = index;
+                    break;
+                }
+                left += width;
+            }
+            let target = (x - left - TABLE_CELL_PAD * self.scale).max(0.0);
+            let cell_block = table_cell_block(&self.source[block_idx].inlines()[cell]);
+            let lines = &table.cells[cell];
+            let content_top = self.blocks[block_idx].y
+                + (table.row_height - table_cell_height(lines)).max(0.0) * 0.5;
+            let line_index = lines
+                .iter()
+                .position(|line| y < content_top + line.y + line.height)
+                .unwrap_or(lines.len().saturating_sub(1));
+            let line = &lines[line_index];
+            let line_start = table_cell_line_start(lines, line_index);
+            let mut position = line.segments.iter().map(|segment| segment.len).sum();
+            let mut advance_x = 0.0;
+            let mut segment_flat = 0;
+            for segment in &line.segments {
+                let run = &cell_block.inlines()[segment.inline];
+                let text = segment_text(run, segment);
+                let width = segment.advance(run, &text, &cell_block, self.scale, measure);
+                if matches!(run, Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_)) {
+                    if target <= advance_x + width * 0.5 {
+                        position = segment_flat;
+                        break;
+                    }
+                } else {
+                    let style = text_style(&cell_block, segment.style, self.scale);
+                    let text_x = advance_x + segment.text_inset(self.scale);
+                    let char_index = caret_char_for_x(&text, text_x, target, &style, measure);
+                    if char_index < segment.len {
+                        position = segment_flat + char_index;
+                        break;
+                    }
+                }
+                advance_x += width;
+                segment_flat += segment.len;
+            }
+            let offset = (line_start + position).min(block_flat_len(&cell_block));
+            let style =
+                style_before(std::slice::from_ref(&cell_block), 0, offset).unwrap_or(Style::PLAIN);
+            return Caret {
+                block: block_idx,
+                inline: cell,
+                offset,
+                style,
+            };
+        }
         let layout_block = &self.blocks[block_idx];
         let line_idx = line_of_y(layout_block, y);
         caret_for_click(
@@ -1288,14 +1881,135 @@ impl DocLayout {
         if self.blocks[block_idx].hidden.is_some() {
             return None;
         }
+        if let Some(table) = self.tables.get(block_idx).and_then(Option::as_ref) {
+            let cell = self.table_cell_at(x, y)?;
+            let left: f32 = table.columns.iter().take(cell.column).sum();
+            let inset = TABLE_CELL_PAD * self.scale;
+            let wrapper = &self.source[block_idx].inlines()[cell.column];
+            let cell_block = table_cell_block(wrapper);
+            let lines = &table.cells[cell.column];
+            let content_top = self.blocks[block_idx].y
+                + (table.row_height - table_cell_height(lines)).max(0.0) * 0.5;
+            let line_index = lines
+                .iter()
+                .position(|line| y < content_top + line.y + line.height)?;
+            let line = &lines[line_index];
+            let local_x = x - left - inset;
+            let baseline = content_top + line.y + line.height * 0.5;
+            let cell_base: usize = self.source[block_idx].inlines()[..cell.column]
+                .iter()
+                .map(|cell| {
+                    cell.table_cell_contents()
+                        .expect("table rows contain table-cell wrappers")
+                        .iter()
+                        .map(|run| run_text(run).chars().count())
+                        .sum::<usize>()
+                })
+                .sum();
+            let mut advance_x = 0.0;
+            for segment in &line.segments {
+                let run = &cell_block.inlines()[segment.inline];
+                let run_start: usize = cell_block.inlines()[..segment.inline]
+                    .iter()
+                    .map(|run| run_text(run).chars().count())
+                    .sum();
+                let text = segment_text(run, segment);
+                let width = segment.advance(run, &text, &cell_block, self.scale, measure);
+                if local_x < advance_x || local_x > advance_x + width {
+                    advance_x += width;
+                    continue;
+                }
+                if let Inline::Math(list) = run {
+                    let local = (local_x - advance_x, baseline - y);
+                    let expression = math_layout::layout(list, 0, self.scale, measure);
+                    let bounds = math_layout::interaction_bounds(&expression);
+                    return (local.0 >= bounds.left
+                        && local.0 <= bounds.right
+                        && local.1 >= -bounds.descent
+                        && local.1 <= bounds.ascent)
+                        .then(|| ContextHit::Math {
+                            block: block_idx,
+                            inline: cell.column,
+                            offset: cell_base + run_start,
+                            node: math_layout::hit_node(list, local, 0, self.scale, measure),
+                        });
+                }
+                let run_len = run_text(run).chars().count();
+                let whole_run = FlatRange::new(
+                    FlatPos {
+                        block: block_idx,
+                        offset: cell_base + run_start,
+                    },
+                    FlatPos {
+                        block: block_idx,
+                        offset: cell_base + run_start + run_len,
+                    },
+                );
+                if segment.style.badge {
+                    return Some(ContextHit::Range {
+                        range: whole_run,
+                        kind: RangeKind::Badge,
+                    });
+                }
+                if segment.style.code && !segment.style.syntax.manual {
+                    return Some(ContextHit::Range {
+                        range: whole_run,
+                        kind: RangeKind::InlineCode,
+                    });
+                }
+                let style = text_style(&cell_block, segment.style, self.scale);
+                let text_x = advance_x + segment.text_inset(self.scale);
+                let within = context_char_for_x(&text, text_x, local_x, &style, measure);
+                let ch = text.chars().nth(within)?;
+                if !ch.is_alphanumeric() && ch != '_' {
+                    return None;
+                }
+                let chars = flat_chars(&cell_block);
+                let clicked = run_start + segment.start + within;
+                let (lower, upper) = if segment.style.code {
+                    code_span_bounds(&cell_block, segment.inline)
+                } else {
+                    (0, chars.len())
+                };
+                let mut start = clicked;
+                while start > lower
+                    && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_')
+                {
+                    start -= 1;
+                }
+                let mut end = clicked + 1;
+                while end < upper && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                    end += 1;
+                }
+                return Some(ContextHit::Range {
+                    range: FlatRange::new(
+                        FlatPos {
+                            block: block_idx,
+                            offset: cell_base + start,
+                        },
+                        FlatPos {
+                            block: block_idx,
+                            offset: cell_base + end,
+                        },
+                    ),
+                    kind: if segment.style.code {
+                        RangeKind::CodeWord
+                    } else {
+                        RangeKind::Word
+                    },
+                });
+            }
+            return None;
+        }
         let layout_block = &self.blocks[block_idx];
         let line_idx = line_of_y(layout_block, y);
-        if let Some((block, inline, node)) =
+        if let Some((block, inline, offset, node)) =
             self.hit_math_node_on_line(block_idx, line_idx, x, y, measure)
         {
             return Some(ContextHit::Math {
                 block,
                 inline,
+                offset,
                 node,
             });
         }
@@ -1397,11 +2111,7 @@ impl DocLayout {
                 {
                     return self.hit_hidden_math_node(block_idx, line_idx, x, y, measure);
                 }
-                let chars: Vec<char> = block
-                    .inlines()
-                    .iter()
-                    .flat_map(|run| run_text(run).chars())
-                    .collect();
+                let chars = flat_chars(block);
                 let (lower, upper) = if segment.style.code {
                     code_span_bounds(block, segment.inline)
                 } else {
@@ -1480,11 +2190,7 @@ impl DocLayout {
                 continue;
             }
 
-            let chars: Vec<char> = block
-                .inlines()
-                .iter()
-                .flat_map(|run| run_text(run).chars())
-                .collect();
+            let chars = flat_chars(block);
             for line in &layout_block.lines {
                 let point = (x - line.x, y);
                 let baseline = line.y + line.height * 0.5;
@@ -1517,6 +2223,7 @@ impl DocLayout {
                                     ContextHit::Math {
                                         block: block_idx,
                                         inline: segment.inline,
+                                        offset: run_start,
                                         node: None,
                                     },
                                 );
@@ -1529,6 +2236,7 @@ impl DocLayout {
                                         ContextHit::Math {
                                             block: block_idx,
                                             inline: segment.inline,
+                                            offset: run_start,
                                             node: Some(node),
                                         },
                                     );
@@ -1703,7 +2411,8 @@ impl DocLayout {
                     return Some(ContextHit::Math {
                         block: hit.0,
                         inline: hit.1,
-                        node: hit.2,
+                        offset: hit.2,
+                        node: hit.3,
                     });
                 }
             }
@@ -1718,7 +2427,7 @@ impl DocLayout {
         x: f32,
         y: f32,
         measure: &dyn Fn(&str, &TextStyle) -> f32,
-    ) -> Option<(usize, usize, Option<NodeAddress>)> {
+    ) -> Option<(usize, usize, usize, Option<NodeAddress>)> {
         let line = &self.blocks[block_idx].lines[line_idx];
         let block = &self.source[block_idx];
         let x = x - line.x;
@@ -1739,6 +2448,10 @@ impl DocLayout {
                     return Some((
                         block_idx,
                         segment.inline,
+                        block.inlines()[..segment.inline]
+                            .iter()
+                            .map(|run| run_text(run).chars().count())
+                            .sum(),
                         math_layout::hit_node(list, local, 0, self.scale, measure),
                     ));
                 }
@@ -1755,9 +2468,63 @@ impl DocLayout {
         x: f32,
         y: f32,
         measure: &dyn Fn(&str, &TextStyle) -> f32,
-    ) -> Option<(usize, usize, MathCursor)> {
+    ) -> Option<(usize, usize, usize, MathCursor)> {
         let block_idx = block_of_y(self, y);
         if self.blocks[block_idx].hidden.is_some() {
+            return None;
+        }
+        if let Some(table) = self.tables.get(block_idx).and_then(Option::as_ref) {
+            let cell = self.table_cell_at(x, y)?;
+            let left: f32 = table.columns.iter().take(cell.column).sum();
+            let inset = TABLE_CELL_PAD * self.scale;
+            let wrapper = &self.source[block_idx].inlines()[cell.column];
+            let cell_block = table_cell_block(wrapper);
+            let lines = &table.cells[cell.column];
+            let content_top = self.blocks[block_idx].y
+                + (table.row_height - table_cell_height(lines)).max(0.0) * 0.5;
+            let line = lines.iter().find(|line| {
+                y >= content_top + line.y && y <= content_top + line.y + line.height
+            })?;
+            let baseline = content_top + line.y + line.height * 0.5;
+            let local_x = x - left - inset;
+            let mut advance_x = 0.0;
+            for segment in &line.segments {
+                let run = &cell_block.inlines()[segment.inline];
+                let text = segment_text(run, segment);
+                let width = segment.advance(run, &text, &cell_block, self.scale, measure);
+                if let Inline::Math(list) = run {
+                    let local = (local_x - advance_x, baseline - y);
+                    let expression = math_layout::layout(list, 0, self.scale, measure);
+                    let bounds = math_layout::interaction_bounds(&expression);
+                    if local.0 >= bounds.left
+                        && local.0 <= bounds.right
+                        && local.1 >= -bounds.descent
+                        && local.1 <= bounds.ascent
+                    {
+                        let offset = self.source[block_idx].inlines()[..cell.column]
+                            .iter()
+                            .map(|cell| {
+                                cell.table_cell_contents()
+                                    .expect("table rows contain table-cell wrappers")
+                                    .iter()
+                                    .map(|run| run_text(run).chars().count())
+                                    .sum::<usize>()
+                            })
+                            .sum::<usize>()
+                            + cell_block.inlines()[..segment.inline]
+                                .iter()
+                                .map(|run| run_text(run).chars().count())
+                                .sum::<usize>();
+                        return Some((
+                            block_idx,
+                            cell.column,
+                            offset,
+                            math_layout::hit(list, local, 0, self.scale, measure),
+                        ));
+                    }
+                }
+                advance_x += width;
+            }
             return None;
         }
         let layout_block = &self.blocks[block_idx];
@@ -1789,7 +2556,7 @@ impl DocLayout {
         x: f32,
         y: f32,
         measure: &dyn Fn(&str, &TextStyle) -> f32,
-    ) -> Option<(usize, usize, MathCursor)> {
+    ) -> Option<(usize, usize, usize, MathCursor)> {
         let line = &self.blocks[block_idx].lines[line_idx];
         let block = &self.source[block_idx];
         let x = x - line.x;
@@ -1813,6 +2580,10 @@ impl DocLayout {
                     return Some((
                         block_idx,
                         segment.inline,
+                        block.inlines()[..segment.inline]
+                            .iter()
+                            .map(|run| run_text(run).chars().count())
+                            .sum(),
                         math_layout::hit(list, (local_x, local_y), 0, self.scale, measure),
                     ));
                 }
@@ -1829,6 +2600,27 @@ impl DocLayout {
         goal_x: f32,
         measure: &dyn Fn(&str, &TextStyle) -> f32,
     ) -> Option<Caret> {
+        if self.tables.get(caret.block).is_some_and(Option::is_some) {
+            if caret.block == 0 {
+                return None;
+            }
+            let previous = self.visible_before(caret.block)?;
+            let target = &self.blocks[previous];
+            return if self.tables.get(previous).is_some_and(Option::is_some) {
+                Some(self.hit(goal_x, target.y + target.height * 0.5, measure))
+            } else {
+                let last_line = target.lines.len() - 1;
+                Some(caret_for_click(
+                    &self.source,
+                    target,
+                    previous,
+                    last_line,
+                    goal_x,
+                    self.scale,
+                    measure,
+                ))
+            };
+        }
         let flat = flat_of_caret(&self.source, caret);
         let block_idx = caret.block;
         let layout_block = &self.blocks[block_idx];
@@ -1849,6 +2641,10 @@ impl DocLayout {
             return None;
         }
         let prev = self.visible_before(block_idx)?;
+        if self.tables.get(prev).is_some_and(Option::is_some) {
+            let target = &self.blocks[prev];
+            return Some(self.hit(goal_x, target.y + target.height * 0.5, measure));
+        }
         let last_line = self.blocks[prev].lines.len() - 1;
         Some(caret_for_click(
             &self.source,
@@ -1881,6 +2677,23 @@ impl DocLayout {
         goal_x: f32,
         measure: &dyn Fn(&str, &TextStyle) -> f32,
     ) -> Option<Caret> {
+        if self.tables.get(caret.block).is_some_and(Option::is_some) {
+            let next = self.visible_after(caret.block)?;
+            let target = &self.blocks[next];
+            return if self.tables.get(next).is_some_and(Option::is_some) {
+                Some(self.hit(goal_x, target.y + target.height * 0.5, measure))
+            } else {
+                Some(caret_for_click(
+                    &self.source,
+                    target,
+                    next,
+                    0,
+                    goal_x,
+                    self.scale,
+                    measure,
+                ))
+            };
+        }
         let flat = flat_of_caret(&self.source, caret);
         let block_idx = caret.block;
         let layout_block = &self.blocks[block_idx];
@@ -1898,6 +2711,10 @@ impl DocLayout {
             ));
         }
         let next = self.visible_after(block_idx)?;
+        if self.tables.get(next).is_some_and(Option::is_some) {
+            let target = &self.blocks[next];
+            return Some(self.hit(goal_x, target.y + target.height * 0.5, measure));
+        }
         Some(caret_for_click(
             &self.source,
             &self.blocks[next],
@@ -3068,7 +3885,7 @@ mod tests {
             line.y + line.height / 2.0,
             &fake_measure,
         );
-        assert!(matches!(inside, Some((0, 1, _))));
+        assert!(matches!(inside, Some((0, 1, _, _))));
 
         let past = laid.hit_math(
             70.0 + atom_width + 20.0,
@@ -3098,7 +3915,7 @@ mod tests {
         let baseline = laid.blocks[0].lines[0].height * 0.5;
         let y = baseline - children[0].1 - denominator.1;
 
-        let (_, _, cursor) = laid
+        let (_, _, _, cursor) = laid
             .hit_math(x, y, &fake_measure)
             .expect("denominator must be interactive");
         assert_eq!(
@@ -3302,6 +4119,7 @@ mod tests {
             Some(ContextHit::Math {
                 block: 0,
                 inline: 0,
+                offset: 0,
                 node: Some(NodeAddress {
                     path: vec![Step {
                         index: 0,
@@ -3391,6 +4209,7 @@ mod tests {
         assert!(hits.contains(&ContextHit::Math {
             block: 0,
             inline: 2,
+            offset: 9,
             node: None,
         }));
     }
@@ -3455,7 +4274,7 @@ mod tests {
             let x = children[0].0 + child.0 + child.2.width * 0.5;
             let local_y = children[0].1 + child.1;
             let y = line.y + line.height * 0.5 - local_y;
-            let (_, _, cursor) = laid
+            let (_, _, _, cursor) = laid
                 .hit_math(x, y, &fake_measure)
                 .expect("hidden limit must remain interactive");
             assert_eq!(cursor.path, vec![Step { index: 0, slot }]);
@@ -3479,7 +4298,7 @@ mod tests {
             &fake_measure,
         );
         let line = &laid.blocks[0].lines[0];
-        let (_, inline, cursor) = laid
+        let (_, inline, _, cursor) = laid
             .hit_math(first_width, line.y + line.height * 0.5, &fake_measure)
             .expect("shared boundary must delegate to math hit-testing");
         assert_eq!(inline, 0);
@@ -3770,5 +4589,96 @@ mod tests {
         assert_eq!(bare, -(NUMBER_GUTTER + CHEVRON_GAP));
         assert_eq!(wide, CHEVRON_RIGHT_FLOOR);
         assert!(wide < bare);
+    }
+
+    #[test]
+    fn a_table_fills_the_measure_and_exposes_cells_and_track_dividers() {
+        let mut document = Document::new(std::path::Path::new("notes/table.md"));
+        document.insert_table();
+        let laid = layout(&document, 400.0, &fake_measure);
+        let table = laid.tables[0].as_ref().unwrap();
+        let middle = laid.blocks[0].y + table.row_height * 0.5;
+
+        assert_eq!(table.columns.iter().sum::<f32>(), 400.0);
+        assert_eq!(laid.hit(300.0, middle, &fake_measure).inline, 1);
+        let second_column = Caret {
+            block: 0,
+            inline: 1,
+            offset: 0,
+            style: Style::PLAIN,
+        };
+        let goal_x = laid.caret_pos(second_column, &fake_measure).0;
+        let next_row = laid
+            .line_down(second_column, goal_x, &fake_measure)
+            .expect("the second table row is visible");
+        assert_eq!((next_row.block, next_row.inline), (1, 1));
+        assert!(matches!(
+            laid.table_resize_at(table.columns[0], middle, 1.0),
+            Some(TableResize::Column {
+                first: 0,
+                divider: 0
+            })
+        ));
+        assert!(matches!(
+            laid.table_resize_at(100.0, laid.blocks[0].y + laid.blocks[0].height, 1.0),
+            Some(TableResize::Row {
+                first: 0,
+                divider: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn long_table_text_wraps_into_a_taller_editable_cell() {
+        let mut document = Document::new(std::path::Path::new("notes/table.md"));
+        document.insert_table();
+        document.insert_text("abcdefghij");
+        let laid = layout(&document, 100.0, &fake_measure);
+        let table = laid.tables[0].as_ref().unwrap();
+        assert!(
+            table.row_height > crate::document::table::DEFAULT_ROW_HEIGHT,
+            "cell text grows the row instead of painting through its edge"
+        );
+        let caret = Caret {
+            block: 0,
+            inline: 0,
+            offset: 6,
+            style: Style::PLAIN,
+        };
+        let (x, y, _) = laid.caret_pos(caret, &fake_measure);
+        assert_eq!(laid.hit(x, y, &fake_measure), caret);
+        assert!(matches!(
+            laid.hit_context(x, y, &fake_measure),
+            Some(ContextHit::Range {
+                kind: RangeKind::Word,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_math_table_cell_uses_the_table_layout_and_remains_interactive() {
+        let mut document = Document::new(std::path::Path::new("notes/table.md"));
+        document.insert_table();
+        document.insert_inline_math();
+        document.math_insert_char('x');
+        let laid = layout(&document, 400.0, &fake_measure);
+        let table = laid.tables[0]
+            .as_ref()
+            .expect("the table layout survives math");
+        let y = laid.blocks[0].y + table.row_height * 0.5;
+        let x = TABLE_CELL_PAD + 5.0;
+        let hit = laid
+            .hit_math(x, y, &fake_measure)
+            .expect("the expression remains directly editable");
+        assert_eq!((hit.0, hit.1), (0, 0));
+        assert!(matches!(
+            laid.hit_context(x, y, &fake_measure),
+            Some(ContextHit::Math {
+                block: 0,
+                inline: 0,
+                ..
+            })
+        ));
     }
 }

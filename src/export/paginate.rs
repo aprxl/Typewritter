@@ -188,6 +188,7 @@ mod tests {
         }
         DocLayout {
             blocks,
+            tables: vec![None; heights.len()],
             height: y,
             scale: 1.0,
             code_colors: vec![Vec::new(); heights.len()],
@@ -219,6 +220,7 @@ mod tests {
                 hidden: None,
                 indicator: None,
             }],
+            tables: vec![None],
             height: total,
             scale: 1.0,
             source: vec![Block::Paragraph(Vec::new())],

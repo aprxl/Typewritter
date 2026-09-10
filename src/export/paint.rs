@@ -16,7 +16,9 @@ use crate::components::editor::{
 };
 use crate::components::sidenotes;
 use crate::document::decoration::{self, Painted};
-use crate::document::layout::{self, DocLayout, NUMBER_GUTTER, NUMBER_SIZE};
+use crate::document::layout::{
+    self, DocLayout, NUMBER_GUTTER, NUMBER_SIZE, TABLE_CELL_PAD,
+};
 use crate::document::{ATOM, Block, Inline, code, math_layout, math_paint};
 use crate::layout::Rect;
 use crate::renderer::{Color, Rounding};
@@ -292,6 +294,7 @@ fn block(
                 );
             }
         }
+        Block::TableRow { .. } => table_row(canvas, layout, piece, first, dy),
         // A fence's tint is drawn by `fences`, which sees the whole run;
         // a paragraph has no furniture of its own at all.
         Block::Paragraph(_) | Block::CodeLine { .. } => {}
@@ -302,6 +305,184 @@ fn block(
             continue;
         };
         self::line(canvas, layout, piece.block, line, dy);
+    }
+}
+
+/// The PDF counterpart of `Editor::draw_table`: one row at a time because
+/// pagination may put neighbouring rows on different sheets. Track geometry
+/// still comes from the same layout snapshot as the editor.
+fn table_row(
+    canvas: &mut dyn Canvas,
+    layout: &DocLayout,
+    piece: &Piece,
+    line: &crate::document::layout::VisLine,
+    dy: f32,
+) {
+    let Some(table) = layout.tables.get(piece.block).and_then(Option::as_ref) else {
+        return;
+    };
+    let top = line.y + dy;
+    let height = line.height;
+    let width: f32 = table.columns.iter().sum();
+    canvas.draw_rectangle(
+        (0.0, top),
+        (width, height),
+        theme::fade(theme::alt(), 0.78),
+        Rounding::NONE,
+    );
+    let mut left = 0.0;
+    for (column, wrapper) in layout.source[piece.block].inlines().iter().enumerate() {
+        let inset = TABLE_CELL_PAD * layout.scale;
+        let contents = wrapper
+            .table_cell_contents()
+            .expect("table rows contain table-cell wrappers");
+        let cell_block = Block::Paragraph(contents.to_vec());
+        let lines = &table.cells[column];
+        let content_height: f32 = lines.iter().map(|line| line.height).sum();
+        let content_top = top + (height - content_height).max(0.0) * 0.5;
+        for line in lines {
+            let line_top = content_top + line.y;
+            let baseline = line_top + line.height * 0.5;
+            let mut cursor = left + inset;
+            let mut pieces = Vec::with_capacity(line.segments.len());
+            for segment in &line.segments {
+                let run = &contents[segment.inline];
+                let text: String = match run {
+                    Inline::Text(text) => text
+                        .text
+                        .chars()
+                        .skip(segment.start)
+                        .take(segment.len.min(VIEW_CAP))
+                        .collect(),
+                    Inline::Math(_) => ATOM.to_string(),
+                    Inline::Note(_) | Inline::EqRef(_) => {
+                        segment.number.clone().unwrap_or_default()
+                    }
+                    Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
+                };
+                let advance = segment.advance(
+                    run,
+                    &text,
+                    &cell_block,
+                    layout.scale,
+                    &|text, style| canvas.measure(text, style),
+                );
+                match run {
+                    Inline::Math(list) => {
+                        let expression =
+                            math_layout::layout(list, 0, layout.scale, &|text, style| {
+                                canvas.measure(text, style)
+                            });
+                        math_paint::draw(canvas, &expression, (cursor, baseline), false);
+                    }
+                    Inline::Note(_) => canvas.draw_text(
+                        &text,
+                        (cursor, baseline - layout::ANCHOR_RISE),
+                        &layout::anchor_style(),
+                        theme::LEFT,
+                    ),
+                    Inline::EqRef(_) => canvas.draw_text(
+                        &text,
+                        (cursor, baseline),
+                        &layout::eq_ref_style(&text, layout.scale),
+                        theme::LEFT,
+                    ),
+                    Inline::Text(_) => {}
+                    Inline::TableCell(_) => unreachable!("nested table cells are invalid"),
+                }
+                pieces.push(decoration::piece(
+                    text,
+                    segment.style,
+                    cursor,
+                    advance,
+                    layout.scale,
+                    segment.padding,
+                ));
+                cursor += advance;
+            }
+            decoration::runs(
+                canvas,
+                &pieces,
+                &cell_block,
+                line_top,
+                line.height,
+                baseline,
+                layout.scale,
+            );
+            for ((text, _, at, _), segment) in pieces.iter().zip(&line.segments) {
+                if matches!(contents[segment.inline], Inline::Text(_)) {
+                    canvas.draw_text(
+                        text,
+                        (*at, baseline),
+                        &layout::table_text_style(segment.style, layout.scale),
+                        theme::LEFT,
+                    );
+                }
+            }
+        }
+        left += table.columns[column];
+    }
+    let line_color = theme::border();
+    if table.lines.left {
+        canvas.draw_rectangle(
+            (0.0, top),
+            (1.0, height),
+            line_color.clone(),
+            Rounding::NONE,
+        );
+    }
+    if table.lines.right {
+        canvas.draw_rectangle(
+            (width, top),
+            (1.0, height),
+            line_color.clone(),
+            Rounding::NONE,
+        );
+    }
+    if table.lines.vertical {
+        let mut edge = 0.0;
+        for track in table
+            .columns
+            .iter()
+            .take(table.columns.len().saturating_sub(1))
+        {
+            edge += track;
+            canvas.draw_rectangle(
+                (edge, top),
+                (1.0, height),
+                line_color.clone(),
+                Rounding::NONE,
+            );
+        }
+    }
+    if table.row == 0 && table.lines.top {
+        canvas.draw_rectangle((0.0, top), (width, 1.0), line_color.clone(), Rounding::NONE);
+    }
+    let rows = (table.first..layout.source.len())
+        .take_while(|&row| {
+            row == table.first
+                || matches!(
+                    layout.source.get(row),
+                    Some(Block::TableRow { first: false, .. })
+                )
+        })
+        .count();
+    if table.row + 1 == rows {
+        if table.lines.bottom {
+            canvas.draw_rectangle(
+                (0.0, top + height),
+                (width, 1.0),
+                line_color,
+                Rounding::NONE,
+            );
+        }
+    } else if table.lines.horizontal {
+        canvas.draw_rectangle(
+            (0.0, top + height),
+            (width, 1.0),
+            line_color,
+            Rounding::NONE,
+        );
     }
 }
 
@@ -341,6 +522,7 @@ fn line(
             // what the author stored — carried on the segment so the drawing
             // and `advance` read one value.
             Inline::Note(_) | Inline::EqRef(_) => segment.number.clone().unwrap_or_default(),
+            Inline::TableCell(_) => unreachable!("table rows use table_row"),
         };
         let width = segment.advance(run, &text, kind, layout.scale, &|text, style| {
             canvas.measure(text, style)
@@ -385,6 +567,7 @@ fn line(
                 let style = layout::eq_ref_style(&text, layout.scale);
                 canvas.draw_text(&text, (cursor, baseline), &style, theme::LEFT);
             }
+            Inline::TableCell(_) => unreachable!("table rows use table_row"),
         }
         pieces.push(decoration::piece(
             text,

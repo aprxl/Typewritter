@@ -1,0 +1,415 @@
+//! Direct manipulation for a table's presentation and structure.
+//!
+//! The little grid is a real six-stroke selector rather than a translation
+//! layer for `Top` and `Bottom` labels. The row and column controls beneath
+//! it make changing the grid's shape just as local as changing its lines.
+
+use crate::document::table::{GridLine, TableLines};
+use crate::layout::Rect;
+use crate::renderer::{Layer, Rounding};
+use crate::theme::{self, TextStyle};
+use crate::ui::{Component, Context, Dirty, Hover};
+
+const CARD_WIDTH: f32 = 218.0;
+const CARD_HEIGHT: f32 = 240.0;
+const GRID: f32 = 96.0;
+const HIT: f32 = 11.0;
+const PAD: f32 = 16.0;
+const BUTTON: f32 = 25.0;
+const ROW_HEIGHT: f32 = 29.0;
+
+/// A structural action selected from the lower half of the table card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableAction {
+    InsertRow,
+    RemoveRow,
+    InsertColumn,
+    RemoveColumn,
+}
+
+/// Every direct target in the card. The shell consumes this instead of
+/// recovering intent from a point after the component has already drawn it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableHit {
+    Line(GridLine),
+    Action(TableAction),
+}
+
+/// The resting popup rectangle. Shared by drawing and input so a control's
+/// hit target always stays over its painted shape.
+pub fn card_anchored(viewport: Rect, anchor: (f32, f32)) -> Rect {
+    let width = CARD_WIDTH.min(viewport.width);
+    let height = CARD_HEIGHT.min(viewport.height);
+    let x = anchor
+        .0
+        .clamp(viewport.x, (viewport.right() - width).max(viewport.x));
+    let y = if anchor.1 + height > viewport.bottom() {
+        anchor.1 - height
+    } else {
+        anchor.1
+    }
+    .clamp(viewport.y, (viewport.bottom() - height).max(viewport.y));
+    Rect::new(x, y, width, height)
+}
+
+fn grid(card: Rect) -> Rect {
+    let size = GRID.min(card.width - PAD * 2.0).max(0.0);
+    Rect::new(
+        card.x + (card.width - size) * 0.5,
+        card.y + 39.0,
+        size,
+        size,
+    )
+}
+
+fn control_row(card: Rect, column: bool) -> Rect {
+    Rect::new(
+        card.x + PAD,
+        grid(card).bottom() + 13.0 + if column { ROW_HEIGHT + 4.0 } else { 0.0 },
+        (card.width - PAD * 2.0).max(0.0),
+        ROW_HEIGHT,
+    )
+}
+
+fn action_rect(card: Rect, action: TableAction) -> Rect {
+    let row = control_row(
+        card,
+        matches!(
+            action,
+            TableAction::InsertColumn | TableAction::RemoveColumn
+        ),
+    );
+    let x = match action {
+        TableAction::InsertRow | TableAction::InsertColumn => row.right() - BUTTON,
+        TableAction::RemoveRow | TableAction::RemoveColumn => row.right() - BUTTON * 2.0 - 4.0,
+    };
+    Rect::new(x, row.y + (row.height - BUTTON) * 0.5, BUTTON, BUTTON)
+}
+
+/// The semantic grid line hit by the pointer.
+pub fn line_at(card: Rect, point: (f32, f32)) -> Option<GridLine> {
+    if !card.contains(point) {
+        return None;
+    }
+    let grid = grid(card);
+    let mid_x = grid.x + grid.width * 0.5;
+    let mid_y = grid.y + grid.height * 0.5;
+    let near = |a: f32, b: f32| (a - b).abs() <= HIT;
+    let across = point.0 >= grid.x - HIT && point.0 <= grid.right() + HIT;
+    let down = point.1 >= grid.y - HIT && point.1 <= grid.bottom() + HIT;
+    if across && near(point.1, grid.y) {
+        Some(GridLine::Top)
+    } else if across && near(point.1, grid.bottom()) {
+        Some(GridLine::Bottom)
+    } else if down && near(point.0, grid.x) {
+        Some(GridLine::Left)
+    } else if down && near(point.0, grid.right()) {
+        Some(GridLine::Right)
+    } else if across && near(point.1, mid_y) {
+        Some(GridLine::Horizontal)
+    } else if down && near(point.0, mid_x) {
+        Some(GridLine::Vertical)
+    } else {
+        None
+    }
+}
+
+/// The direct line or structural control under `point`.
+pub fn hit_at(card: Rect, point: (f32, f32)) -> Option<TableHit> {
+    line_at(card, point).map(TableHit::Line).or_else(|| {
+        [
+            TableAction::InsertRow,
+            TableAction::RemoveRow,
+            TableAction::InsertColumn,
+            TableAction::RemoveColumn,
+        ]
+        .into_iter()
+        .find(|action| action_rect(card, *action).contains(point))
+        .map(TableHit::Action)
+    })
+}
+
+pub struct TableLinesMenu {
+    lines: TableLines,
+    anchor: (f32, f32),
+    row: usize,
+    column: usize,
+    rows: usize,
+    columns: usize,
+    hover: Option<TableHit>,
+    hover_fade: Hover,
+    dirty: Dirty,
+}
+
+impl TableLinesMenu {
+    pub fn new(
+        lines: TableLines,
+        anchor: (f32, f32),
+        row: usize,
+        column: usize,
+        rows: usize,
+        columns: usize,
+    ) -> Self {
+        Self {
+            lines,
+            anchor,
+            row,
+            column,
+            rows,
+            columns,
+            hover: None,
+            hover_fade: Hover::new(),
+            dirty: Dirty::new(),
+        }
+    }
+
+    pub fn closed() -> Self {
+        Self::new(TableLines::default(), (0.0, 0.0), 0, 0, 0, 0)
+    }
+
+    fn draw_control(&self, layer: &Layer, card: Rect, column: bool) {
+        let row = control_row(card, column);
+        let count = if column { self.columns } else { self.rows };
+        let selected = if column { self.column } else { self.row };
+        let name = if column { "COLUMNS" } else { "ROWS" };
+        let label = format!("{name}  {} / {count}", selected.saturating_add(1));
+        let label_style = TextStyle::sans(10.5, theme::dim()).tracked(0.08);
+        theme::draw(
+            layer,
+            &label,
+            (row.x, row.y + row.height * 0.5),
+            &label_style,
+            theme::LEFT,
+        );
+        let actions = if column {
+            [TableAction::RemoveColumn, TableAction::InsertColumn]
+        } else {
+            [TableAction::RemoveRow, TableAction::InsertRow]
+        };
+        for action in actions {
+            let rect = action_rect(card, action);
+            let available =
+                !matches!(action, TableAction::RemoveRow | TableAction::RemoveColumn) || count > 1;
+            let hovered = available && self.hover == Some(TableHit::Action(action));
+            if hovered {
+                theme::hover_fill(layer, rect, self.hover_fade.value());
+            }
+            layer.draw_rectangle(
+                rect.position(),
+                rect.size(),
+                theme::fade(theme::alt(), 0.72),
+                Rounding::uniform(6.0),
+            );
+            theme::rounded_outline(layer, rect.inset(0.5), 5.5, 1.0, theme::border());
+            let glyph = match action {
+                TableAction::InsertRow | TableAction::InsertColumn => "+",
+                TableAction::RemoveRow | TableAction::RemoveColumn => "−",
+            };
+            theme::draw(
+                layer,
+                glyph,
+                (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5),
+                &TextStyle::sans(
+                    16.0,
+                    if !available {
+                        theme::faint()
+                    } else if hovered {
+                        theme::accent()
+                    } else {
+                        theme::ink()
+                    },
+                ),
+                theme::CENTER,
+            );
+        }
+    }
+}
+
+impl Component for TableLinesMenu {
+    fn measure(&mut self, _: &Layer) -> (f32, f32) {
+        (0.0, 0.0)
+    }
+
+    fn sync(&mut self, context: &Context) {
+        let hover = context
+            .mouse
+            .in_window
+            .then(|| {
+                hit_at(
+                    card_anchored(context.self_rect, self.anchor),
+                    context.mouse.position,
+                )
+            })
+            .flatten();
+        if self
+            .hover_fade
+            .track(&mut self.hover, hover, context.animation_dt)
+        {
+            self.dirty.set();
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.get()
+    }
+
+    fn clear_dirty(&mut self) {
+        self.dirty.clear();
+    }
+
+    fn is_animating(&self) -> bool {
+        self.hover_fade.is_animating()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn draw(&mut self, layer: &Layer, rect: Rect) {
+        let card = card_anchored(rect, self.anchor);
+        layer.draw_rectangle(
+            card.position(),
+            card.size(),
+            theme::elevated_popup(1.0),
+            Rounding::uniform(super::popup::CARD_RADIUS),
+        );
+        theme::rounded_outline(
+            layer,
+            card.inset(0.5),
+            super::popup::CARD_RADIUS - 0.5,
+            1.0,
+            theme::non_text(),
+        );
+        theme::draw(
+            layer,
+            "TABLE",
+            (card.x + PAD, card.y + 21.0),
+            &TextStyle::sans(10.5, theme::faint()).tracked(0.12),
+            theme::LEFT,
+        );
+        theme::draw(
+            layer,
+            "grid",
+            (card.right() - PAD, card.y + 21.0),
+            &TextStyle::sans(11.0, theme::dim()).italic(),
+            theme::RIGHT,
+        );
+
+        let grid = grid(card);
+        let mid_x = grid.x + grid.width * 0.5;
+        let mid_y = grid.y + grid.height * 0.5;
+        let stroke = |line: GridLine| {
+            if self.lines.enabled(line) {
+                theme::accent()
+            } else if self.hover == Some(TableHit::Line(line)) {
+                theme::fade(theme::accent(), 0.7)
+            } else {
+                theme::faint()
+            }
+        };
+        let thickness = |line: GridLine| {
+            if self.lines.enabled(line) || self.hover == Some(TableHit::Line(line)) {
+                2.5
+            } else {
+                1.0
+            }
+        };
+        theme::rule(
+            layer,
+            (grid.x, grid.y),
+            grid.width,
+            thickness(GridLine::Top),
+            stroke(GridLine::Top),
+        );
+        theme::rule(
+            layer,
+            (grid.x, grid.bottom()),
+            grid.width,
+            thickness(GridLine::Bottom),
+            stroke(GridLine::Bottom),
+        );
+        theme::vertical_rule(
+            layer,
+            (grid.x, grid.y),
+            grid.height,
+            thickness(GridLine::Left),
+            stroke(GridLine::Left),
+        );
+        theme::vertical_rule(
+            layer,
+            (grid.right(), grid.y),
+            grid.height,
+            thickness(GridLine::Right),
+            stroke(GridLine::Right),
+        );
+        theme::rule(
+            layer,
+            (grid.x, mid_y),
+            grid.width,
+            thickness(GridLine::Horizontal),
+            stroke(GridLine::Horizontal),
+        );
+        theme::vertical_rule(
+            layer,
+            (mid_x, grid.y),
+            grid.height,
+            thickness(GridLine::Vertical),
+            stroke(GridLine::Vertical),
+        );
+        theme::rule(
+            layer,
+            (card.x + PAD, grid.bottom() + 6.0),
+            card.width - PAD * 2.0,
+            1.0,
+            theme::border(),
+        );
+        self.draw_control(layer, card, false);
+        self.draw_control(layer, card, true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_painted_stroke_has_a_direct_hit() {
+        let card = card_anchored(Rect::new(0.0, 0.0, 400.0, 400.0), (80.0, 80.0));
+        let grid = grid(card);
+        assert_eq!(line_at(card, (grid.x + 30.0, grid.y)), Some(GridLine::Top));
+        assert_eq!(
+            line_at(card, (grid.x + 30.0, grid.bottom())),
+            Some(GridLine::Bottom)
+        );
+        assert_eq!(line_at(card, (grid.x, grid.y + 30.0)), Some(GridLine::Left));
+        assert_eq!(
+            line_at(card, (grid.right(), grid.y + 30.0)),
+            Some(GridLine::Right)
+        );
+        assert_eq!(
+            line_at(card, (grid.x + 20.0, grid.y + grid.height * 0.5)),
+            Some(GridLine::Horizontal)
+        );
+        assert_eq!(
+            line_at(card, (grid.x + grid.width * 0.5, grid.y + 20.0)),
+            Some(GridLine::Vertical)
+        );
+    }
+
+    #[test]
+    fn row_and_column_buttons_have_direct_hits() {
+        let card = card_anchored(Rect::new(0.0, 0.0, 400.0, 400.0), (80.0, 80.0));
+        for action in [
+            TableAction::InsertRow,
+            TableAction::RemoveRow,
+            TableAction::InsertColumn,
+            TableAction::RemoveColumn,
+        ] {
+            let rect = action_rect(card, action);
+            assert_eq!(
+                hit_at(card, (rect.x + 2.0, rect.y + 2.0)),
+                Some(TableHit::Action(action))
+            );
+        }
+    }
+}

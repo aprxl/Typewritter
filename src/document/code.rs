@@ -250,6 +250,14 @@ pub fn block_extent(blocks: &[Block], at: usize) -> std::ops::RangeInclusive<usi
 }
 
 pub fn colors(blocks: &[Block]) -> Vec<Vec<Option<Ink>>> {
+    fn flat_len(run: &Inline) -> usize {
+        match run {
+            Inline::Text(text) => text.text.chars().count(),
+            Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => 1,
+            Inline::TableCell(contents) => contents.iter().map(flat_len).sum(),
+        }
+    }
+
     let mut colors: Vec<Vec<Option<Ink>>> = blocks
         .iter()
         .map(|block| {
@@ -258,7 +266,7 @@ pub fn colors(blocks: &[Block]) -> Vec<Vec<Option<Ink>>> {
                 block
                     .inlines()
                     .iter()
-                    .map(|run| run.text().chars().count())
+                    .map(flat_len)
                     .sum()
             ]
         })
@@ -289,6 +297,8 @@ pub fn colors(blocks: &[Block]) -> Vec<Vec<Option<Ink>>> {
                 }
             }
             block = end + 1;
+        } else if blocks[block].is_table() {
+            block += 1;
         } else {
             let mut offset = 0;
             let runs = blocks[block].inlines();
@@ -319,6 +329,9 @@ pub fn colors(blocks: &[Block]) -> Vec<Vec<Option<Ink>>> {
         }
     }
     for (block, row) in blocks.iter().zip(&mut colors) {
+        if block.is_table() {
+            continue;
+        }
         let mut offset = 0;
         for run in block.inlines() {
             let len = run.text().chars().count();

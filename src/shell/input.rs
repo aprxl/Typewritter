@@ -14,19 +14,20 @@ use winit::keyboard::KeyCode;
 use super::commands;
 use crate::components::dialog::{self, Prompt};
 use crate::components::palette;
+use crate::components::table_lines;
 use crate::components::{
     ContextMenu, Dialog, Editor, FileTree, Finder, FormatBar, MathMenu, Onboarding, Palette,
     SlashMenu, SymbolMenu, TabStrip, Topics, context_menu, editor, file_tree, format_bar,
     math_menu, onboarding, scrollbar, sidenotes, symbol_menu, theme_switch, title_bar,
 };
 use crate::config::Config;
-use crate::document::layout::{ContextHit, DocLayout, RangeKind};
+use crate::document::layout::{ContextHit, DocLayout, RangeKind, TableResize};
 use crate::document::math::{self, AccentKind, BigOp, MathNode, NodeAddress, Slot, SymbolRole};
 use crate::document::math_style::{self, HighlightShape, MathHue};
 use crate::document::math_symbols;
 use crate::document::{
     BadgeColor, Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, ListMarker, Style,
-    math_conversion, math_layout,
+    TableDirection, math_conversion, math_layout,
 };
 use crate::input::Input;
 use crate::layout::Rect;
@@ -43,7 +44,7 @@ use std::rc::Rc;
 
 use super::{
     ContextGhost, ContextMenuState, InsertEvent, InsertMarker, InsertShortcuts, MathMenuState,
-    MenuDismiss, PaletteState, Shell, SlashMenuState, WordFormatState,
+    MenuDismiss, PaletteState, Shell, SlashMenuState, TableDrag, TableLinesState, WordFormatState,
 };
 
 /// Apply one recorded Insert-mode event. Text and editing keys are recorded
@@ -57,12 +58,9 @@ fn apply_insert_event(docs: &mut Tabs, event: &InsertEvent) {
         InsertEvent::Delete => docs.delete_forward(),
         InsertEvent::Enter => docs.newline(),
         InsertEvent::SetHeading(level) => docs.set_heading(Some(*level)),
-        InsertEvent::SetEmphasis { bold, italic } => docs.touch(|doc| {
-            if !doc.caret.style.is_boxed() {
-                doc.caret.style.bold = *bold;
-                doc.caret.style.italic = *italic;
-            }
-        }),
+        InsertEvent::SetEmphasis { bold, italic } => {
+            docs.touch(|doc| doc.set_emphasis(*bold, *italic));
+        }
         InsertEvent::ToggleInlineCode => docs.toggle_code(),
         InsertEvent::ToggleBadge => docs.toggle_badge(),
         InsertEvent::ToggleHighlight => docs.toggle_highlight(),
@@ -98,6 +96,7 @@ fn empty_body_block(docs: &Tabs) -> bool {
     docs.active().is_some_and(|tab| {
         matches!(tab.document.focus, Focus::Body)
             && !tab.document.scope()[tab.document.caret.block].is_code()
+            && !tab.document.in_table()
             && tab.document.block_len(tab.document.caret.block) == 0
     })
 }
@@ -154,7 +153,9 @@ impl InsertShortcuts {
                 self.reset();
                 return true;
             }
-            Some(InsertMarker::OpenBracket) if c == '^' => {
+            Some(InsertMarker::OpenBracket)
+                if c == '^' && docs.active().is_some_and(|tab| !tab.document.in_table()) =>
+            {
                 erase_marker_text(docs, repeat, 1);
                 insert_event(docs, repeat, InsertEvent::InsertSidenote);
                 self.reset();
@@ -341,6 +342,12 @@ impl Shell {
             self.handle_dialog_input(input, viewport);
             return;
         }
+        // The line picker is a direct manipulation surface: while it is up,
+        // clicks belong to its strokes and Escape/outside-click close it.
+        if self.table_lines.is_some() {
+            self.handle_table_lines_input(input, viewport);
+            return;
+        }
         // Ctrl+drag is an editor gesture, not a click-to-place or context
         // click. It also gets first refusal over an already-open context
         // menu so the existing multi-selection survives another stroke.
@@ -510,6 +517,139 @@ impl Shell {
         }
     }
 
+    fn open_table_lines(&mut self, first: usize, row: usize, column: usize, anchor: (f32, f32)) {
+        self.context_menu = None;
+        self.format_bar = None;
+        self.table_lines = Some(TableLinesState {
+            first,
+            row,
+            column,
+            anchor,
+        });
+        self.refresh_table_lines();
+    }
+
+    fn refresh_table_lines(&mut self) {
+        let menu = self.table_lines.as_ref().and_then(|state| {
+            self.docs.borrow().active().and_then(|tab| {
+                let body = tab.document.body().get(state.first..)?;
+                let settings = body.first()?.table_settings()?;
+                // The first row anchors this table. A following table also
+                // has a `first` row, but it is the next block rather than a
+                // continuation of this one.
+                let rows = body
+                    .iter()
+                    .enumerate()
+                    .take_while(|(index, block)| {
+                        *index == 0 || matches!(block, Block::TableRow { first: false, .. })
+                    })
+                    .count();
+                let columns = body.first().map_or(0, |block| block.inlines().len());
+                Some(crate::components::TableLinesMenu::new(
+                    settings.lines,
+                    state.anchor,
+                    state.row.min(rows.saturating_sub(1)),
+                    state.column.min(columns.saturating_sub(1)),
+                    rows,
+                    columns,
+                ))
+            })
+        });
+        self.regions[self.table_lines_region].set_component(Box::new(
+            menu.unwrap_or_else(crate::components::TableLinesMenu::closed),
+        ));
+    }
+
+    fn close_table_lines(&mut self) {
+        self.table_lines = None;
+        self.refresh_table_lines();
+    }
+
+    fn handle_table_lines_input(&mut self, input: &Input, viewport: Rect) {
+        if input.is_key_pressed(KeyCode::Escape) {
+            self.close_table_lines();
+            return;
+        }
+        if !input.is_mouse_pressed(MouseButton::Left) || !input.is_cursor_in_window() {
+            return;
+        }
+        let point = input.mouse_position();
+        let Some(state) = self.table_lines.as_ref() else {
+            return;
+        };
+        let card = table_lines::card_anchored(viewport, state.anchor);
+        match table_lines::hit_at(card, point) {
+            Some(table_lines::TableHit::Line(line)) => {
+                self.docs.borrow_mut().toggle_table_line(state.first, line);
+                self.refresh_table_lines();
+            }
+            Some(table_lines::TableHit::Action(action)) => {
+                let mut docs = self.docs.borrow_mut();
+                match action {
+                    table_lines::TableAction::InsertRow => {
+                        docs.insert_table_row(state.first, state.row);
+                    }
+                    table_lines::TableAction::RemoveRow => {
+                        docs.remove_table_row(state.first, state.row);
+                    }
+                    table_lines::TableAction::InsertColumn => {
+                        docs.insert_table_column(state.first, state.column);
+                    }
+                    table_lines::TableAction::RemoveColumn => {
+                        docs.remove_table_column(state.first, state.column);
+                    }
+                }
+                drop(docs);
+                self.refresh_table_lines();
+            }
+            None => self.close_table_lines(),
+        }
+    }
+
+    /// Update a live table divider drag. The delta uses the last point, not
+    /// the drag origin, so every frame applies one stable adjustment and the
+    /// table does not jump when its layout is rebuilt under the pointer.
+    fn drive_table_drag(&mut self, input: &Input) -> bool {
+        let Some(drag) = &mut self.table_drag else {
+            return false;
+        };
+        if !input.is_mouse_down(MouseButton::Left) {
+            self.docs.borrow_mut().end_transaction();
+            self.table_drag = None;
+            return true;
+        }
+        let point = input.mouse_position();
+        let delta = (point.0 - drag.last.0, point.1 - drag.last.1);
+        if delta == (0.0, 0.0) {
+            return true;
+        }
+        let resize = drag.resize;
+        drag.last = point;
+        let rect = self.layout.rect(self.text_column);
+        let layout = self.current_layout(Editor::content_width(rect));
+        match resize {
+            TableResize::Column { first, divider } => {
+                let width = layout
+                    .tables
+                    .get(first)
+                    .and_then(Option::as_ref)
+                    .map(|table| table.columns.iter().sum::<f32>())
+                    .unwrap_or(0.0);
+                if width > 0.0 {
+                    self.docs
+                        .borrow_mut()
+                        .resize_table_column(first, divider, delta.0 / width);
+                }
+            }
+            TableResize::Row { first, divider } => {
+                self.docs
+                    .borrow_mut()
+                    .resize_table_row(first, divider, delta.1 / layout.scale);
+            }
+        }
+        true
+    }
+
     /// Whether a click landed on a fold affordance — a gutter chevron or a
     /// collapsed-body indicator — and toggled/unfolded it. Runs before caret
     /// placement in either mode: these are controls, not text.
@@ -646,8 +786,11 @@ impl Shell {
                 self.brush_inside.clear();
                 self.brush_revision = self.brush_revision.wrapping_add(1);
             }
-            if released
-                && let Some(target) = self
+            if released {
+                // A stroke that touched code words is a colouring gesture:
+                // its palette is the more specific tool, and it claims the
+                // release ahead of the prose bar.
+                if let Some(target) = self
                     .brush_selected
                     .iter()
                     .find(|hit| {
@@ -660,13 +803,29 @@ impl Shell {
                         )
                     })
                     .cloned()
-            {
-                self.open_context_target(
-                    commands::CODE_COLOR_MENU,
-                    input.mouse_position(),
-                    Some(target),
-                );
-                return true;
+                {
+                    self.open_context_target(
+                        commands::CODE_COLOR_MENU,
+                        input.mouse_position(),
+                        Some(target),
+                    );
+                    return true;
+                }
+                // Anything else with a word in it opens the format bar over
+                // the whole selection — the point of sweeping several words
+                // is to format them together.
+                if self.brush_selected.iter().any(|hit| {
+                    matches!(
+                        hit,
+                        ContextHit::Range {
+                            kind: RangeKind::Word,
+                            ..
+                        }
+                    )
+                }) {
+                    self.open_format_bar(self.brush_selected.clone(), input.mouse_position());
+                    return true;
+                }
             }
             return false;
         }
@@ -738,6 +897,9 @@ impl Shell {
     /// mode-dependent, so it's split into
     /// [`Shell::edit_frame_insert`]/[`Shell::edit_frame_normal`].
     fn edit_frame(&mut self, input: &Input) {
+        if self.drive_table_drag(input) {
+            return;
+        }
         let rect = self.layout.rect(self.text_column);
         let mouse = input.mouse_position();
         let over_editor = input.is_cursor_in_window() && rect.contains(mouse);
@@ -791,6 +953,18 @@ impl Shell {
             if self.fold_click(rect, mouse) {
                 return;
             }
+            if let Some((local_x, local_y)) = self.editor_point(rect, mouse) {
+                let layout = self.current_layout(editor::Editor::content_width(rect));
+                if let Some(resize) = layout.table_resize_at(local_x, local_y, 5.0) {
+                    self.goal_x = None;
+                    self.docs.borrow_mut().begin_transaction();
+                    self.table_drag = Some(TableDrag {
+                        resize,
+                        last: mouse,
+                    });
+                    return;
+                }
+            }
             // A click on a task's checkbox toggles it, whatever the mode:
             // it is a control, not a caret placement.
             if let Some((local_x, local_y)) = self.editor_point(rect, mouse)
@@ -824,13 +998,22 @@ impl Shell {
                     ) {
                         // A word opens the format bar; any other target
                         // keeps the classic list menu.
-                        self.open_format_bar(&target, mouse);
+                        self.open_format_bar(vec![target], mouse);
                     } else {
                         let ids = self.context_ids(&target);
                         self.open_context_target(&ids, mouse, Some(target));
                     }
+                } else if let Some((local_x, local_y)) = self.editor_point(rect, mouse)
+                    && let Some(cell) = self
+                        .current_layout(editor::Editor::content_width(rect))
+                        .table_cell_at(local_x, local_y)
+                {
+                    // Text itself reaches the familiar word-format bar above;
+                    // the cell's quiet gutter opens the table's own direct
+                    // manipulation card.
+                    self.open_table_lines(cell.first, cell.row, cell.column, mouse);
                 }
-            } else if let Some((block, inline, cursor)) = self.math_at(rect, mouse) {
+            } else if let Some((block, inline, offset, cursor)) = self.math_at(rect, mouse) {
                 self.goal_x = None;
                 set_body_coordinate_caret(
                     &mut self.docs.borrow_mut(),
@@ -841,7 +1024,9 @@ impl Shell {
                         style: Style::PLAIN,
                     }),
                 );
-                self.docs.borrow_mut().enter_math_at(block, inline, cursor);
+                self.docs
+                    .borrow_mut()
+                    .enter_math_at(block, inline, offset, cursor);
                 self.apply(ExtendedAction::Enter(Mode::Insert));
             } else if let Some(caret) = self.caret_at(rect, mouse) {
                 self.goal_x = None;
@@ -876,13 +1061,30 @@ impl Shell {
     /// motion records the goal x (`goal_col` in pixels, spec §5); any
     /// non-vertical caret move clears it.
     fn arrow_keys(&mut self, input: &Input) {
+        let table_direction = if input.is_key_typed(KeyCode::ArrowUp) {
+            Some(TableDirection::Up)
+        } else if input.is_key_typed(KeyCode::ArrowDown) {
+            Some(TableDirection::Down)
+        } else if input.is_key_typed(KeyCode::ArrowLeft) {
+            Some(TableDirection::Left)
+        } else if input.is_key_typed(KeyCode::ArrowRight) {
+            Some(TableDirection::Right)
+        } else {
+            None
+        };
+        if let Some(direction) = table_direction
+            && self.docs.borrow_mut().table_move(direction)
+        {
+            self.goal_x = None;
+            return;
+        }
         if input.is_key_typed(KeyCode::ArrowUp) || input.is_key_typed(KeyCode::ArrowDown) {
             let rect = self.layout.rect(self.text_column);
             let width = crate::components::editor::Editor::content_width(rect);
             let layout = self.current_layout(width);
             let layer = self.regions[self.text_region].layer();
             let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
-            let (goal, next) = {
+            let (goal, next, in_table) = {
                 let docs = self.docs.borrow();
                 let Some(tab) = docs.active() else {
                     return;
@@ -896,13 +1098,19 @@ impl Shell {
                 } else {
                     layout.line_down(caret, goal, &measure)
                 };
-                (goal, next)
+                (goal, next, tab.document.in_table())
             };
             self.goal_x = Some(goal);
             if let Some(next) = next {
                 self.docs
                     .borrow_mut()
                     .move_caret_to(next.block, next.inline, next.offset);
+            } else if in_table {
+                if input.is_key_typed(KeyCode::ArrowUp) {
+                    self.docs.borrow_mut().open_above();
+                } else {
+                    self.docs.borrow_mut().open_below();
+                }
             }
             return;
         }
@@ -973,6 +1181,12 @@ impl Shell {
         let in_math = self.docs.borrow().in_math();
         if in_math {
             self.edit_frame_math(input);
+            return;
+        }
+
+        if input.is_key_typed(KeyCode::Tab) && self.docs.borrow_mut().table_tab(input.shift()) {
+            self.insert_shortcuts.reset();
+            self.goal_x = None;
             return;
         }
 
@@ -1183,6 +1397,10 @@ impl Shell {
 
     /// Normal and command modes consume resolved characters one at a time.
     fn edit_frame_normal(&mut self, input: &Input) {
+        if input.is_key_typed(KeyCode::Tab) && self.docs.borrow_mut().table_tab(input.shift()) {
+            self.goal_x = None;
+            return;
+        }
         for c in input.text().chars() {
             if !self.vim.command_active() && c == '/' && self.vim.visual_mode().is_some() {
                 let anchor = self.compute_slash_anchor();
@@ -1374,10 +1592,22 @@ impl Shell {
                         .inlines()
                         .iter()
                         .map(|run| match run {
-                            crate::document::Inline::Text(text) => text.text.as_str(),
-                            crate::document::Inline::Math(_) => "\u{FFFC}",
-                            crate::document::Inline::Note(_) => "\u{FFFC}",
-                            crate::document::Inline::EqRef(_) => "\u{FFFC}",
+                            crate::document::Inline::Text(text) => text.text.clone(),
+                            crate::document::Inline::Math(_)
+                            | crate::document::Inline::Note(_)
+                            | crate::document::Inline::EqRef(_) => "\u{FFFC}".into(),
+                            crate::document::Inline::TableCell(contents) => contents
+                                .iter()
+                                .map(|run| match run {
+                                    crate::document::Inline::Text(text) => text.text.clone(),
+                                    crate::document::Inline::Math(_)
+                                    | crate::document::Inline::Note(_)
+                                    | crate::document::Inline::EqRef(_) => "\u{FFFC}".into(),
+                                    crate::document::Inline::TableCell(_) => {
+                                        unreachable!("nested table cells are invalid")
+                                    }
+                                })
+                                .collect(),
                         })
                         .collect::<String>()
                         .chars()
@@ -1840,7 +2070,7 @@ impl Shell {
 
         let mut last: Option<crate::document::Caret> = None;
         for _ in 0..count.max(1) {
-            let next = {
+            let (next, in_table) = {
                 let docs = self.docs.borrow();
                 let Some(tab) = docs.active() else {
                     break;
@@ -1850,13 +2080,21 @@ impl Shell {
                     .goal_x
                     .unwrap_or_else(|| layout.caret_pos(caret, &measure).0);
                 self.goal_x = Some(goal);
-                if up {
+                let next = if up {
                     layout.line_up(caret, goal, &measure)
                 } else {
                     layout.line_down(caret, goal, &measure)
-                }
+                };
+                (next, tab.document.in_table())
             };
             let Some(next) = next else {
+                if in_table {
+                    if up {
+                        self.docs.borrow_mut().open_above();
+                    } else {
+                        self.docs.borrow_mut().open_below();
+                    }
+                }
                 break;
             };
             last = Some(next);
@@ -2209,19 +2447,13 @@ impl Shell {
             ContextHit::Math {
                 block,
                 inline,
+                offset,
                 node: Some(address),
             } => {
                 let docs = self.docs.borrow();
                 let node = docs
                     .active()
-                    .and_then(|tab| tab.document.body().get(*block))
-                    .and_then(|block| block.inlines().get(*inline))
-                    .and_then(|run| match run {
-                        Inline::Math(list) => math::node_at(list, address),
-                        Inline::Text(_) => None,
-                        Inline::Note(_) => None,
-                        Inline::EqRef(_) => None,
-                    });
+                    .and_then(|tab| tab.document.math_node_at(*block, *inline, *offset, address));
                 match node {
                     Some(MathNode::Sym(ch)) if ch.is_alphabetic() => symbol_context_ids(*ch),
                     Some(MathNode::Resolved { variant, body, .. }) => {
@@ -2242,22 +2474,23 @@ impl Shell {
         }
     }
 
-    /// Which document target the open formatting surface — the classic
+    /// Which document targets the open formatting surface — the classic
     /// context menu or the word-format bar — is operating on. Both keep
-    /// their target in the shell, so the two surfaces cannot disagree about
-    /// what a toggle applies to.
-    fn context_target(&self) -> Option<ContextHit> {
-        match self
-            .context_menu
-            .as_ref()
-            .and_then(|state| state.target.clone())
-        {
-            Some(target) => Some(target),
-            None => self
-                .format_bar
-                .as_ref()
-                .and_then(|state| state.target.clone()),
+    /// them in the shell, so the two surfaces cannot disagree about what a
+    /// toggle applies to. The menu always names exactly one; the bar names
+    /// as many as the brush swept up.
+    fn context_targets(&self) -> Vec<ContextHit> {
+        if let Some(state) = &self.context_menu {
+            return state.target.clone().into_iter().collect();
         }
+        match &self.format_bar {
+            Some(state) => state.targets.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    fn context_target(&self) -> Option<ContextHit> {
+        self.context_targets().into_iter().next()
     }
 
     fn context_range(&self) -> Option<FlatRange> {
@@ -2267,27 +2500,59 @@ impl Shell {
         }
     }
 
-    fn context_math_target(&self) -> Option<(usize, usize, NodeAddress)> {
+    /// The prose ranges a text style lands on, and how many targets it has
+    /// to leave alone.
+    ///
+    /// One target is styled whatever its kind: the surface over it offers
+    /// only what that kind can take, and un-badging a badge or un-coding an
+    /// inline-code run are its own rows. A brush selection is several
+    /// things at once, and a text style reaches only the words in it —
+    /// math, code and boxed runs are counted instead, for the warning that
+    /// goes up before anything changes.
+    fn format_ranges(&self) -> (Vec<FlatRange>, usize) {
+        style_targets(&self.context_targets())
+    }
+
+    fn context_math_target(&self) -> Option<(usize, usize, usize, NodeAddress)> {
         match self.context_target() {
             Some(ContextHit::Math {
                 block,
                 inline,
+                offset,
                 node: Some(address),
-            }) => Some((block, inline, address.clone())),
+            }) => Some((block, inline, offset, address.clone())),
             _ => None,
         }
     }
 
     fn context_command_checked(&self, id: &str) -> bool {
-        let target = self.context_target();
-        let Some(target) = target else {
-            return false;
-        };
         let docs = self.docs.borrow();
         let Some(document) = docs.active().map(|tab| &tab.document) else {
             return false;
         };
-        Self::context_command_checked_for(document, target, id)
+        match self.context_targets().as_slice() {
+            // One target answers for itself, whatever kind it is: a math
+            // node's card asks about roles and variants, not about bold.
+            [target] => Self::context_command_checked_for(document, target.clone(), id),
+            // A brush selection's ring describes what the button would
+            // change, so it reads the words the toggle reaches and nothing
+            // else — lit only when every one of them already carries the
+            // format, which is what makes one press mean one thing.
+            _ => {
+                let (ranges, _) = self.format_ranges();
+                !ranges.is_empty()
+                    && ranges.iter().all(|range| {
+                        Self::context_command_checked_for(
+                            document,
+                            ContextHit::Range {
+                                range: *range,
+                                kind: RangeKind::Word,
+                            },
+                            id,
+                        )
+                    })
+            }
+        }
     }
 
     fn context_command_checked_for(document: &Document, target: ContextHit, id: &str) -> bool {
@@ -2355,16 +2620,10 @@ impl Shell {
             ContextHit::Math {
                 block,
                 inline,
+                offset,
                 node: Some(address),
             } => {
-                let node = document
-                    .body()
-                    .get(block)
-                    .and_then(|block| block.inlines().get(inline))
-                    .and_then(|run| match run {
-                        Inline::Math(list) => math::node_at(list, &address),
-                        Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
-                    });
+                let node = document.math_node_at(block, inline, offset, &address);
                 // Hue and shape are not stored on the node — they are the
                 // reader's own vocabulary, kept in the vault config — so
                 // they are answered from the style server rather than from
@@ -2462,64 +2721,53 @@ impl Shell {
         }
     }
 
+    /// Applies one text style to every range the open surface holds, as a
+    /// single undo step.
+    ///
+    /// A selection where some words already carry the style and some do not
+    /// is made uniform rather than inverted word by word: one press turns
+    /// the style on unless every range already has it. Toggling each range
+    /// against its own state would leave the reader looking at a selection
+    /// half of which went bold and half of which went plain, from one press
+    /// of one button.
+    fn context_toggle_style(&mut self, mask: Style) {
+        let (ranges, _) = self.format_ranges();
+        apply_style_to_ranges(&mut self.docs.borrow_mut(), &ranges, mask);
+    }
+
     pub(super) fn context_toggle_bold(&mut self) {
-        if let Some(range) = self.context_range() {
-            self.docs.borrow_mut().toggle_style_range(
-                range,
-                Style {
-                    bold: true,
-                    ..Style::PLAIN
-                },
-            );
-        }
+        self.context_toggle_style(Style {
+            bold: true,
+            ..Style::PLAIN
+        });
     }
 
     pub(super) fn context_toggle_italic(&mut self) {
-        if let Some(range) = self.context_range() {
-            self.docs.borrow_mut().toggle_style_range(
-                range,
-                Style {
-                    italic: true,
-                    ..Style::PLAIN
-                },
-            );
-        }
+        self.context_toggle_style(Style {
+            italic: true,
+            ..Style::PLAIN
+        });
     }
 
     pub(super) fn context_toggle_highlight(&mut self) {
-        if let Some(range) = self.context_range() {
-            self.docs.borrow_mut().toggle_style_range(
-                range,
-                Style {
-                    highlight: true,
-                    ..Style::PLAIN
-                },
-            );
-        }
+        self.context_toggle_style(Style {
+            highlight: true,
+            ..Style::PLAIN
+        });
     }
 
     pub(super) fn context_toggle_inline_code(&mut self) {
-        if let Some(range) = self.context_range() {
-            self.docs.borrow_mut().toggle_style_range(
-                range,
-                Style {
-                    code: true,
-                    ..Style::PLAIN
-                },
-            );
-        }
+        self.context_toggle_style(Style {
+            code: true,
+            ..Style::PLAIN
+        });
     }
 
     pub(super) fn context_toggle_badge(&mut self) {
-        if let Some(range) = self.context_range() {
-            self.docs.borrow_mut().toggle_style_range(
-                range,
-                Style {
-                    badge: true,
-                    ..Style::PLAIN
-                },
-            );
-        }
+        self.context_toggle_style(Style {
+            badge: true,
+            ..Style::PLAIN
+        });
     }
 
     pub(super) fn context_code_settings(&mut self) {
@@ -2608,56 +2856,51 @@ impl Shell {
     }
 
     pub(super) fn context_set_math_role(&mut self, role: SymbolRole) {
-        if let Some((block, inline, address)) = self.context_math_target() {
+        if let Some((block, inline, offset, address)) = self.context_math_target() {
             self.docs
                 .borrow_mut()
-                .set_math_node_role_at(block, inline, &address, role);
+                .set_math_node_role_at(block, inline, offset, &address, role);
         }
     }
 
     pub(super) fn context_set_math_variant(&mut self, variant: &str) {
-        if let Some((block, inline, address)) = self.context_math_target() {
+        if let Some((block, inline, offset, address)) = self.context_math_target() {
             self.docs
                 .borrow_mut()
-                .set_math_node_variant_at(block, inline, &address, variant);
+                .set_math_node_variant_at(block, inline, offset, &address, variant);
         }
     }
 
     pub(super) fn context_set_math_delimiter(&mut self, open: char) {
-        if let Some((block, inline, address)) = self.context_math_target() {
+        if let Some((block, inline, offset, address)) = self.context_math_target() {
             self.docs
                 .borrow_mut()
-                .set_math_group_delimiter_at(block, inline, &address, open);
+                .set_math_group_delimiter_at(block, inline, offset, &address, open);
         }
     }
 
     pub(super) fn context_set_math_accent(&mut self, kind: AccentKind) {
-        if let Some((block, inline, address)) = self.context_math_target() {
+        if let Some((block, inline, offset, address)) = self.context_math_target() {
             self.docs
                 .borrow_mut()
-                .set_math_accent_kind_at(block, inline, &address, kind);
+                .set_math_accent_kind_at(block, inline, offset, &address, kind);
         }
     }
 
     pub(super) fn context_set_math_big_op(&mut self, kind: BigOp) {
-        if let Some((block, inline, address)) = self.context_math_target() {
+        if let Some((block, inline, offset, address)) = self.context_math_target() {
             self.docs
                 .borrow_mut()
-                .set_math_big_op_kind_at(block, inline, &address, kind);
+                .set_math_big_op_kind_at(block, inline, offset, &address, kind);
         }
     }
 
     /// The node the open formatting surface points at, if it is a math one.
     fn context_math_node(&self) -> Option<MathNode> {
-        let (block, inline, address) = self.context_math_target()?;
+        let (block, inline, offset, address) = self.context_math_target()?;
         let docs = self.docs.borrow();
         docs.active()
-            .and_then(|tab| tab.document.body().get(block))
-            .and_then(|block| block.inlines().get(inline))
-            .and_then(|run| match run {
-                Inline::Math(list) => math::node_at(list, &address),
-                Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
-            })
+            .and_then(|tab| tab.document.math_node_at(block, inline, offset, &address))
             .cloned()
     }
 
@@ -2947,11 +3190,28 @@ impl Shell {
 
     // ---- word-format bar ---------------------------------------------------
 
-    /// Opens the format bar over `target` (a word range) at `anchor`. The
-    /// bar keeps its target so toggles keep applying to the same word while
-    /// it stays open — the whole point of a toolbar over a one-shot menu.
-    fn open_format_bar(&mut self, target: &ContextHit, anchor: (f32, f32)) {
-        let ids = self.context_ids(target);
+    /// Opens the format bar over `targets` at `anchor`: one word for a
+    /// click, or a whole Ctrl-brush selection for a stroke. The bar keeps
+    /// its targets so toggles keep applying to the same words while it
+    /// stays open — the whole point of a toolbar over a one-shot menu.
+    ///
+    /// The bar is the *word* format bar, so it takes its rows from the
+    /// first word in the selection; a stroke that swept up math or code
+    /// as well still shows what those words can take, and the warning at
+    /// [`Shell::warn_mixed_format`] handles the rest.
+    fn open_format_bar(&mut self, targets: Vec<ContextHit>, anchor: (f32, f32)) {
+        let Some(word) = targets.iter().find(|target| {
+            matches!(
+                target,
+                ContextHit::Range {
+                    kind: RangeKind::Word,
+                    ..
+                }
+            )
+        }) else {
+            return;
+        };
+        let ids = self.context_ids(word);
         let items = commands::menu(&ids);
         if items.is_empty() {
             return;
@@ -2969,8 +3229,9 @@ impl Shell {
             items,
             selected: 0,
             anchor,
-            target: Some(target.clone()),
+            targets,
             hover_cell: None,
+            mixed_ack: false,
         });
         // A fresh pop every time the bar opens, driven from the shell so
         // the per-toggle refresh below never replays it.
@@ -3099,7 +3360,50 @@ impl Shell {
         if let Some(state) = &mut self.format_bar {
             state.selected = cell;
         }
+        // A selection holding more than prose gets asked once, before
+        // anything changes; the card's own confirm runs the command.
+        if self.warn_mixed_format(command) {
+            return;
+        }
         (command.run)(self);
+        self.refresh_format_bar();
+    }
+
+    /// A brush selection can hold math and code as well as words, and a
+    /// text style only ever lands on the words. Rather than half-apply a
+    /// format in silence, the first one pressed on such a selection says
+    /// what it can reach and offers exactly that.
+    ///
+    /// Answering settles it for as long as the bar stays open: a reader who
+    /// has said "yes, the words" once is not asked again for italic.
+    /// `true` means the card is up and the command has not run.
+    fn warn_mixed_format(&mut self, command: &'static commands::Command) -> bool {
+        if self.format_bar.as_ref().is_none_or(|state| state.mixed_ack) {
+            return false;
+        }
+        let (ranges, skipped) = self.format_ranges();
+        if skipped == 0 || ranges.is_empty() {
+            return false;
+        }
+        self.open_dialog(Prompt::MixedFormat {
+            command: command.id,
+            label: command.title,
+            words: ranges.len(),
+            skipped,
+        });
+        true
+    }
+
+    /// The mixed-selection card was confirmed: remember the answer so the
+    /// bar stops asking, then run the format it was holding back.
+    fn apply_mixed_format(&mut self, command: &str) {
+        self.close_dialog();
+        if let Some(state) = &mut self.format_bar {
+            state.mixed_ack = true;
+        }
+        if let Some(command) = commands::COMMANDS.iter().find(|entry| entry.id == command) {
+            (command.run)(self);
+        }
         self.refresh_format_bar();
     }
 
@@ -3873,7 +4177,11 @@ impl Shell {
         }
 
         let (confirm_button, cancel_button) = dialog::buttons(viewport);
-        let confirmed = input.is_key_typed(KeyCode::Enter)
+        // A fresh press, never the OS repeat: the format bar's own Enter is
+        // what raises the mixed-selection card, and a held key would then
+        // answer the question it had only just asked. Nothing a card does
+        // wants repeating anyway — Esc has always been edge-triggered here.
+        let confirmed = input.is_key_pressed(KeyCode::Enter)
             || click.is_some_and(|at| confirm_button.contains(at));
         let cancelled = input.is_key_pressed(KeyCode::Escape)
             || click.is_some_and(|at| cancel_button.contains(at));
@@ -3904,6 +4212,7 @@ impl Shell {
                 self.close_dialog();
                 self.run_export(if dark { Theme::DARK } else { Theme::LIGHT });
             }
+            Some(Prompt::MixedFormat { command, .. }) => self.apply_mixed_format(command),
             None => {}
         }
     }
@@ -4635,6 +4944,62 @@ fn add_brush_hits(
     *inside = current_hits;
 }
 
+/// Split what a formatting surface is aimed at into the prose ranges a text
+/// style lands on and a count of the targets it has to leave alone.
+///
+/// One target is styled whatever its kind: the surface over it offers only
+/// what that kind can take, and un-badging a badge or un-coding an
+/// inline-code run are its own rows. A brush selection is several things at
+/// once, and a text style reaches only the words in it — math, code and
+/// boxed runs are counted instead, for the warning that goes up before
+/// anything changes.
+fn style_targets(targets: &[ContextHit]) -> (Vec<FlatRange>, usize) {
+    if let [ContextHit::Range { range, .. }] = targets {
+        return (vec![*range], 0);
+    }
+    let mut ranges = Vec::new();
+    let mut skipped = 0;
+    for target in targets {
+        match target {
+            ContextHit::Range {
+                range,
+                kind: RangeKind::Word,
+            } => ranges.push(*range),
+            _ => skipped += 1,
+        }
+    }
+    (ranges, skipped)
+}
+
+/// Apply one text style to every range, as a single undo step.
+///
+/// A selection where some words already carry the style and some do not is
+/// made uniform rather than inverted word by word: one press turns the style
+/// on unless every range already has it. Toggling each range against its own
+/// state would leave the reader looking at a selection half of which went
+/// bold and half of which went plain, from one press of one button.
+fn apply_style_to_ranges(docs: &mut Tabs, ranges: &[FlatRange], mask: Style) {
+    if ranges.is_empty() {
+        return;
+    }
+    let Some(document) = docs.active().map(|tab| &tab.document) else {
+        return;
+    };
+    let enable = !ranges
+        .iter()
+        .all(|range| document.style_range_is_active(*range, mask));
+    docs.transaction(|docs| {
+        for range in ranges {
+            let active = docs
+                .active()
+                .is_some_and(|tab| tab.document.style_range_is_active(*range, mask));
+            if active != enable {
+                docs.toggle_style_range(*range, mask);
+            }
+        }
+    });
+}
+
 fn brush_sweep_samples(from: (f32, f32), to: (f32, f32), radius: f32) -> Vec<(f32, f32)> {
     let dx = to.0 - from.0;
     let dy = to.1 - from.1;
@@ -4685,11 +5050,11 @@ fn finder_input(state: &mut super::FinderState, input: &Input) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BodyCoordinate, Shell, add_brush_hits, brush_sweep_samples, delete_chars,
-        delete_inside_math, enter_insert, focus_note, focus_note_at, math_menu_rows,
+        BodyCoordinate, Shell, add_brush_hits, apply_style_to_ranges, brush_sweep_samples,
+        delete_chars, delete_inside_math, enter_insert, focus_note, focus_note_at, math_menu_rows,
         math_menu_variant_start, move_inside_math, moved_math_menu_selection, note_at_caret,
         note_at_point, paste, reset_brush_selection, return_to_anchor, set_body_coordinate_caret,
-        symbol_base_glyph, symbol_context_ids,
+        style_targets, symbol_base_glyph, symbol_context_ids,
     };
     use crate::document::layout::{ContextHit, RangeKind};
     use crate::document::math::{AccentKind, MathNode, NodeAddress, SymbolRole};
@@ -4734,6 +5099,7 @@ mod tests {
         let target = ContextHit::Math {
             block: 0,
             inline: 0,
+            offset: 0,
             node: Some(NodeAddress {
                 path: Vec::new(),
                 index: 0,
@@ -4759,6 +5125,7 @@ mod tests {
         let target = ContextHit::Math {
             block: 0,
             inline: 0,
+            offset: 0,
             node: Some(NodeAddress {
                 path: Vec::new(),
                 index: 0,
@@ -4785,6 +5152,7 @@ mod tests {
         let target = ContextHit::Math {
             block: 0,
             inline: 0,
+            offset: 0,
             node: Some(NodeAddress {
                 path: Vec::new(),
                 index: 0,
@@ -4929,11 +5297,157 @@ mod tests {
         assert_eq!(inside, vec![crossed]);
     }
 
+    fn word(block: usize, start: usize, end: usize) -> ContextHit {
+        ContextHit::Range {
+            range: FlatRange::new(
+                FlatPos {
+                    block,
+                    offset: start,
+                },
+                FlatPos { block, offset: end },
+            ),
+            kind: RangeKind::Word,
+        }
+    }
+
+    fn span(block: usize, start: usize, end: usize) -> FlatRange {
+        FlatRange::new(
+            FlatPos {
+                block,
+                offset: start,
+            },
+            FlatPos { block, offset: end },
+        )
+    }
+
+    /// The brush picks up whatever the circle touched, and a stroke across a
+    /// line of prose with an equation in it takes both. Bold has nothing to
+    /// say to a math node, so the words go through and the rest is counted —
+    /// that count is the whole basis of the warning the bar puts up.
+    #[test]
+    fn a_style_reaches_the_words_in_a_mixed_selection_and_counts_the_rest() {
+        let targets = vec![
+            word(0, 0, 9),
+            ContextHit::Math {
+                block: 0,
+                inline: 1,
+                offset: 9,
+                node: Some(NodeAddress {
+                    path: Vec::new(),
+                    index: 0,
+                }),
+            },
+            word(0, 12, 15),
+            ContextHit::Range {
+                range: span(2, 0, 4),
+                kind: RangeKind::CodeBlock,
+            },
+        ];
+        let (ranges, skipped) = style_targets(&targets);
+        assert_eq!(ranges.len(), 2, "both words are styled: {ranges:?}");
+        assert_eq!(ranges[0].start.offset, 0);
+        assert_eq!(ranges[1].start.offset, 12);
+        assert_eq!(skipped, 2, "the math node and the code block are counted");
+    }
+
+    /// A single click is not a mixed selection, whatever it landed on: the
+    /// surface over one target offers only what that target can take, so a
+    /// badge's own menu still un-badges it and nothing is ever counted out.
+    #[test]
+    fn one_target_is_styled_whatever_kind_it_is() {
+        for kind in [
+            RangeKind::Word,
+            RangeKind::Badge,
+            RangeKind::InlineCode,
+            RangeKind::CodeBlock,
+        ] {
+            let (ranges, skipped) = style_targets(&[ContextHit::Range {
+                range: span(0, 0, 3),
+                kind,
+            }]);
+            assert_eq!(ranges.len(), 1, "{kind:?} is styled on its own");
+            assert_eq!(skipped, 0, "{kind:?} is not counted out on its own");
+        }
+    }
+
+    /// One press of one button has one meaning. A selection where only some
+    /// words are already bold goes all-bold rather than inverting each word
+    /// against itself, which would leave the reader looking at a selection
+    /// they had just asked to make bold with half of it plain.
+    #[test]
+    fn a_style_over_a_half_formatted_selection_makes_it_uniform() {
+        let mut tabs = insert_tabs("uniform-style", "alpha beta gamma\n");
+        let bold = Style {
+            bold: true,
+            ..Style::PLAIN
+        };
+        let (alpha, gamma) = (span(0, 0, 5), span(0, 11, 16));
+        tabs.toggle_style_range(alpha, bold);
+        {
+            let document = &tabs.active().unwrap().document;
+            assert!(
+                document.style_range_is_active(alpha, bold)
+                    && !document.style_range_is_active(gamma, bold),
+                "the selection starts half bold"
+            );
+        }
+
+        apply_style_to_ranges(&mut tabs, &[alpha, gamma], bold);
+        let document = &tabs.active().unwrap().document;
+        assert!(
+            document.style_range_is_active(alpha, bold)
+                && document.style_range_is_active(gamma, bold),
+            "a half-bold selection turns fully bold, it does not swap halves"
+        );
+    }
+
+    /// The second press is the one that takes it off, and it takes it off
+    /// everywhere: fully formatted is the only state a toggle reads as
+    /// "already on".
+    #[test]
+    fn a_style_over_a_fully_formatted_selection_clears_it() {
+        let mut tabs = insert_tabs("clear-style", "alpha beta gamma\n");
+        let italic = Style {
+            italic: true,
+            ..Style::PLAIN
+        };
+        let (alpha, gamma) = (span(0, 0, 5), span(0, 11, 16));
+        apply_style_to_ranges(&mut tabs, &[alpha, gamma], italic);
+        apply_style_to_ranges(&mut tabs, &[alpha, gamma], italic);
+        let document = &tabs.active().unwrap().document;
+        assert!(
+            !document.style_range_is_active(alpha, italic)
+                && !document.style_range_is_active(gamma, italic),
+            "a second press clears every word it set"
+        );
+    }
+
+    /// Several words formatted together came from one gesture, so they undo
+    /// together too — one press, one step back.
+    #[test]
+    fn formatting_a_selection_is_one_undo_step() {
+        let mut tabs = insert_tabs("undo-style", "alpha beta gamma\n");
+        let bold = Style {
+            bold: true,
+            ..Style::PLAIN
+        };
+        let (alpha, gamma) = (span(0, 0, 5), span(0, 11, 16));
+        apply_style_to_ranges(&mut tabs, &[alpha, gamma], bold);
+        tabs.undo();
+        let document = &tabs.active().unwrap().document;
+        assert!(
+            !document.style_range_is_active(alpha, bold)
+                && !document.style_range_is_active(gamma, bold),
+            "one undo takes the whole selection back"
+        );
+    }
+
     #[test]
     fn escape_reset_clears_the_entire_brush_selection() {
         let target = ContextHit::Math {
             block: 2,
             inline: 0,
+            offset: 0,
             node: None,
         };
         let mut selected = vec![target.clone()];
@@ -5159,6 +5673,7 @@ mod tests {
             .map(|run| match run {
                 Inline::Text(text) => text.text.as_str(),
                 Inline::Math(_) | Inline::Note(_) | Inline::EqRef(_) => "\u{FFFC}",
+                Inline::TableCell(_) => unreachable!("notes cannot contain table-cell wrappers"),
             })
             .collect()
     }

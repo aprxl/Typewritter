@@ -37,6 +37,19 @@ fn main() {
                 Inline::Note(_) => notes += 1,
                 Inline::EqRef(_) => refs += 1,
                 Inline::Text(_) => {}
+                Inline::TableCell(contents) => {
+                    for run in contents {
+                        match run {
+                            Inline::Math(_) => inline_math += 1,
+                            Inline::Note(_) => notes += 1,
+                            Inline::EqRef(_) => refs += 1,
+                            Inline::Text(_) => {}
+                            Inline::TableCell(_) => {
+                                unreachable!("nested table cells are invalid")
+                            }
+                        }
+                    }
+                }
             }
         }
     }

@@ -55,6 +55,7 @@ pub fn outline(blocks: &[Block]) -> Vec<Node> {
                 Inline::Math(_) => "",
                 Inline::Note(_) => "",
                 Inline::EqRef(_) => "",
+                Inline::TableCell(_) => unreachable!("heading blocks cannot contain table cells"),
             })
             .collect();
 
