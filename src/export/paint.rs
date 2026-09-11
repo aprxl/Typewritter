@@ -650,6 +650,9 @@ mod tests {
         Path {
             at: (f32, f32),
             d: String,
+            /// The pen's colour when the path is stroked at all — what tells
+            /// a radical's sign from a table's border.
+            color: Option<Color>,
         },
     }
 
@@ -685,6 +688,15 @@ mod tests {
                     } if *c == color => Some(*rounding),
                     _ => None,
                 })
+                .collect()
+        }
+
+        /// Every stroked path drawn in `color`, in order: how the page's
+        /// hand-drawn geometry is told apart by ink.
+        fn strokes_in(&self, color: Color) -> Vec<&Call> {
+            self.calls
+                .iter()
+                .filter(|call| matches!(call, Call::Path { color: Some(c), .. } if *c == color))
                 .collect()
         }
 
@@ -744,10 +756,15 @@ mod tests {
             self.calls.push(Call::Circle { center, radius });
         }
 
-        fn draw_path(&mut self, d: &str, at: (f32, f32), _: f32, _: &PathPaint) {
+        fn draw_path(&mut self, d: &str, at: (f32, f32), _: f32, paint: &PathPaint) {
+            let color = match paint {
+                PathPaint::Stroke(pen) => Some(pen.color.clone()),
+                _ => None,
+            };
             self.calls.push(Call::Path {
                 at,
                 d: d.to_string(),
+                color,
             });
         }
 
@@ -970,6 +987,58 @@ mod tests {
             at.0 >= 3.0 * GLYPH,
             "notation must start past the run before it, not at {}",
             at.0
+        );
+    }
+
+    /// A fraction's bar is markup between two operands, not part of either of
+    /// them, so the page rules it in the same quiet grammar ink the editor
+    /// uses. One paint path, one colour — `SPEC.md` §10's promise.
+    #[test]
+    fn the_fraction_bars_rule_keeps_the_operators_ink_on_the_page() {
+        let layout = laid_out(
+            vec![Block::Paragraph(vec![Inline::Math(vec![MathNode::Frac {
+                num: vec![MathNode::Sym('x')],
+                den: vec![MathNode::Sym('y')],
+            }])])],
+            500.0,
+        );
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        let bars = painted.rectangles(theme::math_operator());
+        assert_eq!(
+            bars.len(),
+            1,
+            "the page rules one bar, in the grammar ink: {:?}",
+            painted.calls
+        );
+        let (_, size) = bars[0];
+        assert!(
+            size.1 < size.0,
+            "the bar is a rule across its operands, not a block: {size:?}"
+        );
+    }
+
+    /// The radical is hand-drawn geometry as well: sign and vinculum are one
+    /// stroked path, and the page strokes it in the operators' ink rather
+    /// than the ink of the expression it carries.
+    #[test]
+    fn the_radicals_sign_keeps_the_operators_ink_on_the_page() {
+        let layout = laid_out(
+            vec![Block::Paragraph(vec![Inline::Math(vec![MathNode::Sqrt {
+                body: vec![MathNode::Sym('x')],
+            }])])],
+            500.0,
+        );
+        let painted = paint(&layout, &whole(&layout), 500.0);
+        assert_eq!(
+            painted.strokes_in(theme::math_operator()).len(),
+            1,
+            "the sign is one path, in the grammar ink: {:?}",
+            painted.calls
+        );
+        assert!(
+            painted.strokes_in(theme::ink()).is_empty(),
+            "no structural geometry in the body ink: {:?}",
+            painted.calls
         );
     }
 
