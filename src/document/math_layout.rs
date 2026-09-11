@@ -58,8 +58,9 @@ pub const BIGOP_GAP: f32 = 0.12;
 /// [`TextStyle::condensed`]).
 ///
 /// It multiplies a glyph's own ratio: `∫` and `∑` are condensed further than
-/// this, and land narrower still. Tune this one by eye.
-pub const MATH_CONDENSE: f32 = 0.8;
+/// this, and land narrower still. Tune this one by eye — it is the single
+/// number that sets how tight every expression in the document reads.
+pub const MATH_CONDENSE: f32 = 0.85;
 /// Stroke width for scalable math geometry at level zero. Height changes do
 /// not change it, so tall delimiters stay the same visual weight as short ones.
 pub const SHAPE_STROKE: f32 = 1.25;
