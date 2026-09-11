@@ -46,6 +46,20 @@ pub const RADICAL_GAP: f32 = 0.10;
 pub const BIGOP_SCALE: f32 = 1.6;
 /// Clearance between a large operator and each of its limits.
 pub const BIGOP_GAP: f32 = 0.12;
+/// How wide every glyph set from the font is, as a fraction of the advance
+/// the typeface gives it.
+///
+/// JuliaMono is a monospace face, and a monospace cell is sized for the
+/// widest thing that has to fit in it — so math set at its natural advance
+/// reads loose: letters sit in boxes wider than their ink, and an expression
+/// gets long fast. One global squeeze is the fix, applied where the glyph
+/// boxes are built rather than at draw time, so the reserved width and the
+/// rendered ink are the same number by construction (see
+/// [`TextStyle::condensed`]).
+///
+/// It multiplies a glyph's own ratio: `∫` and `∑` are condensed further than
+/// this, and land narrower still. Tune this one by eye.
+pub const MATH_CONDENSE: f32 = 0.8;
 /// Stroke width for scalable math geometry at level zero. Height changes do
 /// not change it, so tall delimiters stay the same visual weight as short ones.
 pub const SHAPE_STROKE: f32 = 1.25;
@@ -73,7 +87,11 @@ pub const INTEGRAL_OVERLAP: f32 = 1.5;
 /// wide, heavy swash rather than the tall narrow sign the notation has.
 /// Condensing the outline re-narrows the ink and thins the spine while
 /// keeping the font's own curve — so its edges stay exactly as smooth as
-/// every glyph around it. This is the one constant worth tuning by eye.
+/// every glyph around it. Worth tuning by eye, beside [`MATH_CONDENSE`].
+///
+/// Relative to the typeface's natural advance, like every other ratio here:
+/// [`MATH_CONDENSE`] applies on top, so the sign is drawn at
+/// `INTEGRAL_CONDENSE * MATH_CONDENSE`.
 pub const INTEGRAL_CONDENSE: f32 = 0.6;
 /// How far the integral sign's glyph is lifted above the anchor line, as a
 /// fraction of the operator's size. JuliaMono's `∫` is a text glyph whose
@@ -477,8 +495,12 @@ fn glyph_with_highlight(
     } else {
         0.0
     };
+    // Measured with the style it will be drawn with, not a natural one: a
+    // box that reserved the font's full advance while the painter condensed
+    // the ink would leave every letter sitting in a gap of its own.
+    let style = TextStyle::math(size, theme::ink()).condensed(MATH_CONDENSE);
     MathBox {
-        width: measure(&text, &TextStyle::math(size, theme::ink())) + pad_x * 2.0,
+        width: measure(&text, &style) + pad_x * 2.0,
         ascent: half + pad_y,
         descent: half + pad_y,
         highlight,
@@ -488,7 +510,7 @@ fn glyph_with_highlight(
             ink: char_ink(ch),
             offset_x: pad_x,
             offset_y: 0.0,
-            condense: 1.0,
+            condense: MATH_CONDENSE,
         },
     }
 }
@@ -604,22 +626,26 @@ fn layout_node(
     }
 }
 
-/// A large operator set from the font rather than drawn. `condense` is the
-/// faux width ratio (`1.0` = natural) applied to the glyph's outline when it
-/// is rasterized — [`TextStyle::condensed`]'s theme-side knob; measurement
-/// applies the same ratio, so rendered and reserved widths stay in step.
+/// A large operator set from the font rather than drawn. `ratio` is that
+/// operator's own faux width ratio (`1.0` = the typeface's natural advance),
+/// which [`MATH_CONDENSE`] squeezes like every other glyph's — so the ratio
+/// this box ends up carrying is the product of the two, and the one the
+/// painter will use. Measurement applies the same ratio, so rendered and
+/// reserved widths stay in step.
+///
 /// `rise` lifts the glyph's centre above the anchor as a fraction of `size`,
 /// which the integral needs because its ink is bottom-biased in JuliaMono's
 /// em box.
 fn text_glyph(
     text: &str,
     size: f32,
-    condense: f32,
+    ratio: f32,
     rise: f32,
     ink: MathInk,
     measure: &dyn Fn(&str, &TextStyle) -> f32,
 ) -> MathBox {
     let half = size * 0.5;
+    let condense = ratio * MATH_CONDENSE;
     let style = TextStyle::math(size, theme::ink()).condensed(condense);
     MathBox {
         width: measure(text, &style),
@@ -1678,6 +1704,69 @@ mod tests {
 
     fn variable_width(level: usize) -> f32 {
         (BASE_SIZE * 0.5 + VARIABLE_PAD_X * 2.0) * super::scale(level, 1.0)
+    }
+
+    /// Every glyph set from the font is squeezed — that is the whole point of
+    /// [`MATH_CONDENSE`], and the box is where the painter reads it from, so
+    /// this is the number that has to be right.
+    #[test]
+    fn every_glyph_set_from_the_font_carries_the_global_squeeze() {
+        let box_ = super::layout(&symbols("xy"), 0, 1.0, &fake_measure);
+        let BoxKind::Row { children } = &box_.kind else {
+            panic!("a symbol list must produce row");
+        };
+        for (_, _, child) in children {
+            let BoxKind::Glyph { condense, .. } = child.kind else {
+                panic!("a symbol must be a glyph");
+            };
+            assert!(
+                (condense - MATH_CONDENSE).abs() < 0.0001,
+                "an ordinary glyph must be set at the global squeeze, got {condense}"
+            );
+        }
+    }
+
+    /// Reserved width and rendered ink are the same number only if layout
+    /// measures every glyph with the ratio it will be drawn at. A glyph
+    /// measured naturally would reserve the monospace cell it is no longer
+    /// painted into, and every letter would sit in a gap of its own.
+    #[test]
+    fn layout_measures_every_glyph_at_the_ratio_it_will_be_drawn_at() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let recording = |text: &str, style: &TextStyle| {
+            seen.borrow_mut().push(style.width);
+            fake_measure(text, style)
+        };
+        let _ = super::layout(&symbols("xy"), 0, 1.0, &recording);
+        let widths = seen.into_inner();
+        assert!(!widths.is_empty(), "the measure must have been asked");
+        assert!(
+            widths
+                .iter()
+                .all(|width| (*width - MATH_CONDENSE).abs() < 0.0001),
+            "every glyph must be measured condensed, saw {widths:?}"
+        );
+
+        // A large operator is measured at its own ratio times the squeeze —
+        // the same number its box carries.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let recording = |text: &str, style: &TextStyle| {
+            seen.borrow_mut().push(style.width);
+            fake_measure(text, style)
+        };
+        let _ = layout(
+            &vec![big_op(BigOp::Integral, Vec::new(), Vec::new())],
+            0,
+            &recording,
+        );
+        let widths = seen.into_inner();
+        let expected = INTEGRAL_CONDENSE * MATH_CONDENSE;
+        assert!(
+            widths
+                .iter()
+                .all(|width| (*width - expected).abs() < 0.0001),
+            "the integral must be measured at its drawn ratio, saw {widths:?}"
+        );
     }
 
     #[test]
@@ -2739,8 +2828,14 @@ mod tests {
             };
             assert_eq!(glyph.as_str(), text);
             assert!((*size - BASE_SIZE * BIGOP_SCALE).abs() < 0.0001);
-            assert!((*condense - INTEGRAL_CONDENSE).abs() < 0.0001);
-            assert!(*condense < 1.0, "the integral glyph must be condensed");
+            assert!(
+                (*condense - INTEGRAL_CONDENSE * MATH_CONDENSE).abs() < 0.0001,
+                "the integral keeps its own narrow shape, squeezed like the rest"
+            );
+            assert!(
+                *condense < MATH_CONDENSE,
+                "the integral must be narrower than an ordinary glyph"
+            );
             assert!(
                 (*offset_y - *size * INTEGRAL_RISE).abs() < 0.0001,
                 "the integral glyph must ride above the anchor"
@@ -2769,7 +2864,10 @@ mod tests {
         else {
             panic!("the sum must be a glyph");
         };
-        assert!((*condense - SUM_CONDENSE).abs() < 0.0001);
+        assert!(
+            (*condense - SUM_CONDENSE * MATH_CONDENSE).abs() < 0.0001,
+            "the sum keeps its own ratio, squeezed by the global one"
+        );
         assert!((*offset_y - BASE_SIZE * BIGOP_SCALE * SUM_RISE).abs() < 0.0001);
         assert_eq!(*ink, MathInk::Operator);
 
@@ -2882,10 +2980,12 @@ mod tests {
             let BoxKind::Row { children: operator } = &operator_box.kind else {
                 panic!("operator must produce row");
             };
-            // Set from the font, condensed to the integral's narrow shape.
+            // Set from the font, condensed to the integral's narrow shape —
+            // its own ratio, squeezed by the global one like every glyph.
             assert!(matches!(
                 &operator[0].2.kind,
-                BoxKind::Glyph { condense, .. } if (*condense - INTEGRAL_CONDENSE).abs() < 0.0001
+                BoxKind::Glyph { condense, .. }
+                    if (*condense - INTEGRAL_CONDENSE * MATH_CONDENSE).abs() < 0.0001
             ));
             assert_eq!(operator_box.width, operator[0].2.width);
             assert_eq!(operator_box.ascent, operator[0].2.ascent);
