@@ -107,6 +107,31 @@ pub fn rounded_outline(canvas: &mut dyn Canvas, rect: Rect, radius: f32, width: 
     canvas.draw_path(&d, (0.0, 0.0), 0.0, &PathPaint::Stroke(pen));
 }
 
+/// A table's border inside `rect`, as [`theme::table_border`] strokes it: the
+/// enabled edges of the panel's rounded rectangle, one stroked path.
+///
+/// The geometry comes from [`theme::table_border_path`], the same generator the
+/// `Layer` painter strokes, so a table's corners are the same on screen and on
+/// a page. A painter that drew the four edges as rules would square off the
+/// table's background, which is rounded on both.
+pub fn table_border(
+    canvas: &mut dyn Canvas,
+    rect: Rect,
+    radius: f32,
+    width: f32,
+    color: Color,
+    lines: crate::document::table::TableLines,
+    ends: theme::TableEnds,
+) {
+    let d = theme::table_border_path(rect, radius, lines, ends);
+    if d.is_empty() {
+        return;
+    }
+    let mut pen = Stroke::new(color, width);
+    pen.join = LineJoin::Round;
+    canvas.draw_path(&d, (0.0, 0.0), 0.0, &PathPaint::Stroke(pen));
+}
+
 /// An open polyline in logical pixels, as [`theme::polyline`] strokes it:
 /// round caps and joins, so a two-segment tick reads as one drawn stroke
 /// rather than three shapes meeting. The `d` is built here rather than

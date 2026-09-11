@@ -49,14 +49,14 @@ const MATH_SELECTION_ROUNDING: Rounding = Rounding::uniform(4.0);
 const GLOW_SPREAD: f32 = 1.0;
 const GLOW_ALPHA: f32 = 0.45;
 
-/// Corner radius of a table's panel. Its border is stroked half a pixel inside
-/// the panel's edge ([`TABLE_BORDER_INSET`]), so the two roundings come from
-/// this one number: the border follows the panel's corners instead of squaring
-/// them off.
-const TABLE_RADIUS: f32 = 8.0;
-const TABLE_BORDER_INSET: f32 = 0.5;
-/// The panel is the table's own background; every grid stroke is a hairline.
-const TABLE_BORDER_WIDTH: f32 = 1.0;
+/// A table's panel: the radius of the rounded rectangle behind the grid, and
+/// the half-pixel inset its one-pixel border is stroked at, so the stroke sits
+/// centred on the panel's edge and the two corners come out concentric. The
+/// PDF painter imports these rather than carrying its own — `PDF.md` §6.
+pub const TABLE_RADIUS: f32 = 8.0;
+pub const TABLE_BORDER_INSET: f32 = 0.5;
+pub const TABLE_BORDER_WIDTH: f32 = 1.0;
+
 pub const GLOW_RADIUS: f32 = 2.5;
 /// Truncate a segment's drawing to this many characters before shaping it —
 /// a single pathological line must cost the same as a normal one, not
@@ -488,6 +488,7 @@ impl Editor {
             TABLE_BORDER_WIDTH,
             line.clone(),
             table.lines,
+            theme::TableEnds::TABLE,
         );
         if table.lines.vertical {
             let mut edge = x;

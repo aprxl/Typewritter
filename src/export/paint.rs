@@ -12,11 +12,13 @@
 //! first one is "don't touch `canvas.rs`".
 
 use crate::components::editor::{
-    BLOCK_PAD, CODE_ROUNDING, EQ_NUMBER_INSET, EQ_NUMBER_SIZE, VIEW_CAP,
+    BLOCK_PAD, CODE_ROUNDING, EQ_NUMBER_INSET, EQ_NUMBER_SIZE, TABLE_BORDER_INSET,
+    TABLE_BORDER_WIDTH, TABLE_RADIUS, VIEW_CAP,
 };
 use crate::components::sidenotes;
 use crate::document::decoration::{self, Painted};
 use crate::document::layout::{self, DocLayout, NUMBER_GUTTER, NUMBER_SIZE, TABLE_CELL_PAD};
+use crate::document::table::TableLines;
 use crate::document::{ATOM, Block, Inline, code, math_layout, math_paint};
 use crate::layout::Rect;
 use crate::renderer::{Color, Rounding};
@@ -322,11 +324,28 @@ fn table_row(
     let top = line.y + dy;
     let height = line.height;
     let width: f32 = table.columns.iter().sum();
+    // The panel is the editor's rounded rectangle, drawn a row at a time: a
+    // fragment rounds the corners it owns and stays square at every seam, and
+    // the rows add up to the same shape. A row's first fragment owns its top
+    // corners only when the table starts there — a row split across a page
+    // break carries on from the page before, square.
+    let laid = &layout.blocks[piece.block];
+    let first_slice = piece.lines.start == 0;
+    let last_slice = piece.lines.end >= laid.lines.len();
+    let first_row = table.row == 0 && first_slice;
+    let last_row = table.row + 1 == table.rows && last_slice;
+    let opens = if first_row { TABLE_RADIUS } else { 0.0 };
+    let closes = if last_row { TABLE_RADIUS } else { 0.0 };
     canvas.draw_rectangle(
         (0.0, top),
         (width, height),
         theme::fade(theme::alt(), 0.78),
-        Rounding::NONE,
+        Rounding {
+            top_left: opens,
+            top_right: opens,
+            bottom_right: closes,
+            bottom_left: closes,
+        },
     );
     let mut left = 0.0;
     let cell_source = &layout.source[piece.block];
@@ -416,22 +435,35 @@ fn table_row(
         left += table.columns[column];
     }
     let line_color = theme::border();
-    if table.lines.left {
-        canvas.draw_rectangle(
-            (0.0, top),
-            (1.0, height),
-            line_color.clone(),
-            Rounding::NONE,
-        );
-    }
-    if table.lines.right {
-        canvas.draw_rectangle(
-            (width, top),
-            (1.0, height),
-            line_color.clone(),
-            Rounding::NONE,
-        );
-    }
+    // One stroked path, the same generator the editor strokes: the enabled
+    // edges of the panel's rounded rectangle. The half-pixel inset is the
+    // table's own — a fragment's sides run seam to seam, so only the ends the
+    // table itself starts and stops at come in.
+    let outer_top = if first_row { TABLE_BORDER_INSET } else { 0.0 };
+    let outer_bottom = if last_row { TABLE_BORDER_INSET } else { 0.0 };
+    canvas::table_border(
+        canvas,
+        Rect::new(
+            TABLE_BORDER_INSET,
+            top + outer_top,
+            width - TABLE_BORDER_INSET * 2.0,
+            height - outer_top - outer_bottom,
+        ),
+        TABLE_RADIUS - TABLE_BORDER_INSET,
+        TABLE_BORDER_WIDTH,
+        line_color.clone(),
+        TableLines {
+            top: table.lines.top && first_row,
+            bottom: table.lines.bottom && last_row,
+            ..table.lines
+        },
+        // The ends this fragment shares with the neighbouring rows are seams:
+        // its sides run to them and carry on, so the pages read as one grid.
+        theme::TableEnds {
+            top: first_row,
+            bottom: last_row,
+        },
+    );
     if table.lines.vertical {
         let mut edge = 0.0;
         for track in table
@@ -448,28 +480,9 @@ fn table_row(
             );
         }
     }
-    if table.row == 0 && table.lines.top {
-        canvas.draw_rectangle((0.0, top), (width, 1.0), line_color.clone(), Rounding::NONE);
-    }
-    let rows = (table.first..layout.source.len())
-        .take_while(|&row| {
-            row == table.first
-                || matches!(
-                    layout.source.get(row),
-                    Some(Block::TableRow { first: false, .. })
-                )
-        })
-        .count();
-    if table.row + 1 == rows {
-        if table.lines.bottom {
-            canvas.draw_rectangle(
-                (0.0, top + height),
-                (width, 1.0),
-                line_color,
-                Rounding::NONE,
-            );
-        }
-    } else if table.lines.horizontal {
+    // The row divider: every seam between two rows, and none under the last —
+    // the table closes there with its `bottom` edge or not at all.
+    if table.row + 1 < table.rows && table.lines.horizontal {
         canvas.draw_rectangle(
             (0.0, top + height),
             (width, 1.0),
@@ -628,6 +641,7 @@ mod tests {
             at: (f32, f32),
             size: (f32, f32),
             color: Color,
+            rounding: Rounding,
         },
         Circle {
             center: (f32, f32),
@@ -635,6 +649,7 @@ mod tests {
         },
         Path {
             at: (f32, f32),
+            d: String,
         },
     }
 
@@ -659,13 +674,40 @@ mod tests {
                 .find(|call| matches!(call, Call::Text { text, .. } if text == wanted))
         }
 
+        /// The corner radii of every rectangle drawn in `color`, in order: how
+        /// a table's panel is rounded row by row.
+        fn roundings(&self, color: Color) -> Vec<Rounding> {
+            self.calls
+                .iter()
+                .filter_map(|call| match call {
+                    Call::Rectangle {
+                        color: c, rounding, ..
+                    } if *c == color => Some(*rounding),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Every stroked path, in order.
+        fn paths(&self) -> Vec<&str> {
+            self.calls
+                .iter()
+                .filter_map(|call| match call {
+                    Call::Path { d, .. } => Some(d.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+
         /// Every rectangle drawn in `color` — which is what tells a fence's
         /// tint from an equation's band and a chip from a highlight's bar.
         fn rectangles(&self, color: Color) -> Vec<((f32, f32), (f32, f32))> {
             self.calls
                 .iter()
                 .filter_map(|call| match call {
-                    Call::Rectangle { at, size, color: c } if *c == color => Some((*at, *size)),
+                    Call::Rectangle {
+                        at, size, color: c, ..
+                    } if *c == color => Some((*at, *size)),
                     _ => None,
                 })
                 .collect()
@@ -683,16 +725,30 @@ mod tests {
     }
 
     impl Canvas for Recorder {
-        fn draw_rectangle(&mut self, at: (f32, f32), size: (f32, f32), color: Color, _: Rounding) {
-            self.calls.push(Call::Rectangle { at, size, color });
+        fn draw_rectangle(
+            &mut self,
+            at: (f32, f32),
+            size: (f32, f32),
+            color: Color,
+            rounding: Rounding,
+        ) {
+            self.calls.push(Call::Rectangle {
+                at,
+                size,
+                color,
+                rounding,
+            });
         }
 
         fn draw_circle(&mut self, center: (f32, f32), radius: f32, _: Color) {
             self.calls.push(Call::Circle { center, radius });
         }
 
-        fn draw_path(&mut self, _: &str, at: (f32, f32), _: f32, _: &PathPaint) {
-            self.calls.push(Call::Path { at });
+        fn draw_path(&mut self, d: &str, at: (f32, f32), _: f32, _: &PathPaint) {
+            self.calls.push(Call::Path {
+                at,
+                d: d.to_string(),
+            });
         }
 
         fn draw_text(&mut self, text: &str, at: (f32, f32), style: &TextStyle, align: Alignment) {
@@ -915,6 +971,101 @@ mod tests {
             "notation must start past the run before it, not at {}",
             at.0
         );
+    }
+
+    /// A table laid out and page-wrapped, with the page holding all of it.
+    fn table_page(text: &str, width: f32) -> (DocLayout, Page) {
+        let document = crate::document::markdown::parse(Path::new("notes/table.md"), text);
+        let layout = layout::layout(&document, width, &|value, _| {
+            value.chars().count() as f32 * GLYPH
+        });
+        let page = whole(&layout);
+        (layout, page)
+    }
+
+    /// Two header cells and two data rows.
+    const TABLE: &str = "| A | B |\n| --- | --- |\n| a | b |\n| c | d |\n";
+
+    /// The table's panel is the editor's rounded rectangle, drawn a row at a
+    /// time: the corners round where the table itself starts and stops, and
+    /// every seam between rows is square, so the rows add up to one shape.
+    #[test]
+    fn a_table_panel_rounds_where_the_table_starts_and_stops() {
+        let (layout, page) = table_page(TABLE, 200.0);
+        let painted = paint(&layout, &page, 200.0);
+        let panel = theme::fade(theme::alt(), 0.78);
+        let roundings = painted.roundings(panel);
+        assert_eq!(roundings.len(), 3, "one panel per row: {:?}", painted.calls);
+        assert_eq!(roundings[0].top_left, TABLE_RADIUS, "the top corners round");
+        assert_eq!(roundings[0].top_right, TABLE_RADIUS);
+        assert_eq!(roundings[0].bottom_left, 0.0, "and stop at the seam");
+        assert_eq!(roundings[1], Rounding::NONE, "a middle row is square");
+        assert_eq!(roundings[2].bottom_left, TABLE_RADIUS, "the bottom rounds");
+        assert_eq!(roundings[2].bottom_right, TABLE_RADIUS);
+        assert_eq!(roundings[2].top_left, 0.0, "and its top is the seam");
+    }
+
+    /// One row's panel covers the row, so the rounded corners sit on the
+    /// table's own corners rather than on a line inside it.
+    #[test]
+    fn a_table_panel_covers_its_row() {
+        let (layout, page) = table_page(TABLE, 200.0);
+        let painted = paint(&layout, &page, 200.0);
+        let panel = theme::fade(theme::alt(), 0.78);
+        let bands = painted.rectangles(panel);
+        let width: f32 = layout.tables[0]
+            .as_ref()
+            .expect("a table")
+            .columns
+            .iter()
+            .sum();
+        for (index, (at, size)) in bands.iter().enumerate() {
+            let laid = &layout.blocks[index];
+            assert_eq!(at.0, 0.0, "the panel starts at the table's left edge");
+            assert_eq!(size.0, width, "and spans its columns");
+            assert_eq!(at.1, laid.lines[0].y, "row {index} starts at its own top");
+            assert_eq!(size.1, laid.height, "and covers its height");
+        }
+    }
+
+    /// The border is stroked from the same generator the editor strokes, on
+    /// the same rect: one path per row, corners only where the table's own
+    /// corners are, and the sides running to every seam.
+    #[test]
+    fn a_table_border_is_the_panel_rounded_outline() {
+        let width = 200.0;
+        let (layout, page) = table_page(TABLE, width);
+        let painted = paint(&layout, &page, width);
+        let table = layout.tables[0].as_ref().expect("a table");
+        let columns: f32 = table.columns.iter().sum();
+        let paths = painted.paths();
+        assert_eq!(paths.len(), 3, "one border per row: {:?}", painted.calls);
+        // The row the table starts in carries its two corners.
+        assert_eq!(paths[0].matches('A').count(), 2, "{}", paths[0]);
+        assert_eq!(paths[1].matches('A').count(), 0, "a seam has no corner");
+        assert_eq!(paths[2].matches('A').count(), 2, "{}", paths[2]);
+        // And it is the editor's own generator, on the editor's own rect.
+        let laid = &layout.blocks[0];
+        let expected = theme::table_border_path(
+            Rect::new(
+                TABLE_BORDER_INSET,
+                laid.lines[0].y + TABLE_BORDER_INSET,
+                columns - TABLE_BORDER_INSET * 2.0,
+                // Only the end the table itself starts at comes in; the row's
+                // bottom is a seam, and the next row's sides carry on from it.
+                laid.height - TABLE_BORDER_INSET,
+            ),
+            TABLE_RADIUS - TABLE_BORDER_INSET,
+            TableLines {
+                bottom: false,
+                ..table.lines
+            },
+            theme::TableEnds {
+                top: true,
+                bottom: false,
+            },
+        );
+        assert_eq!(paths[0], expected, "the page strokes the screen's border");
     }
 
     #[test]

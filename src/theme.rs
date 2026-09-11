@@ -835,13 +835,35 @@ pub fn rounded_rect_path(rect: Rect, radius: f32) -> String {
     )
 }
 
+/// Which of a border rect's two ends the table itself starts and stops at.
+///
+/// The editor strokes one rect for a whole table, so both ends are its own. A
+/// page fragment of a table whose neighbouring rows sit on another page shares
+/// an end with it. The difference is the corner: a table's own end insets its
+/// perpendicular edges by the radius, where the panel's curve takes over, while
+/// a shared end is a seam and its edges run corner to corner, so consecutive
+/// fragments make one unbroken line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TableEnds {
+    pub top: bool,
+    pub bottom: bool,
+}
+
+impl TableEnds {
+    /// A rect that is the whole table.
+    pub const TABLE: Self = Self {
+        top: true,
+        bottom: true,
+    };
+}
+
 /// The SVG path data for a table's border: the enabled edges of the same
 /// rounded rectangle [`rounded_rect_path`] traces, so a table whose reader
 /// switched an edge off still follows the shape of the rounded panel behind it
 /// instead of collapsing into a square. A corner curves only where the two
 /// edges that meet there are both drawn — a lone edge ends on the flat part of
-/// the rectangle rather than hooking into empty space.
-pub fn table_border_path(rect: Rect, radius: f32, lines: TableLines) -> String {
+/// the rectangle rather than hooking out past the panel's corner.
+pub fn table_border_path(rect: Rect, radius: f32, lines: TableLines, ends: TableEnds) -> String {
     let r = radius.max(0.0).min(rect.width / 2.0).min(rect.height / 2.0);
     let (x, y) = rect.position();
     let right_edge = rect.right();
@@ -851,6 +873,14 @@ pub fn table_border_path(rect: Rect, radius: f32, lines: TableLines) -> String {
     let arc = |from: (f32, f32), to: (f32, f32)| {
         format!("M{} {} A{r} {r} 0 0 1 {} {} ", from.0, from.1, to.0, to.1)
     };
+    // A vertical edge stops where the panel's corner curve begins — the curve
+    // belongs to the corner, so an edge whose neighbour is missing ends there
+    // rather than running out past the panel's silhouette. At a seam there is
+    // no curve to stop for and the edge runs corner to corner.
+    let (top_end, bottom_end) = (
+        if ends.top { ty } else { y },
+        if ends.bottom { by } else { bottom_edge },
+    );
     let mut d = String::new();
     if lines.top {
         d.push_str(&format!("M{mx} {y} H{tx} "));
@@ -859,21 +889,21 @@ pub fn table_border_path(rect: Rect, radius: f32, lines: TableLines) -> String {
         d.push_str(&format!("M{tx} {bottom_edge} H{mx} "));
     }
     if lines.left {
-        d.push_str(&format!("M{x} {by} V{ty} "));
+        d.push_str(&format!("M{x} {bottom_end} V{top_end} "));
     }
     if lines.right {
-        d.push_str(&format!("M{right_edge} {ty} V{by} "));
+        d.push_str(&format!("M{right_edge} {top_end} V{bottom_end} "));
     }
-    if lines.top && lines.left {
+    if lines.top && lines.left && ends.top {
         d.push_str(&arc((x, ty), (mx, y)));
     }
-    if lines.top && lines.right {
+    if lines.top && lines.right && ends.top {
         d.push_str(&arc((tx, y), (right_edge, ty)));
     }
-    if lines.bottom && lines.right {
+    if lines.bottom && lines.right && ends.bottom {
         d.push_str(&arc((right_edge, by), (tx, bottom_edge)));
     }
-    if lines.bottom && lines.left {
+    if lines.bottom && lines.left && ends.bottom {
         d.push_str(&arc((mx, bottom_edge), (x, by)));
     }
     d.trim_end().to_string()
@@ -888,8 +918,9 @@ pub fn table_border(
     width: f32,
     color: Color,
     lines: TableLines,
+    ends: TableEnds,
 ) {
-    let d = table_border_path(rect, radius, lines);
+    let d = table_border_path(rect, radius, lines, ends);
     if d.is_empty() {
         return;
     }
@@ -1220,30 +1251,42 @@ mod tests {
             horizontal: true,
             vertical: true,
         };
-        for case in 0..16u8 {
-            let lines = edges(case);
-            for rect in [
-                card,
-                Rect::new(0.0, 0.0, 40.0, 2.0),
-                Rect::new(0.0, 0.0, 8.0, 8.0),
-            ] {
-                let d = table_border_path(rect, 7.5, lines);
-                assert!(parses(&d), "case {case} on {rect:?} produced {d:?}");
+        for ends in [
+            TableEnds::TABLE,
+            TableEnds {
+                top: false,
+                bottom: false,
+            },
+        ] {
+            for case in 0..16u8 {
+                let lines = edges(case);
+                for rect in [
+                    card,
+                    Rect::new(0.0, 0.0, 40.0, 2.0),
+                    Rect::new(0.0, 0.0, 8.0, 8.0),
+                ] {
+                    let d = table_border_path(rect, 7.5, lines, ends);
+                    assert!(
+                        parses(&d),
+                        "case {case} on {rect:?} with {ends:?} produced {d:?}"
+                    );
+                }
             }
         }
         // No edges is nothing to stroke, not an empty path.
-        assert!(table_border_path(card, 7.5, edges(0)).is_empty());
+        let table = TableEnds::TABLE;
+        assert!(table_border_path(card, 7.5, edges(0), table).is_empty());
         // One edge is a straight run, with no corner to curve.
-        let lone = table_border_path(card, 7.5, edges(1));
+        let lone = table_border_path(card, 7.5, edges(1), table);
         assert!(!lone.contains('A'), "a lone edge curves nowhere: {lone}");
         // Two edges that meet curve the corner between them.
-        let corner = table_border_path(card, 7.5, edges(5));
+        let corner = table_border_path(card, 7.5, edges(5), table);
         assert_eq!(corner.matches('A').count(), 1, "one corner: {corner}");
         // Opposite edges never meet, so they never curve.
-        let rails = table_border_path(card, 7.5, edges(3));
+        let rails = table_border_path(card, 7.5, edges(3), table);
         assert!(!rails.contains('A'), "parallel edges meet nowhere: {rails}");
         // All four is the same shape the background draws: four corners.
-        let closed = table_border_path(card, 7.5, edges(15));
+        let closed = table_border_path(card, 7.5, edges(15), table);
         assert_eq!(closed.matches('A').count(), 4, "four corners: {closed}");
     }
 
@@ -1445,6 +1488,93 @@ mod tests {
         PathReader::read(d)
     }
 
+    /// A page fragment's share of a table. Its sides run to the ends it shares
+    /// with the neighbouring rows — no corner there, and no gap at the seam —
+    /// while the fragment the table actually starts and stops in carries the
+    /// corners, so the pages stack into one border.
+    #[test]
+    fn a_fragment_side_runs_to_the_seam_and_carries_on() {
+        let rect = table_rect();
+        let below = Rect::new(rect.x, rect.bottom(), rect.width, rect.height);
+        // The edges a page fragment draws: the sides on every fragment, the
+        // closing horizontal edge only where the table itself closes — a seam
+        // between two rows is drawn as the row divider, not as the border.
+        let sides = TableLines {
+            top: false,
+            bottom: false,
+            left: true,
+            right: true,
+            horizontal: true,
+            vertical: true,
+        };
+        let opening = TableLines { top: true, ..sides };
+        let first = table_border_path(
+            rect,
+            7.5,
+            opening,
+            TableEnds {
+                top: true,
+                bottom: false,
+            },
+        );
+        let next = table_border_path(
+            below,
+            7.5,
+            sides,
+            TableEnds {
+                top: false,
+                bottom: false,
+            },
+        );
+        let verticals = |d: &str| -> Vec<Segment> {
+            segments(d)
+                .into_iter()
+                .filter(|segment| match segment {
+                    Segment::Line { from, to } => from.0 == to.0,
+                    Segment::Arc { .. } => false,
+                })
+                .collect()
+        };
+        assert_eq!(segments(&next).len(), 2, "a middle fragment is two sides");
+        assert_eq!(
+            verticals(&first).len(),
+            2,
+            "the top fragment is two sides too"
+        );
+        let corners = |d: &str| -> usize {
+            segments(d)
+                .into_iter()
+                .filter(|segment| matches!(segment, Segment::Arc { .. }))
+                .count()
+        };
+        assert_eq!(corners(&first), 2, "the table's own end curves: {first}");
+        assert_eq!(corners(&next), 0, "a seam has no corner: {next}");
+        // The seam is one point, so the two fragments' sides meet exactly and
+        // the stroke carries on across the page break.
+        let ends_at_seam: Vec<_> = verticals(&first)
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Line { from, to } => {
+                    (from.1.max(to.1) == (rect.bottom() * 100.0).round() as i32).then_some(from.0)
+                }
+                Segment::Arc { .. } => None,
+            })
+            .collect();
+        let starts_below: Vec<_> = verticals(&next)
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Line { from, to } => {
+                    (from.1.min(to.1) == (below.y * 100.0).round() as i32).then_some(from.0)
+                }
+                Segment::Arc { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            ends_at_seam, starts_below,
+            "both sides reach the seam and pick up below it"
+        );
+    }
+
     /// The table the editor draws its border around, and the half-pixel inset
     /// the stroke sits at — the two numbers that tie the border to the panel.
     fn table_rect() -> Rect {
@@ -1476,7 +1606,7 @@ mod tests {
     fn all_four_edges_draw_the_panel_own_outline() {
         let rect = table_rect();
         let outline = rounded_rect_path(border_rect(rect), 7.5);
-        let border = table_border_path(border_rect(rect), 7.5, all_edges());
+        let border = table_border_path(border_rect(rect), 7.5, all_edges(), TableEnds::TABLE);
         assert_eq!(
             segments(&outline).len(),
             8,
@@ -1505,7 +1635,7 @@ mod tests {
                 horizontal: true,
                 vertical: true,
             };
-            let border = table_border_path(rect.inset(0.5), 7.5, lines);
+            let border = table_border_path(rect.inset(0.5), 7.5, lines, TableEnds::TABLE);
             let drawn = segments(&border);
             // One run per enabled edge, plus a corner wherever two enabled
             // edges meet: the count is what says the path was read at all.

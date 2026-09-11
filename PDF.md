@@ -466,6 +466,7 @@ thing would be indirection with no reader.
 | Badges | ✅ shared | ✅ shared | — |
 | Highlights | ✅ shared | ✅ shared | — |
 | Sidenotes (anchor, marker, body) | ✅ shared | ✅ | ✅ travels with its anchor |
+| Tables (panel, grid, rounded border) | ✅ shared | ✅ shared | ✅ a row is one line |
 | Images | — | ⬜ | ⬜ |
 
 Images are the only row left, and they are ⬜ in *every* column: the
