@@ -902,13 +902,16 @@ fn radical(
         body_x * 0.78,
         width - stroke * 0.5,
     );
+    // Structural geometry, not part of the term under it: the sign is drawn
+    // in the operators' ink, the same as a delimiter, so it reads as the
+    // markup around the expression rather than as one of its symbols.
     let sign = stroked_box(
         width,
         -top + stroke * 0.5,
         valley + stroke * 0.5,
         path,
         stroke,
-        MathInk::Term,
+        MathInk::Operator,
     );
     let mut children = (0..2).map(|_| None).collect::<Vec<_>>();
     children[0] = Some((0.0, 0.0, sign));
@@ -2606,7 +2609,11 @@ mod tests {
             panic!("radical must be one connected stroke");
         };
         assert_eq!(*thickness, SHAPE_STROKE);
-        assert_eq!(*ink, MathInk::Term);
+        assert_eq!(
+            *ink,
+            MathInk::Operator,
+            "the radical is structural markup, drawn dimmer than its body"
+        );
         assert_eq!(path.matches('M').count(), 1);
         assert_eq!(sign.2.width, body.0 + body.2.width);
         assert!(sign.2.ascent > body.2.ascent);
