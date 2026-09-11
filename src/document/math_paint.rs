@@ -109,12 +109,15 @@ fn draw_inner(
         }
         BoxKind::Bar { thickness } => {
             // A fractional one-pixel rule smears across adjacent rows.
+            // The operators' ink, like every other piece of structural
+            // geometry: the bar is markup between the operands, not part
+            // of either of them.
             canvas::rule(
                 canvas,
                 (origin.0, (origin.1 - thickness * 0.5).round()),
                 box_.width,
                 *thickness,
-                theme::ink(),
+                theme::math_operator(),
             );
         }
         BoxKind::Slot { visible, .. } => {
@@ -315,6 +318,26 @@ mod tests {
             "both group delimiters use the quiet grammar ink"
         );
         assert!(canvas.calls.contains(&Call::Text("z".into(), theme::ink())));
+    }
+
+    /// The fraction bar is markup between two operands, not part of either
+    /// of them, so it is drawn in the quiet grammar ink like the radical
+    /// and the delimiters — never in the full body ink.
+    #[test]
+    fn the_fraction_bar_uses_the_operators_ink() {
+        let canvas = painted(&vec![MathNode::Frac {
+            num: vec![MathNode::Sym('x')],
+            den: vec![MathNode::Sym('y')],
+        }]);
+
+        assert!(
+            canvas.calls.contains(&Call::Fill(theme::math_operator())),
+            "the bar must be the dimmed grammar ink"
+        );
+        assert!(
+            !canvas.calls.contains(&Call::Fill(theme::ink())),
+            "no part of a fraction's structural geometry is full body ink"
+        );
     }
 
     /// An expression with no symbols in it makes no highlight calls at all.
