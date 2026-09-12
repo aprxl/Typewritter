@@ -155,19 +155,22 @@ fn calendar_widget(
             theme::CENTER,
         );
     }
-    let arrow_y = inner.y + 14.0;
-    icon(
-        canvas,
-        theme::icons::CHEVRON_LEFT,
-        (card.rect.right() - WIDGET_PAD - 26.0, arrow_y - 9.0),
-        theme::dim(),
-    );
-    icon(
-        canvas,
-        theme::icons::CHEVRON_RIGHT,
-        (card.rect.right() - WIDGET_PAD - 10.0, arrow_y - 9.0),
-        theme::dim(),
-    );
+    if let Some(previous) = card.previous {
+        icon(
+            canvas,
+            theme::icons::CHEVRON_LEFT,
+            (previous.x + previous.width * 0.5, previous.y + 3.0),
+            theme::dim(),
+        );
+    }
+    if let Some(next) = card.next {
+        icon(
+            canvas,
+            theme::icons::CHEVRON_RIGHT,
+            (next.x + next.width * 0.5, next.y + 3.0),
+            theme::dim(),
+        );
+    }
 }
 
 fn clarity_widget(canvas: &mut dyn Canvas, value: Option<ClarityLevel>, rect: Rect) {

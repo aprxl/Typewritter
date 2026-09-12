@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::document::{
     BadgeColor, Block, Document, FlatRange, Focus, ListMarker, Style, flat_len, fold_owner_of,
-    math, math_conversion, table,
+    math, math_conversion, table, widget,
 };
 
 /// What a Backspace/Delete at a cell boundary resolves to: fold the blank
@@ -131,6 +131,11 @@ impl Tabs {
 
     pub fn active_index(&self) -> Option<usize> {
         self.active
+    }
+
+    pub fn in_widget_row(&self) -> bool {
+        self.active()
+            .is_some_and(|tab| tab.document.in_widget_row())
     }
 
     pub fn activate(&mut self, index: usize) {
@@ -649,6 +654,54 @@ impl Tabs {
 
     pub fn insert_divider(&mut self) {
         self.edit(|doc| doc.insert_divider());
+    }
+
+    pub fn insert_widget(&mut self, value: widget::Widget) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.insert_widget(value));
+        changed
+    }
+
+    pub fn set_widget_at(
+        &mut self,
+        block: usize,
+        slot: usize,
+        span: usize,
+        value: widget::Widget,
+    ) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.set_widget_at(block, slot, span, value));
+        changed
+    }
+
+    pub fn remove_widget_at(&mut self, block: usize, slot: usize) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.remove_widget_at(block, slot));
+        changed
+    }
+
+    pub fn toggle_widget_calendar_day(&mut self, block: usize, placement: usize, day: u8) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.toggle_widget_calendar_day(block, placement, day));
+        changed
+    }
+
+    pub fn shift_widget_calendar(
+        &mut self,
+        block: usize,
+        placement: usize,
+        months: i32,
+        years: i32,
+    ) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.shift_widget_calendar(block, placement, months, years));
+        changed
+    }
+
+    pub fn cycle_widget_clarity(&mut self, block: usize, placement: usize) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.cycle_widget_clarity(block, placement));
+        changed
     }
 
     /// Puts a sidenote anchor at the caret and opens an empty note for it.
@@ -1231,6 +1284,24 @@ impl Tabs {
 
     pub fn move_end(&mut self) {
         self.touch(Document::move_end);
+    }
+
+    pub fn widget_move_horizontal(&mut self, delta: i32) -> bool {
+        let mut moved = false;
+        self.touch(|doc| moved = doc.move_widget_horizontal(delta));
+        moved
+    }
+
+    pub fn widget_move_vertical(&mut self, up: bool) -> bool {
+        let mut moved = false;
+        self.touch(|doc| moved = doc.move_widget_vertical(up));
+        moved
+    }
+
+    pub fn widget_tab(&mut self, backwards: bool) -> bool {
+        let mut moved = false;
+        self.touch(|doc| moved = doc.widget_tab(backwards));
+        moved
     }
 
     /// Jump the caret to a model position (click-to-place / vim jumps).

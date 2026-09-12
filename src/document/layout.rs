@@ -278,6 +278,8 @@ pub struct WidgetCardLayout {
     pub span: usize,
     pub rect: Rect,
     pub days: Vec<WidgetDayLayout>,
+    pub previous: Option<Rect>,
+    pub next: Option<Rect>,
 }
 
 /// Geometry of a widget row, including unused tracks for edit-only affordances
@@ -1142,12 +1144,34 @@ fn widget_layout(
                 }
                 super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => Vec::new(),
             };
+            let (previous, next) = match &placement.widget {
+                super::widget::Widget::Calendar(_) => {
+                    let inner = rect.inset(WIDGET_PAD * scale);
+                    (
+                        Some(Rect::new(
+                            rect.right() - WIDGET_PAD * scale - 34.0 * scale,
+                            inner.y + 2.0 * scale,
+                            16.0 * scale,
+                            24.0 * scale,
+                        )),
+                        Some(Rect::new(
+                            rect.right() - WIDGET_PAD * scale - 18.0 * scale,
+                            inner.y + 2.0 * scale,
+                            16.0 * scale,
+                            24.0 * scale,
+                        )),
+                    )
+                }
+                super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => (None, None),
+            };
             WidgetCardLayout {
                 placement: placement_index,
                 slot: placement.slot,
                 span: placement.span,
                 rect,
                 days,
+                previous,
+                next,
             }
         })
         .collect::<Vec<_>>();
@@ -2073,6 +2097,22 @@ impl DocLayout {
             .iter()
             .find(|day| day.rect.contains((x, y)))?;
         Some((block, placement, day.day))
+    }
+
+    /// The previous/next month control at a point, with the month delta to
+    /// apply. Controls are part of the card snapshot so pointer routing and
+    /// painting use the same geometry.
+    pub fn widget_calendar_control_at(&self, x: f32, y: f32) -> Option<(usize, usize, i32)> {
+        let (block, placement) = self.widget_at(x, y)?;
+        let row = self.widget_rows.get(block)?.as_ref()?;
+        let card = row.cards.get(placement)?;
+        if card.previous.is_some_and(|rect| rect.contains((x, y))) {
+            return Some((block, placement, -1));
+        }
+        if card.next.is_some_and(|rect| rect.contains((x, y))) {
+            return Some((block, placement, 1));
+        }
+        None
     }
 
     /// Reports the label and y of each anchor in the document, in document
@@ -3462,6 +3502,16 @@ mod tests {
         assert_eq!(
             laid.widget_slot_at(prose_point.0, prose_point.1),
             Some((0, 1))
+        );
+        let previous = widget.cards[0].previous.expect("previous month control");
+        let next = widget.cards[0].next.expect("next month control");
+        assert_eq!(
+            laid.widget_calendar_control_at(previous.x + 2.0, previous.y + 2.0),
+            Some((0, 0, -1))
+        );
+        assert_eq!(
+            laid.widget_calendar_control_at(next.x + 2.0, next.y + 2.0),
+            Some((0, 0, 1))
         );
     }
 

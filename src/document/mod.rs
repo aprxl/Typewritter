@@ -402,6 +402,20 @@ impl Block {
         matches!(self, Block::WidgetRow(_))
     }
 
+    pub fn widget_row_ref(&self) -> Option<&widget::WidgetRow> {
+        match self {
+            Block::WidgetRow(row) => Some(row),
+            _ => None,
+        }
+    }
+
+    pub fn widget_row_mut(&mut self) -> Option<&mut widget::WidgetRow> {
+        match self {
+            Block::WidgetRow(row) => Some(row),
+            _ => None,
+        }
+    }
+
     pub fn table_first(&self) -> bool {
         matches!(self, Block::TableRow { first: true, .. })
     }
@@ -1722,6 +1736,12 @@ impl Document {
         if (start.block, start.offset) >= (end.block, end.offset) {
             return None;
         }
+        if (start.block..=end.block).any(|block| self.scope()[block].is_widget()) {
+            // A widget row has no flat text, so a character-range operation
+            // cannot describe removing part of it. Structural row deletion
+            // remains available through `delete_line`/`delete_lines`.
+            return None;
+        }
         if start.block != end.block
             && (start.block..=end.block).any(|block| self.scope()[block].is_table())
         {
@@ -2549,6 +2569,290 @@ impl Document {
             .is_some_and(Block::is_table)
     }
 
+    /// Whether the caret is on a widget row. Widget rows use their four
+    /// tracks as caret units, so ordinary inline editing must never reach
+    /// their empty run slice.
+    pub fn in_widget_row(&self) -> bool {
+        self.scope()
+            .get(self.caret.block)
+            .is_some_and(Block::is_widget)
+    }
+
+    /// The widget row under the caret, if any.
+    pub fn widget_row(&self) -> Option<&widget::WidgetRow> {
+        match self.scope().get(self.caret.block) {
+            Some(Block::WidgetRow(row)) => Some(row),
+            _ => None,
+        }
+    }
+
+    fn widget_free_slot(row: &widget::WidgetRow, preferred: usize) -> Option<usize> {
+        (preferred..widget::TRACKS)
+            .chain(0..preferred.min(widget::TRACKS))
+            .find(|&slot| row.placement_at(slot).is_none())
+    }
+
+    /// Inserts a one-track widget at the caret. A blank paragraph becomes the
+    /// row itself; otherwise the row is inserted immediately below it. When
+    /// the caret is already on a row, the current/free track is used.
+    pub fn insert_widget(&mut self, value: widget::Widget) -> bool {
+        if matches!(self.focus, Focus::Note(_)) {
+            return false;
+        }
+        self.clamp_caret();
+        let b = self.caret.block;
+        if let Block::WidgetRow(row) = &self.scope()[b] {
+            let Some(slot) = Self::widget_free_slot(row, self.caret.inline) else {
+                return false;
+            };
+            let changed = self.scope_mut()[b]
+                .widget_row_mut()
+                .expect("widget row")
+                .set(slot, 1, value);
+            if changed {
+                self.set_caret(b, slot, 0);
+                self.dirty = true;
+                self.enforce();
+            }
+            return changed;
+        }
+        let at = if self.block_flat_len(b) == 0 {
+            self.scope_mut()[b] = Block::WidgetRow(widget::WidgetRow::new(value));
+            b
+        } else {
+            self.scope_mut()
+                .insert(b + 1, Block::WidgetRow(widget::WidgetRow::new(value)));
+            b + 1
+        };
+        self.set_caret(at, 0, 0);
+        self.dirty = true;
+        self.enforce();
+        true
+    }
+
+    /// Places a widget into an existing row and focuses its track. This is
+    /// the click/chooser path, so `block` is always a body index.
+    pub fn set_widget_at(
+        &mut self,
+        block: usize,
+        slot: usize,
+        span: usize,
+        value: widget::Widget,
+    ) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let changed = match self.body.get_mut(block) {
+            Some(Block::WidgetRow(row)) => row.set(slot, span, value),
+            _ => false,
+        };
+        if changed {
+            self.set_caret(block, slot, 0);
+            self.dirty = true;
+            self.enforce();
+        }
+        changed
+    }
+
+    /// Removes the placement covering `slot`. Removing the final placement
+    /// removes the row anchor too, returning the caret to adjacent Markdown.
+    pub fn remove_widget_at(&mut self, block: usize, slot: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let removed = match self.body.get_mut(block) {
+            Some(Block::WidgetRow(row)) => row.remove_at(slot).is_some(),
+            _ => false,
+        };
+        if !removed {
+            return false;
+        }
+        if self.body[block]
+            .widget_row_ref()
+            .is_some_and(widget::WidgetRow::is_empty)
+        {
+            if self.body.len() == 1 {
+                self.body[0] = empty_block();
+                self.set_caret(0, 0, 0);
+            } else {
+                self.body.remove(block);
+                self.set_caret(block.min(self.body.len() - 1), 0, 0);
+            }
+        } else {
+            self.set_caret(block, slot.min(widget::TRACKS - 1), 0);
+        }
+        self.dirty = true;
+        self.enforce();
+        true
+    }
+
+    /// Toggles one calendar day. The placement index is from the immutable
+    /// layout snapshot and is checked again against the live row.
+    pub fn toggle_widget_calendar_day(&mut self, block: usize, placement: usize, day: u8) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let changed = match self.body.get_mut(block) {
+            Some(Block::WidgetRow(row)) => match row.placements.get_mut(placement) {
+                Some(widget::WidgetPlacement {
+                    widget: widget::Widget::Calendar(calendar),
+                    ..
+                }) => calendar.toggle_day(u32::from(day)),
+                _ => false,
+            },
+            _ => false,
+        };
+        if changed {
+            self.set_caret(
+                block,
+                match &self.body[block] {
+                    Block::WidgetRow(row) => row.placements[placement].slot,
+                    _ => 0,
+                },
+                0,
+            );
+            self.dirty = true;
+        }
+        changed
+    }
+
+    /// Moves a calendar by months or years and clears its selected days.
+    pub fn shift_widget_calendar(
+        &mut self,
+        block: usize,
+        placement: usize,
+        months: i32,
+        years: i32,
+    ) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let changed = match self.body.get_mut(block) {
+            Some(Block::WidgetRow(row)) => match row.placements.get_mut(placement) {
+                Some(widget::WidgetPlacement {
+                    widget: widget::Widget::Calendar(calendar),
+                    ..
+                }) => {
+                    if months != 0 {
+                        calendar.shift_month(months);
+                    }
+                    if years != 0 {
+                        calendar.shift_year(years);
+                    }
+                    months != 0 || years != 0
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if changed {
+            self.set_caret(
+                block,
+                match &self.body[block] {
+                    Block::WidgetRow(row) => row.placements[placement].slot,
+                    _ => 0,
+                },
+                0,
+            );
+            self.dirty = true;
+        }
+        changed
+    }
+
+    /// Cycles Clarity through unset → Review → Working → Clear → unset.
+    pub fn cycle_widget_clarity(&mut self, block: usize, placement: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let changed = match self.body.get_mut(block) {
+            Some(Block::WidgetRow(row)) => match row.placements.get_mut(placement) {
+                Some(widget::WidgetPlacement {
+                    widget: widget::Widget::Clarity(clarity),
+                    ..
+                }) => {
+                    clarity.value = match clarity.value {
+                        None => Some(widget::ClarityLevel::Review),
+                        Some(widget::ClarityLevel::Review) => Some(widget::ClarityLevel::Working),
+                        Some(widget::ClarityLevel::Working) => Some(widget::ClarityLevel::Clear),
+                        Some(widget::ClarityLevel::Clear) => None,
+                    };
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if changed {
+            self.set_caret(
+                block,
+                match &self.body[block] {
+                    Block::WidgetRow(row) => row.placements[placement].slot,
+                    _ => 0,
+                },
+                0,
+            );
+            self.dirty = true;
+        }
+        changed
+    }
+
+    /// Advance the widget caret one horizontal track. The shell uses `false`
+    /// at an edge to fall through to normal document movement.
+    pub fn move_widget_horizontal(&mut self, delta: i32) -> bool {
+        if !self.in_widget_row() {
+            return false;
+        }
+        let slot = self.caret.inline as i32 + delta;
+        if !(0..widget::TRACKS as i32).contains(&slot) {
+            return false;
+        }
+        self.caret.inline = slot as usize;
+        self.caret.offset = 0;
+        self.caret.style = Style::PLAIN;
+        true
+    }
+
+    /// Leave a widget row vertically through its neighbouring Markdown block.
+    pub fn move_widget_vertical(&mut self, up: bool) -> bool {
+        if !self.in_widget_row() {
+            return false;
+        }
+        let target = if up {
+            self.caret.block.checked_sub(1)
+        } else {
+            (self.caret.block + 1 < self.scope().len()).then_some(self.caret.block + 1)
+        };
+        let Some(block) = target else {
+            return true;
+        };
+        let offset = if up { self.block_len(block) } else { 0 };
+        self.set_caret(block, 0, offset);
+        true
+    }
+
+    /// Tab through every track, leaving the row at either edge.
+    pub fn widget_tab(&mut self, backwards: bool) -> bool {
+        if !self.in_widget_row() {
+            return false;
+        }
+        let slot = self.caret.inline as i32 + if backwards { -1 } else { 1 };
+        if (0..widget::TRACKS as i32).contains(&slot) {
+            self.caret.inline = slot as usize;
+            self.caret.offset = 0;
+            self.caret.style = Style::PLAIN;
+            return true;
+        }
+        let next = if backwards {
+            self.caret.block.checked_sub(1)
+        } else {
+            (self.caret.block + 1 < self.scope().len()).then_some(self.caret.block + 1)
+        };
+        if let Some(block) = next {
+            self.set_caret(block, 0, if backwards { self.block_len(block) } else { 0 });
+        }
+        true
+    }
+
     // ---- edits (content changes set `dirty`) ----------------------------
 
     /// Inserts `text` exactly as given. Every keystroke and every paste from
@@ -2562,6 +2866,9 @@ impl Document {
         }
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_widget() {
+            return;
+        }
         // A display block is one atom: there is no prose beside it to type
         // into, so typed characters enter the tree at the side of the atom
         // the caret rests on. Splicing prose here would demote the whole
@@ -2800,6 +3107,9 @@ impl Document {
             return;
         }
         self.clamp_caret();
+        if self.in_widget_row() {
+            return;
+        }
         // Notation markers carry no meaning inside a display atom; the
         // characters join the tree like any typed ones.
         if matches!(self.scope()[self.caret.block], Block::Math { .. }) {
@@ -2849,6 +3159,9 @@ impl Document {
     pub fn backspace(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_widget() {
+            return;
+        }
         let i = self.caret.inline;
         let o = self.caret.offset;
         let before = self.caret_flat(b);
@@ -3001,6 +3314,9 @@ impl Document {
     pub fn delete_forward(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_widget() {
+            return;
+        }
         let i = self.caret.inline;
         let o = self.caret.offset;
         if self.scope()[b].is_table() {
@@ -3117,6 +3433,9 @@ impl Document {
             return;
         }
         let b = self.caret.block;
+        if self.scope()[b].is_widget() {
+            return;
+        }
         let i = self.caret.inline;
         let o = self.caret.offset;
         if self.scope()[b].is_table() {
@@ -3184,6 +3503,9 @@ impl Document {
     pub fn delete_char(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_widget() {
+            return;
+        }
         if self.scope()[b].is_table() {
             let cell = self.caret.inline;
             let offset = self.caret.offset;
@@ -3246,6 +3568,19 @@ impl Document {
     pub fn delete_line(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_widget() {
+            if self.scope().len() == 1 {
+                self.scope_mut()[0] = empty_block();
+                self.set_caret(0, 0, 0);
+            } else {
+                self.scope_mut().remove(b);
+                self.set_caret(b.min(self.scope().len() - 1), 0, 0);
+            }
+            self.caret.style = Style::PLAIN;
+            self.dirty = true;
+            self.enforce();
+            return;
+        }
         if self.scope()[b].is_table() {
             // `dd` clears the current cell; deleting a row is a structural
             // table edit and is deliberately available only from the popup.
@@ -3304,6 +3639,13 @@ impl Document {
     pub fn open_below(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_widget() {
+            self.scope_mut().insert(b + 1, empty_block());
+            self.set_caret(b + 1, 0, 0);
+            self.dirty = true;
+            self.enforce();
+            return;
+        }
         if self.scope()[b].is_table() {
             let Some(range) = self.table_bounds(b) else {
                 return;
@@ -3333,6 +3675,13 @@ impl Document {
     pub fn open_above(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
+        if self.scope()[b].is_widget() {
+            self.scope_mut().insert(b, empty_block());
+            self.set_caret(b, 0, 0);
+            self.dirty = true;
+            self.enforce();
+            return;
+        }
         if self.scope()[b].is_table() {
             let Some(range) = self.table_bounds(b) else {
                 return;
@@ -3360,7 +3709,7 @@ impl Document {
     /// Set the pending bold/italic combination used by the `*`, `**`, and
     /// `***` insert gestures.
     pub fn set_emphasis(&mut self, bold: bool, italic: bool) {
-        if self.caret.style.is_boxed() {
+        if self.in_widget_row() || self.caret.style.is_boxed() {
             return;
         }
         self.caret.style.bold = bold;
@@ -3369,7 +3718,7 @@ impl Document {
 
     /// Flip `bold` on the pending context.
     pub fn toggle_bold(&mut self) {
-        if self.caret.style.is_boxed() {
+        if self.in_widget_row() || self.caret.style.is_boxed() {
             return;
         }
         self.caret.style.bold = !self.caret.style.bold;
@@ -3377,7 +3726,7 @@ impl Document {
 
     /// Flip `italic` on the pending context.
     pub fn toggle_italic(&mut self) {
-        if self.caret.style.is_boxed() {
+        if self.in_widget_row() || self.caret.style.is_boxed() {
             return;
         }
         self.caret.style.italic = !self.caret.style.italic;
@@ -3385,6 +3734,9 @@ impl Document {
 
     /// Flip `code` on the pending context. Not a content edit; no dirty.
     pub fn toggle_code(&mut self) {
+        if self.in_widget_row() {
+            return;
+        }
         let on = !self.caret.style.code;
         self.caret.style = Style {
             code: on,
@@ -3395,6 +3747,9 @@ impl Document {
     /// Flip `badge` on the pending context: what is typed next becomes the
     /// chip's label. Not a content edit; no dirty.
     pub fn toggle_badge(&mut self) {
+        if self.in_widget_row() {
+            return;
+        }
         let on = !self.caret.style.badge;
         self.caret.style = Style {
             badge: on,
@@ -3405,7 +3760,7 @@ impl Document {
     /// Flip `highlight` on the pending context. Not a content edit; no
     /// dirty. A boxed context ignores it — see [`Style::is_boxed`].
     pub fn toggle_highlight(&mut self) {
-        if self.caret.style.is_boxed() {
+        if self.in_widget_row() || self.caret.style.is_boxed() {
             return;
         }
         self.caret.style.highlight = !self.caret.style.highlight;
@@ -3418,7 +3773,7 @@ impl Document {
     pub fn set_code(&mut self, on: bool) {
         self.clamp_caret();
         let b = self.caret.block;
-        if self.scope()[b].is_table() {
+        if self.scope()[b].is_table() || self.scope()[b].is_widget() {
             return;
         }
         if self.scope()[b].is_code() == on {
@@ -3455,7 +3810,7 @@ impl Document {
         let Some(current) = self.body.get(block) else {
             return false;
         };
-        if current.is_table() {
+        if current.is_table() || current.is_widget() {
             return false;
         }
         if current.is_code() == on {
@@ -3493,7 +3848,7 @@ impl Document {
     pub fn set_heading(&mut self, level: Option<u8>) {
         self.clamp_caret();
         let b = self.caret.block;
-        if self.scope()[b].is_table() {
+        if self.scope()[b].is_table() || self.scope()[b].is_widget() {
             return;
         }
         if let Some(level) = level {
@@ -3551,7 +3906,7 @@ impl Document {
         let Some(current) = self.body.get(block) else {
             return false;
         };
-        if current.is_table() {
+        if current.is_table() || current.is_widget() {
             return false;
         }
         if matches!((current, level), (Block::Paragraph(_), None))
@@ -3592,7 +3947,7 @@ impl Document {
         }
         self.clamp_caret();
         let b = self.caret.block;
-        if self.scope()[b].is_table() {
+        if self.scope()[b].is_table() || self.scope()[b].is_widget() {
             return;
         }
         if self.scope()[b].is_code() {
@@ -3669,7 +4024,7 @@ impl Document {
     pub fn insert_divider(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
-        if self.scope()[b].is_table() {
+        if self.scope()[b].is_table() || self.scope()[b].is_widget() {
             return;
         }
         let at = if self.block_flat_len(b) == 0 {
@@ -3691,6 +4046,9 @@ impl Document {
         let b = self.caret.block;
         let i = self.caret.inline;
         let o = self.caret.offset;
+        if self.scope()[b].is_widget() {
+            return;
+        }
         if self.scope()[b].is_table() {
             let at = self.scope()[b].cells()[i].run_at(o);
             let contents =
@@ -3784,7 +4142,7 @@ impl Document {
         if matches!(self.focus, Focus::Note(_)) {
             return None;
         }
-        if self.scope()[self.caret.block].is_table() {
+        if self.scope()[self.caret.block].is_table() || self.scope()[self.caret.block].is_widget() {
             return None;
         }
         let label = self.next_free_label();
@@ -3830,7 +4188,7 @@ impl Document {
     pub fn insert_math_block(&mut self) {
         self.clamp_caret();
         let b = self.caret.block;
-        if self.scope()[b].is_table() {
+        if self.scope()[b].is_table() || self.scope()[b].is_widget() {
             return;
         }
         let at = if self.block_flat_len(b) == 0 {
@@ -4601,6 +4959,10 @@ mod tests {
                 }
                 continue;
             }
+            if block.is_widget() {
+                assert!(!block.widget_row_ref().unwrap().placements.is_empty());
+                continue;
+            }
             assert!(!block.inlines().is_empty());
             for (i, run) in block.inlines().iter().enumerate() {
                 assert!(!(run.text().is_empty() && (block.inlines().len() > 1 || i != 0)));
@@ -4614,6 +4976,65 @@ mod tests {
         let caret_block = &d.scope()[d.caret.block];
         assert!(d.caret.inline < caret_block.unit_count());
         assert!(d.caret.offset <= caret_block.unit_len(d.caret.inline));
+    }
+
+    #[test]
+    fn widget_operations_edit_only_the_row_and_keep_caret_units_safe() {
+        let mut d = doc();
+        assert!(d.insert_widget(widget::Widget::Empty));
+        assert!(d.in_widget_row());
+        let before = d.body().to_vec();
+        d.insert_text("must not become prose");
+        d.backspace();
+        d.newline();
+        assert_eq!(d.body(), before.as_slice());
+
+        d.set_caret(0, 1, 0);
+        assert!(d.insert_widget(widget::Widget::Calendar(
+            widget::WidgetRow::local_calendar(),
+        )));
+        d.set_caret(0, 2, 0);
+        assert!(d.insert_widget(widget::Widget::Clarity(widget::ClarityWidget::default(),)));
+        assert_eq!(d.body()[0].widget_row_ref().unwrap().placements.len(), 3);
+        assert!(d.toggle_widget_calendar_day(0, 1, 1));
+        assert!(d.shift_widget_calendar(0, 1, 1, 0));
+        assert!(matches!(
+            &d.body()[0].widget_row_ref().unwrap().placements[1].widget,
+            widget::Widget::Calendar(calendar) if calendar.selected.is_empty()
+        ));
+        assert!(d.cycle_widget_clarity(0, 2));
+        assert!(matches!(
+            &d.body()[0].widget_row_ref().unwrap().placements[2].widget,
+            widget::Widget::Clarity(widget) if widget.value == Some(widget::ClarityLevel::Review)
+        ));
+        assert!(d.remove_widget_at(0, 1));
+        assert!(d.remove_widget_at(0, 0));
+        assert!(d.remove_widget_at(0, 2));
+        assert!(matches!(d.body(), [Block::Paragraph(_)]));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn widget_navigation_traverses_tracks_then_adjacent_blocks() {
+        let mut d = doc();
+        *d.body_mut() = vec![
+            Block::Paragraph(vec![plain_run("above")]),
+            Block::WidgetRow(widget::WidgetRow::new(widget::Widget::Empty)),
+            Block::Paragraph(vec![plain_run("below")]),
+        ];
+        d.set_caret(1, 1, 0);
+        assert!(d.move_widget_horizontal(1));
+        assert_eq!(d.caret.inline, 2);
+        assert!(d.widget_tab(true));
+        assert_eq!(d.caret.inline, 1);
+        assert!(d.widget_tab(true));
+        assert_eq!(d.caret.inline, 0);
+        assert!(d.widget_tab(true));
+        assert_eq!((d.caret.block, d.caret.offset), (0, 5));
+        d.set_caret(1, 3, 0);
+        assert!(d.move_widget_vertical(false));
+        assert_eq!((d.caret.block, d.caret.offset), (2, 0));
+        assert_invariants(&d);
     }
 
     #[test]

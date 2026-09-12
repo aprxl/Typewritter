@@ -27,7 +27,7 @@ use crate::document::math_style::{self, HighlightShape, MathHue};
 use crate::document::math_symbols;
 use crate::document::{
     BadgeColor, Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, ListMarker, Style,
-    TableDirection, math_conversion, math_layout,
+    TableDirection, math_conversion, math_layout, widget,
 };
 use crate::input::Input;
 use crate::layout::Rect;
@@ -1048,6 +1048,108 @@ impl Shell {
         true
     }
 
+    /// Routes a click on a widget card before the ordinary editor hit-test.
+    /// Cards and controls claim their own geometry; a free track only claims
+    /// the point when the layout would otherwise land on the row itself, so
+    /// prose flowing beside a widget remains clickable prose.
+    fn widget_click(&mut self, rect: Rect, mouse: (f32, f32)) -> bool {
+        let Some((local_x, local_y)) = self.editor_point(rect, mouse) else {
+            return false;
+        };
+        let layout = self.current_layout(editor::Editor::content_width(rect));
+        let slot_for = |block: usize, placement: usize| {
+            layout
+                .source
+                .get(block)
+                .and_then(Block::widget_row_ref)
+                .and_then(|row| row.placements.get(placement))
+                .map(|placement| placement.slot)
+        };
+        if let Some((block, placement, day)) = layout.widget_day_at(local_x, local_y)
+            && let Some(slot) = slot_for(block, placement)
+        {
+            self.goal_x = None;
+            set_body_coordinate_caret(
+                &mut self.docs.borrow_mut(),
+                BodyCoordinate::Caret(Caret {
+                    block,
+                    inline: slot,
+                    offset: 0,
+                    style: Style::PLAIN,
+                }),
+            );
+            self.docs
+                .borrow_mut()
+                .toggle_widget_calendar_day(block, placement, day);
+            return true;
+        }
+        if let Some((block, placement, months)) =
+            layout.widget_calendar_control_at(local_x, local_y)
+            && let Some(slot) = slot_for(block, placement)
+        {
+            self.goal_x = None;
+            set_body_coordinate_caret(
+                &mut self.docs.borrow_mut(),
+                BodyCoordinate::Caret(Caret {
+                    block,
+                    inline: slot,
+                    offset: 0,
+                    style: Style::PLAIN,
+                }),
+            );
+            self.docs
+                .borrow_mut()
+                .shift_widget_calendar(block, placement, months, 0);
+            return true;
+        }
+        if let Some((block, placement)) = layout.widget_at(local_x, local_y)
+            && let Some(slot) = slot_for(block, placement)
+        {
+            let clarity = layout
+                .source
+                .get(block)
+                .and_then(Block::widget_row_ref)
+                .and_then(|row| row.placements.get(placement))
+                .is_some_and(|placement| matches!(placement.widget, widget::Widget::Clarity(_)));
+            self.goal_x = None;
+            set_body_coordinate_caret(
+                &mut self.docs.borrow_mut(),
+                BodyCoordinate::Caret(Caret {
+                    block,
+                    inline: slot,
+                    offset: 0,
+                    style: Style::PLAIN,
+                }),
+            );
+            if clarity {
+                self.docs
+                    .borrow_mut()
+                    .cycle_widget_clarity(block, placement);
+            }
+            return true;
+        }
+        let Some((block, slot)) = layout.widget_slot_at(local_x, local_y) else {
+            return false;
+        };
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+        if layout.hit(local_x, local_y, &measure).block != block {
+            return false;
+        }
+        self.goal_x = None;
+        set_body_coordinate_caret(
+            &mut self.docs.borrow_mut(),
+            BodyCoordinate::Caret(Caret {
+                block,
+                inline: slot,
+                offset: 0,
+                style: Style::PLAIN,
+            }),
+        );
+        self.open_context_menu(commands::WIDGET_MENU, mouse);
+        true
+    }
+
     /// Scroll, click-to-place, and the arrow/Home/End keys need an actual
     /// buffer, so they're guarded on a tab being active. The vim keymap and
     /// the divider drag aren't: what a plain key means past scroll/arrows is
@@ -1121,6 +1223,9 @@ impl Shell {
                     });
                     return;
                 }
+            }
+            if self.widget_click(rect, mouse) {
+                return;
             }
             // A click on a task's checkbox toggles it, whatever the mode:
             // it is a control, not a caret placement.
@@ -1218,6 +1323,37 @@ impl Shell {
     /// motion records the goal x (`goal_col` in pixels, spec §5); any
     /// non-vertical caret move clears it.
     fn arrow_keys(&mut self, input: &Input) {
+        if self.docs.borrow().in_widget_row() {
+            self.goal_x = None;
+            if input.is_key_typed(KeyCode::ArrowUp) {
+                self.docs.borrow_mut().widget_move_vertical(true);
+                return;
+            }
+            if input.is_key_typed(KeyCode::ArrowDown) {
+                self.docs.borrow_mut().widget_move_vertical(false);
+                return;
+            }
+            if input.is_key_typed(KeyCode::ArrowLeft) {
+                if !self.docs.borrow_mut().widget_move_horizontal(-1) {
+                    self.docs.borrow_mut().move_left();
+                }
+                return;
+            }
+            if input.is_key_typed(KeyCode::ArrowRight) {
+                if !self.docs.borrow_mut().widget_move_horizontal(1) {
+                    self.docs.borrow_mut().move_right();
+                }
+                return;
+            }
+            if input.is_key_typed(KeyCode::Home) {
+                self.docs.borrow_mut().move_home();
+                return;
+            }
+            if input.is_key_typed(KeyCode::End) {
+                self.docs.borrow_mut().move_end();
+                return;
+            }
+        }
         let table_direction = if input.is_key_typed(KeyCode::ArrowUp) {
             Some(TableDirection::Up)
         } else if input.is_key_typed(KeyCode::ArrowDown) {
@@ -1344,6 +1480,11 @@ impl Shell {
         if input.is_key_typed(KeyCode::Tab)
             && self.docs.borrow_mut().table_tab_or_exit(input.shift())
         {
+            self.insert_shortcuts.reset();
+            self.goal_x = None;
+            return;
+        }
+        if input.is_key_typed(KeyCode::Tab) && self.docs.borrow_mut().widget_tab(input.shift()) {
             self.insert_shortcuts.reset();
             self.goal_x = None;
             return;
@@ -1568,6 +1709,54 @@ impl Shell {
         }
     }
 
+    /// Vim's `hjkl` remains the fastest way through a widget row in Normal
+    /// mode. At a horizontal edge the ordinary document motion gets the key,
+    /// while vertical motion always leaves the row through its neighbour.
+    fn widget_normal_key(&mut self, c: char) -> bool {
+        if self.vim.current_mode() != VimMode::Normal
+            || self.vim.command_active()
+            || self.vim.visual_mode().is_some()
+            || !self.docs.borrow().in_widget_row()
+        {
+            return false;
+        }
+        self.goal_x = None;
+        match c {
+            'h' => {
+                if !self.docs.borrow_mut().widget_move_horizontal(-1) {
+                    self.docs.borrow_mut().move_left();
+                }
+                true
+            }
+            'l' => {
+                if !self.docs.borrow_mut().widget_move_horizontal(1) {
+                    self.docs.borrow_mut().move_right();
+                }
+                true
+            }
+            'k' => {
+                self.docs.borrow_mut().widget_move_vertical(true);
+                true
+            }
+            'j' => {
+                self.docs.borrow_mut().widget_move_vertical(false);
+                true
+            }
+            'x' => {
+                let target = {
+                    let docs = self.docs.borrow();
+                    let Some(tab) = docs.active() else {
+                        return true;
+                    };
+                    (tab.document.caret.block, tab.document.caret.inline)
+                };
+                self.docs.borrow_mut().remove_widget_at(target.0, target.1);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Normal and command modes consume resolved characters one at a time.
     fn edit_frame_normal(&mut self, input: &Input) {
         if input.is_key_typed(KeyCode::Tab)
@@ -1576,7 +1765,14 @@ impl Shell {
             self.goal_x = None;
             return;
         }
+        if input.is_key_typed(KeyCode::Tab) && self.docs.borrow_mut().widget_tab(input.shift()) {
+            self.goal_x = None;
+            return;
+        }
         for c in input.text().chars() {
+            if self.widget_normal_key(c) {
+                continue;
+            }
             if !self.vim.command_active() && c == '/' && self.vim.visual_mode().is_some() {
                 let anchor = self.compute_slash_anchor();
                 if matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })) {

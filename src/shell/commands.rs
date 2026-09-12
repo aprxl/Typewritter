@@ -17,7 +17,7 @@ use crate::components::dialog::Prompt;
 use crate::components::palette;
 use crate::document::math::{AccentKind, BigOp, SymbolRole};
 use crate::document::math_style::{HighlightShape, MathHue};
-use crate::document::{BadgeColor, ListMarker};
+use crate::document::{BadgeColor, ListMarker, widget};
 use crate::input::Input;
 
 #[derive(Clone, Copy)]
@@ -449,6 +449,39 @@ pub const COMMANDS: &[Command] = &[
         group: "Format",
         chord: None,
         run: |shell| shell.docs.borrow_mut().insert_table(),
+    },
+    Command {
+        id: "format.widget_empty",
+        title: "Empty widget",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell.docs.borrow_mut().insert_widget(widget::Widget::Empty);
+        },
+    },
+    Command {
+        id: "format.widget_calendar",
+        title: "Calendar widget",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell
+                .docs
+                .borrow_mut()
+                .insert_widget(widget::Widget::Calendar(widget::WidgetRow::local_calendar()));
+        },
+    },
+    Command {
+        id: "format.widget_clarity",
+        title: "Clarity widget",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell
+                .docs
+                .borrow_mut()
+                .insert_widget(widget::Widget::Clarity(widget::ClarityWidget::default()));
+        },
     },
     // The table's structure, reachable without a mouse. `Ctrl+J`/`Ctrl+K`
     // add a row below/above (vim's down/up), `Ctrl+H`/`Ctrl+L` add a column
@@ -1092,6 +1125,14 @@ pub fn editor_entries() -> Vec<palette::Entry> {
 /// behaviour from the palette entry with the same name.
 pub const EDITOR_MENU: &[&str] = &["edit.cut", "edit.copy", "edit.paste"];
 
+/// The chooser for an unused track in a widget row. The commands operate on
+/// the body caret that the click routed to that track.
+pub const WIDGET_MENU: &[&str] = &[
+    "format.widget_empty",
+    "format.widget_calendar",
+    "format.widget_clarity",
+];
+
 pub const WORD_MENU: &[&str] = &[
     "context.bold",
     "context.italic",
@@ -1337,6 +1378,25 @@ mod tests {
                 .iter()
                 .any(|command| command.id == "format.sidenote")
         );
+    }
+
+    #[test]
+    fn widget_commands_are_reachable_from_both_editor_menus() {
+        for id in WIDGET_MENU {
+            assert!(
+                COMMANDS.iter().any(|command| command.id == *id),
+                "{id} is not in the command table"
+            );
+            assert!(
+                editor_commands().iter().any(|command| command.id == *id),
+                "{id} is not in the slash menu"
+            );
+            assert_eq!(
+                menu(&[*id]).len(),
+                1,
+                "{id} is not in the context menu path"
+            );
+        }
     }
 
     #[test]
