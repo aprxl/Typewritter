@@ -19,6 +19,7 @@ use crate::document::{
     Block, Caret, Document, FlatPos, FlatRange, Inline, ListMarker, Style, fold_region_end,
     math_layout, outline, table,
 };
+use crate::layout::Rect;
 use crate::theme::{self, TextStyle};
 
 /// Visual line heights, in logical pixels.
@@ -118,6 +119,12 @@ pub const ANCHOR_SIZE: f32 = 11.0;
 /// How far an anchor's number sits above the line baseline — high enough to
 /// read as a footnote marker, low enough not to collide with the line above.
 pub const ANCHOR_RISE: f32 = 6.0;
+/// The gap between the four horizontal widget tracks.
+pub const WIDGET_GAP: f32 = 12.0;
+pub const WIDGET_EMPTY_HEIGHT: f32 = 96.0;
+pub const WIDGET_CALENDAR_HEIGHT: f32 = 180.0;
+pub const WIDGET_RADIUS: f32 = 10.0;
+pub const WIDGET_PAD: f32 = 10.0;
 
 /// A run of a visual line that came from one source run, covering exactly
 /// `[start, start + len)` chars of it. Ranges on a line are contiguous and
@@ -180,6 +187,9 @@ pub struct VisLine {
     /// every line of the block. The caret, the click hit-tests, and the
     /// drawing all add it, so they cannot drift apart.
     pub x: f32,
+    /// Width available to this line. It is the full column for ordinary
+    /// blocks, or the free lane beside a widget row.
+    pub width: f32,
     /// Actual line height: the block's floor or its tallest content.
     pub height: f32,
     pub segments: Vec<Segment>,
@@ -251,6 +261,35 @@ pub struct TableCell {
     pub column: usize,
 }
 
+/// One selectable calendar day, in the same document coordinates as its
+/// containing widget card.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WidgetDayLayout {
+    pub day: u8,
+    pub rect: Rect,
+}
+
+/// Geometry of one placed widget. The source placement remains in
+/// `DocLayout::source`; this snapshot only contains hit-testable rectangles.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WidgetCardLayout {
+    pub placement: usize,
+    pub slot: usize,
+    pub span: usize,
+    pub rect: Rect,
+    pub days: Vec<WidgetDayLayout>,
+}
+
+/// Geometry of a widget row, including unused tracks for edit-only affordances
+/// and the largest free Markdown lane beside the cards.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WidgetRowLayout {
+    pub tracks: Vec<Rect>,
+    pub cards: Vec<WidgetCardLayout>,
+    pub lane: Option<Rect>,
+    pub height: f32,
+}
+
 /// One sidenote anchor: where it is, and the number the reader sees.
 pub struct Anchor {
     /// The block and inline run the anchor occupies.
@@ -276,6 +315,8 @@ pub struct DocLayout {
     pub blocks: Vec<BlockLayout>,
     /// Table geometry aligned with [`Self::blocks`].
     pub tables: Vec<Option<TableLayout>>,
+    /// Widget geometry aligned with `blocks` and `source`.
+    pub widget_rows: Vec<Option<WidgetRowLayout>>,
     /// Total content height, for scroll bounds.
     pub height: f32,
     /// How much smaller than the page this layout is set: every text size
@@ -852,6 +893,7 @@ fn table_cell_layout(
             lines.push(VisLine {
                 y,
                 x,
+                width,
                 height,
                 segments: segments_for(&pieces, &chunks, kind),
                 cell_line: index,
@@ -1019,6 +1061,158 @@ fn table_layout_for(
     })
 }
 
+fn widget_height(widget: &super::widget::Widget, scale: f32) -> f32 {
+    match widget {
+        super::widget::Widget::Calendar(_) => WIDGET_CALENDAR_HEIGHT * scale,
+        super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => {
+            WIDGET_EMPTY_HEIGHT * scale
+        }
+    }
+}
+
+/// Measure a widget row and choose the ordinary Markdown lane beside it. A
+/// lane is a contiguous run of genuinely free tracks; explicit Empty widgets
+/// are occupied and therefore reserve their track.
+fn widget_layout(
+    row: &super::widget::WidgetRow,
+    width: f32,
+    y: f32,
+    scale: f32,
+) -> WidgetRowLayout {
+    let gap = WIDGET_GAP * scale;
+    let track_width = ((width - gap * (super::widget::TRACKS - 1) as f32)
+        / super::widget::TRACKS as f32)
+        .max(0.0);
+    let row_height = row
+        .placements
+        .iter()
+        .map(|placement| widget_height(&placement.widget, scale))
+        .fold(WIDGET_EMPTY_HEIGHT * scale, f32::max);
+    let tracks = (0..super::widget::TRACKS)
+        .map(|slot| {
+            Rect::new(
+                slot as f32 * (track_width + gap),
+                y,
+                track_width,
+                row_height,
+            )
+        })
+        .collect::<Vec<_>>();
+    let cards = row
+        .placements
+        .iter()
+        .enumerate()
+        .map(|(placement_index, placement)| {
+            let left = tracks[placement.slot].x;
+            let card_width =
+                track_width * placement.span as f32 + gap * (placement.span - 1) as f32;
+            let rect = Rect::new(left, y, card_width, widget_height(&placement.widget, scale));
+            let days = match &placement.widget {
+                super::widget::Widget::Calendar(calendar) => {
+                    let inner = rect.inset(WIDGET_PAD * scale);
+                    let heading_height = if calendar.heading == super::widget::CalendarHeading::None
+                    {
+                        8.0 * scale
+                    } else {
+                        28.0 * scale
+                    };
+                    let weekday_height = 12.0 * scale;
+                    let grid = Rect::new(
+                        inner.x,
+                        inner.y + heading_height + weekday_height,
+                        inner.width,
+                        (inner.height - heading_height - weekday_height).max(0.0),
+                    );
+                    let cell_width = grid.width / 7.0;
+                    let cell_height = grid.height / 6.0;
+                    (1..=calendar.days())
+                        .map(|day| {
+                            let index = calendar.first_weekday() + day - 1;
+                            WidgetDayLayout {
+                                day: day as u8,
+                                rect: Rect::new(
+                                    grid.x + (index % 7) as f32 * cell_width,
+                                    grid.y + (index / 7) as f32 * cell_height,
+                                    cell_width,
+                                    cell_height,
+                                ),
+                            }
+                        })
+                        .collect()
+                }
+                super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => Vec::new(),
+            };
+            WidgetCardLayout {
+                placement: placement_index,
+                slot: placement.slot,
+                span: placement.span,
+                rect,
+                days,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let occupied = (0..super::widget::TRACKS)
+        .map(|slot| row.placement_at(slot).is_some())
+        .collect::<Vec<_>>();
+    let mut best: Option<(usize, usize)> = None;
+    let mut start = 0;
+    while start < occupied.len() {
+        if occupied[start] {
+            start += 1;
+            continue;
+        }
+        let end = (start..occupied.len())
+            .find(|&slot| occupied[slot])
+            .unwrap_or(occupied.len());
+        let length = end - start;
+        let center_distance = ((start + end) as f32 * 0.5 - 2.0).abs();
+        let better = best.is_none_or(|(best_start, best_end)| {
+            let best_length = best_end - best_start;
+            let best_distance = ((best_start + best_end) as f32 * 0.5 - 2.0).abs();
+            length > best_length
+                || (length == best_length
+                    && (center_distance < best_distance
+                        || (center_distance == best_distance && start < best_start)))
+        });
+        if better {
+            best = Some((start, end));
+        }
+        start = end;
+    }
+    let lane = best.map(|(start, end)| {
+        Rect::new(
+            tracks[start].x,
+            y,
+            track_width * (end - start) as f32 + gap * (end - start - 1) as f32,
+            row_height,
+        )
+    });
+    WidgetRowLayout {
+        tracks,
+        cards,
+        lane,
+        height: row_height,
+    }
+}
+
+fn widget_block_fits_lane(
+    block: &Block,
+    lane: Rect,
+    scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> bool {
+    // Tables and display math own their full-width furniture in the existing
+    // painters. Keep them below a widget band until those painters gain an
+    // explicit lane origin; prose, headings, lists, dividers, and code still
+    // flow through the selected free run.
+    if block.is_table() || block.is_math() {
+        return false;
+    }
+    let _ = (scale, measure, lane);
+    true
+}
+
 /// Lays out a slice of blocks — a whole document's body, or one note's body —
 /// at `scale`, which multiplies every text size and vertical measure the
 /// layout produces. `measure(text, style) -> width` is the only rendering
@@ -1097,6 +1291,7 @@ pub fn layout_blocks(
 
     let mut laid = Vec::with_capacity(blocks.len());
     let mut tables = Vec::with_capacity(blocks.len());
+    let mut widget_rows = Vec::with_capacity(blocks.len());
     let mut y = 0.0f32;
     let mut first_block = true;
     // The gap the previous block already contributed below itself. A display
@@ -1118,6 +1313,9 @@ pub fn layout_blocks(
     // The table currently being laid out. Its tracks, row count and settings
     // are measured once at its first row and reused by every row after it.
     let mut table_shared: Option<TableShared> = None;
+    // A following run of ordinary Markdown may use the widest free lane until
+    // its cursor passes the widget row's bottom edge.
+    let mut widget_flow: Option<Rect> = None;
 
     for (source_index, block) in blocks.iter().enumerate() {
         let mut hidden = false;
@@ -1144,13 +1342,29 @@ pub fn layout_blocks(
                         indicator: None,
                     });
                     tables.push(None);
+                    widget_rows.push(None);
                 }
             }
         }
         if hidden {
             continue;
         }
-        let gap_above = if first_block {
+        let mut lane = None;
+        let mut resumed_below = false;
+        if let Some(flow) = widget_flow {
+            if block.is_widget() {
+                y = flow.bottom() + GAP_PARAGRAPH * scale;
+                widget_flow = None;
+                resumed_below = true;
+            } else if widget_block_fits_lane(block, flow, scale, measure) {
+                lane = Some(flow);
+            } else {
+                y = flow.bottom() + GAP_PARAGRAPH * scale;
+                widget_flow = None;
+                resumed_below = true;
+            }
+        }
+        let gap_above = if lane.is_some() || resumed_below || first_block {
             0.0
         } else if block.is_math() {
             (GAP_MATH * scale - gap_below_previous).max(0.0)
@@ -1161,6 +1375,37 @@ pub fn layout_blocks(
         };
         y += gap_above;
         first_block = false;
+
+        if let Block::WidgetRow(row) = block {
+            let row_layout = widget_layout(row, width, y, scale);
+            let height = row_layout.height;
+            let has_lane = row_layout.lane;
+            laid.push(BlockLayout {
+                y,
+                lines: vec![VisLine {
+                    y,
+                    x: 0.0,
+                    width,
+                    height,
+                    segments: Vec::new(),
+                    cell_line: 0,
+                }],
+                height,
+                hidden: None,
+                indicator: None,
+            });
+            tables.push(None);
+            widget_rows.push(Some(row_layout));
+            let gap_after = GAP_PARAGRAPH * scale;
+            if let Some(lane) = has_lane {
+                widget_flow = Some(lane);
+            } else {
+                widget_flow = None;
+                y += height + gap_after;
+            }
+            gap_below_previous = gap_after;
+            continue;
+        }
 
         let table = table_layout_for(
             blocks,
@@ -1205,10 +1450,13 @@ pub fn layout_blocks(
             Block::ListItem { .. } => LIST_INDENT * scale,
             _ => 0.0,
         };
+        let available_width = lane.map_or(width, |lane| lane.width);
+        let lane_x = lane.map_or(0.0, |lane| lane.x);
         let lines = if table.is_some() {
             vec![VisLine {
                 y,
                 x: 0.0,
+                width: available_width,
                 height: base_line_height,
                 segments: Vec::new(),
                 cell_line: 0,
@@ -1219,7 +1467,7 @@ pub fn layout_blocks(
                 &pieces,
                 block,
                 block.inlines(),
-                width - indent,
+                available_width - indent,
                 scale,
                 measure,
                 false,
@@ -1247,7 +1495,8 @@ pub fn layout_blocks(
                     let height = base_line_height.max(content_height);
                     let line = VisLine {
                         y: line_y,
-                        x: indent,
+                        x: lane_x + indent,
+                        width: available_width - indent,
                         height,
                         segments: segments_for(&pieces, line_pieces, block),
                         cell_line: 0,
@@ -1281,6 +1530,8 @@ pub fn layout_blocks(
             indicator,
         });
         tables.push(table);
+        widget_rows.push(None);
+        let content_bottom = y + height;
         y += height;
 
         let grouped_with_next = (block.is_table()
@@ -1311,6 +1562,11 @@ pub fn layout_blocks(
             GAP_PARAGRAPH * scale
         };
         y += gap_after;
+        if let Some(flow) = widget_flow
+            && content_bottom >= flow.bottom()
+        {
+            widget_flow = None;
+        }
         gap_below_previous = gap_after;
     }
 
@@ -1320,6 +1576,14 @@ pub fn layout_blocks(
         if let Some(indicator) = &mut laid[*owner].indicator {
             indicator.lines = *count;
         }
+    }
+
+    // A row with a free lane deliberately leaves `y` at the row's top while
+    // following Markdown flows beside it. If the row is the final block (or
+    // every following block is hidden), there was no ordinary block pass to
+    // advance the cursor past the cards themselves.
+    if let Some(flow) = widget_flow {
+        y = flow.bottom() + GAP_PARAGRAPH * scale;
     }
 
     // A note sits beside the line its anchor is on, and that line is only
@@ -1335,6 +1599,7 @@ pub fn layout_blocks(
     DocLayout {
         blocks: laid,
         tables,
+        widget_rows,
         source: blocks.to_vec(),
         code_colors: super::code::colors(blocks),
         height: y,
@@ -1740,6 +2005,76 @@ fn flat_to_pos(block: &Block, flat: usize) -> (usize, usize) {
 }
 
 impl DocLayout {
+    /// Resolve an overlapping widget row before ordinary block hit testing.
+    /// A card claims its own rectangle; the free lane belongs to the Markdown
+    /// block laid out beside it, which is the rule that keeps widgets from
+    /// becoming invisible paragraph blockers.
+    fn block_at(&self, x: f32, y: f32) -> usize {
+        let block_idx = block_of_y(self, y);
+        if !self.source[block_idx].is_widget() {
+            return block_idx;
+        }
+        let Some(row) = self.widget_rows.get(block_idx).and_then(Option::as_ref) else {
+            return block_idx;
+        };
+        if row.cards.iter().any(|card| card.rect.contains((x, y))) {
+            return block_idx;
+        }
+        let Some(lane) = row.lane else {
+            return block_idx;
+        };
+        if !lane.contains((x, y)) {
+            return block_idx;
+        }
+        for index in block_idx + 1..self.source.len() {
+            let block = &self.blocks[index];
+            if block.hidden.is_some() {
+                continue;
+            }
+            if block.y > y {
+                break;
+            }
+            if block.lines.iter().any(|line| {
+                y >= line.y && y < line.y + line.height && x >= line.x && x < line.x + line.width
+            }) {
+                return index;
+            }
+        }
+        block_idx
+    }
+
+    /// The placed card at a point, before the Markdown lane is considered.
+    pub fn widget_at(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+        let block = block_of_y(self, y);
+        let row = self.widget_rows.get(block)?.as_ref()?;
+        row.cards
+            .iter()
+            .find(|card| card.rect.contains((x, y)))
+            .map(|card| (block, card.placement))
+    }
+
+    /// The track under a point. A free track is returned too, so the editor
+    /// can open its widget chooser without adding a placeholder model object.
+    pub fn widget_slot_at(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+        let block = block_of_y(self, y);
+        let row = self.widget_rows.get(block)?.as_ref()?;
+        row.tracks
+            .iter()
+            .position(|track| track.contains((x, y)))
+            .map(|slot| (block, slot))
+    }
+
+    /// A calendar day at a point, if the point is inside a placed calendar.
+    pub fn widget_day_at(&self, x: f32, y: f32) -> Option<(usize, usize, u8)> {
+        let (block, placement) = self.widget_at(x, y)?;
+        let row = self.widget_rows[block].as_ref()?;
+        let day = row.cards[placement]
+            .days
+            .iter()
+            .find(|day| day.rect.contains((x, y)))?;
+        Some((block, placement, day.day))
+    }
+
     /// Reports the label and y of each anchor in the document, in document
     /// order, so the margin can put a note beside the sentence that made it.
     /// The y is in document coordinates, the same space the editor scrolls in.
@@ -1776,7 +2111,7 @@ impl DocLayout {
     /// is the same one [`Self::hit`] reads: x from the content column's
     /// left edge, y in document coordinates.
     pub fn task_at(&self, x: f32, y: f32) -> Option<usize> {
-        let block_idx = block_of_y(self, y);
+        let block_idx = self.block_at(x, y);
         let (bx, by, w, h) = self.task_box(block_idx)?;
         (x >= bx && x <= bx + w && y >= by && y <= by + h).then_some(block_idx)
     }
@@ -1790,7 +2125,7 @@ impl DocLayout {
     /// The table cell containing a point, if any. Its geometry is shared by
     /// the context click routing and the structural controls in the card.
     pub fn table_cell_at(&self, x: f32, y: f32) -> Option<TableCell> {
-        let block = block_of_y(self, y);
+        let block = self.block_at(x, y);
         let table = self.tables.get(block)?.as_ref()?;
         let layout = self.blocks.get(block)?;
         if x < 0.0
@@ -1921,7 +2256,7 @@ impl DocLayout {
     /// Nearest caret position for a click at (x, y) — y relative to content
     /// top. Style context follows the style-before rule.
     pub fn hit(&self, x: f32, y: f32, measure: &dyn Fn(&str, &TextStyle) -> f32) -> Caret {
-        let block_idx = block_of_y(self, y);
+        let block_idx = self.block_at(x, y);
         if let Some(owner) = self.blocks[block_idx].hidden {
             // Folded ground: the nearest legal caret is the end of the
             // folded heading that owns the hidden block.
@@ -1931,6 +2266,15 @@ impl DocLayout {
                 block: owner,
                 inline,
                 offset,
+                style: Style::PLAIN,
+            };
+        }
+        if self.source[block_idx].is_widget() {
+            let slot = self.widget_slot_at(x, y).map_or(0, |(_, slot)| slot);
+            return Caret {
+                block: block_idx,
+                inline: slot,
+                offset: 0,
                 style: Style::PLAIN,
             };
         }
@@ -2014,8 +2358,11 @@ impl DocLayout {
         y: f32,
         measure: &dyn Fn(&str, &TextStyle) -> f32,
     ) -> Option<ContextHit> {
-        let block_idx = block_of_y(self, y);
+        let block_idx = self.block_at(x, y);
         if self.blocks[block_idx].hidden.is_some() {
+            return None;
+        }
+        if self.source[block_idx].is_widget() {
             return None;
         }
         if let Some(table) = self.tables.get(block_idx).and_then(Option::as_ref) {
@@ -2601,7 +2948,7 @@ impl DocLayout {
         y: f32,
         measure: &dyn Fn(&str, &TextStyle) -> f32,
     ) -> Option<(usize, usize, usize, MathCursor)> {
-        let block_idx = block_of_y(self, y);
+        let block_idx = self.block_at(x, y);
         if self.blocks[block_idx].hidden.is_some() {
             return None;
         }
@@ -2938,6 +3285,9 @@ mod tests {
     use super::*;
     use crate::document::math::{BigOp, MathNode, Slot, Step};
     use crate::document::math_layout::BoxKind;
+    use crate::document::widget::{
+        CalendarWidget, ClarityWidget, Widget, WidgetPlacement, WidgetRow,
+    };
     use crate::document::{Focus, Inline, Sidenote, Text};
     use std::cell::Cell;
 
@@ -3062,6 +3412,71 @@ mod tests {
             text: text.into(),
             style: Style::PLAIN,
         })])
+    }
+
+    #[test]
+    fn widgets_keep_prose_in_the_largest_free_lane() {
+        let row = WidgetRow {
+            placements: vec![
+                WidgetPlacement {
+                    slot: 0,
+                    span: 1,
+                    widget: Widget::Calendar(CalendarWidget {
+                        year: 2026,
+                        month: 9,
+                        heading: crate::document::widget::CalendarHeading::Both,
+                        selected: vec![12],
+                    }),
+                },
+                WidgetPlacement {
+                    slot: 2,
+                    span: 1,
+                    widget: Widget::Clarity(ClarityWidget::default()),
+                },
+            ],
+        };
+        let laid = layout_blocks(
+            &[Block::WidgetRow(row), para("hello world")],
+            400.0,
+            1.0,
+            &fake_measure,
+        );
+        let widget = laid.widget_rows[0].as_ref().expect("widget geometry");
+        let lane = widget.lane.expect("one free track remains");
+        assert_eq!(widget.cards.len(), 2);
+        assert_eq!(widget.cards[0].days.len(), 30);
+        assert_eq!(laid.blocks[1].lines[0].x, lane.x);
+        assert_eq!(laid.blocks[1].lines[0].width, lane.width);
+        assert!(laid.height > widget.height);
+
+        let card_point = widget.cards[0].rect.position();
+        assert_eq!(
+            laid.widget_at(card_point.0 + 4.0, card_point.1 + 4.0),
+            Some((0, 0))
+        );
+        let prose_point = (lane.x + 5.0, laid.blocks[1].lines[0].y + 5.0);
+        assert_eq!(
+            laid.hit(prose_point.0, prose_point.1, &fake_measure).block,
+            1
+        );
+        assert_eq!(
+            laid.widget_slot_at(prose_point.0, prose_point.1),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn wide_blocks_resume_below_a_widget_row() {
+        let row = WidgetRow::new(Widget::Empty);
+        let math = Block::Math {
+            list: vec![Inline::Math(vec![MathNode::Sym('x')])],
+            tag: None,
+        };
+        let laid = layout_blocks(&[Block::WidgetRow(row), math], 400.0, 1.0, &fake_measure);
+        let widgets = laid.widget_rows[0].as_ref().unwrap();
+        assert!(laid.blocks[1].y >= widgets.height + GAP_PARAGRAPH);
+        assert_eq!(laid.blocks[1].lines[0].x, 0.0);
+        assert_eq!(laid.blocks[1].lines[0].width, 400.0);
     }
 
     const BOLD: Style = Style {

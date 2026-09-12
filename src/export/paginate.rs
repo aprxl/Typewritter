@@ -177,6 +177,7 @@ mod tests {
                 lines: vec![VisLine {
                     y,
                     x: 0.0,
+                    width: 500.0,
                     height,
                     segments: Vec::new(),
                     cell_line: 0,
@@ -190,6 +191,7 @@ mod tests {
         DocLayout {
             blocks,
             tables: vec![None; heights.len()],
+            widget_rows: vec![None; heights.len()],
             height: y,
             scale: 1.0,
             code_colors: vec![Vec::new(); heights.len()],
@@ -208,6 +210,7 @@ mod tests {
             .map(|index| VisLine {
                 y: index as f32 * height,
                 x: 0.0,
+                width: 500.0,
                 height,
                 segments: Vec::new(),
                 cell_line: 0,
@@ -223,6 +226,7 @@ mod tests {
                 indicator: None,
             }],
             tables: vec![None],
+            widget_rows: vec![None],
             height: total,
             scale: 1.0,
             source: vec![Block::Paragraph(Vec::new())],

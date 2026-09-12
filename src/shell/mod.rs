@@ -1678,6 +1678,7 @@ impl Shell {
                 None => DocLayout {
                     blocks: Vec::new(),
                     tables: Vec::new(),
+                    widget_rows: Vec::new(),
                     height: 0.0,
                     scale: 1.0,
                     source: Vec::new(),

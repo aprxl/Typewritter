@@ -45,7 +45,7 @@ pub(super) fn append(doc: &Document, text: &mut String) {
             // text this pass walks cannot address it, and nothing inside a
             // cell can carry a code brush. Skipping keeps `block` aligned
             // with the scope index `apply` reads back.
-            if source.is_table() {
+            if source.is_table() || source.is_widget() {
                 continue;
             }
             let mut start = 0;
@@ -96,7 +96,7 @@ pub(super) fn apply(doc: &mut Document, metadata: Metadata) {
         let Some(block) = doc.scope().get(entry.block) else {
             continue;
         };
-        if block.is_table() {
+        if block.is_table() || block.is_widget() {
             continue;
         }
         let text = block.inlines().iter().map(Inline::text).collect::<String>();
@@ -134,9 +134,9 @@ pub(super) fn plain(doc: &Document) -> Document {
         .iter_mut()
         .chain(doc.notes.iter_mut().flat_map(|note| &mut note.body))
     {
-        // A table row's content is its cells, not a run list, and nothing
-        // inside a cell can carry a code annotation.
-        if block.is_table() {
+        // Table and widget rows have structural content, not a run list,
+        // and neither can carry a code annotation.
+        if block.is_table() || block.is_widget() {
             continue;
         }
         for run in block.inlines_mut() {

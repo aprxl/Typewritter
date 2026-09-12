@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::canvas::Offset;
 use crate::document::decoration::{self, Painted};
 use crate::document::layout::{
     self, CHEVRON_WIDTH, ContextHit, DocLayout, FOLD_INDICATOR_HEIGHT, NUMBER_GUTTER, NUMBER_SIZE,
@@ -13,6 +14,7 @@ use crate::document::layout::{
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_layout::{self, MathBox};
 use crate::document::math_paint;
+use crate::document::widget_paint;
 use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style, flat_len, table};
 use crate::layout::Rect;
 use crate::renderer::{Layer, PathPaint, Rounding, ShaderEffect};
@@ -745,6 +747,7 @@ impl Editor {
             layout: Rc::new(DocLayout {
                 blocks: Vec::new(),
                 tables: Vec::new(),
+                widget_rows: Vec::new(),
                 height: 0.0,
                 scale: 1.0,
                 source: Vec::new(),
@@ -1006,6 +1009,30 @@ impl Component for Editor {
             bi = end + 1;
         }
 
+        // Widget cards are shared with PDF painting. Their source row is a
+        // structural block, while the following prose remains in the normal
+        // text pass and uses the free lane the layout assigned it.
+        for (bi, row_layout) in self.layout.widget_rows.iter().enumerate() {
+            let Some(row_layout) = row_layout else {
+                continue;
+            };
+            let Some(Block::WidgetRow(row)) = self.layout.source.get(bi) else {
+                continue;
+            };
+            let active_slot = caret
+                .filter(|caret| caret.block == bi)
+                .map(|caret| caret.inline);
+            let mut base = layer;
+            let mut canvas = Offset::new(&mut base, (x, content - self.scroll));
+            widget_paint::row(
+                &mut canvas,
+                row,
+                row_layout,
+                active_slot,
+                active_slot.is_some(),
+            );
+        }
+
         self.draw_selection(layer, rect, x, content);
         let (spans, blocks) = self.selection_bars();
         for range in spans {
@@ -1030,6 +1057,9 @@ impl Component for Editor {
                 if kind.table_first() {
                     self.draw_table(layer, rect, x, content, bi);
                 }
+                continue;
+            }
+            if kind.is_widget() {
                 continue;
             }
             // A rule has no runs to paint, so it is drawn here rather than
@@ -1391,6 +1421,14 @@ impl Component for Editor {
         }
 
         if self.math.is_some() {
+            return;
+        }
+        if caret.is_some_and(|caret| {
+            self.layout
+                .source
+                .get(caret.block)
+                .is_some_and(Block::is_widget)
+        }) {
             return;
         }
         // No caret here — the page while focus lives in a note, or an

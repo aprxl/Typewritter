@@ -335,47 +335,55 @@ pub fn parse_payload(payload: &str) -> Option<WidgetRow> {
     Some(WidgetRow { placements })
 }
 
-fn placement_value(placement: &WidgetPlacement) -> Value {
-    let mut object = Map::new();
-    object.insert("slot".into(), Value::from(placement.slot + 1));
+fn placement_json(placement: &WidgetPlacement) -> String {
+    let mut fields = vec![format!("\"slot\":{}", placement.slot + 1)];
     if placement.span != 1 {
-        object.insert("span".into(), Value::from(placement.span));
+        fields.push(format!("\"span\":{}", placement.span));
     }
     match &placement.widget {
         Widget::Empty => {
-            object.insert("type".into(), Value::from("empty"));
+            fields.push("\"type\":\"empty\"".into());
         }
         Widget::Calendar(calendar) => {
-            object.insert("type".into(), Value::from("calendar"));
-            object.insert(
-                "date".into(),
-                Value::from(format!("{:04}-{:02}", calendar.year, calendar.month)),
-            );
+            fields.push("\"type\":\"calendar\"".into());
+            fields.push(format!(
+                "\"date\":\"{:04}-{:02}\"",
+                calendar.year, calendar.month
+            ));
             if let Some(show) = calendar.heading.as_str() {
-                object.insert("show".into(), Value::from(show));
+                fields.push(format!("\"show\":\"{show}\""));
             }
             if !calendar.selected.is_empty() {
-                object.insert(
-                    "selected".into(),
-                    Value::Array(calendar.selected.iter().copied().map(Value::from).collect()),
-                );
+                let selected = calendar
+                    .selected
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                fields.push(format!("\"selected\":[{selected}]"));
             }
         }
         Widget::Clarity(clarity) => {
-            object.insert("type".into(), Value::from("clarity"));
+            fields.push("\"type\":\"clarity\"".into());
             if let Some(value) = clarity.value {
-                object.insert("value".into(), Value::from(value.as_str()));
+                fields.push(format!("\"value\":\"{}\"", value.as_str()));
             }
         }
     }
-    Value::Object(object)
+    format!("{{{}}}", fields.join(","))
 }
 
 pub fn serialize_payload(row: &WidgetRow) -> String {
     let mut placements = row.placements.clone();
     placements.sort_by_key(|placement| placement.slot);
-    serde_json::to_string(&placements.iter().map(placement_value).collect::<Vec<_>>())
-        .expect("widget JSON values are always serializable")
+    format!(
+        "[{}]",
+        placements
+            .iter()
+            .map(placement_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 #[cfg(test)]

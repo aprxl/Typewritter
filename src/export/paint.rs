@@ -19,6 +19,7 @@ use crate::components::sidenotes;
 use crate::document::decoration::{self, Painted};
 use crate::document::layout::{self, DocLayout, NUMBER_GUTTER, NUMBER_SIZE, TABLE_CELL_PAD};
 use crate::document::table::TableLines;
+use crate::document::widget_paint;
 use crate::document::{ATOM, Block, Inline, code, math_layout, math_paint};
 use crate::layout::Rect;
 use crate::renderer::{Color, Rounding};
@@ -298,7 +299,12 @@ fn block(
         // A fence's tint is drawn by `fences`, which sees the whole run;
         // a paragraph has no furniture of its own at all.
         Block::Paragraph(_) | Block::CodeLine { .. } => {}
-        Block::WidgetRow(_) => {}
+        Block::WidgetRow(row) => {
+            if let Some(row_layout) = layout.widget_rows.get(piece.block).and_then(Option::as_ref) {
+                let mut offset = Offset::new(canvas, (0.0, dy));
+                widget_paint::row(&mut offset, row, row_layout, None, false);
+            }
+        }
     }
 
     for index in piece.lines.clone() {
