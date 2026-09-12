@@ -365,6 +365,7 @@ pub fn text_style(kind: &Block, style: Style, scale: f32) -> TextStyle {
         } => TextStyle::sans(17.5 * scale, theme::dim()),
         Block::ListItem { .. } => TextStyle::sans(17.5 * scale, theme::ink()),
         Block::CodeLine { .. } => TextStyle::mono(17.5 * scale, theme::ink()),
+        Block::WidgetRow(_) => TextStyle::sans(17.5 * scale, theme::ink()),
     };
     if style.bold {
         base = base.bold();
@@ -1193,6 +1194,7 @@ pub fn layout_blocks(
                 LINE_BODY * scale
             }
             Block::ListItem { .. } => LINE_BODY * scale,
+            Block::WidgetRow(_) => 0.0,
         };
 
         // A list item's content column is indented once for the whole

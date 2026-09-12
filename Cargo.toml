@@ -13,6 +13,7 @@ edition = "2024"
 # all of its own chrome and links no other UI toolkit.
 arboard = "3.6"
 bytemuck = { version = "1.18", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 glyphon = "0.11.0"
 fuzzy-matcher = "0.3.7"
 image = { version = "0.25", default-features = false, features = ["png"] }

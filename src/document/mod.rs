@@ -21,6 +21,7 @@ pub mod math_symbols;
 pub mod outline;
 pub mod table;
 pub mod table_edit;
+pub mod widget;
 
 /// Flat-text stand-in for one opaque math atom.
 pub const ATOM: char = '\u{FFFC}';
@@ -118,6 +119,9 @@ pub enum Block {
         first: bool,
         settings: std::sync::Arc<table::TableSettings>,
     },
+    /// One horizontal four-track widget band. Free tracks are intentionally
+    /// not blocks: the following Markdown block may flow through them.
+    WidgetRow(widget::WidgetRow),
     /// One list item. Items are flat blocks; nested lists are out of scope.
     ListItem {
         marker: ListMarker,
@@ -284,6 +288,7 @@ impl Block {
             } => inlines,
             Block::CodeLine { content, .. } => content,
             Block::TableRow { .. } => &[],
+            Block::WidgetRow(_) => &[],
         }
     }
 
@@ -304,6 +309,9 @@ impl Block {
             Block::TableRow { .. } => {
                 panic!("a table row's content is its cells, not a run list")
             }
+            Block::WidgetRow(_) => {
+                panic!("a widget row's content is its placements, not a run list")
+            }
         }
     }
 
@@ -311,6 +319,7 @@ impl Block {
     pub fn cells(&self) -> &[table::Cell] {
         match self {
             Block::TableRow { cells, .. } => cells,
+            Block::WidgetRow(_) => &[],
             _ => &[],
         }
     }
@@ -318,6 +327,7 @@ impl Block {
     pub fn cells_mut(&mut self) -> Option<&mut Vec<table::Cell>> {
         match self {
             Block::TableRow { cells, .. } => Some(cells),
+            Block::WidgetRow(_) => None,
             _ => None,
         }
     }
@@ -326,6 +336,7 @@ impl Block {
     pub fn flat_len(&self) -> usize {
         match self {
             Block::TableRow { cells, .. } => cells.iter().map(table::Cell::flat_len).sum(),
+            Block::WidgetRow(_) => 0,
             block => block.inlines().iter().map(flat_len).sum(),
         }
     }
@@ -335,6 +346,7 @@ impl Block {
     pub fn unit_len(&self, unit: usize) -> usize {
         match self {
             Block::TableRow { cells, .. } => cells.get(unit).map_or(0, table::Cell::flat_len),
+            Block::WidgetRow(_) => 0,
             block => block.inlines().get(unit).map_or(0, flat_len),
         }
     }
@@ -342,6 +354,7 @@ impl Block {
     pub fn unit_count(&self) -> usize {
         match self {
             Block::TableRow { cells, .. } => cells.len(),
+            Block::WidgetRow(_) => widget::TRACKS,
             block => block.inlines().len(),
         }
     }
@@ -382,6 +395,10 @@ impl Block {
 
     pub fn is_table(&self) -> bool {
         matches!(self, Block::TableRow { .. })
+    }
+
+    pub fn is_widget(&self) -> bool {
+        matches!(self, Block::WidgetRow(_))
     }
 
     pub fn table_first(&self) -> bool {
@@ -507,6 +524,7 @@ pub fn cell_text(cell: &table::Cell) -> String {
 pub fn block_runs(block: &Block) -> Vec<&Inline> {
     match block {
         Block::TableRow { cells, .. } => cells.iter().flat_map(|cell| cell.all_runs()).collect(),
+        Block::WidgetRow(_) => Vec::new(),
         block => block.inlines().iter().collect(),
     }
 }
@@ -703,6 +721,9 @@ fn prune_block(block: &mut Block) {
         }
         return;
     }
+    if block.is_widget() {
+        return;
+    }
     let syntax = block
         .inlines()
         .first()
@@ -764,6 +785,7 @@ fn prune_block(block: &mut Block) {
             // A row is repaired through its cells and returns above; this
             // arm only exists so the match stays exhaustive.
             Block::TableRow { .. } => unreachable!("a table row prunes through its cells"),
+            Block::WidgetRow(row) => Block::WidgetRow(row.clone()),
             Block::Divider(_) => divider_block(),
             Block::Math { .. } => math_block(),
             Block::ListItem { marker, .. } => list_block(*marker),
@@ -1639,6 +1661,9 @@ impl Document {
         if block.is_table() {
             return Vec::new();
         }
+        if block.is_widget() {
+            return Vec::new();
+        }
         slice_inline_runs(block.inlines(), start, end)
     }
 
@@ -1677,6 +1702,7 @@ impl Document {
             // `slice_runs` yields nothing for one, so a row is handed back
             // exactly as it was rather than spliced into prose.
             Block::TableRow { .. } => (*block).clone(),
+            Block::WidgetRow(_) => (*block).clone(),
             Block::ListItem { marker, .. } => Block::ListItem {
                 marker: *marker,
                 content: runs,
@@ -2308,6 +2334,9 @@ impl Document {
         let table_caret = self.scope()[caret_block]
             .is_table()
             .then_some((self.caret.inline, self.caret.offset));
+        let widget_caret = self.scope()[caret_block]
+            .is_widget()
+            .then_some(self.caret.inline);
         // The invariant holds in *every* scope, not just where the caret
         // happens to be: a note body left with an empty run would be an
         // invariant only until focus moved elsewhere.
@@ -2337,6 +2366,11 @@ impl Document {
                 };
                 self.caret.inline = cell;
                 self.caret.offset = offset;
+            } else if let Some(inline) = widget_caret
+                && self.scope()[caret_block].is_widget()
+            {
+                self.caret.inline = inline.min(self.scope()[caret_block].unit_count() - 1);
+                self.caret.offset = 0;
             } else {
                 let (inline, offset) = self.flat_to_pos(caret_block, caret_offset);
                 self.caret.inline = inline;

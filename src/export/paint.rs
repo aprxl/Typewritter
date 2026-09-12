@@ -298,6 +298,7 @@ fn block(
         // A fence's tint is drawn by `fences`, which sees the whole run;
         // a paragraph has no furniture of its own at all.
         Block::Paragraph(_) | Block::CodeLine { .. } => {}
+        Block::WidgetRow(_) => {}
     }
 
     for index in piece.lines.clone() {

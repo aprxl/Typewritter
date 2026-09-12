@@ -24,7 +24,16 @@ use std::path::Path;
 use super::math_notation;
 use super::{
     BadgeColor, Block, Caret, Document, Focus, Inline, ListMarker, Sidenote, Style, Text, table,
+    widget,
 };
+
+const WIDGET_MARKER: &str = "<!-- typewritter-widgets:v1 ";
+
+fn parse_widget_line(line: &str) -> Option<widget::WidgetRow> {
+    let line = line.trim();
+    let payload = line.strip_prefix(WIDGET_MARKER)?.strip_suffix(" -->")?;
+    widget::parse_payload(payload)
+}
 
 /// Scan for the next unescaped occurrence of `marker` at or after `start`.
 /// The char immediately before a match must be non-whitespace. Escaped
@@ -830,6 +839,11 @@ pub fn parse(path: &Path, text: &str) -> Document {
             }
             continue;
         }
+        if let Some(row) = parse_widget_line(line) {
+            flush_para(&mut blocks, &mut para);
+            blocks.push(Block::WidgetRow(row));
+            continue;
+        }
         if line.trim().starts_with("```") {
             flush_para(&mut blocks, &mut para);
             let info = line.trim()[3..].trim();
@@ -1250,6 +1264,12 @@ fn serialize_plain(doc: &Document) -> String {
                 out.push('\n');
                 out.push_str(&math_notation::print(list));
                 out.push_str("\n```");
+                i += 1;
+            }
+            Block::WidgetRow(row) => {
+                out.push_str(WIDGET_MARKER);
+                out.push_str(&widget::serialize_payload(row));
+                out.push_str(" -->");
                 i += 1;
             }
             Block::ListItem { marker, content } => {
