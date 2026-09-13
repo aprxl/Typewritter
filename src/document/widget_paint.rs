@@ -161,12 +161,11 @@ fn calendar_widget(
     }
     let grid_color = theme::fade(theme::border(), 0.35);
     for column in 1..7 {
-        canvas::rule(
-            canvas,
+        canvas.draw_rectangle(
             (inner.x + column as f32 * cell_width, first_day),
-            6.0 * cell_height,
-            1.0,
+            (1.0, 6.0 * cell_height),
             grid_color.clone(),
+            Rounding::NONE,
         );
     }
     for row in 1..6 {
@@ -239,4 +238,98 @@ fn clarity_widget(canvas: &mut dyn Canvas, value: Option<ClarityLevel>, rect: Re
         &TextStyle::sans(11.0, color),
         theme::CENTER,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::layout::{WidgetCardLayout, WidgetDayLayout};
+    use crate::renderer::Alignment;
+
+    #[derive(Default)]
+    struct RecordingCanvas {
+        rectangles: Vec<((f32, f32), (f32, f32))>,
+    }
+
+    impl Canvas for RecordingCanvas {
+        fn draw_rectangle(
+            &mut self,
+            at: (f32, f32),
+            size: (f32, f32),
+            _color: Color,
+            _rounding: Rounding,
+        ) {
+            self.rectangles.push((at, size));
+        }
+
+        fn draw_circle(&mut self, _center: (f32, f32), _radius: f32, _color: Color) {}
+
+        fn draw_path(&mut self, _d: &str, _at: (f32, f32), _rotation: f32, _paint: &PathPaint) {}
+
+        fn draw_text(
+            &mut self,
+            _text: &str,
+            _at: (f32, f32),
+            _style: &TextStyle,
+            _align: Alignment,
+        ) {
+        }
+
+        fn measure(&self, _text: &str, _style: &TextStyle) -> f32 {
+            0.0
+        }
+    }
+
+    #[test]
+    fn calendar_grid_columns_are_vertical_and_stay_inside_the_card() {
+        let rect = Rect::new(0.0, 0.0, 210.0, 180.0);
+        let inner = rect.inset(WIDGET_PAD);
+        let first_day = inner.y + 40.0;
+        let cell_width = inner.width / 7.0;
+        let cell_height = (inner.height - 40.0) / 6.0;
+        let days = (1..=30)
+            .map(|day| WidgetDayLayout {
+                day,
+                rect: Rect::new(
+                    inner.x + f32::from(day - 1) % 7.0 * cell_width,
+                    first_day,
+                    cell_width,
+                    cell_height,
+                ),
+            })
+            .collect();
+        let card = WidgetCardLayout {
+            placement: 0,
+            slot: 0,
+            span: 1,
+            rect,
+            days,
+            previous: None,
+            next: None,
+        };
+        let calendar = crate::document::widget::CalendarWidget {
+            year: 2026,
+            month: 9,
+            heading: CalendarHeading::Both,
+            selected: Vec::new(),
+        };
+        let mut canvas = RecordingCanvas::default();
+
+        calendar_widget(&mut canvas, &calendar, &card);
+
+        assert_eq!(canvas.rectangles.len(), 11);
+        for ((x, y), (width, height)) in &canvas.rectangles[..6] {
+            assert_eq!(*width, 1.0);
+            assert!(*height > 1.0);
+            assert!(*x >= inner.x && *x + *width <= inner.right());
+            assert!(*y >= inner.y && *y + *height <= inner.bottom());
+        }
+        for ((x, y), (width, height)) in &canvas.rectangles[6..] {
+            assert!(*width > 1.0);
+            assert_eq!(*height, 1.0);
+            assert!(*x >= inner.x && *x + *width <= inner.right());
+            assert!(*y >= inner.y && *y + *height <= inner.bottom());
+        }
+        assert_eq!(canvas.rectangles[0].0.1, first_day);
+    }
 }
