@@ -948,20 +948,25 @@ pub fn hover_fill(layer: &Layer, rect: Rect, weight: f32) {
 /// A softly lit surface. The gradient is geometry rendered by Atomos;
 /// no texture allocation or continuously running effect is needed.
 pub fn surface(layer: &Layer, rect: Rect, base: Color, radius: f32) {
+    layer.draw_rectangle(
+        rect.position(),
+        rect.size(),
+        surface_color(base),
+        Rounding::uniform(radius),
+    );
+}
+
+/// The same surface lighting for document painters (screen and export).
+pub fn surface_color(base: Color) -> Color {
     let top = mix(
         base.clone(),
         ink(),
         if mode() == Mode::Dark { 0.018 } else { 0.006 },
     );
-    let (Color::Solid(top), Color::Solid(bottom)) = (top, base) else {
-        return;
+    let (Color::Solid(top), Color::Solid(bottom)) = (top, base.clone()) else {
+        return base;
     };
-    layer.draw_rectangle(
-        rect.position(),
-        rect.size(),
-        Color::gradient(top, bottom, GradientDirection::Vertical),
-        Rounding::uniform(radius),
-    );
+    Color::gradient(top, bottom, GradientDirection::Vertical)
 }
 
 /// The app's handwritten tau, drawn as a native path at any scale.

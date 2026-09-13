@@ -841,12 +841,15 @@ impl Shell {
     }
 
     /// Drive a pending widget gesture. A drop is accepted only in the same
-    /// row and only when the layout still resolves the pointer to that row;
-    /// prose flowing through the lane therefore remains protected.
+    /// row. Preview and drop share the same span-aware geometry check.
     fn drive_widget_drag(&mut self, input: &Input) -> bool {
         let Some(drag) = &mut self.widget_drag else {
             return false;
         };
+        if input.is_key_pressed(KeyCode::Escape) || !input.is_cursor_in_window() {
+            self.widget_drag = None;
+            return true;
+        }
         let point = input.mouse_position();
         if input.is_mouse_down(MouseButton::Left) {
             let dx = point.0 - drag.origin.0;
@@ -863,28 +866,25 @@ impl Shell {
             return true;
         }
         let rect = self.layout.rect(self.text_column);
+        if !rect.contains(point) {
+            return true;
+        }
         let Some((local_x, local_y)) = self.editor_point(rect, point) else {
             return true;
         };
         let layout = self.current_layout(editor::Editor::content_width(rect));
-        let Some((block, slot)) = layout.widget_slot_at(local_x, local_y) else {
+        let Some(slot) = layout
+            .widget_rows
+            .get(drag.block)
+            .and_then(Option::as_ref)
+            .and_then(|row| row.drop_slot(drag.slot, (local_x, local_y)))
+        else {
             return true;
         };
-        if block != drag.block {
-            return true;
-        }
-        if layout.widget_lane_blocked_at(local_x, local_y) {
-            return true;
-        }
-        let layer = self.regions[self.text_region].layer();
-        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
-        if layout.hit(local_x, local_y, &measure).block != block {
-            return true;
-        }
         self.goal_x = None;
         self.docs
             .borrow_mut()
-            .move_widget_at(block, drag.slot, slot);
+            .move_widget_at(drag.block, drag.slot, slot);
         true
     }
 

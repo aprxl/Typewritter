@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::widget_layout::{WidgetRowLayout, widget_layout};
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::{
     Block, Caret, Document, FlatPos, FlatRange, Inline, ListMarker, Style, fold_region_end,
@@ -119,14 +120,6 @@ pub const ANCHOR_SIZE: f32 = 11.0;
 /// How far an anchor's number sits above the line baseline — high enough to
 /// read as a footnote marker, low enough not to collide with the line above.
 pub const ANCHOR_RISE: f32 = 6.0;
-/// The gap between the four horizontal widget tracks.
-pub const WIDGET_GAP: f32 = 12.0;
-pub const WIDGET_EMPTY_HEIGHT: f32 = 96.0;
-pub const WIDGET_CALENDAR_HEIGHT: f32 = 180.0;
-pub const WIDGET_RADIUS: f32 = 10.0;
-pub const WIDGET_PAD: f32 = 10.0;
-pub const WIDGET_CALENDAR_CONTROL: f32 = 24.0;
-pub const WIDGET_CALENDAR_CONTROL_GAP: f32 = 4.0;
 
 /// A run of a visual line that came from one source run, covering exactly
 /// `[start, start + len)` chars of it. Ranges on a line are contiguous and
@@ -261,38 +254,6 @@ pub struct TableCell {
     pub first: usize,
     pub row: usize,
     pub column: usize,
-}
-
-/// One selectable calendar day, in the same document coordinates as its
-/// containing widget card.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WidgetDayLayout {
-    pub day: u8,
-    pub rect: Rect,
-}
-
-/// Geometry of one placed widget. The source placement remains in
-/// `DocLayout::source`; this snapshot only contains hit-testable rectangles.
-#[derive(Clone, Debug, PartialEq)]
-pub struct WidgetCardLayout {
-    pub placement: usize,
-    pub slot: usize,
-    pub span: usize,
-    pub rect: Rect,
-    pub days: Vec<WidgetDayLayout>,
-    pub previous: Option<Rect>,
-    pub next: Option<Rect>,
-}
-
-/// Geometry of a widget row, including unused tracks for edit-only affordances
-/// and the largest free Markdown lane beside the cards.
-#[derive(Clone, Debug, PartialEq)]
-pub struct WidgetRowLayout {
-    pub tracks: Vec<Rect>,
-    pub cards: Vec<WidgetCardLayout>,
-    pub lane: Option<Rect>,
-    pub lane_has_content: bool,
-    pub height: f32,
 }
 
 /// One sidenote anchor: where it is, and the number the reader sees.
@@ -1118,158 +1079,6 @@ fn table_layout_for(
         cells,
         lines: shared.settings.lines,
     })
-}
-
-fn widget_height(widget: &super::widget::Widget, scale: f32) -> f32 {
-    match widget {
-        super::widget::Widget::Calendar(_) => WIDGET_CALENDAR_HEIGHT * scale,
-        super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => {
-            WIDGET_EMPTY_HEIGHT * scale
-        }
-    }
-}
-
-/// Measure a widget row and choose the ordinary Markdown lane beside it. A
-/// lane is a contiguous run of genuinely free tracks; explicit Empty widgets
-/// are occupied and therefore reserve their track.
-fn widget_layout(
-    row: &super::widget::WidgetRow,
-    width: f32,
-    y: f32,
-    scale: f32,
-) -> WidgetRowLayout {
-    let gap = WIDGET_GAP * scale;
-    let track_width = ((width - gap * (super::widget::TRACKS - 1) as f32)
-        / super::widget::TRACKS as f32)
-        .max(0.0);
-    let row_height = row
-        .placements
-        .iter()
-        .map(|placement| widget_height(&placement.widget, scale))
-        .fold(WIDGET_EMPTY_HEIGHT * scale, f32::max);
-    let tracks = (0..super::widget::TRACKS)
-        .map(|slot| {
-            Rect::new(
-                slot as f32 * (track_width + gap),
-                y,
-                track_width,
-                row_height,
-            )
-        })
-        .collect::<Vec<_>>();
-    let cards = row
-        .placements
-        .iter()
-        .enumerate()
-        .map(|(placement_index, placement)| {
-            let left = tracks[placement.slot].x;
-            let card_width =
-                track_width * placement.span as f32 + gap * (placement.span - 1) as f32;
-            let rect = Rect::new(left, y, card_width, widget_height(&placement.widget, scale));
-            let days = match &placement.widget {
-                super::widget::Widget::Calendar(calendar) => {
-                    let inner = rect.inset(WIDGET_PAD * scale);
-                    let heading_height = if calendar.heading == super::widget::CalendarHeading::None
-                    {
-                        8.0 * scale
-                    } else {
-                        28.0 * scale
-                    };
-                    let weekday_height = 12.0 * scale;
-                    let grid = Rect::new(
-                        inner.x,
-                        inner.y + heading_height + weekday_height,
-                        inner.width,
-                        (inner.height - heading_height - weekday_height).max(0.0),
-                    );
-                    let cell_width = grid.width / 7.0;
-                    let cell_height = grid.height / 6.0;
-                    (1..=calendar.days())
-                        .map(|day| {
-                            let index = calendar.first_weekday() + day - 1;
-                            WidgetDayLayout {
-                                day: day as u8,
-                                rect: Rect::new(
-                                    grid.x + (index % 7) as f32 * cell_width,
-                                    grid.y + (index / 7) as f32 * cell_height,
-                                    cell_width,
-                                    cell_height,
-                                ),
-                            }
-                        })
-                        .collect()
-                }
-                super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => Vec::new(),
-            };
-            let (previous, next) = match &placement.widget {
-                super::widget::Widget::Calendar(_) => {
-                    let inner = rect.inset(WIDGET_PAD * scale);
-                    let control = WIDGET_CALENDAR_CONTROL * scale;
-                    let gap = WIDGET_CALENDAR_CONTROL_GAP * scale;
-                    let next_x = (inner.right() - control).max(inner.x);
-                    let previous_x = (next_x - control - gap).max(inner.x);
-                    (
-                        Some(Rect::new(previous_x, inner.y, control, control)),
-                        Some(Rect::new(next_x, inner.y, control, control)),
-                    )
-                }
-                super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => (None, None),
-            };
-            WidgetCardLayout {
-                placement: placement_index,
-                slot: placement.slot,
-                span: placement.span,
-                rect,
-                days,
-                previous,
-                next,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let occupied = (0..super::widget::TRACKS)
-        .map(|slot| row.placement_at(slot).is_some())
-        .collect::<Vec<_>>();
-    let mut best: Option<(usize, usize)> = None;
-    let mut start = 0;
-    while start < occupied.len() {
-        if occupied[start] {
-            start += 1;
-            continue;
-        }
-        let end = (start..occupied.len())
-            .find(|&slot| occupied[slot])
-            .unwrap_or(occupied.len());
-        let length = end - start;
-        let center_distance = ((start + end) as f32 * 0.5 - 2.0).abs();
-        let better = best.is_none_or(|(best_start, best_end)| {
-            let best_length = best_end - best_start;
-            let best_distance = ((best_start + best_end) as f32 * 0.5 - 2.0).abs();
-            length > best_length
-                || (length == best_length
-                    && (center_distance < best_distance
-                        || (center_distance == best_distance && start < best_start)))
-        });
-        if better {
-            best = Some((start, end));
-        }
-        start = end;
-    }
-    let lane = best.map(|(start, end)| {
-        Rect::new(
-            tracks[start].x,
-            y,
-            track_width * (end - start) as f32 + gap * (end - start - 1) as f32,
-            row_height,
-        )
-    });
-    WidgetRowLayout {
-        tracks,
-        cards,
-        lane,
-        lane_has_content: false,
-        height: row_height,
-    }
 }
 
 fn widget_block_fits_lane(

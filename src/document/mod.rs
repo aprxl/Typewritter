@@ -22,6 +22,7 @@ pub mod outline;
 pub mod table;
 pub mod table_edit;
 pub mod widget;
+pub mod widget_layout;
 pub mod widget_paint;
 
 /// Flat-text stand-in for one opaque math atom.

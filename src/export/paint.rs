@@ -302,7 +302,12 @@ fn block(
         Block::WidgetRow(row) => {
             if let Some(row_layout) = layout.widget_rows.get(piece.block).and_then(Option::as_ref) {
                 let mut offset = Offset::new(canvas, (0.0, dy));
-                widget_paint::row(&mut offset, row, row_layout, None, false);
+                widget_paint::row(
+                    &mut offset,
+                    row,
+                    row_layout,
+                    widget_paint::Interaction::default(),
+                );
             }
         }
     }

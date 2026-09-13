@@ -1,335 +1,233 @@
-//! Shared widget-row painter for the screen and PDF.
+//! Shared widget surfaces for the screen and PDF. Editing chrome is opt-in.
+
+mod calendar;
+mod clarity;
+#[cfg(test)]
+mod tests;
 
 use crate::canvas::{self, Canvas};
-use crate::document::layout::{WIDGET_PAD, WIDGET_RADIUS, WidgetRowLayout};
-use crate::document::widget::{CalendarHeading, ClarityLevel, Widget, WidgetRow};
+use crate::document::widget::{Widget, WidgetRow};
+use crate::document::widget_layout::{Hit, WIDGET_RADIUS, WidgetRowLayout};
 use crate::layout::Rect;
-use crate::renderer::{Color, LineCap, LineJoin, PathPaint, Rounding, Stroke};
+use crate::renderer::Rounding;
 use crate::theme::{self, TextStyle};
 
-const WEEKDAYS: [&str; 7] = ["M", "T", "W", "T", "F", "S", "S"];
-const SHORT_MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Interaction {
+    pub active_slot: Option<usize>,
+    pub hover: Option<Hit>,
+    pub hover_amount: f32,
+    pub drag: Option<DragPreview>,
+}
 
-/// Paint one widget row. `active_slot` is editor state; `show_unused` keeps
-/// free tracks visible only while the caret is on this row. PDF callers pass
-/// `None, false`, so those affordances never leak into exports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DragPreview {
+    pub slot: usize,
+    pub target: Option<usize>,
+}
+
+impl Interaction {
+    fn amount(self, hit: Hit) -> f32 {
+        if self.hover == Some(hit) {
+            self.hover_amount
+        } else {
+            0.0
+        }
+    }
+}
+
 pub fn row(
     canvas: &mut dyn Canvas,
     source: &WidgetRow,
     layout: &WidgetRowLayout,
-    active_slot: Option<usize>,
-    show_unused: bool,
+    state: Interaction,
 ) {
-    if show_unused {
+    let scale = layout.scale;
+    let radius = WIDGET_RADIUS * scale;
+    let editing = state.active_slot.is_some() || state.hover.is_some() || state.drag.is_some();
+    if editing {
         for (slot, track) in layout.tracks.iter().enumerate() {
-            if source.placement_at(slot).is_none() {
-                let contains_text = layout.lane_has_content
-                    && layout.lane.is_some_and(|lane| {
-                        lane.contains((track.x + track.width * 0.5, track.y + track.height * 0.5))
-                    });
-                let colour = if contains_text {
-                    theme::fade(theme::comment(), 0.8)
-                } else {
-                    theme::fade(theme::non_text(), 0.7)
-                };
-                canvas::rounded_outline(canvas, *track, WIDGET_RADIUS, 1.0, colour.clone());
-                if !contains_text {
-                    let centre = (track.x + track.width * 0.5, track.y + track.height * 0.5);
-                    canvas.draw_path(
-                        theme::icons::PLUS,
-                        (centre.0 - 9.0, centre.1 - 9.0),
-                        0.0,
-                        &PathPaint::Stroke(Stroke::new(colour, 1.2)),
-                    );
-                }
+            if source.placement_at(slot).is_some() || layout.text_track(slot) {
+                continue;
             }
-        }
-        if let Some(lane) = layout.lane.filter(|_| layout.lane_has_content) {
-            let marker = Rect::new(lane.right() - 24.0, lane.bottom() - 26.0, 22.0, 22.0);
-            canvas.draw_rectangle(
-                marker.position(),
-                marker.size(),
-                theme::fade(theme::panel(), 0.95),
-                Rounding::uniform(6.0),
+            let center = (track.x + track.width * 0.5, track.y + 32.0 * scale);
+            let hot = state.amount(Hit::Add(slot));
+            let active = state.active_slot == Some(slot);
+            canvas.draw_circle(
+                center,
+                13.0 * scale,
+                theme::mix(
+                    theme::alt(),
+                    theme::selection(),
+                    if active { 0.75 } else { hot * 0.7 },
+                ),
             );
-            canvas::rounded_outline(
+            let color = if active {
+                theme::accent()
+            } else {
+                theme::dim()
+            };
+            canvas::polyline(
                 canvas,
-                marker,
-                6.0,
-                1.0,
-                theme::fade(theme::comment(), 0.85),
+                &[
+                    (center.0 - 4.0 * scale, center.1),
+                    (center.0 + 4.0 * scale, center.1),
+                ],
+                color.clone(),
+                1.2 * scale,
             );
-            icon(
+            canvas::polyline(
                 canvas,
-                theme::icons::FILE_LINES,
-                (marker.x - 1.0, marker.y - 1.0),
-                theme::comment(),
+                &[
+                    (center.0, center.1 - 4.0 * scale),
+                    (center.0, center.1 + 4.0 * scale),
+                ],
+                color,
+                1.2 * scale,
+            );
+            fitted_text(
+                canvas,
+                "Add widget",
+                Rect::new(track.x, center.1 + 19.0 * scale, track.width, 14.0 * scale),
+                &TextStyle::sans(10.0 * scale, theme::comment()),
+                true,
             );
         }
     }
-
     for card in &layout.cards {
         let placement = &source.placements[card.placement];
-        let active = active_slot
-            .is_some_and(|slot| placement.slot <= slot && slot < placement.slot + placement.span);
-        let fill = match &placement.widget {
-            Widget::Empty => theme::fade(theme::alt(), 0.55),
-            Widget::Calendar(_) => theme::fade(theme::panel(), 0.72),
-            Widget::Clarity(_) => theme::fade(theme::alt(), 0.65),
-        };
+        let active = state
+            .active_slot
+            .is_some_and(|slot| card.slot <= slot && slot < card.slot + card.span);
+        let hot = state.hover.and_then(Hit::placement) == Some(card.placement);
+        let dragging = state.drag.filter(|drag| drag.slot == card.slot);
+        // A two-pixel contact shadow gives a little depth without a blur pass.
+        canvas.draw_rectangle(
+            (card.rect.x, card.rect.y + 2.0 * scale),
+            card.rect.size(),
+            theme::scale_alpha(theme::shadow_ink(), 0.16),
+            Rounding::uniform(radius),
+        );
+        let fill = theme::mix(
+            theme::background(),
+            theme::panel(),
+            if matches!(placement.widget, Widget::Empty) {
+                0.42
+            } else {
+                0.28
+            },
+        );
         canvas.draw_rectangle(
             card.rect.position(),
             card.rect.size(),
-            fill,
-            Rounding::uniform(WIDGET_RADIUS),
+            theme::surface_color(fill),
+            Rounding::uniform(radius),
         );
         canvas::rounded_outline(
             canvas,
             card.rect,
-            WIDGET_RADIUS,
-            if active { 1.5 } else { 1.0 },
-            if active {
-                theme::accent()
-            } else {
-                theme::fade(theme::border(), 0.9)
-            },
+            radius,
+            scale,
+            theme::mix(
+                theme::border(),
+                theme::accent(),
+                if active || dragging.is_some() {
+                    0.42
+                } else if hot {
+                    0.16 * state.hover_amount
+                } else {
+                    0.0
+                },
+            ),
         );
         match &placement.widget {
             Widget::Empty => {}
-            Widget::Calendar(calendar) => calendar_widget(canvas, calendar, card),
-            Widget::Clarity(clarity) => clarity_widget(canvas, clarity.value, card.rect),
+            Widget::Calendar(calendar) => calendar::draw(canvas, calendar, card, scale, state),
+            Widget::Clarity(clarity) => clarity::draw(
+                canvas,
+                clarity.value,
+                card,
+                scale,
+                if hot { state.hover_amount } else { 0.0 },
+            ),
         }
-    }
-}
-
-fn icon(canvas: &mut dyn Canvas, path: &str, at: (f32, f32), color: Color) {
-    let mut pen = Stroke::new(color, 1.2);
-    pen.cap = LineCap::Round;
-    pen.join = LineJoin::Round;
-    canvas.draw_path(path, at, 0.0, &PathPaint::Stroke(pen));
-}
-
-fn calendar_widget(
-    canvas: &mut dyn Canvas,
-    calendar: &crate::document::widget::CalendarWidget,
-    card: &crate::document::layout::WidgetCardLayout,
-) {
-    let inner = card.rect.inset(WIDGET_PAD);
-    let heading = match calendar.heading {
-        CalendarHeading::Both => format!(
-            "{} {}",
-            SHORT_MONTHS[calendar.month as usize - 1],
-            calendar.year
-        ),
-        CalendarHeading::Month => SHORT_MONTHS[calendar.month as usize - 1].to_string(),
-        CalendarHeading::Year => calendar.year.to_string(),
-        CalendarHeading::None => String::new(),
-    };
-    if let (Some(previous), Some(next)) = (card.previous, card.next) {
-        calendar_button(canvas, previous, theme::icons::CHEVRON_LEFT);
-        calendar_button(canvas, next, theme::icons::CHEVRON_RIGHT);
-    }
-    let show_icon = inner.width >= 120.0;
-    if show_icon {
-        icon(
-            canvas,
-            theme::icons::CALENDAR,
-            (inner.x, inner.y),
-            theme::accent(),
-        );
-    }
-    if !heading.is_empty() {
-        canvas.draw_text(
-            &heading,
-            (inner.x + if show_icon { 26.0 } else { 0.0 }, inner.y + 14.0),
-            &TextStyle::sans(11.0, theme::ink()).bold(),
-            theme::LEFT,
-        );
-    }
-    let first_day = card.days.first().map_or(inner.y, |day| day.rect.y);
-    let cell_width = card.days.first().map_or(0.0, |day| day.rect.width);
-    let cell_height = card.days.first().map_or(0.0, |day| day.rect.height);
-    for (index, weekday) in WEEKDAYS.iter().enumerate() {
-        canvas.draw_text(
-            weekday,
-            (inner.x + (index as f32 + 0.5) * cell_width, first_day - 6.0),
-            &TextStyle::mono(8.0, theme::comment()),
-            theme::CENTER,
-        );
-    }
-    let grid_color = theme::fade(theme::border(), 0.35);
-    for column in 1..7 {
-        canvas.draw_rectangle(
-            (inner.x + column as f32 * cell_width, first_day),
-            (1.0, 6.0 * cell_height),
-            grid_color.clone(),
-            Rounding::NONE,
-        );
-    }
-    for row in 1..6 {
-        canvas::rule(
-            canvas,
-            (inner.x, first_day + row as f32 * cell_height),
-            7.0 * cell_width,
-            1.0,
-            grid_color.clone(),
-        );
-    }
-    for day in &card.days {
-        let selected = calendar.is_selected(u32::from(day.day));
-        let rect = day.rect.inset(1.5);
-        if selected {
-            canvas.draw_rectangle(
-                rect.position(),
-                rect.size(),
-                theme::fade(theme::accent(), 0.33),
-                Rounding::uniform(5.0),
+        if active || hot || dragging.is_some() {
+            let label = if let Some(drag) = dragging {
+                if drag.target.is_some() {
+                    "Release to place"
+                } else {
+                    "Space occupied"
+                }
+            } else if layout.lane_has_content {
+                "Text lane in use"
+            } else {
+                "Drag to move"
+            };
+            let footer = card.footer;
+            for column in 0..2 {
+                for dot in 0..3 {
+                    canvas.draw_circle(
+                        (
+                            footer.x + (2.0 + column as f32 * 3.0) * scale,
+                            footer.y + (4.0 + dot as f32 * 3.0) * scale,
+                        ),
+                        0.8 * scale,
+                        theme::comment(),
+                    );
+                }
+            }
+            fitted_text(
+                canvas,
+                label,
+                Rect::new(
+                    footer.x + 13.0 * scale,
+                    footer.y,
+                    (footer.width - 13.0 * scale).max(0.0),
+                    footer.height,
+                ),
+                &TextStyle::sans(9.0 * scale, theme::comment()),
+                false,
             );
         }
-        canvas.draw_text(
-            &day.day.to_string(),
-            (
-                day.rect.x + day.rect.width * 0.5,
-                day.rect.y + day.rect.height * 0.5,
-            ),
-            &TextStyle::sans(
-                10.0,
-                if selected {
-                    theme::accent()
-                } else {
-                    theme::ink()
-                },
-            ),
-            theme::CENTER,
+    }
+    if let Some(drag) = state.drag
+        && let Some(target) = drag.target
+        && target != drag.slot
+        && let Some(rect) = layout.drop_rect(drag.slot, target)
+    {
+        canvas.draw_rectangle(
+            rect.position(),
+            rect.size(),
+            theme::fade(theme::selection(), 0.5),
+            Rounding::uniform(radius),
         );
+        canvas::rounded_outline(canvas, rect, radius, 1.5 * scale, theme::accent());
     }
 }
 
-fn calendar_button(canvas: &mut dyn Canvas, rect: Rect, path: &str) {
-    canvas.draw_rectangle(
-        rect.position(),
-        rect.size(),
-        theme::fade(theme::alt(), 0.7),
-        Rounding::uniform(7.0),
-    );
-    canvas::rounded_outline(canvas, rect, 7.0, 1.0, theme::fade(theme::border(), 0.85));
-    icon(canvas, path, (rect.x + 3.0, rect.y + 3.0), theme::dim());
-}
-
-fn clarity_widget(canvas: &mut dyn Canvas, value: Option<ClarityLevel>, rect: Rect) {
-    let centre = (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5);
-    let (symbol, label, color) = match value {
-        Some(ClarityLevel::Review) => ("?", "Review", theme::warning()),
-        Some(ClarityLevel::Working) => ("~", "Working", theme::cool()),
-        Some(ClarityLevel::Clear) => ("✓", "Clear", theme::live()),
-        None => ("?", "Clarity", theme::comment()),
-    };
+/// Fit labels to their own rectangle; the document layer cannot scissor
+/// individual cards. This also covers long years and very narrow viewports.
+fn fitted_text(canvas: &mut dyn Canvas, text: &str, rect: Rect, style: &TextStyle, centered: bool) {
+    if rect.width <= 0.0 {
+        return;
+    }
+    let mut label = text.to_string();
+    if canvas.measure(&label, style) > rect.width {
+        while !label.is_empty() && canvas.measure(&format!("{label}…"), style) > rect.width {
+            label.pop();
+        }
+        if label.is_empty() {
+            return;
+        }
+        label.push('…');
+    }
     canvas.draw_text(
-        symbol,
-        (centre.0, centre.1 - 8.0),
-        &TextStyle::sans(28.0, color.clone()).bold(),
-        theme::CENTER,
+        &label,
+        (
+            rect.x + if centered { rect.width * 0.5 } else { 0.0 },
+            rect.y + rect.height * 0.5,
+        ),
+        style,
+        if centered { theme::CENTER } else { theme::LEFT },
     );
-    canvas.draw_text(
-        label,
-        (centre.0, centre.1 + 22.0),
-        &TextStyle::sans(11.0, color),
-        theme::CENTER,
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::document::layout::{WidgetCardLayout, WidgetDayLayout};
-    use crate::renderer::Alignment;
-
-    #[derive(Default)]
-    struct RecordingCanvas {
-        rectangles: Vec<((f32, f32), (f32, f32))>,
-    }
-
-    impl Canvas for RecordingCanvas {
-        fn draw_rectangle(
-            &mut self,
-            at: (f32, f32),
-            size: (f32, f32),
-            _color: Color,
-            _rounding: Rounding,
-        ) {
-            self.rectangles.push((at, size));
-        }
-
-        fn draw_circle(&mut self, _center: (f32, f32), _radius: f32, _color: Color) {}
-
-        fn draw_path(&mut self, _d: &str, _at: (f32, f32), _rotation: f32, _paint: &PathPaint) {}
-
-        fn draw_text(
-            &mut self,
-            _text: &str,
-            _at: (f32, f32),
-            _style: &TextStyle,
-            _align: Alignment,
-        ) {
-        }
-
-        fn measure(&self, _text: &str, _style: &TextStyle) -> f32 {
-            0.0
-        }
-    }
-
-    #[test]
-    fn calendar_grid_columns_are_vertical_and_stay_inside_the_card() {
-        let rect = Rect::new(0.0, 0.0, 210.0, 180.0);
-        let inner = rect.inset(WIDGET_PAD);
-        let first_day = inner.y + 40.0;
-        let cell_width = inner.width / 7.0;
-        let cell_height = (inner.height - 40.0) / 6.0;
-        let days = (1..=30)
-            .map(|day| WidgetDayLayout {
-                day,
-                rect: Rect::new(
-                    inner.x + f32::from(day - 1) % 7.0 * cell_width,
-                    first_day,
-                    cell_width,
-                    cell_height,
-                ),
-            })
-            .collect();
-        let card = WidgetCardLayout {
-            placement: 0,
-            slot: 0,
-            span: 1,
-            rect,
-            days,
-            previous: None,
-            next: None,
-        };
-        let calendar = crate::document::widget::CalendarWidget {
-            year: 2026,
-            month: 9,
-            heading: CalendarHeading::Both,
-            selected: Vec::new(),
-        };
-        let mut canvas = RecordingCanvas::default();
-
-        calendar_widget(&mut canvas, &calendar, &card);
-
-        assert_eq!(canvas.rectangles.len(), 11);
-        for ((x, y), (width, height)) in &canvas.rectangles[..6] {
-            assert_eq!(*width, 1.0);
-            assert!(*height > 1.0);
-            assert!(*x >= inner.x && *x + *width <= inner.right());
-            assert!(*y >= inner.y && *y + *height <= inner.bottom());
-        }
-        for ((x, y), (width, height)) in &canvas.rectangles[6..] {
-            assert!(*width > 1.0);
-            assert_eq!(*height, 1.0);
-            assert!(*x >= inner.x && *x + *width <= inner.right());
-            assert!(*y >= inner.y && *y + *height <= inner.bottom());
-        }
-        assert_eq!(canvas.rectangles[0].0.1, first_day);
-    }
 }

@@ -81,6 +81,8 @@ pub struct Context {
     pub focus_amount: f32,
     /// Mouse state, for components that handle clicks and hovers.
     pub mouse: Mouse,
+    /// The widget being dragged, as document block and starting track.
+    pub widget_drag: Option<(usize, usize)>,
     /// Whether THIS region owns the shared popup shadow layer this frame —
     /// exactly the region whose popup is on screen (or falling as a ghost).
     /// Owners paint/clear it; everyone else must never touch it, or a

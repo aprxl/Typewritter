@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use krilla::color::rgb;
 use krilla::geom::{Path, PathBuilder, Point, Rect, Transform};
 use krilla::num::NormalizedF32;
-use krilla::paint::{Fill, Stroke};
+use krilla::paint::{Fill, LinearGradient, SpreadMethod, Stop, Stroke};
 use krilla::surface::Surface;
 use krilla::text::{Font, GlyphId, KrillaGlyph};
 
@@ -21,8 +21,8 @@ use lyon::path::Event as PathEvent;
 use lyon_extra::parser::{ParserOptions, PathParser, Source};
 
 use crate::renderer::{
-    Alignment, Color, FaceId, FillRule, HorizontalAlign, Layer, LineCap, LineJoin, PathPaint,
-    Rounding, VerticalAlign,
+    Alignment, Color, FaceId, FillRule, GradientDirection, HorizontalAlign, Layer, LineCap,
+    LineJoin, PathPaint, Rounding, VerticalAlign,
 };
 use crate::theme::TextStyle;
 
@@ -97,23 +97,55 @@ impl<'a, 'b> PdfCanvas<'a, 'b> {
 /// A colour as krilla sees it: sRGB bytes, which is how the theme authors
 /// them, plus alpha as coverage.
 ///
-/// Only [`Color::Solid`] reaches a page — every call site in `paint.rs`
-/// passes a `theme` colour and every one of those is solid. The others have
-/// no single value to fill with, so they assert in a debug build and print
-/// as ink rather than as nothing.
+/// Text and strokes use solid theme ink. Surface gradients are handled by
+/// `rectangle_fill`, where the shape's bounds give the gradient its extent.
 fn solid(color: &Color) -> (rgb::Color, f32) {
     let [r, g, b, a] = match color {
         Color::Solid(rgba) => *rgba,
-        _ => {
-            debug_assert!(false, "the page paints solid colours only");
-            [0x00, 0x00, 0x00, 0xFF]
-        }
+        _ => panic!("non-solid PDF ink needs shape bounds"),
     };
     (rgb::Color::new(r, g, b), f32::from(a) / 255.0)
 }
 
 fn fill(color: &Color) -> Fill {
     fill_with(color, FillRule::NonZero)
+}
+
+fn rectangle_fill(at: (f32, f32), size: (f32, f32), color: &Color) -> Fill {
+    let Color::Gradient { stops, direction } = color else {
+        return fill(color);
+    };
+    let end = match direction {
+        GradientDirection::Horizontal => (at.0 + size.0, at.1),
+        GradientDirection::Vertical => (at.0, at.1 + size.1),
+    };
+    let gradient = LinearGradient {
+        x1: at.0,
+        y1: at.1,
+        x2: end.0,
+        y2: end.1,
+        transform: Transform::identity(),
+        spread_method: SpreadMethod::Pad,
+        stops: stops
+            .iter()
+            .enumerate()
+            .map(|(index, &[r, g, b, a])| Stop {
+                offset: if index == 0 {
+                    NormalizedF32::ZERO
+                } else {
+                    NormalizedF32::ONE
+                },
+                color: rgb::Color::new(r, g, b).into(),
+                opacity: NormalizedF32::new(f32::from(a) / 255.0).expect("byte alpha"),
+            })
+            .collect(),
+        anti_alias: true,
+    };
+    Fill {
+        paint: gradient.into(),
+        opacity: NormalizedF32::ONE,
+        rule: krilla::paint::FillRule::NonZero,
+    }
 }
 
 fn fill_with(color: &Color, rule: FillRule) -> Fill {
@@ -304,7 +336,9 @@ impl Canvas for PdfCanvas<'_, '_> {
             bottom_left: self.geometry.length(rounding.bottom_left),
         };
         if let Some(path) = rounded_rect(at, size, rounding) {
-            self.paint(&path, &color);
+            self.surface
+                .set_fill(Some(rectangle_fill(at, size, &color)));
+            self.surface.draw_path(&path);
         }
     }
 
@@ -476,5 +510,40 @@ impl Canvas for PdfCanvas<'_, '_> {
 
     fn measure(&self, text: &str, style: &TextStyle) -> f32 {
         self.shaper.width(text, style)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::Theme;
+
+    #[test]
+    fn light_and_dark_card_surfaces_export_as_gradients() {
+        for theme in [Theme::LIGHT, Theme::DARK] {
+            let (Color::Solid(start), Color::Solid(end)) = (theme.panel, theme.background) else {
+                unreachable!()
+            };
+            for direction in [GradientDirection::Vertical, GradientDirection::Horizontal] {
+                let color = Color::gradient(start, end, direction);
+                let surface_fill = rectangle_fill((37.0, 51.0), (120.0, 200.0), &color);
+                assert_ne!(surface_fill.paint, fill(&Color::Solid(start)).paint);
+                assert_eq!(surface_fill.opacity, NormalizedF32::ONE);
+                let mut document = krilla::Document::new();
+                {
+                    let mut page = document.start_page();
+                    let mut surface = page.surface();
+                    surface.set_fill(Some(surface_fill));
+                    surface.draw_path(
+                        &rounded_rect((37.0, 51.0), (120.0, 200.0), Rounding::uniform(14.0))
+                            .unwrap(),
+                    );
+                }
+                let bytes = document
+                    .finish()
+                    .expect("a valid PDF shading in both themes");
+                assert!(bytes.starts_with(b"%PDF-"));
+            }
+        }
     }
 }

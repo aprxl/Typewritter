@@ -1099,6 +1099,11 @@ impl Shell {
                 in_window: input.is_cursor_in_window(),
             },
             scroll_y: input.scroll_delta().1,
+            widget_drag: self
+                .widget_drag
+                .as_ref()
+                .filter(|drag| drag.moved)
+                .map(|drag| (drag.block, drag.slot)),
             self_rect: Rect::default(),
             divider_hover: self.divider_hover.value(),
             debug_rows: self.debug_rows,

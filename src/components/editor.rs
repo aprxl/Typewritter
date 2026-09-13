@@ -14,6 +14,7 @@ use crate::document::layout::{
 use crate::document::math::{MathCursor, NodeAddress};
 use crate::document::math_layout::{self, MathBox};
 use crate::document::math_paint;
+use crate::document::widget_layout::Hit as WidgetHit;
 use crate::document::widget_paint;
 use crate::document::{ATOM, Block, Caret, FlatRange, Inline, Style, flat_len, table};
 use crate::layout::Rect;
@@ -201,6 +202,9 @@ pub struct Editor {
     /// that table's normal divider stroke is disabled.
     table_resize_hover: Option<TableResize>,
     table_resize_fade: Hover,
+    widget_hover: Option<(usize, WidgetHit)>,
+    widget_fade: Hover,
+    widget_drag: Option<(usize, widget_paint::DragPreview)>,
     empty: super::empty_state::EmptyState,
     dirty: Dirty,
 }
@@ -704,6 +708,9 @@ impl Editor {
             brush_point: None,
             table_resize_hover: None,
             table_resize_fade: Hover::new(),
+            widget_hover: None,
+            widget_fade: Hover::new(),
+            widget_drag: None,
             caret_on: true,
             glow: None,
             empty: super::empty_state::EmptyState::default(),
@@ -771,6 +778,9 @@ impl Editor {
             brush_point: None,
             table_resize_hover: None,
             table_resize_fade: Hover::new(),
+            widget_hover: None,
+            widget_fade: Hover::new(),
+            widget_drag: None,
             caret_on: true,
             glow: None,
             empty: super::empty_state::EmptyState::default(),
@@ -842,6 +852,42 @@ impl Component for Editor {
         {
             self.dirty.set();
         }
+        let point = (
+            context.mouse.position.0 - Self::content_x(context.self_rect),
+            context.mouse.position.1 - context.self_rect.y - self.metrics.top + self.scroll,
+        );
+        let interactive = self.has_file && self.metrics.page && context.hovering(context.self_rect);
+        let hover = if interactive && context.widget_drag.is_none() {
+            self.layout
+                .widget_rows
+                .iter()
+                .enumerate()
+                .find_map(|(block, row)| row.as_ref()?.hit(point).map(|hit| (block, hit)))
+        } else {
+            None
+        };
+        if self
+            .widget_fade
+            .track(&mut self.widget_hover, hover, context.animation_dt)
+        {
+            self.dirty.set();
+        }
+        let drag = context
+            .widget_drag
+            .filter(|_| self.metrics.page)
+            .map(|(block, slot)| {
+                let target = if interactive {
+                    self.layout
+                        .widget_rows
+                        .get(block)
+                        .and_then(Option::as_ref)
+                        .and_then(|row| row.drop_slot(slot, point))
+                } else {
+                    None
+                };
+                (block, widget_paint::DragPreview { slot, target })
+            });
+        self.dirty.write(&mut self.widget_drag, drag);
     }
 
     fn is_dirty(&self) -> bool {
@@ -853,7 +899,9 @@ impl Component for Editor {
     }
 
     fn is_animating(&self) -> bool {
-        (!self.has_file && self.empty.is_animating()) || self.table_resize_fade.is_animating()
+        (!self.has_file && self.empty.is_animating())
+            || self.table_resize_fade.is_animating()
+            || self.widget_fade.is_animating()
     }
 
     fn draw(&mut self, layer: &Layer, rect: Rect) {
@@ -918,11 +966,18 @@ impl Component for Editor {
         }));
 
         // The current-line band does not blink — it identifies the line the
-        // caret is on, regardless of caret visibility. The page's spans the
-        // whole column; a note's spans only its own content column, so the
-        // marker and rule beside it stay visible.
-        if caret.is_some() {
-            let (band_x, band_width) = if self.metrics.page {
+        // caret is on, regardless of caret visibility. A widget has its own
+        // focus outline. Prose alongside it tints only its available lane;
+        // ordinary lines retain the full-column band.
+        if let Some(caret) = caret.filter(|caret| !self.layout.source[caret.block].is_widget()) {
+            let lane_line = self.layout.blocks[caret.block].lines.iter().find(|line| {
+                line.y <= caret_baseline
+                    && caret_baseline < line.y + line.height
+                    && line.width < self.metrics.content_width(rect)
+            });
+            let (band_x, band_width) = if let Some(line) = lane_line {
+                (x + line.x - 6.0, line.width + 12.0)
+            } else if self.metrics.page {
                 (x - 12.0, self.metrics.content_width(rect) + 24.0)
             } else {
                 (x, self.metrics.content_width(rect))
@@ -1028,8 +1083,18 @@ impl Component for Editor {
                 &mut canvas,
                 row,
                 row_layout,
-                active_slot,
-                active_slot.is_some(),
+                widget_paint::Interaction {
+                    active_slot,
+                    hover: self
+                        .widget_hover
+                        .filter(|(block, _)| *block == bi)
+                        .map(|(_, hit)| hit),
+                    hover_amount: self.widget_fade.value(),
+                    drag: self
+                        .widget_drag
+                        .filter(|(block, _)| *block == bi)
+                        .map(|(_, drag)| drag),
+                },
             );
         }
 
