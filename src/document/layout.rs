@@ -125,6 +125,8 @@ pub const WIDGET_EMPTY_HEIGHT: f32 = 96.0;
 pub const WIDGET_CALENDAR_HEIGHT: f32 = 180.0;
 pub const WIDGET_RADIUS: f32 = 10.0;
 pub const WIDGET_PAD: f32 = 10.0;
+pub const WIDGET_CALENDAR_CONTROL: f32 = 24.0;
+pub const WIDGET_CALENDAR_CONTROL_GAP: f32 = 4.0;
 
 /// A run of a visual line that came from one source run, covering exactly
 /// `[start, start + len)` chars of it. Ranges on a line are contiguous and
@@ -289,6 +291,7 @@ pub struct WidgetRowLayout {
     pub tracks: Vec<Rect>,
     pub cards: Vec<WidgetCardLayout>,
     pub lane: Option<Rect>,
+    pub lane_has_content: bool,
     pub height: f32,
 }
 
@@ -1147,19 +1150,13 @@ fn widget_layout(
             let (previous, next) = match &placement.widget {
                 super::widget::Widget::Calendar(_) => {
                     let inner = rect.inset(WIDGET_PAD * scale);
+                    let control = WIDGET_CALENDAR_CONTROL * scale;
+                    let gap = WIDGET_CALENDAR_CONTROL_GAP * scale;
+                    let next_x = (inner.right() - control).max(inner.x);
+                    let previous_x = (next_x - control - gap).max(inner.x);
                     (
-                        Some(Rect::new(
-                            rect.right() - WIDGET_PAD * scale - 34.0 * scale,
-                            inner.y + 2.0 * scale,
-                            16.0 * scale,
-                            24.0 * scale,
-                        )),
-                        Some(Rect::new(
-                            rect.right() - WIDGET_PAD * scale - 18.0 * scale,
-                            inner.y + 2.0 * scale,
-                            16.0 * scale,
-                            24.0 * scale,
-                        )),
+                        Some(Rect::new(previous_x, inner.y, control, control)),
+                        Some(Rect::new(next_x, inner.y, control, control)),
                     )
                 }
                 super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => (None, None),
@@ -1216,6 +1213,7 @@ fn widget_layout(
         tracks,
         cards,
         lane,
+        lane_has_content: false,
         height: row_height,
     }
 }
@@ -1315,7 +1313,7 @@ pub fn layout_blocks(
 
     let mut laid = Vec::with_capacity(blocks.len());
     let mut tables = Vec::with_capacity(blocks.len());
-    let mut widget_rows = Vec::with_capacity(blocks.len());
+    let mut widget_rows: Vec<Option<WidgetRowLayout>> = Vec::with_capacity(blocks.len());
     let mut y = 0.0f32;
     let mut first_block = true;
     // The gap the previous block already contributed below itself. A display
@@ -1339,7 +1337,7 @@ pub fn layout_blocks(
     let mut table_shared: Option<TableShared> = None;
     // A following run of ordinary Markdown may use the widest free lane until
     // its cursor passes the widget row's bottom edge.
-    let mut widget_flow: Option<Rect> = None;
+    let mut widget_flow: Option<(usize, Rect)> = None;
 
     for (source_index, block) in blocks.iter().enumerate() {
         let mut hidden = false;
@@ -1375,13 +1373,16 @@ pub fn layout_blocks(
         }
         let mut lane = None;
         let mut resumed_below = false;
-        if let Some(flow) = widget_flow {
+        if let Some((widget_block, flow)) = widget_flow {
             if block.is_widget() {
                 y = flow.bottom() + GAP_PARAGRAPH * scale;
                 widget_flow = None;
                 resumed_below = true;
             } else if widget_block_fits_lane(block, flow, scale, measure) {
                 lane = Some(flow);
+                if let Some(Some(row_layout)) = widget_rows.get_mut(widget_block) {
+                    row_layout.lane_has_content = true;
+                }
             } else {
                 y = flow.bottom() + GAP_PARAGRAPH * scale;
                 widget_flow = None;
@@ -1422,7 +1423,7 @@ pub fn layout_blocks(
             widget_rows.push(Some(row_layout));
             let gap_after = GAP_PARAGRAPH * scale;
             if let Some(lane) = has_lane {
-                widget_flow = Some(lane);
+                widget_flow = Some((source_index, lane));
             } else {
                 widget_flow = None;
                 y += height + gap_after;
@@ -1586,7 +1587,7 @@ pub fn layout_blocks(
             GAP_PARAGRAPH * scale
         };
         y += gap_after;
-        if let Some(flow) = widget_flow
+        if let Some((_, flow)) = widget_flow
             && content_bottom >= flow.bottom()
         {
             widget_flow = None;
@@ -1606,7 +1607,7 @@ pub fn layout_blocks(
     // following Markdown flows beside it. If the row is the final block (or
     // every following block is hidden), there was no ordinary block pass to
     // advance the cursor past the cards themselves.
-    if let Some(flow) = widget_flow {
+    if let Some((_, flow)) = widget_flow {
         y = flow.bottom() + GAP_PARAGRAPH * scale;
     }
 
@@ -2016,6 +2017,9 @@ fn caret_for_click(
 /// `(inline, offset)` for a block-flat position, clamped to the block's end.
 fn flat_to_pos(block: &Block, flat: usize) -> (usize, usize) {
     let runs = block.inlines();
+    if runs.is_empty() {
+        return (0, 0);
+    }
     let mut pos = 0;
     for (i, run) in runs.iter().enumerate() {
         let len = run_text(run).chars().count();
@@ -2029,6 +2033,15 @@ fn flat_to_pos(block: &Block, flat: usize) -> (usize, usize) {
 }
 
 impl DocLayout {
+    fn widget_caret(&self, block: usize, slot: usize) -> Caret {
+        Caret {
+            block,
+            inline: slot.min(super::widget::TRACKS - 1),
+            offset: 0,
+            style: Style::PLAIN,
+        }
+    }
+
     /// Resolve an overlapping widget row before ordinary block hit testing.
     /// A card claims its own rectangle; the free lane belongs to the Markdown
     /// block laid out beside it, which is the rule that keeps widgets from
@@ -2058,6 +2071,9 @@ impl DocLayout {
             if block.y > y {
                 break;
             }
+            if row.lane_has_content && y < block.y + block.height {
+                return index;
+            }
             if block.lines.iter().any(|line| {
                 y >= line.y && y < line.y + line.height && x >= line.x && x < line.x + line.width
             }) {
@@ -2086,6 +2102,20 @@ impl DocLayout {
             .iter()
             .position(|track| track.contains((x, y)))
             .map(|slot| (block, slot))
+    }
+
+    /// Whether a point is in the free track lane already occupied by flowing
+    /// Markdown. The entire lane is reserved once a block uses it, including
+    /// its whitespace, so adding or dropping a card cannot collide with the
+    /// paragraph's next reflow.
+    pub fn widget_lane_blocked_at(&self, x: f32, y: f32) -> bool {
+        let block = block_of_y(self, y);
+        self.widget_rows
+            .get(block)
+            .and_then(Option::as_ref)
+            .is_some_and(|row| {
+                row.lane_has_content && row.lane.is_some_and(|lane| lane.contains((x, y)))
+            })
     }
 
     /// A calendar day at a point, if the point is inside a placed calendar.
@@ -2264,6 +2294,16 @@ impl DocLayout {
                 left + inset + line.x + x,
                 content_top + line.y + line.height * 0.5,
                 line.height,
+            );
+        }
+        if self.source[caret.block].is_widget()
+            && let Some(row) = self.widget_rows[caret.block].as_ref()
+        {
+            let track = &row.tracks[caret.inline.min(row.tracks.len().saturating_sub(1))];
+            return (
+                track.x + track.width * 0.5,
+                track.y + track.height * 0.5,
+                track.height,
             );
         }
         let flat = flat_of_caret(&self.source, caret);
@@ -3119,6 +3159,8 @@ impl DocLayout {
             let target = &self.blocks[previous];
             return if self.tables.get(previous).is_some_and(Option::is_some) {
                 Some(self.hit(goal_x, target.y + target.height * 0.5, measure))
+            } else if self.source[previous].is_widget() {
+                Some(self.widget_caret(previous, caret.inline))
             } else {
                 let last_line = target.lines.len() - 1;
                 Some(caret_for_click(
@@ -3155,6 +3197,9 @@ impl DocLayout {
         if self.tables.get(prev).is_some_and(Option::is_some) {
             let target = &self.blocks[prev];
             return Some(self.hit(goal_x, target.y + target.height * 0.5, measure));
+        }
+        if self.source[prev].is_widget() {
+            return Some(self.widget_caret(prev, caret.inline));
         }
         let last_line = self.blocks[prev].lines.len() - 1;
         Some(caret_for_click(
@@ -3193,6 +3238,8 @@ impl DocLayout {
             let target = &self.blocks[next];
             return if self.tables.get(next).is_some_and(Option::is_some) {
                 Some(self.hit(goal_x, target.y + target.height * 0.5, measure))
+            } else if self.source[next].is_widget() {
+                Some(self.widget_caret(next, caret.inline))
             } else {
                 Some(caret_for_click(
                     &self.source,
@@ -3225,6 +3272,9 @@ impl DocLayout {
         if self.tables.get(next).is_some_and(Option::is_some) {
             let target = &self.blocks[next];
             return Some(self.hit(goal_x, target.y + target.height * 0.5, measure));
+        }
+        if self.source[next].is_widget() {
+            return Some(self.widget_caret(next, caret.inline));
         }
         Some(caret_for_click(
             &self.source,
@@ -3328,7 +3378,7 @@ mod tests {
     use crate::document::widget::{
         CalendarWidget, ClarityWidget, Widget, WidgetPlacement, WidgetRow,
     };
-    use crate::document::{Focus, Inline, Sidenote, Text};
+    use crate::document::{Caret, Focus, Inline, Sidenote, Text};
     use std::cell::Cell;
 
     /// Every glyph 10 wide, so line breaks are countable by hand.
@@ -3483,6 +3533,7 @@ mod tests {
         );
         let widget = laid.widget_rows[0].as_ref().expect("widget geometry");
         let lane = widget.lane.expect("one free track remains");
+        assert!(widget.lane_has_content);
         assert_eq!(widget.cards.len(), 2);
         assert_eq!(widget.cards[0].days.len(), 30);
         assert_eq!(laid.blocks[1].lines[0].x, lane.x);
@@ -3495,6 +3546,7 @@ mod tests {
             Some((0, 0))
         );
         let prose_point = (lane.x + 5.0, laid.blocks[1].lines[0].y + 5.0);
+        assert!(laid.widget_lane_blocked_at(prose_point.0, prose_point.1));
         assert_eq!(
             laid.hit(prose_point.0, prose_point.1, &fake_measure).block,
             1
@@ -3505,6 +3557,17 @@ mod tests {
         );
         let previous = widget.cards[0].previous.expect("previous month control");
         let next = widget.cards[0].next.expect("next month control");
+        assert!(widget.cards[0].rect.contains(previous.position()));
+        assert!(widget.cards[0].rect.contains((
+            previous.right() - f32::EPSILON,
+            previous.bottom() - f32::EPSILON,
+        )));
+        assert!(widget.cards[0].rect.contains(next.position()));
+        assert!(
+            widget.cards[0]
+                .rect
+                .contains((next.right() - f32::EPSILON, next.bottom() - f32::EPSILON,))
+        );
         assert_eq!(
             laid.widget_calendar_control_at(previous.x + 2.0, previous.y + 2.0),
             Some((0, 0, -1))
@@ -3527,6 +3590,31 @@ mod tests {
         assert!(laid.blocks[1].y >= widgets.height + GAP_PARAGRAPH);
         assert_eq!(laid.blocks[1].lines[0].x, 0.0);
         assert_eq!(laid.blocks[1].lines[0].width, 400.0);
+    }
+
+    #[test]
+    fn vertical_motion_between_tables_and_widgets_keeps_the_track_caret() {
+        let table = crate::document::table_row(
+            2,
+            true,
+            std::sync::Arc::new(crate::document::table::TableSettings::new(2, 1)),
+        );
+        let row = Block::WidgetRow(WidgetRow::new(Widget::Empty));
+        let laid = layout_blocks(&[table, row], 400.0, 1.0, &fake_measure);
+        let table_caret = Caret {
+            block: 0,
+            inline: 0,
+            offset: 0,
+            style: Style::PLAIN,
+        };
+        let widget_caret = laid
+            .line_down(table_caret, 0.0, &fake_measure)
+            .expect("table moves into the widget row");
+        assert_eq!((widget_caret.block, widget_caret.inline), (1, 0));
+        let table_caret = laid
+            .line_up(widget_caret, 0.0, &fake_measure)
+            .expect("widget moves back into the table");
+        assert_eq!((table_caret.block, table_caret.inline), (0, 0));
     }
 
     const BOLD: Style = Style {

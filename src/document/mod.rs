@@ -2654,6 +2654,24 @@ impl Document {
         changed
     }
 
+    /// Moves a widget within one body row, preserving its span and refusing
+    /// to overwrite another placement.
+    pub fn move_widget_at(&mut self, block: usize, from: usize, to: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let changed = match self.body.get_mut(block) {
+            Some(Block::WidgetRow(row)) => row.move_at(from, to),
+            _ => false,
+        };
+        if changed {
+            self.set_caret(block, to, 0);
+            self.dirty = true;
+            self.enforce();
+        }
+        changed
+    }
+
     /// Removes the placement covering `slot`. Removing the final placement
     /// removes the row anchor too, returning the caret to adjacent Markdown.
     pub fn remove_widget_at(&mut self, block: usize, slot: usize) -> bool {
@@ -5011,6 +5029,33 @@ mod tests {
         assert!(d.remove_widget_at(0, 0));
         assert!(d.remove_widget_at(0, 2));
         assert!(matches!(d.body(), [Block::Paragraph(_)]));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn widget_drag_moves_a_span_without_overwriting_other_tracks() {
+        let mut d = doc();
+        let row = widget::WidgetRow {
+            placements: vec![
+                widget::WidgetPlacement {
+                    slot: 0,
+                    span: 2,
+                    widget: widget::Widget::Calendar(widget::WidgetRow::local_calendar()),
+                },
+                widget::WidgetPlacement {
+                    slot: 3,
+                    span: 1,
+                    widget: widget::Widget::Clarity(widget::ClarityWidget::default()),
+                },
+            ],
+        };
+        *d.body_mut() = vec![Block::WidgetRow(row)];
+        assert!(!d.move_widget_at(0, 0, 2));
+        assert!(d.move_widget_at(0, 0, 1));
+        let row = d.body()[0].widget_row_ref().unwrap();
+        assert_eq!(row.placements[0].slot, 1);
+        assert_eq!(row.placements[0].span, 2);
+        assert_eq!(row.placements[1].slot, 3);
         assert_invariants(&d);
     }
 

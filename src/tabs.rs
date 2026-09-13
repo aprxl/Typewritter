@@ -674,6 +674,12 @@ impl Tabs {
         changed
     }
 
+    pub fn move_widget_at(&mut self, block: usize, from: usize, to: usize) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.move_widget_at(block, from, to));
+        changed
+    }
+
     pub fn remove_widget_at(&mut self, block: usize, slot: usize) -> bool {
         let mut changed = false;
         self.edit(|doc| changed = doc.remove_widget_at(block, slot));

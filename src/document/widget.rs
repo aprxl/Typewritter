@@ -100,6 +100,35 @@ impl WidgetRow {
         Some(self.placements.remove(index))
     }
 
+    /// Moves the placement covering `from` to a free horizontal track. A
+    /// placement keeps its span, and another placement is never overwritten.
+    pub fn move_at(&mut self, from: usize, to: usize) -> bool {
+        let Some(index) = self
+            .placements
+            .iter()
+            .position(|placement| placement.slot <= from && from < placement.slot + placement.span)
+        else {
+            return false;
+        };
+        let span = self.placements[index].span;
+        if to >= TRACKS || to + span > TRACKS || to == self.placements[index].slot {
+            return false;
+        }
+        if self
+            .placements
+            .iter()
+            .enumerate()
+            .any(|(other, placement)| {
+                other != index && placement.slot < to + span && to < placement.slot + placement.span
+            })
+        {
+            return false;
+        }
+        self.placements[index].slot = to;
+        self.normalize();
+        true
+    }
+
     pub fn normalize(&mut self) {
         self.placements.sort_by_key(|placement| placement.slot);
     }

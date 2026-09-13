@@ -450,6 +450,15 @@ struct TableDrag {
     last: (f32, f32),
 }
 
+/// A pending widget drag. The model changes only on a valid drop, so a
+/// cancelled gesture cannot leave a row half-moved or steal a Markdown lane.
+struct WidgetDrag {
+    block: usize,
+    slot: usize,
+    origin: (f32, f32),
+    moved: bool,
+}
+
 pub struct Shell {
     layout: Layout,
     regions: Vec<Region>,
@@ -506,6 +515,8 @@ pub struct Shell {
     table_lines: Option<TableLinesState>,
     /// The table divider currently being dragged, if any.
     table_drag: Option<TableDrag>,
+    /// A widget card being moved within its row.
+    widget_drag: Option<WidgetDrag>,
     /// Persistent Ctrl-brush selection, plus the targets currently under the
     /// brush so a held stroke toggles each target only on entry.
     brush_selected: Vec<ContextHit>,
@@ -869,6 +880,7 @@ impl Shell {
             format_bar: None,
             table_lines: None,
             table_drag: None,
+            widget_drag: None,
             menu_dismiss: None,
             menu_dismiss_clock: 0.0,
             brush_selected: Vec::new(),

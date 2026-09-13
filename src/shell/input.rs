@@ -44,7 +44,8 @@ use std::rc::Rc;
 
 use super::{
     ContextGhost, ContextMenuState, InsertEvent, InsertMarker, InsertShortcuts, MathMenuState,
-    MenuDismiss, PaletteState, Shell, SlashMenuState, TableDrag, TableLinesState, WordFormatState,
+    MenuDismiss, PaletteState, Shell, SlashMenuState, TableDrag, TableLinesState, WidgetDrag,
+    WordFormatState,
 };
 
 /// Apply one recorded Insert-mode event. Text and editing keys are recorded
@@ -807,6 +808,86 @@ impl Shell {
         true
     }
 
+    /// Start a deferred card click. Waiting until release lets the same
+    /// gesture either activate a calendar/Clarity card or move it, without
+    /// toggling a day as a side effect of dragging.
+    fn start_widget_drag(&mut self, rect: Rect, mouse: (f32, f32)) -> bool {
+        let Some((local_x, local_y)) = self.editor_point(rect, mouse) else {
+            return false;
+        };
+        let layout = self.current_layout(editor::Editor::content_width(rect));
+        let Some((block, placement)) = layout.widget_at(local_x, local_y) else {
+            return false;
+        };
+        let Some(card) = layout
+            .widget_rows
+            .get(block)
+            .and_then(Option::as_ref)
+            .and_then(|row| row.cards.get(placement))
+        else {
+            return false;
+        };
+        if !card.rect.contains((local_x, local_y)) {
+            return false;
+        }
+        self.goal_x = None;
+        self.widget_drag = Some(WidgetDrag {
+            block,
+            slot: card.slot,
+            origin: mouse,
+            moved: false,
+        });
+        true
+    }
+
+    /// Drive a pending widget gesture. A drop is accepted only in the same
+    /// row and only when the layout still resolves the pointer to that row;
+    /// prose flowing through the lane therefore remains protected.
+    fn drive_widget_drag(&mut self, input: &Input) -> bool {
+        let Some(drag) = &mut self.widget_drag else {
+            return false;
+        };
+        let point = input.mouse_position();
+        if input.is_mouse_down(MouseButton::Left) {
+            let dx = point.0 - drag.origin.0;
+            let dy = point.1 - drag.origin.1;
+            if dx * dx + dy * dy >= 16.0 {
+                drag.moved = true;
+            }
+            return true;
+        }
+
+        let drag = self.widget_drag.take().expect("widget drag exists");
+        if !drag.moved {
+            self.widget_click(self.layout.rect(self.text_column), point);
+            return true;
+        }
+        let rect = self.layout.rect(self.text_column);
+        let Some((local_x, local_y)) = self.editor_point(rect, point) else {
+            return true;
+        };
+        let layout = self.current_layout(editor::Editor::content_width(rect));
+        let Some((block, slot)) = layout.widget_slot_at(local_x, local_y) else {
+            return true;
+        };
+        if block != drag.block {
+            return true;
+        }
+        if layout.widget_lane_blocked_at(local_x, local_y) {
+            return true;
+        }
+        let layer = self.regions[self.text_region].layer();
+        let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
+        if layout.hit(local_x, local_y, &measure).block != block {
+            return true;
+        }
+        self.goal_x = None;
+        self.docs
+            .borrow_mut()
+            .move_widget_at(block, drag.slot, slot);
+        true
+    }
+
     /// Whether a click landed on a fold affordance — a gutter chevron or a
     /// collapsed-body indicator — and toggled/unfolded it. Runs before caret
     /// placement in either mode: these are controls, not text.
@@ -1131,6 +1212,9 @@ impl Shell {
         let Some((block, slot)) = layout.widget_slot_at(local_x, local_y) else {
             return false;
         };
+        if layout.widget_lane_blocked_at(local_x, local_y) {
+            return false;
+        }
         let layer = self.regions[self.text_region].layer();
         let measure = |text: &str, style: &TextStyle| theme::width(layer, text, style);
         if layout.hit(local_x, local_y, &measure).block != block {
@@ -1156,6 +1240,9 @@ impl Shell {
     /// mode-dependent, so it's split into
     /// [`Shell::edit_frame_insert`]/[`Shell::edit_frame_normal`].
     fn edit_frame(&mut self, input: &Input) {
+        if self.drive_widget_drag(input) {
+            return;
+        }
         if self.drive_table_drag(input) {
             return;
         }
@@ -1223,6 +1310,9 @@ impl Shell {
                     });
                     return;
                 }
+            }
+            if self.start_widget_drag(rect, mouse) {
+                return;
             }
             if self.widget_click(rect, mouse) {
                 return;

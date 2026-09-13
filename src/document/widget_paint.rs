@@ -8,19 +8,8 @@ use crate::renderer::{Color, LineCap, LineJoin, PathPaint, Rounding, Stroke};
 use crate::theme::{self, TextStyle};
 
 const WEEKDAYS: [&str; 7] = ["M", "T", "W", "T", "F", "S", "S"];
-const MONTHS: [&str; 12] = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
+const SHORT_MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
 /// Paint one widget row. `active_slot` is editor state; `show_unused` keeps
@@ -36,21 +25,48 @@ pub fn row(
     if show_unused {
         for (slot, track) in layout.tracks.iter().enumerate() {
             if source.placement_at(slot).is_none() {
-                canvas::rounded_outline(
-                    canvas,
-                    *track,
-                    WIDGET_RADIUS,
-                    1.0,
-                    theme::fade(theme::non_text(), 0.7),
-                );
-                let centre = (track.x + track.width * 0.5, track.y + track.height * 0.5);
-                canvas.draw_path(
-                    theme::icons::PLUS,
-                    (centre.0 - 9.0, centre.1 - 9.0),
-                    0.0,
-                    &PathPaint::Stroke(Stroke::new(theme::fade(theme::non_text(), 0.8), 1.2)),
-                );
+                let contains_text = layout.lane_has_content
+                    && layout.lane.is_some_and(|lane| {
+                        lane.contains((track.x + track.width * 0.5, track.y + track.height * 0.5))
+                    });
+                let colour = if contains_text {
+                    theme::fade(theme::comment(), 0.8)
+                } else {
+                    theme::fade(theme::non_text(), 0.7)
+                };
+                canvas::rounded_outline(canvas, *track, WIDGET_RADIUS, 1.0, colour.clone());
+                if !contains_text {
+                    let centre = (track.x + track.width * 0.5, track.y + track.height * 0.5);
+                    canvas.draw_path(
+                        theme::icons::PLUS,
+                        (centre.0 - 9.0, centre.1 - 9.0),
+                        0.0,
+                        &PathPaint::Stroke(Stroke::new(colour, 1.2)),
+                    );
+                }
             }
+        }
+        if let Some(lane) = layout.lane.filter(|_| layout.lane_has_content) {
+            let marker = Rect::new(lane.right() - 24.0, lane.bottom() - 26.0, 22.0, 22.0);
+            canvas.draw_rectangle(
+                marker.position(),
+                marker.size(),
+                theme::fade(theme::panel(), 0.95),
+                Rounding::uniform(6.0),
+            );
+            canvas::rounded_outline(
+                canvas,
+                marker,
+                6.0,
+                1.0,
+                theme::fade(theme::comment(), 0.85),
+            );
+            icon(
+                canvas,
+                theme::icons::FILE_LINES,
+                (marker.x - 1.0, marker.y - 1.0),
+                theme::comment(),
+            );
         }
     }
 
@@ -102,29 +118,64 @@ fn calendar_widget(
 ) {
     let inner = card.rect.inset(WIDGET_PAD);
     let heading = match calendar.heading {
-        CalendarHeading::Both => {
-            format!("{} {}", MONTHS[calendar.month as usize - 1], calendar.year)
-        }
-        CalendarHeading::Month => MONTHS[calendar.month as usize - 1].to_string(),
+        CalendarHeading::Both => format!(
+            "{} {}",
+            SHORT_MONTHS[calendar.month as usize - 1],
+            calendar.year
+        ),
+        CalendarHeading::Month => SHORT_MONTHS[calendar.month as usize - 1].to_string(),
         CalendarHeading::Year => calendar.year.to_string(),
         CalendarHeading::None => String::new(),
     };
+    if let (Some(previous), Some(next)) = (card.previous, card.next) {
+        calendar_button(canvas, previous, theme::icons::CHEVRON_LEFT);
+        calendar_button(canvas, next, theme::icons::CHEVRON_RIGHT);
+    }
+    let show_icon = inner.width >= 120.0;
+    if show_icon {
+        icon(
+            canvas,
+            theme::icons::CALENDAR,
+            (inner.x, inner.y),
+            theme::accent(),
+        );
+    }
     if !heading.is_empty() {
         canvas.draw_text(
             &heading,
-            (inner.x, inner.y + 14.0),
-            &TextStyle::sans(12.0, theme::ink()).bold(),
+            (inner.x + if show_icon { 26.0 } else { 0.0 }, inner.y + 14.0),
+            &TextStyle::sans(11.0, theme::ink()).bold(),
             theme::LEFT,
         );
     }
     let first_day = card.days.first().map_or(inner.y, |day| day.rect.y);
     let cell_width = card.days.first().map_or(0.0, |day| day.rect.width);
+    let cell_height = card.days.first().map_or(0.0, |day| day.rect.height);
     for (index, weekday) in WEEKDAYS.iter().enumerate() {
         canvas.draw_text(
             weekday,
             (inner.x + (index as f32 + 0.5) * cell_width, first_day - 6.0),
             &TextStyle::mono(8.0, theme::comment()),
             theme::CENTER,
+        );
+    }
+    let grid_color = theme::fade(theme::border(), 0.35);
+    for column in 1..7 {
+        canvas::rule(
+            canvas,
+            (inner.x + column as f32 * cell_width, first_day),
+            6.0 * cell_height,
+            1.0,
+            grid_color.clone(),
+        );
+    }
+    for row in 1..6 {
+        canvas::rule(
+            canvas,
+            (inner.x, first_day + row as f32 * cell_height),
+            7.0 * cell_width,
+            1.0,
+            grid_color.clone(),
         );
     }
     for day in &card.days {
@@ -155,22 +206,17 @@ fn calendar_widget(
             theme::CENTER,
         );
     }
-    if let Some(previous) = card.previous {
-        icon(
-            canvas,
-            theme::icons::CHEVRON_LEFT,
-            (previous.x + previous.width * 0.5, previous.y + 3.0),
-            theme::dim(),
-        );
-    }
-    if let Some(next) = card.next {
-        icon(
-            canvas,
-            theme::icons::CHEVRON_RIGHT,
-            (next.x + next.width * 0.5, next.y + 3.0),
-            theme::dim(),
-        );
-    }
+}
+
+fn calendar_button(canvas: &mut dyn Canvas, rect: Rect, path: &str) {
+    canvas.draw_rectangle(
+        rect.position(),
+        rect.size(),
+        theme::fade(theme::alt(), 0.7),
+        Rounding::uniform(7.0),
+    );
+    canvas::rounded_outline(canvas, rect, 7.0, 1.0, theme::fade(theme::border(), 0.85));
+    icon(canvas, path, (rect.x + 3.0, rect.y + 3.0), theme::dim());
 }
 
 fn clarity_widget(canvas: &mut dyn Canvas, value: Option<ClarityLevel>, rect: Rect) {
