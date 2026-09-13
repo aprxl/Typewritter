@@ -107,13 +107,13 @@ impl WidgetRowLayout {
         })
     }
 
-    /// Preview and commit use the same span-aware acceptance rule. Protect
-    /// the entire Markdown lane, including portions without painted glyphs.
+    /// Preview and commit use the same span-aware acceptance rule. A card may
+    /// enter the Markdown lane: committing the move recomputes that lane and
+    /// reflows its prose around the card's new position.
     pub fn drop_slot(&self, from: usize, point: (f32, f32)) -> Option<usize> {
         let card = self.cards.iter().find(|card| card.slot == from)?;
         let to = self.tracks.iter().position(|track| track.contains(point))?;
         if to + card.span > self.tracks.len()
-            || (to..to + card.span).any(|slot| self.text_track(slot))
             || self.cards.iter().any(|other| {
                 other.slot != from && other.slot < to + card.span && to < other.slot + other.span
             })
@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_drop_cannot_cover_text_even_when_pointer_is_in_a_free_track() {
+    fn wide_drop_can_reflow_text_when_pointer_is_in_a_free_track() {
         let source = WidgetRow {
             placements: vec![WidgetPlacement {
                 slot: 0,
@@ -400,10 +400,8 @@ mod tests {
         layout.lane_has_content = true;
         let on_source_edge = center(layout.tracks[1]);
         assert!(!layout.text_track(1));
-        assert_eq!(layout.drop_slot(0, on_source_edge), None);
-        assert_eq!(layout.hit(center(layout.tracks[3])), None);
-        layout.lane_has_content = false;
         assert_eq!(layout.drop_slot(0, on_source_edge), Some(1));
+        assert_eq!(layout.hit(center(layout.tracks[3])), None);
         assert_eq!(layout.drop_slot(0, center(layout.tracks[3])), None);
         let target = center(layout.tracks[2]);
         assert_eq!(layout.drop_slot(0, target), Some(2));

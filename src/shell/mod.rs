@@ -451,7 +451,8 @@ struct TableDrag {
 }
 
 /// A pending widget drag. The model changes only on a valid drop, so a
-/// cancelled gesture cannot leave a row half-moved or steal a Markdown lane.
+/// cancelled gesture cannot leave a row half-moved; a committed drop reflows
+/// any Markdown lane it enters.
 struct WidgetDrag {
     block: usize,
     slot: usize,

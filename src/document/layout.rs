@@ -2214,10 +2214,10 @@ impl DocLayout {
             })
     }
 
-    /// Whether a point is in the free track lane already occupied by flowing
-    /// Markdown. The entire lane is reserved once a block uses it, including
-    /// its whitespace, so adding or dropping a card cannot collide with the
-    /// paragraph's next reflow.
+    /// Whether a point is in a free track lane already occupied by flowing
+    /// Markdown. This keeps a plain click in prose from opening the widget
+    /// chooser; dragging an existing card deliberately has separate,
+    /// reflow-aware acceptance.
     pub fn widget_lane_blocked_at(&self, x: f32, y: f32) -> bool {
         self.widget_rows
             .iter()
@@ -3683,6 +3683,37 @@ mod tests {
             laid.widget_calendar_control_at(next.x + 2.0, next.y + 2.0),
             Some((0, 0, 1))
         );
+    }
+
+    #[test]
+    fn moving_a_widget_reflows_the_adjacent_prose() {
+        let mut row = WidgetRow::new(Widget::Empty);
+        let text = "These words begin beside the widget and should follow it when the card moves.";
+        let before = layout_blocks(
+            &[Block::WidgetRow(row.clone()), para(text)],
+            400.0,
+            1.0,
+            &fake_measure,
+        );
+        let before_lane = before.widget_rows[0].as_ref().unwrap().lane.unwrap();
+
+        assert!(before.widget_rows[0].as_ref().unwrap().lane_has_content);
+        assert_eq!(before.blocks[1].lines[0].x, before_lane.x);
+        assert!(before_lane.x > 0.0);
+
+        assert!(row.move_at(0, 3));
+        let after = layout_blocks(
+            &[Block::WidgetRow(row), para(text)],
+            400.0,
+            1.0,
+            &fake_measure,
+        );
+        let after_lane = after.widget_rows[0].as_ref().unwrap().lane.unwrap();
+
+        assert!(after.widget_rows[0].as_ref().unwrap().lane_has_content);
+        assert_eq!(after.blocks[1].lines[0].x, after_lane.x);
+        assert_eq!(after_lane.x, 0.0);
+        assert_ne!(before_lane, after_lane);
     }
 
     #[test]

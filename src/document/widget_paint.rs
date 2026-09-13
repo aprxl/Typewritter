@@ -159,7 +159,7 @@ pub fn row(
                     "Space occupied"
                 }
             } else if layout.lane_has_content {
-                "Text lane in use"
+                "Drag to reflow text"
             } else {
                 "Drag to move"
             };
