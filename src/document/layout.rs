@@ -190,7 +190,7 @@ pub struct VisLine {
     /// drawing all add it, so they cannot drift apart.
     pub x: f32,
     /// Width available to this line. It is the full column for ordinary
-    /// blocks, or the free lane beside a widget row.
+    /// blocks, or the free lane beside a widget row until that lane ends.
     pub width: f32,
     /// Actual line height: the block's floor or its tallest content.
     pub height: f32,
@@ -844,6 +844,60 @@ fn segments_for(pieces: &[Piece], line: &[Chunk], kind: &Block) -> Vec<Segment> 
     segs
 }
 
+fn wrapped_line_content_height(
+    line: &[Chunk],
+    pieces: &[Piece],
+    block: &Block,
+    scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> f32 {
+    line.iter()
+        .filter_map(
+            |&chunk| match &block.inlines()[pieces[chunk.piece].inline] {
+                Inline::Math(list) => {
+                    let expression = math_layout::layout(list, 0, scale, measure);
+                    Some(expression.ascent + expression.descent + MATH_LEADING * scale)
+                }
+                Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
+            },
+        )
+        .fold(0.0, f32::max)
+}
+
+fn layout_wrapped_lines(
+    grouped: &[Vec<Chunk>],
+    pieces: &[Piece],
+    block: &Block,
+    origin: Rect,
+    base_line_height: f32,
+    scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> Vec<VisLine> {
+    let mut line_y = origin.y;
+    grouped
+        .iter()
+        .map(|line_pieces| {
+            let height = base_line_height.max(wrapped_line_content_height(
+                line_pieces,
+                pieces,
+                block,
+                scale,
+                measure,
+            ));
+            let line = VisLine {
+                y: line_y,
+                x: origin.x,
+                width: origin.width,
+                height,
+                segments: segments_for(pieces, line_pieces, block),
+                cell_line: 0,
+            };
+            line_y += height;
+            line
+        })
+        .collect()
+}
+
 /// One pass over `doc`'s own blocks at full scale; `measure(text, style) ->
 /// width` is the only rendering input. The thin wrapper around
 /// [`layout_blocks`] — a whole document is just its body at scale `1.0`.
@@ -1488,53 +1542,111 @@ pub fn layout_blocks(
             }]
         } else {
             let pieces = tokens(block.inlines(), source_index, &number_of);
-            let grouped = wrap(
-                &pieces,
-                block,
-                block.inlines(),
-                available_width - indent,
-                scale,
-                measure,
-                false,
-            );
-            let mut line_y = y;
-            grouped
-                .iter()
-                .map(|line_pieces| {
-                    let content_height = line_pieces
-                        .iter()
-                        .filter_map(|&piece_index| {
-                            match &block.inlines()[pieces[piece_index.piece].inline] {
-                                Inline::Math(list) => {
-                                    let expression = math_layout::layout(list, 0, scale, measure);
-                                    Some(
-                                        expression.ascent
-                                            + expression.descent
-                                            + MATH_LEADING * scale,
-                                    )
-                                }
-                                Inline::Text(_) | Inline::Note(_) | Inline::EqRef(_) => None,
-                            }
-                        })
-                        .fold(0.0, f32::max);
-                    let height = base_line_height.max(content_height);
-                    let line = VisLine {
-                        y: line_y,
-                        x: lane_x + indent,
-                        width: available_width - indent,
-                        height,
-                        segments: segments_for(&pieces, line_pieces, block),
-                        cell_line: 0,
-                    };
-                    line_y += height;
-                    line
-                })
-                .collect::<Vec<_>>()
+            let full_width = width - indent;
+            if let Some((widget_block, flow)) = widget_flow.filter(|_| lane.is_some()) {
+                let lane_grouped = wrap(
+                    &pieces,
+                    block,
+                    block.inlines(),
+                    flow.width - indent,
+                    scale,
+                    measure,
+                    false,
+                );
+                let lane_lines = layout_wrapped_lines(
+                    &lane_grouped,
+                    &pieces,
+                    block,
+                    Rect::new(lane_x + indent, y, flow.width - indent, 0.0),
+                    base_line_height,
+                    scale,
+                    measure,
+                );
+                let lane_count = lane_lines
+                    .iter()
+                    .take_while(|line| line.y + line.height <= flow.bottom())
+                    .count();
+                if lane_count == 0 {
+                    widget_flow = None;
+                    y = flow.bottom() + GAP_PARAGRAPH * scale;
+                    let grouped = wrap(
+                        &pieces,
+                        block,
+                        block.inlines(),
+                        full_width,
+                        scale,
+                        measure,
+                        false,
+                    );
+                    layout_wrapped_lines(
+                        &grouped,
+                        &pieces,
+                        block,
+                        Rect::new(indent, y, full_width, 0.0),
+                        base_line_height,
+                        scale,
+                        measure,
+                    )
+                } else if lane_count == lane_lines.len() {
+                    if let Some(Some(row_layout)) = widget_rows.get_mut(widget_block) {
+                        row_layout.lane_has_content = true;
+                    }
+                    lane_lines
+                } else {
+                    if let Some(Some(row_layout)) = widget_rows.get_mut(widget_block) {
+                        row_layout.lane_has_content = true;
+                    }
+                    let remaining_piece = lane_grouped[lane_count]
+                        .first()
+                        .map_or(pieces.len(), |chunk| chunk.piece);
+                    let mut lines = lane_lines[..lane_count].to_vec();
+                    let suffix = &pieces[remaining_piece..];
+                    let grouped = wrap(
+                        suffix,
+                        block,
+                        block.inlines(),
+                        full_width,
+                        scale,
+                        measure,
+                        false,
+                    );
+                    let suffix_y = flow.bottom();
+                    lines.extend(layout_wrapped_lines(
+                        &grouped,
+                        suffix,
+                        block,
+                        Rect::new(indent, suffix_y, full_width, 0.0),
+                        base_line_height,
+                        scale,
+                        measure,
+                    ));
+                    lines
+                }
+            } else {
+                let grouped = wrap(
+                    &pieces,
+                    block,
+                    block.inlines(),
+                    available_width - indent,
+                    scale,
+                    measure,
+                    false,
+                );
+                layout_wrapped_lines(
+                    &grouped,
+                    &pieces,
+                    block,
+                    Rect::new(lane_x + indent, y, available_width - indent, 0.0),
+                    base_line_height,
+                    scale,
+                    measure,
+                )
+            }
         };
 
         // VisLine heights are content-driven, so later lines start after the
         // actual height of every earlier line rather than a copied constant.
-        let mut height = lines.iter().map(|line| line.height).sum();
+        let mut height = lines.last().map_or(0.0, |line| line.y + line.height - y);
         // A folded heading reserves its indicator's band right here, in the
         // flow, so everything below it moves in the same pass — the reflow
         // is one layout, not a settle.
@@ -3575,6 +3687,50 @@ mod tests {
         assert_eq!(
             laid.widget_calendar_control_at(next.x + 2.0, next.y + 2.0),
             Some((0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn prose_rewraps_at_the_bottom_of_a_widget_lane() {
+        let row = WidgetRow::new(Widget::Calendar(CalendarWidget {
+            year: 2026,
+            month: 9,
+            heading: crate::document::widget::CalendarHeading::Both,
+            selected: Vec::new(),
+        }));
+        let text = (0..50).map(|_| "word").collect::<Vec<_>>().join(" ");
+        let laid = layout_blocks(
+            &[Block::WidgetRow(row), para(&text)],
+            400.0,
+            1.0,
+            &fake_measure,
+        );
+        let widget = laid.widget_rows[0].as_ref().expect("widget geometry");
+        let lane = widget.lane.expect("one free track remains");
+        let paragraph = &laid.blocks[1];
+        let first_full_width = paragraph
+            .lines
+            .iter()
+            .position(|line| line.y >= widget.height)
+            .expect("long prose continues below the widget");
+
+        assert!(first_full_width > 0);
+        assert!(
+            paragraph.lines[..first_full_width]
+                .iter()
+                .all(|line| line.x == lane.x && line.width == lane.width)
+        );
+        assert!(
+            paragraph.lines[first_full_width..]
+                .iter()
+                .all(|line| line.x == 0.0 && line.width == 400.0)
+        );
+        assert_eq!(paragraph.lines[first_full_width].y, widget.height);
+        assert_eq!(
+            laid.height,
+            paragraph.lines.last().unwrap().y
+                + paragraph.lines.last().unwrap().height
+                + GAP_PARAGRAPH
         );
     }
 
