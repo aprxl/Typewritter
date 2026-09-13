@@ -42,6 +42,9 @@ pub struct WidgetRowLayout {
     pub tracks: Vec<Rect>,
     pub cards: Vec<WidgetCardLayout>,
     pub lane: Option<Rect>,
+    /// The complete widget wall this row belongs to. A wall can contain one
+    /// row; export uses its bounds to keep the visual unit whole.
+    pub wall: Option<Rect>,
     pub lane_has_content: bool,
     pub height: f32,
     pub scale: f32,
@@ -301,6 +304,7 @@ pub fn widget_layout(
         tracks,
         cards,
         lane,
+        wall: None,
         lane_has_content: false,
         height: row_height,
         scale,

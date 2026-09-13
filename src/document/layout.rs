@@ -46,6 +46,10 @@ pub const MATH_PAD: f32 = 10.0;
 pub const MATH_LEADING: f32 = 4.0;
 /// Space below a paragraph.
 pub const GAP_PARAGRAPH: f32 = 14.0;
+/// A widget wall is furniture, not a line of prose. Give the text flowing
+/// beside it a little air before its first baseline, while keeping every
+/// subsequent line on the normal rhythm.
+pub const WIDGET_FLOW_TOP_GAP: f32 = 10.0;
 /// Clear space above *and* below a display expression — the **total**, not
 /// an addition to whatever the neighbouring block already contributes, so an
 /// equation is inset by the same amount top and bottom whatever it sits
@@ -1098,6 +1102,104 @@ fn widget_block_fits_lane(
     true
 }
 
+/// A vertical run of rows whose free tracks make the same text lane. Widget
+/// markers remain in source order, but the cards form one visual wall and the
+/// Markdown between them may use its complete height.
+#[derive(Clone, Debug)]
+struct WidgetWall {
+    /// The Markdown lane, from its deliberately inset first line through the
+    /// bottom of the final card in the wall.
+    lane: Rect,
+    /// `(source block, card-top)` for every row that belongs to this wall.
+    members: Vec<(usize, f32)>,
+    /// Set once adjacent Markdown claims the lane. Rows added later inherit
+    /// it, so their edit affordance truthfully protects the wall's text.
+    has_content: bool,
+    /// The final widget marker has been placed. Keep the plan through the
+    /// following Markdown pass so a wall with contiguous markers can still
+    /// learn that its lane is occupied.
+    last_member_placed: bool,
+}
+
+impl WidgetWall {
+    fn member_y(&self, source_index: usize) -> Option<f32> {
+        self.members
+            .iter()
+            .find(|(index, _)| *index == source_index)
+            .map(|(_, y)| *y)
+    }
+
+    fn final_member(&self, source_index: usize) -> bool {
+        self.members
+            .last()
+            .is_some_and(|(index, _)| *index == source_index)
+    }
+
+    fn bounds(&self) -> Rect {
+        let top = self.members[0].1;
+        Rect::new(self.lane.x, top, self.lane.width, self.lane.bottom() - top)
+    }
+}
+
+fn same_lane(a: Rect, b: Rect) -> bool {
+    (a.x - b.x).abs() < f32::EPSILON && (a.width - b.width).abs() < f32::EPSILON
+}
+
+/// Plans every compatible widget row before adjacent prose is wrapped. The
+/// look-ahead is what lets the first paragraph use space beside a later row,
+/// rather than discovering the extra height after it has already reflowed.
+fn widget_wall(
+    blocks: &[Block],
+    start: usize,
+    first: &super::widget::WidgetRow,
+    width: f32,
+    y: f32,
+    scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> Option<WidgetWall> {
+    let first_layout = widget_layout(first, width, y, scale);
+    let first_lane = first_layout.lane?;
+    let mut members = vec![(start, y)];
+    let mut bottom = y + first_layout.height;
+
+    for (index, block) in blocks.iter().enumerate().skip(start + 1) {
+        // The fold walk below hides the body of a collapsed heading. Do not
+        // let an invisible future widget extend this visual wall.
+        if block.is_folded() {
+            break;
+        }
+        match block {
+            Block::WidgetRow(row) => {
+                let row_y = bottom + GAP_PARAGRAPH * scale;
+                let layout = widget_layout(row, width, row_y, scale);
+                let Some(lane) = layout.lane else {
+                    break;
+                };
+                if !same_lane(first_lane, lane) {
+                    break;
+                }
+                members.push((index, row_y));
+                bottom = row_y + layout.height;
+            }
+            block if widget_block_fits_lane(block, first_lane, scale, measure) => {}
+            _ => break,
+        }
+    }
+
+    let text_top = y + WIDGET_FLOW_TOP_GAP * scale;
+    Some(WidgetWall {
+        lane: Rect::new(
+            first_lane.x,
+            text_top,
+            first_lane.width,
+            (bottom - text_top).max(0.0),
+        ),
+        members,
+        has_content: false,
+        last_member_placed: false,
+    })
+}
+
 /// Lays out a slice of blocks — a whole document's body, or one note's body —
 /// at `scale`, which multiplies every text size and vertical measure the
 /// layout produces. `measure(text, style) -> width` is the only rendering
@@ -1198,9 +1300,12 @@ pub fn layout_blocks(
     // The table currently being laid out. Its tracks, row count and settings
     // are measured once at its first row and reused by every row after it.
     let mut table_shared: Option<TableShared> = None;
-    // A following run of ordinary Markdown may use the widest free lane until
-    // its cursor passes the widget row's bottom edge.
-    let mut widget_flow: Option<(usize, Rect)> = None;
+    // A following run of ordinary Markdown may use a widget wall's free lane
+    // until its cursor passes the final card's bottom edge. The plan stays
+    // around after the text fills it, until every later widget marker has
+    // been placed at its pre-reserved vertical position.
+    let mut widget_flow: Option<Rect> = None;
+    let mut wall_plan: Option<WidgetWall> = None;
 
     for (source_index, block) in blocks.iter().enumerate() {
         let mut hidden = false;
@@ -1234,21 +1339,43 @@ pub fn layout_blocks(
         if hidden {
             continue;
         }
+        let planned_widget_y = wall_plan
+            .as_ref()
+            .and_then(|wall| wall.member_y(source_index));
+        if widget_flow.is_none()
+            && planned_widget_y.is_none()
+            && wall_plan
+                .as_ref()
+                .is_some_and(|wall| wall.last_member_placed)
+        {
+            wall_plan = None;
+        }
         let mut lane = None;
         let mut resumed_below = false;
-        if let Some((widget_block, flow)) = widget_flow {
-            if block.is_widget() {
+        if let Some(flow) = widget_flow {
+            if planned_widget_y.is_some() {
+                // This marker belongs to the wall we already measured. It
+                // must not interrupt the prose using the wall's shared lane.
+            } else if block.is_widget() {
                 y = flow.bottom() + GAP_PARAGRAPH * scale;
                 widget_flow = None;
+                wall_plan = None;
                 resumed_below = true;
             } else if widget_block_fits_lane(block, flow, scale, measure) {
                 lane = Some(flow);
-                if let Some(Some(row_layout)) = widget_rows.get_mut(widget_block) {
-                    row_layout.lane_has_content = true;
+                y = y.max(flow.y);
+                if let Some(wall) = &mut wall_plan {
+                    wall.has_content = true;
+                    for (widget_block, _) in &wall.members {
+                        if let Some(Some(row_layout)) = widget_rows.get_mut(*widget_block) {
+                            row_layout.lane_has_content = true;
+                        }
+                    }
                 }
             } else {
                 y = flow.bottom() + GAP_PARAGRAPH * scale;
                 widget_flow = None;
+                wall_plan = None;
                 resumed_below = true;
             }
         }
@@ -1265,13 +1392,28 @@ pub fn layout_blocks(
         first_block = false;
 
         if let Block::WidgetRow(row) = block {
-            let row_layout = widget_layout(row, width, y, scale);
+            let row_y = planned_widget_y.unwrap_or(y);
+            let mut row_layout = widget_layout(row, width, row_y, scale);
+            let planned_wall =
+                (planned_widget_y.is_none() && row_layout.lane.is_some()).then(|| {
+                    widget_wall(blocks, source_index, row, width, row_y, scale, measure)
+                        .expect("a row with a lane plans a widget wall")
+                });
+            row_layout.wall = if let Some(wall) = &planned_wall {
+                Some(wall.bounds())
+            } else {
+                wall_plan.as_ref().map(WidgetWall::bounds)
+            };
+            if planned_widget_y.is_some() && wall_plan.as_ref().is_some_and(|wall| wall.has_content)
+            {
+                row_layout.lane_has_content = true;
+            }
             let height = row_layout.height;
             let has_lane = row_layout.lane;
             laid.push(BlockLayout {
-                y,
+                y: row_y,
                 lines: vec![VisLine {
-                    y,
+                    y: row_y,
                     x: 0.0,
                     width,
                     height,
@@ -1284,12 +1426,25 @@ pub fn layout_blocks(
             });
             tables.push(None);
             widget_rows.push(Some(row_layout));
+            if planned_widget_y.is_some() {
+                if let Some(wall) = &mut wall_plan
+                    && wall.final_member(source_index)
+                {
+                    wall.last_member_placed = true;
+                }
+                continue;
+            }
             let gap_after = GAP_PARAGRAPH * scale;
-            if let Some(lane) = has_lane {
-                widget_flow = Some((source_index, lane));
-            } else {
+            if let Some(mut wall) = planned_wall {
+                wall.last_member_placed = wall.final_member(source_index);
+                widget_flow = Some(wall.lane);
+                wall_plan = Some(wall);
+            } else if has_lane.is_none() {
                 widget_flow = None;
+                wall_plan = None;
                 y += height + gap_after;
+            } else {
+                unreachable!("a row with a lane always has a widget wall plan");
             }
             gap_below_previous = gap_after;
             continue;
@@ -1352,7 +1507,7 @@ pub fn layout_blocks(
         } else {
             let pieces = tokens(block.inlines(), source_index, &number_of);
             let full_width = width - indent;
-            if let Some((widget_block, flow)) = widget_flow.filter(|_| lane.is_some()) {
+            if let Some(flow) = widget_flow.filter(|_| lane.is_some()) {
                 let lane_grouped = wrap(
                     &pieces,
                     block,
@@ -1397,14 +1552,8 @@ pub fn layout_blocks(
                         measure,
                     )
                 } else if lane_count == lane_lines.len() {
-                    if let Some(Some(row_layout)) = widget_rows.get_mut(widget_block) {
-                        row_layout.lane_has_content = true;
-                    }
                     lane_lines
                 } else {
-                    if let Some(Some(row_layout)) = widget_rows.get_mut(widget_block) {
-                        row_layout.lane_has_content = true;
-                    }
                     let remaining_piece = lane_grouped[lane_count]
                         .first()
                         .map_or(pieces.len(), |chunk| chunk.piece);
@@ -1508,7 +1657,7 @@ pub fn layout_blocks(
             GAP_PARAGRAPH * scale
         };
         y += gap_after;
-        if let Some((_, flow)) = widget_flow
+        if let Some(flow) = widget_flow
             && content_bottom >= flow.bottom()
         {
             widget_flow = None;
@@ -1528,7 +1677,7 @@ pub fn layout_blocks(
     // following Markdown flows beside it. If the row is the final block (or
     // every following block is hidden), there was no ordinary block pass to
     // advance the cursor past the cards themselves.
-    if let Some((_, flow)) = widget_flow {
+    if let Some(flow) = widget_flow {
         y = flow.bottom() + GAP_PARAGRAPH * scale;
     }
 
@@ -1968,6 +2117,24 @@ impl DocLayout {
     /// block laid out beside it, which is the rule that keeps widgets from
     /// becoming invisible paragraph blockers.
     fn block_at(&self, x: f32, y: f32) -> usize {
+        if let Some((widget_block, _)) = self.widget_at(x, y) {
+            return widget_block;
+        }
+        if let Some(widget_block) = self.widget_lane_at(x, y) {
+            if let Some((text_block, _)) = self.blocks.iter().enumerate().find(|(index, block)| {
+                !self.source[*index].is_widget()
+                    && block.hidden.is_none()
+                    && block.lines.iter().any(|line| {
+                        y >= line.y
+                            && y < line.y + line.height
+                            && x >= line.x
+                            && x < line.x + line.width
+                    })
+            }) {
+                return text_block;
+            }
+            return widget_block;
+        }
         let block_idx = block_of_y(self, y);
         if !self.source[block_idx].is_widget() {
             return block_idx;
@@ -2006,23 +2173,45 @@ impl DocLayout {
 
     /// The placed card at a point, before the Markdown lane is considered.
     pub fn widget_at(&self, x: f32, y: f32) -> Option<(usize, usize)> {
-        let block = block_of_y(self, y);
-        let row = self.widget_rows.get(block)?.as_ref()?;
-        row.cards
+        self.widget_rows
             .iter()
-            .find(|card| card.rect.contains((x, y)))
-            .map(|card| (block, card.placement))
+            .enumerate()
+            .find_map(|(block, row)| {
+                row.as_ref()?.cards.iter().find_map(|card| {
+                    card.rect
+                        .contains((x, y))
+                        .then_some((block, card.placement))
+                })
+            })
+    }
+
+    /// The row whose Markdown lane contains this point. Unlike source-order
+    /// lookup, this remains correct when a later compatible row is part of a
+    /// widget wall and shares vertical space with earlier prose.
+    fn widget_lane_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.widget_rows
+            .iter()
+            .enumerate()
+            .find_map(|(block, row)| {
+                let row = row.as_ref()?;
+                (row.lane_has_content && row.lane.is_some_and(|lane| lane.contains((x, y))))
+                    .then_some(block)
+            })
     }
 
     /// The track under a point. A free track is returned too, so the editor
     /// can open its widget chooser without adding a placeholder model object.
     pub fn widget_slot_at(&self, x: f32, y: f32) -> Option<(usize, usize)> {
-        let block = block_of_y(self, y);
-        let row = self.widget_rows.get(block)?.as_ref()?;
-        row.tracks
+        self.widget_rows
             .iter()
-            .position(|track| track.contains((x, y)))
-            .map(|slot| (block, slot))
+            .enumerate()
+            .find_map(|(block, row)| {
+                row.as_ref()?
+                    .tracks
+                    .iter()
+                    .position(|track| track.contains((x, y)))
+                    .map(|slot| (block, slot))
+            })
     }
 
     /// Whether a point is in the free track lane already occupied by flowing
@@ -2030,13 +2219,10 @@ impl DocLayout {
     /// its whitespace, so adding or dropping a card cannot collide with the
     /// paragraph's next reflow.
     pub fn widget_lane_blocked_at(&self, x: f32, y: f32) -> bool {
-        let block = block_of_y(self, y);
         self.widget_rows
-            .get(block)
-            .and_then(Option::as_ref)
-            .is_some_and(|row| {
-                row.lane_has_content && row.lane.is_some_and(|lane| lane.contains((x, y)))
-            })
+            .iter()
+            .flatten()
+            .any(|row| row.lane_has_content && row.lane.is_some_and(|lane| lane.contains((x, y))))
     }
 
     /// A calendar day at a point, if the point is inside a placed calendar.
@@ -3541,6 +3727,159 @@ mod tests {
                 + paragraph.lines.last().unwrap().height
                 + GAP_PARAGRAPH
         );
+    }
+
+    #[test]
+    fn compatible_widget_rows_make_one_tall_markdown_wall() {
+        let calendar = WidgetRow::new(Widget::Calendar(CalendarWidget {
+            year: 2026,
+            month: 9,
+            heading: crate::document::widget::CalendarHeading::Both,
+            selected: Vec::new(),
+        }));
+        let clarity = WidgetRow::new(Widget::Clarity(ClarityWidget::default()));
+        let text = std::iter::repeat_n("word", 100)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let laid = layout_blocks(
+            &[
+                Block::WidgetRow(calendar),
+                para(&text),
+                Block::WidgetRow(clarity),
+            ],
+            400.0,
+            1.0,
+            &fake_measure,
+        );
+        let first = laid.widget_rows[0].as_ref().unwrap();
+        let second = laid.widget_rows[2].as_ref().unwrap();
+        let lane = first.lane.unwrap();
+        let paragraph = &laid.blocks[1];
+        let wall_bottom = second.height + second.cards[0].rect.y;
+
+        assert_eq!(paragraph.lines[0].y, WIDGET_FLOW_TOP_GAP);
+        assert_eq!(second.cards[0].rect.y, first.height + GAP_PARAGRAPH);
+        assert_eq!(first.wall, second.wall);
+        assert!(first.lane_has_content && second.lane_has_content);
+        assert!(paragraph.lines.iter().any(|line| {
+            line.y >= second.cards[0].rect.y
+                && line.y < wall_bottom
+                && line.x == lane.x
+                && line.width == lane.width
+        }));
+        let first_full_width = paragraph
+            .lines
+            .iter()
+            .position(|line| line.x == 0.0)
+            .expect("long prose eventually leaves the wall");
+        assert_eq!(paragraph.lines[first_full_width].y, wall_bottom);
+
+        let prose = paragraph
+            .lines
+            .iter()
+            .find(|line| line.y >= second.cards[0].rect.y && line.y < wall_bottom)
+            .unwrap();
+        assert_eq!(
+            laid.hit(lane.x + 5.0, prose.y + 5.0, &fake_measure).block,
+            1
+        );
+        let card = second.cards[0].rect;
+        assert_eq!(laid.widget_at(card.x + 4.0, card.y + 4.0), Some((2, 0)));
+        assert_eq!(laid.hit(card.x + 4.0, card.y + 4.0, &fake_measure).block, 2);
+    }
+
+    #[test]
+    fn contiguous_widget_rows_reserve_their_shared_text_lane() {
+        let calendar = WidgetRow::new(Widget::Calendar(CalendarWidget {
+            year: 2026,
+            month: 9,
+            heading: crate::document::widget::CalendarHeading::Both,
+            selected: Vec::new(),
+        }));
+        let clarity = WidgetRow::new(Widget::Clarity(ClarityWidget::default()));
+        let text = std::iter::repeat_n("word", 60)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let laid = layout_blocks(
+            &[
+                Block::WidgetRow(calendar),
+                Block::WidgetRow(clarity),
+                para(&text),
+            ],
+            400.0,
+            1.0,
+            &fake_measure,
+        );
+        let first = laid.widget_rows[0].as_ref().unwrap();
+        let second = laid.widget_rows[1].as_ref().unwrap();
+        let paragraph = &laid.blocks[2];
+
+        assert!(first.lane_has_content && second.lane_has_content);
+        assert_eq!(paragraph.lines[0].y, WIDGET_FLOW_TOP_GAP);
+        assert!(paragraph.lines.iter().any(|line| {
+            line.y >= second.cards[0].rect.y
+                && line.y < second.cards[0].rect.bottom()
+                && line.x == first.lane.unwrap().x
+        }));
+    }
+
+    #[test]
+    fn a_changed_widget_distribution_ends_the_markdown_wall() {
+        let first = WidgetRow::new(Widget::Empty);
+        let second = WidgetRow {
+            placements: vec![WidgetPlacement {
+                slot: 1,
+                span: 1,
+                widget: Widget::Empty,
+            }],
+        };
+        let text = std::iter::repeat_n("word", 100)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let laid = layout_blocks(
+            &[
+                Block::WidgetRow(first),
+                para(&text),
+                Block::WidgetRow(second),
+            ],
+            400.0,
+            1.0,
+            &fake_measure,
+        );
+        let first = laid.widget_rows[0].as_ref().unwrap();
+        let second = laid.widget_rows[2].as_ref().unwrap();
+        let paragraph = &laid.blocks[1];
+
+        assert_eq!(
+            paragraph.lines.iter().find(|line| line.x == 0.0).unwrap().y,
+            first.height
+        );
+        assert!(second.cards[0].rect.y >= paragraph.y + paragraph.height + GAP_PARAGRAPH);
+    }
+
+    #[test]
+    fn a_folded_heading_does_not_extend_a_widget_wall_with_hidden_rows() {
+        let laid = layout_blocks(
+            &[
+                Block::WidgetRow(WidgetRow::new(Widget::Empty)),
+                Block::Heading {
+                    level: 1,
+                    folded: true,
+                    content: vec![Inline::Text(Text {
+                        text: "Collapsed".into(),
+                        style: Style::PLAIN,
+                    })],
+                },
+                Block::WidgetRow(WidgetRow::new(Widget::Clarity(ClarityWidget::default()))),
+            ],
+            400.0,
+            1.0,
+            &fake_measure,
+        );
+
+        let first = laid.widget_rows[0].as_ref().unwrap();
+        assert_eq!(first.wall.unwrap().bottom(), first.height);
+        assert!(laid.widget_rows[2].is_none());
     }
 
     #[test]

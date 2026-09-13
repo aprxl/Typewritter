@@ -91,7 +91,7 @@ pub fn paginate(layout: &DocLayout, geometry: &PageGeometry) -> Vec<Page> {
 /// against one that prints in two halves.
 fn demand(layout: &DocLayout, lines: &[(usize, usize)], index: usize, height: f32) -> f32 {
     let mut end = index + 1;
-    while end < lines.len() && !breakable(&layout.source, lines[end - 1], lines[end]) {
+    while end < lines.len() && !breakable(layout, lines[end - 1], lines[end]) {
         end += 1;
     }
     let first = line(layout, lines[index]);
@@ -103,14 +103,23 @@ fn demand(layout: &DocLayout, lines: &[(usize, usize)], index: usize, height: f3
     }
 }
 
-/// Every visual line in the document, in order, as `(block, line)`.
+/// Every visual line in visual order, as `(block, line)`. Widget walls may
+/// place a later source marker beside prose that started after the first row,
+/// so source order alone is no longer the document's paint order.
 fn lines(layout: &DocLayout) -> Vec<(usize, usize)> {
-    layout
+    let mut lines = layout
         .blocks
         .iter()
         .enumerate()
         .flat_map(|(block, laid)| (0..laid.lines.len()).map(move |line| (block, line)))
-        .collect()
+        .collect::<Vec<_>>();
+    lines.sort_by(|left, right| {
+        line(layout, *left)
+            .y
+            .total_cmp(&line(layout, *right).y)
+            .then_with(|| left.cmp(right))
+    });
+    lines
 }
 
 fn line(layout: &DocLayout, at: (usize, usize)) -> &VisLine {
@@ -119,7 +128,17 @@ fn line(layout: &DocLayout, at: (usize, usize)) -> &VisLine {
 
 /// Whether a page may break between two adjacent lines — `PDF.md` §5's
 /// keep-rules, all four of them, said once.
-fn breakable(source: &[Block], previous: (usize, usize), next: (usize, usize)) -> bool {
+fn breakable(layout: &DocLayout, previous: (usize, usize), next: (usize, usize)) -> bool {
+    if layout.widget_rows.iter().flatten().any(|row| {
+        row.wall.is_some_and(|wall| {
+            let previous = line(layout, previous).y;
+            let next = line(layout, next).y;
+            wall.y <= previous && previous < wall.bottom() && wall.y <= next && next < wall.bottom()
+        })
+    }) {
+        return false;
+    }
+    let source = &layout.source;
     if previous.0 == next.0 {
         // Inside one block, only prose splits. Notation broken across a
         // sheet is not a smaller equation but two wrong ones; a fence cut
@@ -166,6 +185,8 @@ mod tests {
 
     use super::*;
     use crate::document::layout::{BlockLayout, VisLine};
+    use crate::document::widget_layout::WidgetRowLayout;
+    use crate::layout::Rect;
 
     /// A layout of `heights`-tall single-line blocks stacked flush.
     fn stacked(heights: &[f32]) -> DocLayout {
@@ -234,6 +255,55 @@ mod tests {
             anchors: Vec::new(),
             equation_numbers: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn lines_follow_visual_order_when_a_widget_wall_overlaps_source_blocks() {
+        let mut layout = stacked(&[240.0, 210.0, 112.0]);
+        layout.blocks[1].y = 10.0;
+        layout.blocks[1].lines[0].y = 10.0;
+        layout.blocks[2].y = 254.0;
+        layout.blocks[2].lines[0].y = 254.0;
+        assert_eq!(lines(&layout), vec![(0, 0), (1, 0), (2, 0)]);
+
+        layout.blocks[1].lines.push(VisLine {
+            y: 280.0,
+            x: 100.0,
+            width: 300.0,
+            height: 30.0,
+            segments: Vec::new(),
+            cell_line: 0,
+        });
+        assert_eq!(lines(&layout), vec![(0, 0), (1, 0), (2, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn a_widget_wall_moves_to_the_next_page_whole() {
+        let mut layout = stacked(&[60.0, 90.0, 90.0]);
+        let wall = Rect::new(0.0, 60.0, 300.0, 180.0);
+        for index in [1, 2] {
+            layout.widget_rows[index] = Some(WidgetRowLayout {
+                tracks: Vec::new(),
+                cards: Vec::new(),
+                lane: None,
+                wall: Some(wall),
+                lane_has_content: true,
+                height: 90.0,
+                scale: 1.0,
+            });
+        }
+
+        let pages = paginate(&layout, &geometry(200.0));
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].pieces[0].block, 0);
+        assert_eq!(
+            pages[1]
+                .pieces
+                .iter()
+                .map(|piece| piece.block)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     fn geometry(height: f32) -> PageGeometry {
