@@ -206,11 +206,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// [`COMPOSITE_SHADER_SRC`] plus a mask texture: the layer's alpha is
-/// multiplied by the mask's alpha (its rendered coverage), which is what
-/// [`Layer::set_clip_shape`] clips with. Only alpha is scaled — the
-/// composite pipeline blends with non-premultiplied `ALPHA_BLENDING`, so
-/// scaling the color too would apply the mask twice.
+/// [`COMPOSITE_SHADER_SRC`] plus a mask texture: the layer is multiplied
+/// by the mask's alpha (its rendered coverage), which is what
+/// [`Layer::set_clip_shape`] clips with. Layer textures are premultiplied
+/// and composited with `PREMULTIPLIED_ALPHA_BLENDING`, so colour and alpha
+/// are scaled together — scaling alpha alone leaves the colour to be
+/// *added* over whatever is below, and nothing outside the shape is cut.
 const MASKED_COMPOSITE_SHADER_SRC: &str = r#"
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -236,7 +237,7 @@ fn vs_main(
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let c = textureSample(tex, samp, in.uv);
     let m = textureSample(mask_tex, samp, in.uv).a;
-    return vec4<f32>(c.rgb, c.a * m);
+    return c * m;
 }
 "#;
 
