@@ -17,6 +17,7 @@ pub mod config;
 pub mod document;
 pub mod export;
 pub mod layout;
+pub mod plot;
 pub mod prose;
 pub mod search;
 pub mod shell;

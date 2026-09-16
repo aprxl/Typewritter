@@ -2,6 +2,7 @@
 
 mod calendar;
 mod clarity;
+mod graph;
 #[cfg(test)]
 mod tests;
 
@@ -146,6 +147,12 @@ pub fn row(
             Widget::Clarity(clarity) => clarity::draw(
                 canvas,
                 clarity.value,
+                card,
+                scale,
+                if hot { state.hover_amount } else { 0.0 },
+            ),
+            Widget::Graph(_) => graph::draw(
+                canvas,
                 card,
                 scale,
                 if hot { state.hover_amount } else { 0.0 },

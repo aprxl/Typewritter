@@ -483,6 +483,30 @@ pub const COMMANDS: &[Command] = &[
                 .insert_widget(widget::Widget::Clarity(widget::ClarityWidget::default()));
         },
     },
+    Command {
+        id: "format.widget_graph",
+        title: "Graph widget",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell
+                .docs
+                .borrow_mut()
+                .insert_widget(widget::Widget::Graph(widget::GraphWidget));
+        },
+    },
+    Command {
+        id: "format.widget_graph_large",
+        title: "Large graph widget",
+        group: "Format",
+        chord: None,
+        run: |shell| {
+            shell
+                .docs
+                .borrow_mut()
+                .insert_widget_spanning(widget::Widget::Graph(widget::GraphWidget), 3);
+        },
+    },
     // The table's structure, reachable without a mouse. `Ctrl+J`/`Ctrl+K`
     // add a row below/above (vim's down/up), `Ctrl+H`/`Ctrl+L` add a column
     // left/right; Shift on the row/column axis deletes it. `Ctrl+T` raises
@@ -1131,6 +1155,8 @@ pub const WIDGET_MENU: &[&str] = &[
     "format.widget_empty",
     "format.widget_calendar",
     "format.widget_clarity",
+    "format.widget_graph",
+    "format.widget_graph_large",
 ];
 
 pub const WORD_MENU: &[&str] = &[

@@ -29,6 +29,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 lyon = "1.0.19"
 lyon_extra = "1.1"
 plotters = { path = "crates/plotters/plotters", default-features = false, features = ["line_series"] }
+plotters-backend = { path = "crates/plotters/plotters-backend" }
 pollster = "0.4"
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "pollster"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -71,7 +72,6 @@ plotters = { path = "crates/plotters/plotters", default-features = false, featur
     "full_palette",
     "svg_backend",
 ] }
-plotters-backend = { path = "crates/plotters/plotters-backend" }
 
 # Dependencies are optimized even in dev builds. Nothing in this app's own
 # hot path is the problem — the shell's per-frame `update` costs single-digit

@@ -20,3 +20,12 @@ This paragraph has enough words to keep moving beside the first card instead of 
 
 <!-- typewritter-widgets:v1 [{"slot":1,"type":"clarity","value":"working"}] -->
 The next card shares the same edge, so this paragraph continues in the same narrow column until the complete wall ends. It only returns to the full measure once there is no widget left beside it. There is room for a final thought beside the smaller card too, rather than making the reader scan an unnecessary empty gutter.
+
+## Graphs
+
+<!-- typewritter-widgets:v1 [{"slot":1,"type":"graph"}] -->
+A small graph takes two tracks and leaves the other two to the note. Its curve is typed in the same notation as the math beside it, so what the page says and what the plot draws come from one expression.
+
+<!-- typewritter-widgets:v1 [{"slot":1,"type":"calendar","date":"2026-09","selected":[16]},{"slot":2,"type":"graph"},{"slot":4,"type":"clarity","value":"working"}] -->
+
+<!-- typewritter-widgets:v1 [{"slot":1,"span":3,"type":"graph"},{"slot":4,"type":"clarity","value":"clear"}] -->

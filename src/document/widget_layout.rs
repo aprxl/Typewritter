@@ -6,6 +6,10 @@ use crate::layout::Rect;
 pub const WIDGET_GAP: f32 = 20.0;
 pub const WIDGET_EMPTY_HEIGHT: f32 = 112.0;
 pub const WIDGET_CALENDAR_HEIGHT: f32 = 240.0;
+/// A small graph sits level with a calendar; a large one is wider and a
+/// little taller, keeping a similar plot shape.
+pub const WIDGET_GRAPH_HEIGHT: f32 = 240.0;
+pub const WIDGET_GRAPH_LARGE_HEIGHT: f32 = 320.0;
 pub const WIDGET_RADIUS: f32 = 14.0;
 pub const WIDGET_PAD: f32 = 12.0;
 pub const WIDGET_CALENDAR_CONTROL: f32 = 24.0;
@@ -136,9 +140,11 @@ impl WidgetRowLayout {
     }
 }
 
-fn widget_height(widget: &super::widget::Widget, scale: f32) -> f32 {
-    match widget {
+fn widget_height(placement: &super::widget::WidgetPlacement, scale: f32) -> f32 {
+    match placement.widget {
         super::widget::Widget::Calendar(_) => WIDGET_CALENDAR_HEIGHT * scale,
+        super::widget::Widget::Graph(_) if placement.span >= 3 => WIDGET_GRAPH_LARGE_HEIGHT * scale,
+        super::widget::Widget::Graph(_) => WIDGET_GRAPH_HEIGHT * scale,
         super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => {
             WIDGET_EMPTY_HEIGHT * scale
         }
@@ -161,7 +167,7 @@ pub fn widget_layout(
     let row_height = row
         .placements
         .iter()
-        .map(|placement| widget_height(&placement.widget, scale))
+        .map(|placement| widget_height(placement, scale))
         .fold(WIDGET_EMPTY_HEIGHT * scale, f32::max);
     let tracks = (0..super::widget::TRACKS)
         .map(|slot| {
@@ -181,7 +187,7 @@ pub fn widget_layout(
             let left = tracks[placement.slot].x;
             let card_width =
                 track_width * placement.span as f32 + gap * (placement.span - 1) as f32;
-            let rect = Rect::new(left, y, card_width, widget_height(&placement.widget, scale));
+            let rect = Rect::new(left, y, card_width, widget_height(placement, scale));
             let inner = rect.inset(WIDGET_PAD * scale);
             // Narrow cards give navigation a separate row. Optional headings
             // never collapse this band into the selectable day cells.
@@ -236,7 +242,9 @@ pub fn widget_layout(
                         })
                         .collect()
                 }
-                super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => Vec::new(),
+                super::widget::Widget::Empty
+                | super::widget::Widget::Clarity(_)
+                | super::widget::Widget::Graph(_) => Vec::new(),
             };
             let (previous, next) = match &placement.widget {
                 super::widget::Widget::Calendar(_) => {
@@ -247,7 +255,9 @@ pub fn widget_layout(
                         Some(Rect::new(next_x, controls_y, control, control)),
                     )
                 }
-                super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => (None, None),
+                super::widget::Widget::Empty
+                | super::widget::Widget::Clarity(_)
+                | super::widget::Widget::Graph(_) => (None, None),
             };
             WidgetCardLayout {
                 placement: placement_index,

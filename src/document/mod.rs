@@ -2588,29 +2588,48 @@ impl Document {
         }
     }
 
-    fn widget_free_slot(row: &widget::WidgetRow, preferred: usize) -> Option<usize> {
-        (preferred..widget::TRACKS)
+    /// The first start where `span` free tracks fit: starts that cover
+    /// `preferred` come first, nearest first, so a wide widget lands over
+    /// the track it was asked for when it can; then any start, from
+    /// `preferred` onward and wrapping.
+    fn widget_free_slot(row: &widget::WidgetRow, preferred: usize, span: usize) -> Option<usize> {
+        let fits = |slot: usize| {
+            slot + span <= widget::TRACKS
+                && (slot..slot + span).all(|track| row.placement_at(track).is_none())
+        };
+        (0..span)
+            .filter_map(|back| preferred.checked_sub(back))
+            .chain(preferred..widget::TRACKS)
             .chain(0..preferred.min(widget::TRACKS))
-            .find(|&slot| row.placement_at(slot).is_none())
+            .find(|&slot| fits(slot))
     }
 
-    /// Inserts a one-track widget at the caret. A blank paragraph becomes the
-    /// row itself; otherwise the row is inserted immediately below it. When
-    /// the caret is already on a row, the current/free track is used.
+    /// Inserts a widget at its default span at the caret — see
+    /// [`Self::insert_widget_spanning`].
     pub fn insert_widget(&mut self, value: widget::Widget) -> bool {
-        if matches!(self.focus, Focus::Note(_)) {
+        let span = value.default_span();
+        self.insert_widget_spanning(value, span)
+    }
+
+    /// Inserts a widget covering `span` tracks at the caret. A blank
+    /// paragraph becomes the row itself; otherwise the row is inserted
+    /// immediately below it. When the caret is already on a row, the
+    /// current track or the nearest free run of tracks is used. A span the
+    /// widget does not allow inserts nothing.
+    pub fn insert_widget_spanning(&mut self, value: widget::Widget, span: usize) -> bool {
+        if matches!(self.focus, Focus::Note(_)) || !value.spans().contains(&span) {
             return false;
         }
         self.clamp_caret();
         let b = self.caret.block;
         if let Block::WidgetRow(row) = &self.scope()[b] {
-            let Some(slot) = Self::widget_free_slot(row, self.caret.inline) else {
+            let Some(slot) = Self::widget_free_slot(row, self.caret.inline, span) else {
                 return false;
             };
             let changed = self.scope_mut()[b]
                 .widget_row_mut()
                 .expect("widget row")
-                .set(slot, 1, value);
+                .set(slot, span, value);
             if changed {
                 self.set_caret(b, slot, 0);
                 self.dirty = true;
@@ -2618,12 +2637,15 @@ impl Document {
             }
             return changed;
         }
+        let mut row = widget::WidgetRow {
+            placements: Vec::new(),
+        };
+        row.set(0, span, value);
         let at = if self.block_flat_len(b) == 0 {
-            self.scope_mut()[b] = Block::WidgetRow(widget::WidgetRow::new(value));
+            self.scope_mut()[b] = Block::WidgetRow(row);
             b
         } else {
-            self.scope_mut()
-                .insert(b + 1, Block::WidgetRow(widget::WidgetRow::new(value)));
+            self.scope_mut().insert(b + 1, Block::WidgetRow(row));
             b + 1
         };
         self.set_caret(at, 0, 0);
@@ -5031,6 +5053,41 @@ mod tests {
         assert!(d.remove_widget_at(0, 0));
         assert!(d.remove_widget_at(0, 2));
         assert!(matches!(d.body(), [Block::Paragraph(_)]));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn a_graph_takes_two_free_tracks_over_the_one_asked_for() {
+        let mut d = doc();
+        let graph = || widget::Widget::Graph(widget::GraphWidget);
+        assert!(d.insert_widget(graph()));
+        let row = d.body()[0].widget_row_ref().unwrap();
+        assert_eq!((row.placements[0].slot, row.placements[0].span), (0, 2));
+
+        // Asked for the last track, the graph starts one earlier.
+        d.set_caret(0, 3, 0);
+        assert!(d.insert_widget(graph()));
+        let row = d.body()[0].widget_row_ref().unwrap();
+        assert_eq!((row.placements[1].slot, row.placements[1].span), (2, 2));
+
+        // A large graph is three tracks from a fresh row.
+        let mut large = doc();
+        assert!(large.insert_widget_spanning(graph(), 3));
+        let row = large.body()[0].widget_row_ref().unwrap();
+        assert_eq!((row.placements[0].slot, row.placements[0].span), (0, 3));
+        assert!(!large.insert_widget_spanning(graph(), 4));
+        assert!(!large.insert_widget_spanning(widget::Widget::Empty, 3));
+
+        // A full row refuses rather than overlapping.
+        d.set_caret(0, 1, 0);
+        assert!(!d.insert_widget(graph()));
+        assert!(!d.insert_widget(widget::Widget::Empty));
+
+        // One free track is not enough for a graph, but is for a card.
+        assert!(d.remove_widget_at(0, 3));
+        d.set_caret(0, 1, 0);
+        assert!(d.insert_widget(widget::Widget::Empty));
+        assert!(!d.insert_widget(graph()));
         assert_invariants(&d);
     }
 

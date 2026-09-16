@@ -662,6 +662,12 @@ impl Tabs {
         changed
     }
 
+    pub fn insert_widget_spanning(&mut self, value: widget::Widget, span: usize) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.insert_widget_spanning(value, span));
+        changed
+    }
+
     pub fn set_widget_at(
         &mut self,
         block: usize,

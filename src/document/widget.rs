@@ -7,6 +7,8 @@
 //! readers that do not know Typewritter still retain the marker as visible
 //! text.
 
+use std::ops::RangeInclusive;
+
 use chrono::{Datelike, Local, NaiveDate};
 use serde_json::{Map, Value};
 
@@ -29,6 +31,7 @@ pub enum Widget {
     Empty,
     Calendar(CalendarWidget),
     Clarity(ClarityWidget),
+    Graph(GraphWidget),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -53,6 +56,12 @@ pub struct ClarityWidget {
     pub value: Option<ClarityLevel>,
 }
 
+/// A plot of one curve. Its size is its placement's span: two tracks for
+/// the small graph, three for the large one. The curve is a fixed showcase
+/// until graphs carry their own expressions.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct GraphWidget;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ClarityLevel {
     Review,
@@ -65,7 +74,7 @@ impl WidgetRow {
         Self {
             placements: vec![WidgetPlacement {
                 slot: 0,
-                span: 1,
+                span: widget.default_span(),
                 widget,
             }],
         }
@@ -82,7 +91,7 @@ impl WidgetRow {
     }
 
     pub fn set(&mut self, slot: usize, span: usize, widget: Widget) -> bool {
-        if slot >= TRACKS || !(1..=2).contains(&span) || slot + span > TRACKS {
+        if slot >= TRACKS || !widget.spans().contains(&span) || slot + span > TRACKS {
             return false;
         }
         self.placements.retain(|placement| {
@@ -208,7 +217,21 @@ impl Widget {
             Self::Empty => "empty",
             Self::Calendar(_) => "calendar",
             Self::Clarity(_) => "clarity",
+            Self::Graph(_) => "graph",
         }
+    }
+
+    /// How many tracks this kind of widget may cover.
+    pub fn spans(&self) -> RangeInclusive<usize> {
+        match self {
+            Self::Graph(_) => 2..=3,
+            Self::Empty | Self::Calendar(_) | Self::Clarity(_) => 1..=2,
+        }
+    }
+
+    /// The span a newly inserted widget of this kind takes.
+    pub fn default_span(&self) -> usize {
+        *self.spans().start()
     }
 }
 
@@ -299,10 +322,7 @@ fn parse_placement(value: &Value) -> Option<WidgetPlacement> {
         Some(value) => value.as_u64()?.try_into().ok()?,
         None => 1,
     };
-    if !(1..=TRACKS).contains(&slot) || !(1..=2).contains(&span) {
-        return None;
-    }
-    if slot - 1 + span > TRACKS {
+    if !(1..=TRACKS).contains(&slot) || span == 0 || slot - 1 + span > TRACKS {
         return None;
     }
     let kind = string_field(object, "type")?;
@@ -331,8 +351,18 @@ fn parse_placement(value: &Value) -> Option<WidgetPlacement> {
                 value: ClarityLevel::parse(object.get("value"))?,
             })
         }
+        "graph" if only_keys(object, &["slot", "span", "type"]) => Widget::Graph(GraphWidget),
         _ => return None,
     };
+    // A graph written without a span is still its smallest size.
+    let span = if object.contains_key("span") {
+        span
+    } else {
+        widget.default_span()
+    };
+    if !widget.spans().contains(&span) || slot - 1 + span > TRACKS {
+        return None;
+    }
     Some(WidgetPlacement {
         slot: slot - 1,
         span,
@@ -366,7 +396,7 @@ pub fn parse_payload(payload: &str) -> Option<WidgetRow> {
 
 fn placement_json(placement: &WidgetPlacement) -> String {
     let mut fields = vec![format!("\"slot\":{}", placement.slot + 1)];
-    if placement.span != 1 {
+    if placement.span != placement.widget.default_span() {
         fields.push(format!("\"span\":{}", placement.span));
     }
     match &placement.widget {
@@ -397,6 +427,9 @@ fn placement_json(placement: &WidgetPlacement) -> String {
             if let Some(value) = clarity.value {
                 fields.push(format!("\"value\":\"{}\"", value.as_str()));
             }
+        }
+        Widget::Graph(_) => {
+            fields.push("\"type\":\"graph\"".into());
         }
     }
     format!("{{{}}}", fields.join(","))
@@ -459,6 +492,39 @@ mod tests {
             parse_payload(r#"[{"slot":1,"type":"empty"},{"slot":1,"type":"empty"}]"#).is_none()
         );
         assert!(parse_payload(r#"[{"slot":1,"type":"unknown"}]"#).is_none());
+    }
+
+    #[test]
+    fn graphs_are_two_or_three_tracks_wide() {
+        let small = parse_payload(r#"[{"slot":1,"type":"graph"}]"#).expect("small graph");
+        assert_eq!(small.placements[0].span, 2);
+        assert_eq!(small.placements[0].widget, Widget::Graph(GraphWidget));
+        assert_eq!(serialize_payload(&small), r#"[{"slot":1,"type":"graph"}]"#);
+
+        let large = parse_payload(r#"[{"slot":2,"span":3,"type":"graph"}]"#).expect("large graph");
+        assert_eq!(large.placements[0].span, 3);
+        assert_eq!(
+            serialize_payload(&large),
+            r#"[{"slot":2,"span":3,"type":"graph"}]"#
+        );
+
+        for rejected in [
+            r#"[{"slot":1,"span":1,"type":"graph"}]"#,
+            r#"[{"slot":1,"span":4,"type":"graph"}]"#,
+            r#"[{"slot":3,"span":3,"type":"graph"}]"#,
+            r#"[{"slot":4,"type":"graph"}]"#,
+            r#"[{"slot":1,"span":3,"type":"calendar","date":"2026-09"}]"#,
+            r#"[{"slot":1,"type":"graph","expression":"y=x"}]"#,
+        ] {
+            assert!(parse_payload(rejected).is_none(), "{rejected}");
+        }
+
+        let mut row = WidgetRow::new(Widget::Graph(GraphWidget));
+        assert_eq!(row.placements[0].span, 2);
+        assert!(!row.set(0, 1, Widget::Graph(GraphWidget)));
+        assert!(!row.set(2, 3, Widget::Graph(GraphWidget)));
+        assert!(row.set(1, 3, Widget::Graph(GraphWidget)));
+        assert!(!row.set(0, 3, Widget::Empty));
     }
 
     #[test]

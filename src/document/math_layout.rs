@@ -228,6 +228,18 @@ pub fn layout(
     layout_inner(list, level, document_scale, measure, true)
 }
 
+/// [`layout`] without the semantic highlights: the notation alone, for
+/// math set as a label (a widget's heading) rather than as note content
+/// the reader edits.
+pub fn layout_plain(
+    list: &MathList,
+    level: usize,
+    document_scale: f32,
+    measure: &dyn Fn(&str, &TextStyle) -> f32,
+) -> MathBox {
+    layout_inner(list, level, document_scale, measure, false)
+}
+
 fn layout_inner(
     list: &MathList,
     level: usize,
