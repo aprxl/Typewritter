@@ -440,8 +440,11 @@ fn leibniz<'a>(
 /// One reading unit of a list.
 #[derive(Clone, Debug, PartialEq)]
 enum Piece {
-    /// Something with a value: a number, a variable, a bracketed whole.
+    /// Something with a value: a number, a variable, a fraction…
     Operand(String),
+    /// A value written in brackets. It multiplies like any operand, but
+    /// right after a function it is that function's whole argument.
+    Bracketed(String),
     /// Something that takes the operands after it as its argument.
     Apply(Applier),
     /// `+ - * /`.
@@ -548,15 +551,17 @@ impl Translator {
                 MathNode::Script { base, sup, sub } => {
                     Piece::Operand(self.script(base, sup.as_deref(), sub.as_deref())?)
                 }
-                MathNode::Group { open, close, body } => Piece::Operand(match (open, close) {
-                    ('(', ')') | ('[', ']') => format!("({})", self.translate(body)?),
-                    ('|', '|') => format!("abs({})", self.translate(body)?),
+                MathNode::Group { open, close, body } => match (open, close) {
+                    ('(', ')') | ('[', ']') => {
+                        Piece::Bracketed(format!("({})", self.translate(body)?))
+                    }
+                    ('|', '|') => Piece::Operand(format!("abs({})", self.translate(body)?)),
                     _ => {
                         return Err(EvalError::Unsupported(format!(
                             "the brackets {open}{close}"
                         )));
                     }
-                }),
+                },
                 MathNode::Sqrt { body } => {
                     Piece::Operand(format!("sqrt({})", self.translate(body)?))
                 }
@@ -721,16 +726,19 @@ impl Translator {
                 variable(&format!("{name}_{index}"))?
             }
         };
+        // The whole power is bracketed: exmex binds a leading minus tighter
+        // than `^`, and −x² must stay −(x²).
         match sup {
-            Some(sup) => Ok(format!("({base})^({})", self.translate(sup)?)),
+            Some(sup) => Ok(format!("(({base})^({}))", self.translate(sup)?)),
             None => Ok(base),
         }
     }
 
-    /// `applier` applied to the argument starting at `pieces[index]`: the
-    /// run of operands there, or — when another applier comes first — that
-    /// application, so `d/dx sin x` is `d/dx (sin x)`. Returns the text and
-    /// the index after the argument.
+    /// `applier` applied to the argument starting at `pieces[index]`: a
+    /// bracketed value there on its own (`sin(2x) e^x` is `sin(2x)·e^x`),
+    /// otherwise the run of operands there, or — when another applier comes
+    /// first — that application, so `d/dx sin x` is `d/dx (sin x)`. Returns
+    /// the text and the index after the argument.
     fn apply(
         &mut self,
         applier: &Applier,
@@ -742,13 +750,16 @@ impl Translator {
             index = next;
             text
         } else {
-            let run: Vec<&str> = pieces[index..]
-                .iter()
-                .map_while(|piece| match piece {
-                    Piece::Operand(text) => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
+            let run: Vec<&str> = match pieces.get(index) {
+                Some(Piece::Bracketed(text)) => vec![text.as_str()],
+                _ => pieces[index..]
+                    .iter()
+                    .map_while(|piece| match piece {
+                        Piece::Operand(text) | Piece::Bracketed(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+            };
             if run.is_empty() {
                 let name = match applier {
                     Applier::Function(name) => (*name).to_owned(),
@@ -783,7 +794,7 @@ impl Translator {
                     after_value = false;
                     index += 1;
                 }
-                Piece::Operand(text) => {
+                Piece::Operand(text) | Piece::Bracketed(text) => {
                     if after_value {
                         out.push('*');
                     }
@@ -911,6 +922,19 @@ mod tests {
         assert!(close(product.eval(0.7), 0.7f64.sin() * 0.7f64.cos()));
         let pi = curve(&format!("y={COS}(sym{{constant|pi|plain}}{{π}}x)"));
         assert!(close(pi.eval(1.0), -1.0));
+        // Brackets right after a function are its whole argument.
+        let bracketed = curve(&format!("y={SIN}(2x)x"));
+        assert!(close(bracketed.eval(0.3), 0.6f64.sin() * 0.3));
+        let unbracketed = curve(&format!("y={SIN}2x(x)"));
+        assert!(close(unbracketed.eval(0.3), (0.6f64 * 0.3).sin()));
+    }
+
+    #[test]
+    fn a_leading_minus_applies_to_the_whole_power() {
+        assert!(close(curve("y=-x^2").eval(3.0), -9.0));
+        assert!(close(curve("y=1-x^2").eval(3.0), -8.0));
+        assert!(close(curve("y=-x^2\\/8").eval(4.0), -2.0));
+        assert!(close(curve("y=2^{-x}").eval(1.0), 0.5));
     }
 
     #[test]
