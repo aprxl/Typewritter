@@ -1,18 +1,23 @@
 //! plotters on Atomos: twelve plots in a grid, drawn by Typewritter's own
-//! renderer. The same plot code runs through two in-app paths, switched
-//! with Tab:
+//! renderer. plotters draws what is inside each plot; the rounded
+//! container, tick marks and axis labels around it are Typewritter's
+//! (`frame.rs`), in the current theme. The same plot code runs through two
+//! in-app paths, switched with Tab:
 //!
 //! - **Vector** — `AtomosBackend` turns every plotters primitive into an
 //!   Atomos draw call (paths, rectangles, polygons, Atomos-shaped text).
 //! - **Bitmap** — plotters' `BitMapBackend` rasterizes into an RGB buffer
 //!   at the window's physical resolution, uploaded as one Atomos image.
 //!
-//! `S` writes every plot through two more backends — SVG and PNG — to
-//! `target/plot-demo/` (the bitmap plot as PNG only). Arrow keys orbit the 3D surface.
+//! `S` writes what plotters draws — the insides, without the frame —
+//! through two more backends, SVG and PNG, to `target/plot-demo/` (the
+//! bitmap plot as PNG only). `D` switches light and dark. Arrow keys orbit
+//! the 3D surface.
 //!
 //! `cargo run --example plot_demo`
 
 mod atomos_backend;
+mod frame;
 mod plots;
 
 use std::path::PathBuf;
@@ -20,8 +25,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atomos_backend::AtomosBackend;
-use plots::{Plot, Scale, View};
-use plotters::prelude::{BitMapBackend, IntoDrawingArea, SVGBackend};
+use plots::{Palette, Plot, Style, Ticks, View};
+use plotters::prelude::{BitMapBackend, IntoDrawingArea, RGBColor, SVGBackend};
 use typewritter::layout::Rect;
 use typewritter::renderer::{
     Alignment, Color, FontParameters, HorizontalAlign, Layer, LayerInvalidation, Pixels, Renderer,
@@ -38,10 +43,10 @@ use winit::{
 };
 
 const COLUMNS: usize = 4;
-const HEADER: f32 = 64.0;
-const PADDING: f32 = 16.0;
-const GAP: f32 = 12.0;
-/// Size of the exported SVGs, in SVG units; PNGs are twice that.
+const HEADER: f32 = 68.0;
+const PADDING: f32 = 20.0;
+const GAP: f32 = 22.0;
+/// Size of the exported plot insides, in SVG units; PNGs are twice that.
 const EXPORT_SIZE: (u32, u32) = (480, 340);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,13 +64,18 @@ impl Path {
     }
 }
 
+/// One plot's pair of layers — see `frame.rs`.
+struct Panel {
+    data: Layer,
+    frame: Layer,
+}
+
 struct Scene {
     window: Arc<Window>,
     renderer: Renderer,
-    /// Background, cards and header text.
+    /// Background and header text.
     chrome: Layer,
-    /// One scissored layer per plot, so one plot can repaint alone.
-    panels: Vec<Layer>,
+    panels: Vec<Panel>,
     stale: Vec<bool>,
     path: Path,
     view: View,
@@ -93,9 +103,18 @@ impl ApplicationHandler for Demo {
         );
         let mut renderer = pollster::block_on(Renderer::new(window.clone()));
         let chrome = renderer.new_layer_bottom(LayerInvalidation::Manual);
-        let panels = Plot::ALL
+        // Every data layer first, then every frame layer, so frames stack
+        // above all data.
+        let data: Vec<Layer> = Plot::ALL
             .iter()
             .map(|_| renderer.new_layer_top(LayerInvalidation::Manual))
+            .collect();
+        let panels = data
+            .into_iter()
+            .map(|data| Panel {
+                data,
+                frame: renderer.new_layer_top(LayerInvalidation::Manual),
+            })
             .collect();
         self.scene = Some(Scene {
             window,
@@ -173,6 +192,10 @@ impl Scene {
                 }
                 self.window.request_redraw();
             }
+            Key::Character(c) if c.eq_ignore_ascii_case("d") => {
+                theme::set(theme::counterpart());
+                self.invalidate_all();
+            }
             Key::Character(c) if c.eq_ignore_ascii_case("s") => {
                 let started = Instant::now();
                 self.status = match export(self.view) {
@@ -201,25 +224,31 @@ impl Scene {
 
         let mut repainted = 0;
         let started = Instant::now();
-        for (index, (plot, layer)) in Plot::ALL.iter().zip(&self.panels).enumerate() {
+        for (index, (plot, panel)) in Plot::ALL.iter().zip(&self.panels).enumerate() {
             if !self.stale[index] {
                 continue;
             }
             self.stale[index] = false;
             repainted += 1;
-            let rect = cells[index];
-            layer.clear();
-            layer.set_clip_rect(Some((rect.position(), rect.size())));
-            if let Err(error) = paint_plot(layer, rect, *plot, self.path, self.view) {
-                eprintln!("{}: {error}", plot.slug());
-                layer.draw_text(
-                    &format!("{}: {error}", plot.slug()),
-                    (rect.x + 12.0, rect.y + 12.0),
-                    theme::warning(),
-                    Alignment::TOP_LEFT,
-                    theme::sans(),
-                    FontParameters::new(12.0),
-                );
+            let cell = cells[index];
+            let spec = plot.frame();
+            let inside = frame::container(cell, &spec);
+            panel.data.clear();
+            panel.frame.clear();
+            frame::clip(&panel.data, inside);
+            match paint_plot(&panel.data, inside, *plot, self.path, self.view) {
+                Ok(ticks) => frame::draw(&panel.frame, cell, inside, &spec, &ticks),
+                Err(error) => {
+                    eprintln!("{}: {error}", plot.slug());
+                    panel.frame.draw_text(
+                        &format!("{}: {error}", plot.slug()),
+                        (inside.x + 12.0, inside.y + 12.0),
+                        theme::warning(),
+                        Alignment::TOP_LEFT,
+                        theme::sans(),
+                        FontParameters::new(12.0),
+                    );
+                }
             }
         }
         if repainted > 0 {
@@ -229,10 +258,10 @@ impl Scene {
                 millis(started.elapsed()),
             );
         }
-        self.paint_chrome(size.width, size.height, &cells);
+        self.paint_chrome(size.width, size.height);
     }
 
-    fn paint_chrome(&self, width: f32, height: f32, cells: &[Rect]) {
+    fn paint_chrome(&self, width: f32, height: f32) {
         let layer = &self.chrome;
         layer.clear();
         layer.draw_rectangle(
@@ -241,47 +270,35 @@ impl Scene {
             theme::background(),
             Rounding::NONE,
         );
-        for cell in cells {
-            let card = cell.inset(-1.0);
-            layer.draw_rectangle(
-                card.position(),
-                card.size(),
-                theme::border(),
-                Rounding::uniform(6.0),
-            );
-        }
 
-        let left = |x: f32, y: f32| (PADDING + x, y);
+        let left = Alignment {
+            horizontal: HorizontalAlign::Left,
+            vertical: VerticalAlign::Center,
+        };
+        let right = Alignment {
+            horizontal: HorizontalAlign::Right,
+            vertical: VerticalAlign::Center,
+        };
         let mut title = FontParameters::new(17.0);
         title.weight = 17.0 * 0.018;
         layer.draw_text(
             "plotters on Atomos",
-            left(0.0, 24.0),
+            (PADDING, 24.0),
             theme::ink(),
-            Alignment {
-                horizontal: HorizontalAlign::Left,
-                vertical: VerticalAlign::Center,
-            },
+            left,
             theme::sans(),
             title,
         );
         layer.draw_text(
             self.path.describe(),
-            left(0.0, 46.0),
+            (PADDING, 46.0),
             theme::accent(),
-            Alignment {
-                horizontal: HorizontalAlign::Left,
-                vertical: VerticalAlign::Center,
-            },
+            left,
             theme::sans(),
             FontParameters::new(12.5),
         );
-        let right = Alignment {
-            horizontal: HorizontalAlign::Right,
-            vertical: VerticalAlign::Center,
-        };
         layer.draw_text(
-            "Tab  switch path     ← → ↑ ↓  orbit 3D     S  export SVG + PNG",
+            "Tab  switch path   D  theme   ← → ↑ ↓  orbit 3D   S  export SVG + PNG",
             (width - PADDING, 24.0),
             theme::dim(),
             right,
@@ -299,61 +316,105 @@ impl Scene {
     }
 }
 
-/// Draws one plot into `rect` through the chosen path.
-fn paint_plot(layer: &Layer, rect: Rect, plot: Plot, path: Path, view: View) -> plots::Outcome {
+/// Draws one plot's inside into `rect` through the chosen path.
+fn paint_plot(
+    layer: &Layer,
+    rect: Rect,
+    plot: Plot,
+    path: Path,
+    view: View,
+) -> plots::Outcome<Ticks> {
     let scale = layer.scale_factor();
+    let style = Style {
+        scale: f64::from(scale),
+        palette: palette(),
+    };
     match path {
         Path::Vector => {
             let backend = AtomosBackend::new(layer.clone(), rect.position(), rect.size());
             let area = backend.into_drawing_area();
-            plot.draw(&area, Scale(f64::from(scale)), view)?;
+            let ticks = plot.draw(&area, style, view)?;
             area.present()?;
+            Ok(ticks)
         }
         Path::Bitmap => {
             let width = (rect.width * scale).round() as u32;
             let height = (rect.height * scale).round() as u32;
             if width == 0 || height == 0 {
-                return Ok(());
+                return Ok(Ticks::default());
             }
             let mut rgb = vec![0u8; (width * height * 3) as usize];
-            {
+            let ticks = {
                 let area =
                     BitMapBackend::with_buffer(&mut rgb, (width, height)).into_drawing_area();
-                plot.draw(&area, Scale(f64::from(scale)), view)?;
+                let ticks = plot.draw(&area, style, view)?;
                 area.present()?;
-            }
+                ticks
+            };
             layer.draw_image(
                 Pixels::new(width, height, atomos_backend::rgb_to_rgba(&rgb)),
                 rect.position(),
                 rect.size(),
                 Color::rgb(0xFF, 0xFF, 0xFF),
             );
+            Ok(ticks)
         }
     }
-    Ok(())
 }
 
-/// Every plot as an SVG (1x) and a PNG (2x), through plotters' own
-/// file-writing backends.
+/// The current theme, as the colours plotters draws the insides with.
+fn palette() -> Palette {
+    let surface = rgb(frame::surface());
+    let border = rgb(theme::border());
+    Palette {
+        surface,
+        // Halfway from the border to the surface: grid lines sit under
+        // the data without competing with the container's edge.
+        grid: mix(border, surface, 0.5),
+        border,
+        ink: rgb(theme::ink()),
+        dim: rgb(theme::dim()),
+    }
+}
+
+fn rgb(color: Color) -> RGBColor {
+    match color {
+        Color::Solid([r, g, b, _]) => RGBColor(r, g, b),
+        _ => unreachable!("theme colours are solid"),
+    }
+}
+
+fn mix(a: RGBColor, b: RGBColor, amount: f64) -> RGBColor {
+    let channel =
+        |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * amount).round() as u8;
+    RGBColor(channel(a.0, b.0), channel(a.1, b.1), channel(a.2, b.2))
+}
+
+/// Every plot's inside as an SVG (1x) and a PNG (2x), through plotters'
+/// own file-writing backends.
 fn export(view: View) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("plot-demo");
     std::fs::create_dir_all(&dir)?;
     let (width, height) = EXPORT_SIZE;
+    let style = |scale| Style {
+        scale,
+        palette: palette(),
+    };
     for plot in Plot::ALL {
         // Without `plotters-svg/bitmap_encoder` (see Cargo.toml) the SVG
         // backend writes a bitmap as one <rect> per pixel.
         if plot != Plot::Mandelbrot {
             let svg = dir.join(format!("{}.svg", plot.slug()));
             let area = SVGBackend::new(&svg, (width, height)).into_drawing_area();
-            plot.draw(&area, Scale(1.0), view)?;
+            plot.draw(&area, style(1.0), view)?;
             area.present()?;
         }
 
         let png = dir.join(format!("{}.png", plot.slug()));
         let area = BitMapBackend::new(&png, (width * 2, height * 2)).into_drawing_area();
-        plot.draw(&area, Scale(2.0), view)?;
+        plot.draw(&area, style(2.0), view)?;
         area.present()?;
     }
     Ok(dir)
@@ -384,7 +445,11 @@ fn millis(duration: Duration) -> String {
 }
 
 fn main() -> Result<(), winit::error::EventLoopError> {
-    theme::set(Theme::LIGHT);
+    theme::set(if std::env::args().any(|arg| arg == "--dark") {
+        Theme::DARK
+    } else {
+        Theme::LIGHT
+    });
     atomos_backend::register_fonts();
     EventLoop::new()?.run_app(&mut Demo::default())
 }

@@ -1,18 +1,25 @@
 //! Twelve plots, each written once against plotters' generic
 //! `DrawingArea`, so the same code draws through any backend.
+//!
+//! plotters draws only what is *inside* a plot — series, grid lines,
+//! legends. The container, the tick marks and every axis label are
+//! Typewritter's (see `frame.rs`); a plot hands back where its ticks fall
+//! and what they read, in [`Ticks`], and the area it is given is exactly
+//! the inside of that container.
 
 use std::f64::consts::PI;
 
 use plotters::coord::Shift;
+use plotters::coord::ranged1d::{BoldPoints, Ranged};
 use plotters::data::Quartiles;
 use plotters::prelude::*;
 use plotters::style::full_palette::{
-    AMBER_700, BLUEGREY_700, DEEPORANGE_400, GREY_100, GREY_200, GREY_400, GREY_600, GREY_800,
-    INDIGO_400, LIGHTBLUE_400, PINK_400, PURPLE_400, TEAL_400, TEAL_600,
+    AMBER_700, BLUEGREY_400, DEEPORANGE_400, GREY_500, INDIGO_400, LIGHTBLUE_400, PINK_400,
+    PURPLE_400, TEAL_400, TEAL_600,
 };
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 
-pub type Outcome = Result<(), Box<dyn std::error::Error>>;
+pub type Outcome<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plot {
@@ -28,6 +35,57 @@ pub enum Plot {
     Surface,
     Heatmap,
     Mandelbrot,
+}
+
+/// What a plot's container carries around it. Fixed per plot, so the frame
+/// can be laid out before anything is drawn.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    pub title: &'static str,
+    /// Tick marks and labels on the left and bottom (or top) edges.
+    pub ticks: bool,
+    pub x_on_top: bool,
+    /// A second set of y ticks on the right edge.
+    pub secondary: bool,
+    pub x_desc: Option<&'static str>,
+    pub y_desc: Option<&'static str>,
+    pub y2_desc: Option<&'static str>,
+}
+
+impl Frame {
+    const fn ticked(title: &'static str) -> Self {
+        Self {
+            title,
+            ticks: true,
+            x_on_top: false,
+            secondary: false,
+            x_desc: None,
+            y_desc: None,
+            y2_desc: None,
+        }
+    }
+
+    const fn bare(title: &'static str) -> Self {
+        Self {
+            ticks: false,
+            ..Self::ticked(title)
+        }
+    }
+}
+
+/// A labelled position along one edge, in backend pixels from the
+/// container's top-left.
+#[derive(Clone, Debug)]
+pub struct Tick {
+    pub at: i32,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Ticks {
+    pub x: Vec<Tick>,
+    pub y: Vec<Tick>,
+    pub y2: Vec<Tick>,
 }
 
 impl Plot {
@@ -63,29 +121,68 @@ impl Plot {
         }
     }
 
+    pub fn frame(self) -> Frame {
+        match self {
+            Plot::Waves => Frame {
+                x_desc: Some("t"),
+                y_desc: Some("amplitude"),
+                ..Frame::ticked("Line styles · legend")
+            },
+            Plot::Scatter => Frame::ticked("Scatter · markers · annotations"),
+            Plot::Histogram => Frame {
+                x_desc: Some("bucket"),
+                y_desc: Some("count"),
+                ..Frame::ticked("Histogram · segmented axis")
+            },
+            Plot::LogArea => Frame {
+                x_desc: Some("n"),
+                y_desc: Some("steps (log)"),
+                ..Frame::ticked("Area series · log scale")
+            },
+            Plot::TwoScales => Frame {
+                secondary: true,
+                y_desc: Some("°C"),
+                y2_desc: Some("mm"),
+                ..Frame::ticked("Two y axes · custom ticks")
+            },
+            Plot::Boxplots => Frame::ticked("Box plots · categorical x"),
+            Plot::Candles => Frame::ticked("Candlesticks · moving average"),
+            Plot::ErrorBars => Frame::ticked("Error bars · sparse ticks"),
+            Plot::Pie => Frame::bare("Pie · donut · no axes"),
+            Plot::Surface => Frame::bare("3D surface · colormap · ← → ↑ ↓"),
+            Plot::Heatmap => Frame {
+                x_on_top: true,
+                ..Frame::ticked("Heatmap · top axis · no grid")
+            },
+            Plot::Mandelbrot => Frame::ticked("Bitmap element · blit_bitmap"),
+        }
+    }
+
+    /// Draws the inside of the container onto `area`, which is exactly
+    /// that inside, and reports where the frame's ticks go.
     pub fn draw<DB: DrawingBackend>(
         self,
         area: &DrawingArea<DB, Shift>,
-        s: Scale,
+        style: Style,
         view: View,
-    ) -> Outcome
+    ) -> Outcome<Ticks>
     where
         DB::ErrorType: 'static,
     {
-        area.fill(&WHITE)?;
+        area.fill(&style.palette.surface)?;
         match self {
-            Plot::Waves => waves(area, s),
-            Plot::Scatter => scatter(area, s),
-            Plot::Histogram => histogram(area, s),
-            Plot::LogArea => log_area(area, s),
-            Plot::TwoScales => two_scales(area, s),
-            Plot::Boxplots => boxplots(area, s),
-            Plot::Candles => candles(area, s),
-            Plot::ErrorBars => error_bars(area, s),
-            Plot::Pie => pie(area, s),
-            Plot::Surface => surface(area, s, view),
-            Plot::Heatmap => heatmap(area, s),
-            Plot::Mandelbrot => mandelbrot(area, s),
+            Plot::Waves => waves(area, style),
+            Plot::Scatter => scatter(area, style),
+            Plot::Histogram => histogram(area, style),
+            Plot::LogArea => log_area(area, style),
+            Plot::TwoScales => two_scales(area, style),
+            Plot::Boxplots => boxplots(area, style),
+            Plot::Candles => candles(area, style),
+            Plot::ErrorBars => error_bars(area, style),
+            Plot::Pie => pie(area, style).map(|()| Ticks::default()),
+            Plot::Surface => surface(area, style, view).map(|()| Ticks::default()),
+            Plot::Heatmap => heatmap(area, style),
+            Plot::Mandelbrot => mandelbrot(area, style),
         }
     }
 }
@@ -106,70 +203,138 @@ impl Default for View {
     }
 }
 
-/// plotters sizes everything in backend pixels; this turns the logical
-/// sizes the plots are written in into those.
+/// The theme's colours, in plotters' terms.
 #[derive(Clone, Copy, Debug)]
-pub struct Scale(pub f64);
+pub struct Palette {
+    pub surface: RGBColor,
+    pub grid: RGBColor,
+    pub border: RGBColor,
+    pub ink: RGBColor,
+    pub dim: RGBColor,
+}
 
-impl Scale {
+/// How a plot is drawn: its palette, and the backend-pixel scale that
+/// turns the logical sizes the plots are written in into what plotters
+/// expects.
+#[derive(Clone, Copy, Debug)]
+pub struct Style {
+    pub scale: f64,
+    pub palette: Palette,
+}
+
+impl Style {
     fn px(self, logical: f64) -> u32 {
-        (logical * self.0).round() as u32
+        (logical * self.scale).round() as u32
     }
 
     fn font(self, logical: f64) -> TextStyle<'static> {
-        ("sans-serif", logical * self.0)
+        ("sans-serif", logical * self.scale)
             .into_font()
-            .color(&GREY_800)
-    }
-
-    fn caption(self) -> TextStyle<'static> {
-        ("sans-serif", 15.0 * self.0, FontStyle::Bold)
-            .into_font()
-            .color(&GREY_800)
-    }
-
-    fn label(self) -> TextStyle<'static> {
-        self.font(11.0).color(&GREY_600)
+            .color(&self.palette.ink)
     }
 
     fn line(self, color: RGBColor, width: f64) -> ShapeStyle {
         color.stroke_width(self.px(width))
     }
+
+    fn legend<'a, DB: DrawingBackend + 'a, CT: CoordTranslate>(
+        self,
+        chart: &mut ChartContext<'a, DB, CT>,
+        position: SeriesLabelPosition,
+    ) -> Outcome
+    where
+        DB::ErrorType: 'static,
+    {
+        chart
+            .configure_series_labels()
+            .position(position)
+            .label_font(self.font(10.0))
+            .background_style(self.palette.surface.mix(0.9))
+            .border_style(self.palette.border)
+            .margin(self.px(8.0))
+            .legend_area_size(self.px(20.0))
+            .draw()?;
+        Ok(())
+    }
 }
 
-fn chart<'a, 'b, DB: DrawingBackend>(
-    area: &'a DrawingArea<DB, Shift>,
-    title: &str,
-    s: Scale,
-) -> ChartBuilder<'a, 'b, DB> {
-    let mut builder = ChartBuilder::on(area);
-    builder
-        .caption(title, s.caption())
-        .margin(s.px(10.0))
-        .x_label_area_size(s.px(30.0))
-        .y_label_area_size(s.px(42.0));
-    builder
+// Plots hide minor grid lines with a transparent style, never
+// `max_light_lines(0)`: on an integer axis that asks plotters for zero key
+// points, and its search for a step that small multiplies until it
+// overflows.
+
+/// Where plotters' "nice" key values along x land, and what they read.
+fn x_ticks<X: Ranged, Y: Ranged>(
+    spec: &Cartesian2d<X, Y>,
+    count: usize,
+    label: impl Fn(&X::ValueType) -> String,
+) -> Vec<Tick>
+where
+    Y::ValueType: Clone,
+{
+    let y = spec.y_spec().range().start;
+    spec.x_spec()
+        .key_points(BoldPoints(count))
+        .into_iter()
+        .map(|x| Tick {
+            label: label(&x),
+            at: spec.translate(&(x, y.clone())).0,
+        })
+        .collect()
+}
+
+fn y_ticks<X: Ranged, Y: Ranged>(
+    spec: &Cartesian2d<X, Y>,
+    count: usize,
+    label: impl Fn(&Y::ValueType) -> String,
+) -> Vec<Tick>
+where
+    X::ValueType: Clone,
+{
+    let x = spec.x_spec().range().start;
+    spec.y_spec()
+        .key_points(BoldPoints(count))
+        .into_iter()
+        .map(|y| Tick {
+            label: label(&y),
+            at: spec.translate(&(x.clone(), y)).1,
+        })
+        .collect()
+}
+
+/// A plain number, without float noise or a trailing `.0`.
+fn number(value: &f64) -> String {
+    let rounded = (value * 1000.0).round() / 1000.0;
+    format!("{}", rounded + 0.0)
+}
+
+fn segment<T: ToString>(value: &SegmentValue<T>) -> String {
+    match value {
+        SegmentValue::Exact(v) | SegmentValue::CenterOf(v) => v.to_string(),
+        SegmentValue::Last => String::new(),
+    }
 }
 
 /// Line series, dashed and dotted variants, π tick labels, a legend.
-fn waves<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+fn waves<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
-    let mut chart = chart(area, "Line styles · legend", s)
-        .y_label_area_size(s.px(52.0))
-        .build_cartesian_2d(0f64..4.0 * PI, -1.25f64..1.25)?;
+    const Y: usize = 6;
+    let mut chart = ChartBuilder::on(area).build_cartesian_2d(0f64..4.0 * PI, -1.25f64..1.25)?;
     chart
         .configure_mesh()
-        .x_labels(5)
-        .x_label_formatter(&|x| format!("{:.1}π", x / PI))
-        .x_desc("t")
-        .y_desc("amplitude")
-        .label_style(s.label())
-        .axis_desc_style(s.font(12.0))
-        .bold_line_style(GREY_200)
-        .light_line_style(GREY_100)
+        .disable_axes()
+        .disable_x_mesh()
+        .y_labels(Y)
+        .light_line_style(TRANSPARENT)
+        .bold_line_style(s.palette.grid)
         .draw()?;
+    // The x grid follows the π ticks below.
+    chart.draw_series((1..4).map(|k| {
+        let x = k as f64 * PI;
+        PathElement::new([(x, -1.25), (x, 1.25)], s.palette.grid)
+    }))?;
 
     let t = || (0..=400).map(|i| i as f64 / 400.0 * 4.0 * PI);
     chart
@@ -205,33 +370,41 @@ where
         ))?
         .label("envelope (dotted)")
         .legend(move |(x, y)| Circle::new((x + 9, y), radius, DEEPORANGE_400.filled()));
+    s.legend(&mut chart, SeriesLabelPosition::UpperRight)?;
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperRight)
-        .label_font(s.font(10.0))
-        .background_style(WHITE.mix(0.85))
-        .border_style(GREY_400)
-        .margin(s.px(6.0))
-        .legend_area_size(s.px(22.0))
-        .draw()?;
-    Ok(())
+    let spec = chart.as_coord_spec();
+    Ok(Ticks {
+        // Multiples of π, not plotters' decimal key points.
+        x: (0..=4)
+            .map(|k| Tick {
+                at: spec.translate(&(k as f64 * PI, 0.0)).0,
+                label: match k {
+                    0 => "0".to_string(),
+                    1 => "π".to_string(),
+                    k => format!("{k}π"),
+                },
+            })
+            .collect(),
+        y: y_ticks(spec, Y, number),
+        ..Ticks::default()
+    })
 }
 
 /// Three marker shapes, and an annotation composed from elements.
-fn scatter<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+fn scatter<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
-    let mut chart = chart(area, "Scatter · markers · annotations", s)
-        .build_cartesian_2d(-4f64..6.0, -3f64..5.0)?;
+    const X: usize = 6;
+    const Y: usize = 5;
+    let mut chart = ChartBuilder::on(area).build_cartesian_2d(-4f64..6.0, -3f64..5.0)?;
     chart
         .configure_mesh()
-        .x_labels(6)
-        .label_style(s.label())
-        // Only the bold grid, drawn faintly.
-        .max_light_lines(0)
-        .bold_line_style(GREY_200)
+        .disable_axes()
+        .x_labels(X)
+        .y_labels(Y)
+        .light_line_style(TRANSPARENT)
+        .bold_line_style(s.palette.grid)
         .draw()?;
 
     let mut rng = Rng(7);
@@ -277,7 +450,7 @@ where
         let ring = s.px(6.0) as i32;
         chart.draw_series(std::iter::once(
             EmptyElement::at(centroid)
-                + Circle::new((0, 0), ring as u32, s.line(GREY_800, 1.5))
+                + Circle::new((0, 0), ring as u32, s.line(s.palette.ink, 1.5))
                 + Text::new(
                     format!("{name} ({:.1}, {:.1})", centroid.0, centroid.1),
                     (ring + 3, -ring - 4),
@@ -285,22 +458,22 @@ where
                 ),
         ))?;
     }
+    s.legend(&mut chart, SeriesLabelPosition::LowerLeft)?;
 
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::LowerLeft)
-        .label_font(s.font(10.0))
-        .background_style(WHITE.mix(0.85))
-        .border_style(GREY_400)
-        .draw()?;
-    Ok(())
+    let spec = chart.as_coord_spec();
+    Ok(Ticks {
+        x: x_ticks(spec, X, number),
+        y: y_ticks(spec, Y, number),
+        ..Ticks::default()
+    })
 }
 
 /// Segmented (categorical) axis and a histogram built from raw samples.
-fn histogram<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+fn histogram<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
+    const Y: usize = 5;
     let mut rng = Rng(42);
     let samples: Vec<u32> = (0..3000)
         .filter_map(|_| {
@@ -309,23 +482,20 @@ where
         })
         .collect();
 
-    let mut chart = chart(area, "Histogram · segmented axis", s)
-        .build_cartesian_2d((0u32..19u32).into_segmented(), 0u32..500u32)?;
+    let mut chart =
+        ChartBuilder::on(area).build_cartesian_2d((0u32..19u32).into_segmented(), 0u32..500u32)?;
     chart
         .configure_mesh()
+        .disable_axes()
         .disable_x_mesh()
-        .bold_line_style(GREY_200)
+        .y_labels(Y)
         .light_line_style(TRANSPARENT)
-        .y_desc("count")
-        .x_desc("bucket")
-        .label_style(s.label())
-        .axis_desc_style(s.font(12.0))
+        .bold_line_style(s.palette.grid)
         .draw()?;
     chart.draw_series(
         Histogram::vertical(&chart)
             .style_func(|bucket, _| {
-                let middle = matches!(bucket, SegmentValue::CenterOf(8..=11));
-                if middle {
+                if matches!(bucket, SegmentValue::CenterOf(8..=11)) {
                     TEAL_600.filled()
                 } else {
                     TEAL_400.mix(0.55).filled()
@@ -334,28 +504,35 @@ where
             .margin(s.px(2.0))
             .data(samples.iter().map(|&bucket| (bucket, 1))),
     )?;
-    Ok(())
+
+    let spec = chart.as_coord_spec();
+    Ok(Ticks {
+        // Every other bucket, labelled at its centre.
+        x: x_ticks(spec, 20, segment)
+            .into_iter()
+            .filter(|tick| tick.label.parse::<u32>().is_ok_and(|b| b % 2 == 0))
+            .collect(),
+        y: y_ticks(spec, Y, |v| v.to_string()),
+        ..Ticks::default()
+    })
 }
 
 /// Logarithmic y axis, filled area series, y-only grid.
-fn log_area<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+fn log_area<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
-    let mut chart = chart(area, "Area series · log scale", s)
-        .y_label_area_size(s.px(48.0))
-        .build_cartesian_2d(1f64..64.0, (1f64..5000.0).log_scale())?;
+    const X: usize = 5;
+    const Y: usize = 5;
+    let mut chart =
+        ChartBuilder::on(area).build_cartesian_2d(1f64..64.0, (1f64..5000.0).log_scale())?;
     chart
         .configure_mesh()
+        .disable_axes()
         .disable_x_mesh()
-        .bold_line_style(GREY_200)
-        .light_line_style(GREY_100)
-        .x_labels(5)
-        .x_label_formatter(&|x| format!("{x:.0}"))
-        .y_label_formatter(&|y| format!("{y:.0}"))
-        .x_desc("n")
-        .label_style(s.label())
-        .axis_desc_style(s.font(12.0))
+        .y_labels(Y)
+        .light_line_style(TRANSPARENT)
+        .bold_line_style(s.palette.grid)
         .draw()?;
 
     let n = || (1..=64).map(f64::from);
@@ -374,18 +551,18 @@ where
                 Rectangle::new([(x, y - 4), (x + 12, y + 4)], color.mix(0.6).filled())
             });
     }
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .label_font(s.font(10.0))
-        .border_style(GREY_400)
-        .background_style(WHITE.mix(0.85))
-        .draw()?;
-    Ok(())
+    s.legend(&mut chart, SeriesLabelPosition::UpperLeft)?;
+
+    let spec = chart.as_coord_spec();
+    Ok(Ticks {
+        x: x_ticks(spec, X, number),
+        y: y_ticks(spec, Y, number),
+        ..Ticks::default()
+    })
 }
 
 /// A secondary y axis, custom tick labels, bars drawn as rectangles.
-fn two_scales<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+fn two_scales<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
@@ -396,33 +573,18 @@ where
     const RAIN: [f64; 12] = [
         78.0, 60.0, 64.0, 52.0, 58.0, 49.0, 44.0, 57.0, 62.0, 88.0, 96.0, 91.0,
     ];
+    const Y: usize = 5;
 
-    let mut chart = chart(area, "Two y axes · custom ticks", s)
-        .right_y_label_area_size(s.px(42.0))
+    let mut chart = ChartBuilder::on(area)
         .build_cartesian_2d(0f64..12.0, 0f64..25.0)?
-        .set_secondary_coord(0f64..12.0, 0f64..120.0);
+        .set_secondary_coord(0f64..12.0, 0f64..125.0);
     chart
         .configure_mesh()
+        .disable_axes()
         .disable_x_mesh()
-        .x_labels(12)
-        .x_label_formatter(&|x| {
-            MONTHS
-                .get(x.floor() as usize)
-                .map_or(String::new(), |m| m.to_string())
-        })
-        .x_label_offset(s.px(9.0) as i32)
-        .y_desc("°C")
-        .y_label_style(s.label().color(&DEEPORANGE_400))
-        .x_label_style(s.label())
-        .axis_desc_style(s.font(12.0).color(&DEEPORANGE_400))
-        .bold_line_style(GREY_200)
+        .y_labels(Y)
         .light_line_style(TRANSPARENT)
-        .draw()?;
-    chart
-        .configure_secondary_axes()
-        .y_desc("rain (mm)")
-        .label_style(s.label().color(&LIGHTBLUE_400))
-        .axis_desc_style(s.font(12.0).color(&LIGHTBLUE_400))
+        .bold_line_style(s.palette.grid)
         .draw()?;
 
     chart
@@ -448,21 +610,31 @@ where
         )?
         .label("temperature")
         .legend(move |(x, y)| PathElement::new([(x, y), (x + 12, y)], s.line(DEEPORANGE_400, 2.0)));
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .label_font(s.font(10.0))
-        .background_style(WHITE.mix(0.85))
-        .border_style(GREY_400)
-        .draw()?;
-    Ok(())
+    s.legend(&mut chart, SeriesLabelPosition::UpperLeft)?;
+
+    let spec = chart.as_coord_spec();
+    let secondary = chart.secondary_plotting_area().as_coord_spec();
+    Ok(Ticks {
+        // One tick per month, at its centre rather than plotters' key points.
+        x: MONTHS
+            .iter()
+            .enumerate()
+            .map(|(month, name)| Tick {
+                at: spec.translate(&(month as f64 + 0.5, 0.0)).0,
+                label: name.to_string(),
+            })
+            .collect(),
+        y: y_ticks(spec, Y, number),
+        y2: y_ticks(secondary, Y, number),
+    })
 }
 
 /// Box-and-whisker plots over a categorical axis.
-fn boxplots<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+fn boxplots<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
+    const Y: usize = 6;
     let mut rng = Rng(3);
     let groups = ["alpha", "beta", "gamma", "delta"];
     let data: Vec<Quartiles> = [(12.0, 2.0), (16.0, 4.5), (9.0, 1.2), (14.0, 3.0)]
@@ -473,18 +645,15 @@ where
         })
         .collect();
 
-    let mut chart = chart(area, "Box plots · categorical x", s)
-        .build_cartesian_2d(groups[..].into_segmented(), 0f32..28f32)?;
+    let mut chart =
+        ChartBuilder::on(area).build_cartesian_2d(groups[..].into_segmented(), 0f32..28f32)?;
     chart
         .configure_mesh()
+        .disable_axes()
         .disable_x_mesh()
-        .bold_line_style(GREY_200)
+        .y_labels(Y)
         .light_line_style(TRANSPARENT)
-        .x_label_formatter(&|group| match group {
-            SegmentValue::Exact(name) | SegmentValue::CenterOf(name) => name.to_string(),
-            SegmentValue::Last => String::new(),
-        })
-        .label_style(s.label())
+        .bold_line_style(s.palette.grid)
         .draw()?;
     let colors = [INDIGO_400, PINK_400, TEAL_600, AMBER_700];
     chart.draw_series(groups.iter().zip(&data).zip(colors).map(
@@ -495,17 +664,25 @@ where
                 .style(s.line(color, 1.5))
         },
     ))?;
-    Ok(())
+
+    let spec = chart.as_coord_spec();
+    Ok(Ticks {
+        x: x_ticks(spec, groups.len(), segment),
+        y: y_ticks(spec, Y, |v| number(&f64::from(*v))),
+        ..Ticks::default()
+    })
 }
 
 /// Candlesticks with a moving average on top.
-fn candles<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+fn candles<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
+    const X: usize = 6;
+    const Y: usize = 5;
     let mut rng = Rng(11);
     let mut price = 100.0;
-    let days: Vec<(u32, f64, f64, f64, f64)> = (0..36)
+    let days: Vec<(u32, f64, f64, f64, f64)> = (1..=36)
         .map(|day| {
             let open = price;
             let close = open + rng.normal() * 2.4 + 0.25;
@@ -518,16 +695,14 @@ where
     let low = days.iter().map(|d| d.3).fold(f64::MAX, f64::min) - 2.0;
     let high = days.iter().map(|d| d.2).fold(f64::MIN, f64::max) + 2.0;
 
-    let mut chart = chart(area, "Candlesticks · moving average", s)
-        .build_cartesian_2d(0u32..36u32, low..high)?;
+    let mut chart = ChartBuilder::on(area).build_cartesian_2d(0u32..37u32, low..high)?;
     chart
         .configure_mesh()
+        .disable_axes()
+        .x_labels(X)
+        .y_labels(Y)
         .light_line_style(TRANSPARENT)
-        .bold_line_style(GREY_200)
-        .x_labels(6)
-        .x_label_formatter(&|d| format!("d{d}"))
-        .y_label_formatter(&|p| format!("${p:.0}"))
-        .label_style(s.label())
+        .bold_line_style(s.palette.grid)
         .draw()?;
     chart.draw_series(days.iter().map(|&(day, open, high, low, close)| {
         CandleStick::new(
@@ -546,24 +721,26 @@ where
         .map(|window| (window[4].0, window.iter().map(|d| d.4).sum::<f64>() / 5.0))
         .collect();
     chart
-        .draw_series(LineSeries::new(average, s.line(BLUEGREY_700, 1.5)))?
+        .draw_series(LineSeries::new(average, s.line(BLUEGREY_400, 1.5)))?
         .label("5-day average")
-        .legend(move |(x, y)| PathElement::new([(x, y), (x + 14, y)], s.line(BLUEGREY_700, 1.5)));
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .label_font(s.font(10.0))
-        .background_style(WHITE.mix(0.85))
-        .border_style(GREY_400)
-        .draw()?;
-    Ok(())
+        .legend(move |(x, y)| PathElement::new([(x, y), (x + 14, y)], s.line(BLUEGREY_400, 1.5)));
+    s.legend(&mut chart, SeriesLabelPosition::UpperLeft)?;
+
+    let spec = chart.as_coord_spec();
+    Ok(Ticks {
+        x: x_ticks(spec, X, |d| format!("d{d}")),
+        y: y_ticks(spec, Y, |p| format!("${p:.0}")),
+        ..Ticks::default()
+    })
 }
 
 /// Noisy samples, down-sampled into error bars, with a fitted line.
-fn error_bars<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+fn error_bars<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
+    const X: usize = 5;
+    const Y: usize = 5;
     let mut rng = Rng(5);
     let raw: Vec<(f64, f64)> = (0..400)
         .map(|i| {
@@ -582,24 +759,24 @@ where
         })
         .collect();
 
-    let mut chart =
-        chart(area, "Error bars · sparse ticks", s).build_cartesian_2d(0f64..10.0, -5f64..9.0)?;
+    let mut chart = ChartBuilder::on(area).build_cartesian_2d(0f64..10.0, -5f64..9.0)?;
     chart
         .configure_mesh()
-        .x_labels(5)
-        .y_labels(5)
+        .disable_axes()
+        .x_labels(X)
+        .y_labels(Y)
+        // Light lines between the labelled ones, still faint.
         .max_light_lines(1)
-        .bold_line_style(GREY_200)
-        .light_line_style(GREY_100)
-        .label_style(s.label())
+        .bold_line_style(s.palette.grid)
+        .light_line_style(s.palette.grid.mix(0.45))
         .draw()?;
     chart
         .draw_series(
             raw.iter()
-                .map(|&p| Circle::new(p, s.px(1.2), GREY_400.filled())),
+                .map(|&p| Circle::new(p, s.px(1.2), GREY_500.mix(0.7).filled())),
         )?
         .label("samples")
-        .legend(move |(x, y)| Circle::new((x + 6, y), s.px(2.0), GREY_400.filled()));
+        .legend(move |(x, y)| Circle::new((x + 6, y), s.px(2.0), GREY_500.filled()));
     chart
         .draw_series(LineSeries::new(
             [(0.0, -2.0), (10.0, 6.0)],
@@ -622,27 +799,26 @@ where
         .legend(move |(x, y)| {
             ErrorBar::new_vertical(x + 6, y - 5, y, y + 5, INDIGO_400.filled(), s.px(8.0))
         });
-    chart
-        .configure_series_labels()
-        .position(SeriesLabelPosition::UpperLeft)
-        .label_font(s.font(10.0))
-        .background_style(WHITE.mix(0.85))
-        .border_style(GREY_400)
-        .draw()?;
-    Ok(())
+    s.legend(&mut chart, SeriesLabelPosition::UpperLeft)?;
+
+    let spec = chart.as_coord_spec();
+    Ok(Ticks {
+        x: x_ticks(spec, X, number),
+        y: y_ticks(spec, Y, number),
+        ..Ticks::default()
+    })
 }
 
-/// A donut chart, placed on a titled drawing area, no coordinate system.
-fn pie<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+/// A donut chart, straight on the drawing area, no coordinate system.
+fn pie<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome
 where
     DB::ErrorType: 'static,
 {
-    let area = area.titled("Pie · donut · no chart", s.caption())?;
     let (width, height) = area.dim_in_pixel();
     let center = (width as i32 / 2, height as i32 / 2);
-    let radius = f64::from(width.min(height)) * 0.3;
+    let radius = f64::from(width.min(height)) * 0.32;
     let sizes = [38.0, 24.0, 17.0, 12.0, 9.0];
-    let colors = [INDIGO_400, TEAL_400, PINK_400, AMBER_700, GREY_400];
+    let colors = [INDIGO_400, TEAL_400, PINK_400, AMBER_700, GREY_500];
     let labels = ["Rust", "Lua", "C++", "Python", "Other"];
 
     let mut pie = Pie::new(&center, &radius, &sizes, &colors, &labels);
@@ -656,19 +832,19 @@ where
         "lines of code",
         center,
         s.font(11.0)
-            .color(&GREY_600)
+            .color(&s.palette.dim)
             .pos(Pos::new(HPos::Center, VPos::Center)),
     ))?;
     Ok(())
 }
 
 /// A 3D surface coloured by a colormap, plus a helix; arrow keys orbit it.
-fn surface<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale, view: View) -> Outcome
+/// Its axes live in 3D, so plotters keeps drawing them.
+fn surface<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style, view: View) -> Outcome
 where
     DB::ErrorType: 'static,
 {
     let mut chart = ChartBuilder::on(area)
-        .caption("3D surface · colormap · ← → ↑ ↓", s.caption())
         .margin(s.px(8.0))
         .build_cartesian_3d(-3.0f64..3.0, -1.2f64..1.2, -3.0f64..3.0)?;
     chart.with_projection(|mut projection| {
@@ -679,13 +855,14 @@ where
     });
     chart
         .configure_axes()
-        .light_grid_style(BLACK.mix(0.06))
-        .bold_grid_style(BLACK.mix(0.15))
+        .light_grid_style(s.palette.grid.mix(0.5))
+        .bold_grid_style(s.palette.grid)
+        .axis_panel_style(s.palette.surface)
         .max_light_lines(2)
         .x_labels(4)
         .y_labels(3)
         .z_labels(4)
-        .label_style(s.label())
+        .label_style(s.font(10.0).color(&s.palette.dim))
         .draw()?;
 
     let steps = |n: i32| (0..=n).map(move |i| -3.0 + 6.0 * i as f64 / n as f64);
@@ -708,71 +885,74 @@ where
 }
 
 /// A matrix heatmap made of rectangles, labelled along the top.
-fn heatmap<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+fn heatmap<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
     const COLUMNS: i32 = 24;
     const ROWS: i32 = 14;
-    let mut chart = ChartBuilder::on(area)
-        .caption("Heatmap · top axis · no mesh", s.caption())
-        .margin(s.px(10.0))
-        .top_x_label_area_size(s.px(22.0))
-        .y_label_area_size(s.px(34.0))
-        // plotters puts a range's start at the bottom; a descending y
-        // range puts row 0 at the top, like a matrix.
-        .build_cartesian_2d(
-            0i32..COLUMNS,
-            std::ops::Range {
-                start: ROWS,
-                end: 0,
-            },
-        )?;
-    chart
-        .configure_mesh()
-        .disable_mesh()
-        .x_labels(8)
-        .y_labels(7)
-        .x_label_formatter(&|hour| format!("{hour}h"))
-        .y_label_formatter(&|row| format!("r{row}"))
-        .label_style(s.label())
-        .draw()?;
-    let gap = s.px(1.0);
-    chart.draw_series(
-        (0..COLUMNS)
-            .flat_map(|x| (0..ROWS).map(move |y| (x, y)))
-            .map(|(x, y)| {
-                let wave = ((x as f64 / 3.8).sin() + (y as f64 / 2.6).cos()) / 2.0;
-                let value = wave * 0.5 + 0.5;
-                let mut cell = Rectangle::new(
-                    [(x, y), (x + 1, y + 1)],
-                    MandelbrotHSL.get_color(value * 0.8).filled(),
-                );
-                cell.set_margin(0, gap, 0, gap);
-                cell
-            }),
+    // plotters puts a range's start at the bottom; a descending y range
+    // puts row 0 at the top, like a matrix.
+    let chart = ChartBuilder::on(area).build_cartesian_2d(
+        0i32..COLUMNS,
+        std::ops::Range {
+            start: ROWS,
+            end: 0,
+        },
     )?;
-    Ok(())
+    let gap = s.px(1.0);
+    chart.plotting_area().draw(&Rectangle::new(
+        [(0, 0), (COLUMNS, ROWS)],
+        s.palette.surface.filled(),
+    ))?;
+    for x in 0..COLUMNS {
+        for y in 0..ROWS {
+            let wave = ((x as f64 / 3.8).sin() + (y as f64 / 2.6).cos()) / 2.0;
+            let value = wave * 0.5 + 0.5;
+            let mut cell = Rectangle::new(
+                [(x, y), (x + 1, y + 1)],
+                ViridisRGB.get_color(value).filled(),
+            );
+            cell.set_margin(0, gap, 0, gap);
+            chart.plotting_area().draw(&cell)?;
+        }
+    }
+
+    // Ticks at cell centres, as a matrix is read.
+    let spec = chart.as_coord_spec();
+    let centre = |at: (i32, i32), other: (i32, i32)| ((at.0 + other.0) / 2, (at.1 + other.1) / 2);
+    Ok(Ticks {
+        x: (0..COLUMNS)
+            .step_by(4)
+            .map(|hour| Tick {
+                at: centre(spec.translate(&(hour, 0)), spec.translate(&(hour + 1, 0))).0,
+                label: format!("{hour}h"),
+            })
+            .collect(),
+        y: (0..ROWS)
+            .step_by(3)
+            .map(|row| Tick {
+                at: centre(spec.translate(&(0, row)), spec.translate(&(0, row + 1))).1,
+                label: format!("r{row}"),
+            })
+            .collect(),
+        ..Ticks::default()
+    })
 }
 
 /// A bitmap computed by hand and handed to the backend as one image.
-fn mandelbrot<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Scale) -> Outcome
+fn mandelbrot<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, _: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
-    let mut chart = chart(area, "Bitmap element · blit_bitmap", s)
-        .build_cartesian_2d(-2.2f64..0.8, -1.25f64..1.25)?;
-    chart
-        .configure_mesh()
-        .disable_mesh()
-        .x_labels(4)
-        .label_style(s.label())
-        .draw()?;
+    const X: usize = 4;
+    const Y: usize = 5;
+    const LIMIT: u32 = 96;
+    let chart = ChartBuilder::on(area).build_cartesian_2d(-2.2f64..0.8, -1.25f64..1.25)?;
 
     let (width, height) = chart.plotting_area().dim_in_pixel();
     let (x_range, y_range) = (chart.x_range(), chart.y_range());
     let mut rgb = Vec::with_capacity((width * height * 3) as usize);
-    const LIMIT: u32 = 96;
     for py in 0..height {
         for px in 0..width {
             let cx = x_range.start + (x_range.end - x_range.start) * px as f64 / width as f64;
@@ -783,7 +963,7 @@ where
                 n += 1;
             }
             let (r, g, b) = if n == LIMIT {
-                GREY_800.rgb()
+                (0x26, 0x23, 0x2B)
             } else {
                 VulcanoHSL.get_color(n as f64 / LIMIT as f64).rgb()
             };
@@ -793,8 +973,14 @@ where
     let image =
         BitMapElement::with_owned_buffer((x_range.start, y_range.end), (width, height), rgb)
             .ok_or("bitmap size mismatch")?;
-    chart.draw_series(std::iter::once(image))?;
-    Ok(())
+    chart.plotting_area().draw(&image)?;
+
+    let spec = chart.as_coord_spec();
+    Ok(Ticks {
+        x: x_ticks(spec, X, number),
+        y: y_ticks(spec, Y, number),
+        ..Ticks::default()
+    })
 }
 
 /// A tiny deterministic generator, so every backend draws the same data.
