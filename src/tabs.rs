@@ -710,6 +710,23 @@ impl Tabs {
         changed
     }
 
+    pub fn set_widget_graph(
+        &mut self,
+        block: usize,
+        placement: usize,
+        graph: widget::GraphWidget,
+    ) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.set_widget_graph(block, placement, graph));
+        changed
+    }
+
+    pub fn resize_widget(&mut self, block: usize, placement: usize, span: usize) -> bool {
+        let mut changed = false;
+        self.edit(|doc| changed = doc.resize_widget(block, placement, span));
+        changed
+    }
+
     pub fn cycle_widget_clarity(&mut self, block: usize, placement: usize) -> bool {
         let mut changed = false;
         self.edit(|doc| changed = doc.cycle_widget_clarity(block, placement));

@@ -823,6 +823,12 @@ impl Translator {
     }
 }
 
+/// Whether a resolved function or constant with this id has a numeric
+/// meaning here — what an editor may safely turn a typed word into.
+pub fn evaluates(role: SymbolRole, id: &str) -> bool {
+    role != SymbolRole::Variable && resolved(id, role).is_ok()
+}
+
 fn resolved(id: &str, role: SymbolRole) -> Result<Piece, EvalError> {
     Ok(match role {
         SymbolRole::Variable => Piece::Operand(variable(id)?),
@@ -935,6 +941,15 @@ mod tests {
         assert!(close(curve("y=1-x^2").eval(3.0), -8.0));
         assert!(close(curve("y=-x^2\\/8").eval(4.0), -2.0));
         assert!(close(curve("y=2^{-x}").eval(1.0), 0.5));
+    }
+
+    #[test]
+    fn evaluable_symbols_are_known_by_role_and_id() {
+        assert!(evaluates(SymbolRole::Function, "sin"));
+        assert!(evaluates(SymbolRole::Constant, "pi"));
+        assert!(!evaluates(SymbolRole::Function, "f"));
+        assert!(!evaluates(SymbolRole::Constant, "vacuum_permittivity"));
+        assert!(!evaluates(SymbolRole::Variable, "x"));
     }
 
     #[test]

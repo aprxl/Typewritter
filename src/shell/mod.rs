@@ -442,6 +442,20 @@ struct TableLinesState {
     focus: Option<crate::components::table_lines::TableHit>,
 }
 
+/// The graph card belongs to one graph placement. Its editing state — the
+/// math caret, the range fields as typed — lives here rather than in the
+/// document, so a half-typed number is not a range and a refresh keeps the
+/// caret where it was.
+struct GraphCardState {
+    block: usize,
+    placement: usize,
+    anchor: (f32, f32),
+    focus: crate::components::graph_card::GraphTarget,
+    cursor: MathCursor,
+    /// `XMin, XMax, YMin, YMax`, as typed.
+    numbers: [String; 4],
+}
+
 /// A live resize carries the exact divider and the last pointer position.
 /// Applying deltas rather than recomputing from the original drag point
 /// keeps repeated frames numerically stable and makes every pixel count.
@@ -514,6 +528,11 @@ pub struct Shell {
     format_bar: Option<WordFormatState>,
     /// The direct grid-line selector opened from a Normal-mode table click.
     table_lines: Option<TableLinesState>,
+    /// The property card opened from a graph widget.
+    graph_card: Option<GraphCardState>,
+    /// Widget work the page keeps between repaints. The page's editor is
+    /// rebuilt for every change and scroll, so the cache lives here.
+    paint_cache: Rc<RefCell<crate::document::widget_paint::PaintCache>>,
     /// The table divider currently being dragged, if any.
     table_drag: Option<TableDrag>,
     /// A widget card being moved within its row.
@@ -551,6 +570,7 @@ pub struct Shell {
     format_region: usize,
     math_menu_region: usize,
     table_lines_region: usize,
+    graph_card_region: usize,
     /// Blinks the caret in the editor and the name prompt.
     caret: Stepped,
     /// The entrance-reveal clock for whichever popup is opening — a menu
@@ -837,6 +857,11 @@ impl Shell {
             Box::new(TableLinesMenu::closed()),
         ));
         let table_lines_region = regions.len() - 1;
+        regions.push(Region::detached(
+            Layout::ROOT,
+            Box::new(crate::components::GraphCard::closed()),
+        ));
+        let graph_card_region = regions.len() - 1;
 
         // The blur layer carrying popups' drop shadows. Created *here* —
         // after every regular region, before any overlay opens — because
@@ -880,6 +905,8 @@ impl Shell {
             context_menu: None,
             format_bar: None,
             table_lines: None,
+            graph_card: None,
+            paint_cache: Rc::default(),
             table_drag: None,
             widget_drag: None,
             menu_dismiss: None,
@@ -910,6 +937,7 @@ impl Shell {
             format_region,
             math_menu_region,
             table_lines_region,
+            graph_card_region,
             // Two steps: the caret should wake the renderer only when it flips.
             caret: Stepped::new(Duration::from_millis(1050), Easing::Linear, 2),
             popup_reveal: Animation::new(
@@ -1321,6 +1349,7 @@ impl Shell {
             || self.math_menu.is_some()
             || self.finder.is_some()
             || self.table_lines.is_some()
+            || self.graph_card.is_some()
     }
 
     /// The smallest the window may be before regions start overlapping.
@@ -1485,6 +1514,7 @@ impl Shell {
                     || matches!(self.menu_dismiss, Some(MenuDismiss::Math { .. })),
             ),
             (self.table_lines_region, self.table_lines.is_some()),
+            (self.graph_card_region, self.graph_card.is_some()),
         ];
         for (index, open) in overlays {
             match (open, self.regions[index].is_attached()) {
@@ -2234,6 +2264,7 @@ impl Shell {
                                 editor::Metrics::PAGE,
                             )
                             .with_math(math)
+                            .with_paint_cache(self.paint_cache.clone())
                             .with_math_selection(math_selection)
                             .with_context_selections(self.marked_targets(), self.brush_point)
                             .with_selection(selection, line_selection),

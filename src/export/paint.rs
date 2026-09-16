@@ -302,11 +302,14 @@ fn block(
         Block::WidgetRow(row) => {
             if let Some(row_layout) = layout.widget_rows.get(piece.block).and_then(Option::as_ref) {
                 let mut offset = Offset::new(canvas, (0.0, dy));
+                // A page is drawn once, so its widgets' work has nothing to be
+                // reused by.
                 widget_paint::row(
                     &mut offset,
                     row,
                     row_layout,
                     widget_paint::Interaction::default(),
+                    &mut widget_paint::PaintCache::default(),
                 );
             }
         }

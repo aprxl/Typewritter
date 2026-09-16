@@ -2801,6 +2801,76 @@ impl Document {
         changed
     }
 
+    /// The graph at `placement`, if that placement still holds one.
+    pub fn widget_graph(&self, block: usize, placement: usize) -> Option<&widget::GraphWidget> {
+        match self
+            .body
+            .get(block)?
+            .widget_row_ref()?
+            .placements
+            .get(placement)?
+        {
+            widget::WidgetPlacement {
+                widget: widget::Widget::Graph(graph),
+                ..
+            } => Some(graph),
+            _ => None,
+        }
+    }
+
+    /// Replaces the graph at `placement`: its expression, ranges and grid.
+    /// Refused when the placement no longer holds a graph.
+    pub fn set_widget_graph(
+        &mut self,
+        block: usize,
+        placement: usize,
+        graph: widget::GraphWidget,
+    ) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let changed = match self.body.get_mut(block) {
+            Some(Block::WidgetRow(row)) => match row.placements.get_mut(placement) {
+                Some(widget::WidgetPlacement {
+                    widget: widget::Widget::Graph(current),
+                    ..
+                }) if *current != graph => {
+                    *current = graph;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if changed {
+            self.dirty = true;
+        }
+        changed
+    }
+
+    /// Changes how many tracks the placement at `placement` covers, keeping
+    /// its start. See [`widget::WidgetRow::resize_at`].
+    pub fn resize_widget(&mut self, block: usize, placement: usize, span: usize) -> bool {
+        if !matches!(self.focus, Focus::Body) {
+            return false;
+        }
+        let changed = match self.body.get_mut(block) {
+            Some(Block::WidgetRow(row)) => match row.placements.get(placement) {
+                Some(found) => {
+                    let slot = found.slot;
+                    row.resize_at(slot, span)
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        if changed {
+            self.dirty = true;
+            self.enforce();
+        }
+        changed
+    }
+
     /// Cycles Clarity through unset → Review → Working → Clear → unset.
     pub fn cycle_widget_clarity(&mut self, block: usize, placement: usize) -> bool {
         if !matches!(self.focus, Focus::Body) {
@@ -5059,7 +5129,7 @@ mod tests {
     #[test]
     fn a_graph_takes_two_free_tracks_over_the_one_asked_for() {
         let mut d = doc();
-        let graph = || widget::Widget::Graph(widget::GraphWidget);
+        let graph = || widget::Widget::Graph(widget::GraphWidget::default());
         assert!(d.insert_widget(graph()));
         let row = d.body()[0].widget_row_ref().unwrap();
         assert_eq!((row.placements[0].slot, row.placements[0].span), (0, 2));
@@ -5088,6 +5158,33 @@ mod tests {
         d.set_caret(0, 1, 0);
         assert!(d.insert_widget(widget::Widget::Empty));
         assert!(!d.insert_widget(graph()));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn a_graph_is_edited_and_resized_in_place() {
+        let mut d = doc();
+        assert!(d.insert_widget(widget::Widget::Graph(widget::GraphWidget::default())));
+        let mut graph = d.widget_graph(0, 0).expect("a graph").clone();
+        graph.expression = math::MathList::new();
+        graph.grid = false;
+        assert!(d.set_widget_graph(0, 0, graph.clone()));
+        assert!(
+            !d.set_widget_graph(0, 0, graph.clone()),
+            "unchanged is not an edit"
+        );
+        assert_eq!(d.widget_graph(0, 0), Some(&graph));
+
+        assert!(d.resize_widget(0, 0, 3));
+        assert_eq!(d.body()[0].widget_row_ref().unwrap().placements[0].span, 3);
+        assert!(!d.resize_widget(0, 0, 4));
+        assert!(d.resize_widget(0, 0, 2));
+
+        d.set_caret(0, 2, 0);
+        assert!(d.insert_widget(widget::Widget::Clarity(widget::ClarityWidget::default())));
+        assert!(!d.resize_widget(0, 0, 3), "the clarity card is in the way");
+        assert!(!d.set_widget_graph(0, 1, graph), "not a graph");
+        assert_eq!(d.widget_graph(0, 1), None);
         assert_invariants(&d);
     }
 

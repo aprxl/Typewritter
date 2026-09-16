@@ -73,7 +73,13 @@ fn active_and_hovered_cards_never_paint_in_the_markdown_lane() {
                 },
             ] {
                 let mut canvas = RecordingCanvas::default();
-                row(&mut canvas, &source, &layout, state);
+                row(
+                    &mut canvas,
+                    &source,
+                    &layout,
+                    state,
+                    &mut PaintCache::default(),
+                );
                 for mark in canvas.marks {
                     // Only the two-pixel contact shadow extends below the card.
                     assert!(

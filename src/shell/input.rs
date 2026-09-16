@@ -13,6 +13,7 @@ use winit::keyboard::KeyCode;
 
 use super::commands;
 use crate::components::dialog::{self, Prompt};
+use crate::components::graph_card::{self, GraphCard, GraphCardView, GraphTarget};
 use crate::components::palette;
 use crate::components::table_lines;
 use crate::components::{
@@ -27,7 +28,7 @@ use crate::document::math_style::{self, HighlightShape, MathHue};
 use crate::document::math_symbols;
 use crate::document::{
     BadgeColor, Block, Caret, Document, FlatPos, FlatRange, Focus, Inline, ListMarker, Style,
-    TableDirection, math_conversion, math_layout, widget,
+    TableDirection, math_conversion, math_eval, math_layout, widget,
 };
 use crate::input::Input;
 use crate::layout::Rect;
@@ -43,9 +44,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    ContextGhost, ContextMenuState, InsertEvent, InsertMarker, InsertShortcuts, MathMenuState,
-    MenuDismiss, PaletteState, Shell, SlashMenuState, TableDrag, TableLinesState, WidgetDrag,
-    WordFormatState,
+    ContextGhost, ContextMenuState, GraphCardState, InsertEvent, InsertMarker, InsertShortcuts,
+    MathMenuState, MenuDismiss, PaletteState, Shell, SlashMenuState, TableDrag, TableLinesState,
+    WidgetDrag, WordFormatState,
 };
 
 /// Apply one recorded Insert-mode event. Text and editing keys are recorded
@@ -359,6 +360,12 @@ impl Shell {
         // clicks belong to its strokes and Escape/outside-click close it.
         if self.table_lines.is_some() {
             self.handle_table_lines_input(input, viewport);
+            return;
+        }
+        // The graph card owns the keyboard while it is up: its fields take
+        // the typing, and Escape or an outside click puts it away.
+        if self.graph_card.is_some() {
+            self.handle_graph_card_input(input, viewport);
             return;
         }
         // Ctrl+drag is an editor gesture, not a click-to-place or context
@@ -762,6 +769,302 @@ impl Shell {
             return;
         }
         self.refresh_table_lines();
+    }
+
+    /// `graph.card`: raise the graph card for the graph under the caret,
+    /// anchored under the caret's band like the table card.
+    pub(super) fn open_graph_card_at_caret(&mut self) {
+        let rect = self.layout.rect(self.text_column);
+        let width = Editor::content_width(rect);
+        let (caret, scroll, placement) = {
+            let docs = self.docs.borrow();
+            let Some(tab) = docs.active() else {
+                return;
+            };
+            let caret = tab.document.caret;
+            let placement = tab
+                .document
+                .body()
+                .get(caret.block)
+                .and_then(Block::widget_row_ref)
+                .and_then(|row| {
+                    row.placements.iter().position(|placement| {
+                        placement.slot <= caret.inline
+                            && caret.inline < placement.slot + placement.span
+                            && matches!(placement.widget, widget::Widget::Graph(_))
+                    })
+                });
+            (caret, docs.editor_scroll, placement)
+        };
+        let Some(placement) = placement else {
+            return;
+        };
+        let band = self.current_layout(width).caret_band(caret);
+        let anchor = (
+            Editor::content_x(rect),
+            rect.y + editor::TOP + band.0 - scroll,
+        );
+        self.open_graph_card(caret.block, placement, anchor);
+    }
+
+    fn open_graph_card(&mut self, block: usize, placement: usize, anchor: (f32, f32)) {
+        let graph = self
+            .docs
+            .borrow()
+            .active()
+            .and_then(|tab| tab.document.widget_graph(block, placement).cloned());
+        let Some(graph) = graph else {
+            return;
+        };
+        self.context_menu = None;
+        self.format_bar = None;
+        if self.table_lines.is_some() {
+            self.close_table_lines();
+        }
+        self.graph_card = Some(GraphCardState {
+            block,
+            placement,
+            anchor,
+            focus: GraphTarget::Expression,
+            cursor: math::MathCursor {
+                path: Vec::new(),
+                index: graph.expression.len(),
+            },
+            numbers: [graph.x.min(), graph.x.max(), graph.y.min(), graph.y.max()]
+                .map(|value| format!("{value}")),
+        });
+        self.refresh_graph_card();
+    }
+
+    fn refresh_graph_card(&mut self) {
+        let card = self.graph_card.as_ref().and_then(|state| {
+            let docs = self.docs.borrow();
+            let document = &docs.active()?.document;
+            let graph = document.widget_graph(state.block, state.placement)?;
+            let row = document.body().get(state.block)?.widget_row_ref()?;
+            let placement = row.placements.get(state.placement)?;
+            let large = placement.span >= 3;
+            let can_resize = row
+                .clone()
+                .resize_at(placement.slot, if large { 2 } else { 3 });
+            let status = match math_eval::Curve::parse(&graph.expression) {
+                Ok(curve) => Ok(match &curve.input {
+                    Some(input) => format!("y as a function of {input}"),
+                    None => "A constant".to_owned(),
+                }),
+                Err(error) => Err(error.to_string()),
+            };
+            let view = GraphCardView {
+                expression: graph.expression.clone(),
+                cursor: (state.focus == GraphTarget::Expression).then(|| state.cursor.clone()),
+                numbers: state.numbers.clone(),
+                invalid: graph_ranges(&state.numbers).2,
+                status,
+                grid: graph.grid,
+                large,
+                can_resize,
+            };
+            Some(GraphCard::new(view, state.anchor, state.focus))
+        });
+        // A graph that is gone — deleted, undone — takes its card with it.
+        if card.is_none() {
+            self.graph_card = None;
+        }
+        self.regions[self.graph_card_region]
+            .set_component(Box::new(card.unwrap_or_else(GraphCard::closed)));
+    }
+
+    fn close_graph_card(&mut self) {
+        self.graph_card = None;
+        self.refresh_graph_card();
+    }
+
+    /// Applies `change` to the card's graph and writes it back as one edit.
+    fn edit_graph(&mut self, change: impl FnOnce(&mut widget::GraphWidget, &mut GraphCardState)) {
+        let Some(state) = self.graph_card.as_mut() else {
+            return;
+        };
+        let (block, placement) = (state.block, state.placement);
+        let graph = self
+            .docs
+            .borrow()
+            .active()
+            .and_then(|tab| tab.document.widget_graph(block, placement).cloned());
+        if let Some(mut graph) = graph {
+            change(&mut graph, state);
+            self.docs
+                .borrow_mut()
+                .set_widget_graph(block, placement, graph);
+        }
+        self.refresh_graph_card();
+    }
+
+    fn handle_graph_card_input(&mut self, input: &Input, viewport: Rect) {
+        let Some(focus) = self.graph_card.as_ref().map(|state| state.focus) else {
+            return;
+        };
+        if input.is_key_pressed(KeyCode::Escape) {
+            self.close_graph_card();
+            return;
+        }
+        if input.is_key_typed(KeyCode::Tab) {
+            if let Some(state) = self.graph_card.as_mut() {
+                state.focus = graph_card::step_focus(focus, !input.shift());
+            }
+            self.refresh_graph_card();
+            return;
+        }
+        if input.is_key_typed(KeyCode::Enter) && focus.takes_text() {
+            self.close_graph_card();
+            return;
+        }
+        match focus {
+            GraphTarget::Expression => self.graph_expression_keys(input),
+            _ if focus.number().is_some() => {
+                let index = focus.number().expect("a range field");
+                self.graph_number_keys(input, index);
+            }
+            _ => {
+                if input.is_key_typed(KeyCode::Enter) || input.is_key_typed(KeyCode::Space) {
+                    self.activate_graph_card(focus);
+                }
+            }
+        }
+
+        if !input.is_mouse_pressed(MouseButton::Left) || !input.is_cursor_in_window() {
+            return;
+        }
+        let point = input.mouse_position();
+        let Some(anchor) = self.graph_card.as_ref().map(|state| state.anchor) else {
+            return;
+        };
+        let card = graph_card::card_anchored(viewport, anchor);
+        match graph_card::hit_at(card, point) {
+            Some(target) => {
+                if let Some(state) = self.graph_card.as_mut() {
+                    state.focus = target;
+                }
+                if target.takes_text() {
+                    self.refresh_graph_card();
+                } else {
+                    self.activate_graph_card(target);
+                }
+            }
+            None if !card.contains(point) => self.close_graph_card(),
+            None => {}
+        }
+    }
+
+    /// Structural math input into the graph's expression — the keys a note
+    /// expression takes, minus the ones that leave it.
+    fn graph_expression_keys(&mut self, input: &Input) {
+        for c in input.text().chars().filter(|c| !c.is_control()) {
+            self.edit_graph(|graph, state| {
+                let list = &mut graph.expression;
+                let cursor = &mut state.cursor;
+                math::clamp(list, cursor);
+                match c {
+                    c if math::PAIRS
+                        .iter()
+                        .any(|&(open, close)| open == c || close == c) =>
+                    {
+                        // `sin(` names the function before opening its
+                        // argument, as `sin ` does.
+                        resolve_graph_word(list, cursor);
+                        if !math::close_group(list, cursor, c)
+                            && !math::insert_group(list, cursor, c)
+                        {
+                            math::insert_char(list, cursor, c);
+                        }
+                    }
+                    ' ' => {
+                        if !math::insert_word(list, cursor) {
+                            resolve_graph_word(list, cursor);
+                        }
+                    }
+                    '/' => math::insert_fraction(list, cursor),
+                    '^' => math::insert_script(list, cursor, Slot::Sup),
+                    '_' => math::insert_script(list, cursor, Slot::Sub),
+                    c => math::insert_char(list, cursor, c),
+                }
+            });
+        }
+        let key = |code| input.is_key_typed(code);
+        if key(KeyCode::Backspace) {
+            self.edit_graph(|graph, state| {
+                math::clamp(&graph.expression, &mut state.cursor);
+                let _ = math::backspace(&mut graph.expression, &mut state.cursor);
+            });
+        }
+        if key(KeyCode::Delete) {
+            self.edit_graph(|graph, state| {
+                math::clamp(&graph.expression, &mut state.cursor);
+                let _ = math::delete_forward(&mut graph.expression, &mut state.cursor);
+            });
+        }
+        if key(KeyCode::ArrowLeft) || key(KeyCode::ArrowRight) {
+            let right = key(KeyCode::ArrowRight);
+            self.edit_graph(|graph, state| {
+                math::clamp(&graph.expression, &mut state.cursor);
+                if right {
+                    math::move_right(&graph.expression, &mut state.cursor);
+                } else {
+                    math::move_left(&graph.expression, &mut state.cursor);
+                }
+            });
+        }
+    }
+
+    /// Plain number entry into range field `index`; a pair that reads as a
+    /// range is written to the graph at once.
+    fn graph_number_keys(&mut self, input: &Input, index: usize) {
+        let typed: String = input
+            .text()
+            .chars()
+            .filter_map(|c| match c {
+                '−' => Some('-'),
+                c if c.is_ascii_digit() || matches!(c, '-' | '.' | 'e' | 'E') => Some(c),
+                _ => None,
+            })
+            .collect();
+        let erase = input.is_key_typed(KeyCode::Backspace);
+        if typed.is_empty() && !erase {
+            return;
+        }
+        self.edit_graph(|graph, state| {
+            let field = &mut state.numbers[index];
+            if erase {
+                field.pop();
+            }
+            field.push_str(&typed);
+            let (x, y, _) = graph_ranges(&state.numbers);
+            if let Some(x) = x {
+                graph.x = x;
+            }
+            if let Some(y) = y {
+                graph.y = y;
+            }
+        });
+    }
+
+    /// Work a card control that is not a text field. The click path and the
+    /// keyboard path both land here.
+    fn activate_graph_card(&mut self, target: GraphTarget) {
+        match target {
+            GraphTarget::Grid => self.edit_graph(|graph, _| graph.grid = !graph.grid),
+            GraphTarget::Small | GraphTarget::Large => {
+                if let Some((block, placement)) = self
+                    .graph_card
+                    .as_ref()
+                    .map(|state| (state.block, state.placement))
+                {
+                    let span = if target == GraphTarget::Large { 3 } else { 2 };
+                    self.docs.borrow_mut().resize_widget(block, placement, span);
+                }
+                self.refresh_graph_card();
+            }
+            _ => self.refresh_graph_card(),
+        }
     }
 
     /// Update a live table divider drag. The delta uses the last point, not
@@ -1192,6 +1495,12 @@ impl Shell {
                 .and_then(Block::widget_row_ref)
                 .and_then(|row| row.placements.get(placement))
                 .is_some_and(|placement| matches!(placement.widget, widget::Widget::Clarity(_)));
+            let graph = layout
+                .source
+                .get(block)
+                .and_then(Block::widget_row_ref)
+                .and_then(|row| row.placements.get(placement))
+                .is_some_and(|placement| matches!(placement.widget, widget::Widget::Graph(_)));
             self.goal_x = None;
             set_body_coordinate_caret(
                 &mut self.docs.borrow_mut(),
@@ -1206,6 +1515,9 @@ impl Shell {
                 self.docs
                     .borrow_mut()
                     .cycle_widget_clarity(block, placement);
+            }
+            if graph {
+                self.open_graph_card(block, placement, mouse);
             }
             return true;
         }
@@ -5502,6 +5814,68 @@ fn finder_input(state: &mut super::FinderState, input: &Input) -> bool {
         changed = true;
     }
     changed
+}
+
+/// The two ranges the card's fields describe, and which fields are wrong:
+/// a field that is not a number, or a pair whose minimum is not below its
+/// maximum.
+fn graph_ranges(
+    numbers: &[String; 4],
+) -> (
+    Option<widget::GraphRange>,
+    Option<widget::GraphRange>,
+    [bool; 4],
+) {
+    let parse = |text: &str| text.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+    let mut invalid = [false; 4];
+    let mut pair = |at: usize| {
+        let (min, max) = (parse(&numbers[at]), parse(&numbers[at + 1]));
+        invalid[at] = min.is_none();
+        invalid[at + 1] = max.is_none();
+        let range = widget::GraphRange::new(min?, max?);
+        if range.is_none() {
+            invalid[at] = true;
+            invalid[at + 1] = true;
+        }
+        range
+    };
+    let x = pair(0);
+    let y = pair(2);
+    (x, y, invalid)
+}
+
+/// Turns the letters before the cursor into the function or constant they
+/// name, when the graph can evaluate it: `sin` → sine, `pi` → π. Leading
+/// digits stay put, so `2sin` is two times the sine.
+fn resolve_graph_word(list: &mut math::MathList, cursor: &mut math::MathCursor) -> bool {
+    let Some(mut query) = math_conversion::query_before(list, cursor) else {
+        return false;
+    };
+    let letters = query
+        .source
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_alphabetic)
+        .count();
+    if letters == 0 {
+        return false;
+    }
+    query.start = query.end - letters;
+    query.source = query.source[query.source.len() - letters..].to_owned();
+    let offers = math_conversion::offers(&query);
+    let Some(offer) = offers.offers.iter().find(|offer| {
+        matches!(
+            offer,
+            math_conversion::Offer::Rewrite { replacement, .. }
+                if matches!(
+                    replacement.as_slice(),
+                    [MathNode::Resolved { id, role, .. }] if math_eval::evaluates(*role, id)
+                )
+        )
+    }) else {
+        return false;
+    };
+    math_conversion::accept(list, cursor, &query, offer)
 }
 
 #[cfg(test)]

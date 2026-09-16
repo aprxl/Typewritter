@@ -13,6 +13,21 @@ use crate::layout::Rect;
 use crate::renderer::Rounding;
 use crate::theme::{self, TextStyle};
 
+/// Work widget painters keep between repaints. Whoever paints the same rows
+/// again and again owns one — the shell, for the page — so a repaint that
+/// changed nothing about a widget redoes none of that widget's work.
+#[derive(Default)]
+pub struct PaintCache {
+    graphs: graph::GraphCache,
+}
+
+impl PaintCache {
+    /// How many graphs have been drawn from scratch through this cache.
+    pub fn graph_builds(&self) -> u64 {
+        self.graphs.builds()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Interaction {
     pub active_slot: Option<usize>,
@@ -42,6 +57,7 @@ pub fn row(
     source: &WidgetRow,
     layout: &WidgetRowLayout,
     state: Interaction,
+    cache: &mut PaintCache,
 ) {
     let scale = layout.scale;
     let radius = WIDGET_RADIUS * scale;
@@ -151,11 +167,13 @@ pub fn row(
                 scale,
                 if hot { state.hover_amount } else { 0.0 },
             ),
-            Widget::Graph(_) => graph::draw(
+            Widget::Graph(graph) => graph::draw(
                 canvas,
+                graph,
                 card,
                 scale,
                 if hot { state.hover_amount } else { 0.0 },
+                &mut cache.graphs,
             ),
         }
         if active || hot || dragging.is_some() {

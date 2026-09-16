@@ -492,7 +492,7 @@ pub const COMMANDS: &[Command] = &[
             shell
                 .docs
                 .borrow_mut()
-                .insert_widget(widget::Widget::Graph(widget::GraphWidget));
+                .insert_widget(widget::Widget::Graph(widget::GraphWidget::default()));
         },
     },
     Command {
@@ -504,8 +504,17 @@ pub const COMMANDS: &[Command] = &[
             shell
                 .docs
                 .borrow_mut()
-                .insert_widget_spanning(widget::Widget::Graph(widget::GraphWidget), 3);
+                .insert_widget_spanning(widget::Widget::Graph(widget::GraphWidget::default()), 3);
         },
+    },
+    // The graph card from the keyboard: the same card a click on the graph
+    // raises, for the graph under the caret.
+    Command {
+        id: "graph.card",
+        title: "Graph card…",
+        group: "Format",
+        chord: None,
+        run: |shell| shell.open_graph_card_at_caret(),
     },
     // The table's structure, reachable without a mouse. `Ctrl+J`/`Ctrl+K`
     // add a row below/above (vim's down/up), `Ctrl+H`/`Ctrl+L` add a column

@@ -12,21 +12,24 @@ use std::ops::RangeInclusive;
 use chrono::{Datelike, Local, NaiveDate};
 use serde_json::{Map, Value};
 
+use super::math::MathList;
+use super::math_notation;
+
 pub const TRACKS: usize = 4;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct WidgetRow {
     pub placements: Vec<WidgetPlacement>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct WidgetPlacement {
     pub slot: usize,
     pub span: usize,
     pub widget: Widget,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum Widget {
     Empty,
     Calendar(CalendarWidget),
@@ -56,11 +59,64 @@ pub struct ClarityWidget {
     pub value: Option<ClarityLevel>,
 }
 
-/// A plot of one curve. Its size is its placement's span: two tracks for
-/// the small graph, three for the large one. The curve is a fixed showcase
-/// until graphs carry their own expressions.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct GraphWidget;
+/// A plot of one curve, `y = expression`. Its size is its placement's span:
+/// two tracks for the small graph, three for the large one.
+#[derive(Clone, PartialEq, Debug)]
+pub struct GraphWidget {
+    /// The right-hand side of `y = …`, as a math tree.
+    pub expression: MathList,
+    pub x: GraphRange,
+    pub y: GraphRange,
+    pub grid: bool,
+}
+
+/// A plotted interval. Only [`GraphRange::new`] builds one, so both ends are
+/// finite and `min < max`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GraphRange {
+    min: f64,
+    max: f64,
+}
+
+impl GraphRange {
+    pub fn new(min: f64, max: f64) -> Option<Self> {
+        (min.is_finite() && max.is_finite() && min < max).then_some(Self { min, max })
+    }
+
+    pub fn min(self) -> f64 {
+        self.min
+    }
+
+    pub fn max(self) -> f64 {
+        self.max
+    }
+}
+
+impl GraphWidget {
+    /// The curve a new graph shows: y = 3 sin(2x) e^(−x²/8), its exponent's
+    /// slash kept inline (`\/`) so the heading stays one line tall.
+    const SHOWCASE: &str =
+        "3sym{function|sin|plain}{sin}(2x)sym{constant|euler_number|plain}{e}^{-x^2\\/8}";
+    pub const DEFAULT_X: GraphRange = GraphRange {
+        min: -5.0,
+        max: 5.0,
+    };
+    pub const DEFAULT_Y: GraphRange = GraphRange {
+        min: -3.0,
+        max: 3.0,
+    };
+}
+
+impl Default for GraphWidget {
+    fn default() -> Self {
+        Self {
+            expression: math_notation::parse(Self::SHOWCASE),
+            x: Self::DEFAULT_X,
+            y: Self::DEFAULT_Y,
+            grid: true,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ClarityLevel {
@@ -107,6 +163,38 @@ impl WidgetRow {
             placement.slot <= slot && slot < placement.slot + placement.span
         })?;
         Some(self.placements.remove(index))
+    }
+
+    /// Changes the span of the placement covering `slot`, keeping its start.
+    /// Refused when the widget does not allow the span, it would leave the
+    /// row, or it would cover another placement.
+    pub fn resize_at(&mut self, slot: usize, span: usize) -> bool {
+        let Some(index) = self
+            .placements
+            .iter()
+            .position(|placement| placement.slot <= slot && slot < placement.slot + placement.span)
+        else {
+            return false;
+        };
+        let placement = &self.placements[index];
+        let start = placement.slot;
+        if span == placement.span
+            || !placement.widget.spans().contains(&span)
+            || start + span > TRACKS
+            || self
+                .placements
+                .iter()
+                .enumerate()
+                .any(|(other, placement)| {
+                    other != index
+                        && placement.slot < start + span
+                        && start < placement.slot + placement.span
+                })
+        {
+            return false;
+        }
+        self.placements[index].span = span;
+        true
     }
 
     /// Moves the placement covering `from` to a free horizontal track. A
@@ -315,6 +403,17 @@ fn parse_selected(value: Option<&Value>, days: u32) -> Option<Vec<u8>> {
     Some(selected)
 }
 
+/// `[min, max]`, or `default` when the key is absent.
+fn parse_range(value: Option<&Value>, default: GraphRange) -> Option<GraphRange> {
+    let Some(value) = value else {
+        return Some(default);
+    };
+    match value.as_array()?.as_slice() {
+        [min, max] => GraphRange::new(min.as_f64()?, max.as_f64()?),
+        _ => None,
+    }
+}
+
 fn parse_placement(value: &Value) -> Option<WidgetPlacement> {
     let object = value.as_object()?;
     let slot: usize = object.get("slot")?.as_u64()?.try_into().ok()?;
@@ -351,7 +450,26 @@ fn parse_placement(value: &Value) -> Option<WidgetPlacement> {
                 value: ClarityLevel::parse(object.get("value"))?,
             })
         }
-        "graph" if only_keys(object, &["slot", "span", "type"]) => Widget::Graph(GraphWidget),
+        "graph"
+            if only_keys(
+                object,
+                &["slot", "span", "type", "expression", "x", "y", "grid"],
+            ) =>
+        {
+            let defaults = GraphWidget::default();
+            Widget::Graph(GraphWidget {
+                expression: match object.get("expression") {
+                    None => defaults.expression,
+                    Some(value) => math_notation::parse(value.as_str()?),
+                },
+                x: parse_range(object.get("x"), defaults.x)?,
+                y: parse_range(object.get("y"), defaults.y)?,
+                grid: match object.get("grid") {
+                    None => defaults.grid,
+                    Some(value) => value.as_bool()?,
+                },
+            })
+        }
         _ => return None,
     };
     // A graph written without a span is still its smallest size.
@@ -428,8 +546,24 @@ fn placement_json(placement: &WidgetPlacement) -> String {
                 fields.push(format!("\"value\":\"{}\"", value.as_str()));
             }
         }
-        Widget::Graph(_) => {
+        Widget::Graph(graph) => {
             fields.push("\"type\":\"graph\"".into());
+            let defaults = GraphWidget::default();
+            if graph.expression != defaults.expression {
+                let notation = math_notation::print(&graph.expression);
+                fields.push(format!(
+                    "\"expression\":{}",
+                    serde_json::to_string(&notation).expect("a string serializes")
+                ));
+            }
+            for (key, range, default) in [("x", graph.x, defaults.x), ("y", graph.y, defaults.y)] {
+                if range != default {
+                    fields.push(format!("\"{key}\":[{},{}]", range.min, range.max));
+                }
+            }
+            if graph.grid != defaults.grid {
+                fields.push(format!("\"grid\":{}", graph.grid));
+            }
         }
     }
     format!("{{{}}}", fields.join(","))
@@ -498,7 +632,10 @@ mod tests {
     fn graphs_are_two_or_three_tracks_wide() {
         let small = parse_payload(r#"[{"slot":1,"type":"graph"}]"#).expect("small graph");
         assert_eq!(small.placements[0].span, 2);
-        assert_eq!(small.placements[0].widget, Widget::Graph(GraphWidget));
+        assert_eq!(
+            small.placements[0].widget,
+            Widget::Graph(GraphWidget::default())
+        );
         assert_eq!(serialize_payload(&small), r#"[{"slot":1,"type":"graph"}]"#);
 
         let large = parse_payload(r#"[{"slot":2,"span":3,"type":"graph"}]"#).expect("large graph");
@@ -514,17 +651,66 @@ mod tests {
             r#"[{"slot":3,"span":3,"type":"graph"}]"#,
             r#"[{"slot":4,"type":"graph"}]"#,
             r#"[{"slot":1,"span":3,"type":"calendar","date":"2026-09"}]"#,
-            r#"[{"slot":1,"type":"graph","expression":"y=x"}]"#,
+            r#"[{"slot":1,"type":"graph","colour":"red"}]"#,
+            r#"[{"slot":1,"type":"graph","x":[5,-5]}]"#,
+            r#"[{"slot":1,"type":"graph","x":[0]}]"#,
+            r#"[{"slot":1,"type":"graph","grid":"no"}]"#,
+            r#"[{"slot":1,"type":"graph","expression":3}]"#,
         ] {
             assert!(parse_payload(rejected).is_none(), "{rejected}");
         }
 
-        let mut row = WidgetRow::new(Widget::Graph(GraphWidget));
+        let edited = WidgetRow {
+            placements: vec![WidgetPlacement {
+                slot: 0,
+                span: 3,
+                widget: Widget::Graph(GraphWidget {
+                    expression: math_notation::parse("x^2/2"),
+                    x: GraphRange::new(-1.5, 2.0).unwrap(),
+                    y: GraphWidget::DEFAULT_Y,
+                    grid: false,
+                }),
+            }],
+        };
+        let payload = serialize_payload(&edited);
+        assert_eq!(
+            payload,
+            r#"[{"slot":1,"span":3,"type":"graph","expression":"{x^2}/2","x":[-1.5,2],"grid":false}]"#
+        );
+        assert_eq!(parse_payload(&payload), Some(edited));
+
+        let mut row = WidgetRow::new(Widget::Graph(GraphWidget::default()));
         assert_eq!(row.placements[0].span, 2);
-        assert!(!row.set(0, 1, Widget::Graph(GraphWidget)));
-        assert!(!row.set(2, 3, Widget::Graph(GraphWidget)));
-        assert!(row.set(1, 3, Widget::Graph(GraphWidget)));
+        assert!(!row.set(0, 1, Widget::Graph(GraphWidget::default())));
+        assert!(!row.set(2, 3, Widget::Graph(GraphWidget::default())));
+        assert!(row.set(1, 3, Widget::Graph(GraphWidget::default())));
         assert!(!row.set(0, 3, Widget::Empty));
+    }
+
+    #[test]
+    fn resizing_keeps_the_start_and_refuses_overlaps() {
+        let mut row = WidgetRow {
+            placements: vec![
+                WidgetPlacement {
+                    slot: 0,
+                    span: 2,
+                    widget: Widget::Graph(GraphWidget::default()),
+                },
+                WidgetPlacement {
+                    slot: 2,
+                    span: 1,
+                    widget: Widget::Empty,
+                },
+            ],
+        };
+        assert!(!row.resize_at(1, 3), "track 2 is taken");
+        row.remove_at(2);
+        assert!(row.resize_at(1, 3));
+        assert_eq!((row.placements[0].slot, row.placements[0].span), (0, 3));
+        assert!(!row.resize_at(0, 3), "already that size");
+        assert!(!row.resize_at(0, 1), "a graph is never one track");
+        assert!(row.resize_at(2, 2));
+        assert!(!row.resize_at(3, 2), "no placement covers track 3");
     }
 
     #[test]

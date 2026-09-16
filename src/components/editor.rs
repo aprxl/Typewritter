@@ -2,6 +2,7 @@
 //! visible. The shell lays out the open document and hands it over as an
 //! [`Rc`]; this component only reads it.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -190,6 +191,9 @@ pub struct Editor {
     /// with this component (see [`Component::draw`]), so it can never hold
     /// a halo for a bar that is no longer there.
     glow: Option<Layer>,
+    /// Widget work kept between repaints. The shell hands the page the same
+    /// cache every time it rebuilds this editor; see [`Self::with_paint_cache`].
+    paint_cache: Rc<RefCell<widget_paint::PaintCache>>,
     /// Math cursor, when the caret is inside an atom. Its bar replaces the
     /// document caret — two blinking bars would be two claims about where
     /// typing goes.
@@ -713,6 +717,7 @@ impl Editor {
             widget_drag: None,
             caret_on: true,
             glow: None,
+            paint_cache: Rc::default(),
             empty: super::empty_state::EmptyState::default(),
             dirty: Dirty::new(),
         }
@@ -745,6 +750,14 @@ impl Editor {
     /// the layer across the component swaps that `rebuild_views` does.
     pub fn with_glow(mut self, glow: Layer) -> Self {
         self.glow = Some(glow);
+        self
+    }
+
+    /// Paint widgets through `cache`. The editor is rebuilt for every
+    /// document change, scroll and caret move, so work worth keeping across
+    /// repaints has to live with whoever rebuilds it.
+    pub fn with_paint_cache(mut self, cache: Rc<RefCell<widget_paint::PaintCache>>) -> Self {
+        self.paint_cache = cache;
         self
     }
 
@@ -783,6 +796,7 @@ impl Editor {
             widget_drag: None,
             caret_on: true,
             glow: None,
+            paint_cache: Rc::default(),
             empty: super::empty_state::EmptyState::default(),
             dirty: Dirty::new(),
         }
@@ -1066,11 +1080,19 @@ impl Component for Editor {
 
         // Widget cards are shared with PDF painting. Their source row is a
         // structural block, while the following prose remains in the normal
-        // text pass and uses the free lane the layout assigned it.
+        // text pass and uses the free lane the layout assigned it. Rows
+        // outside the viewport are not painted at all, however many a note
+        // holds.
+        let mut paint_cache = self.paint_cache.borrow_mut();
         for (bi, row_layout) in self.layout.widget_rows.iter().enumerate() {
             let Some(row_layout) = row_layout else {
                 continue;
             };
+            let top =
+                content + row_layout.tracks.first().map_or(0.0, |track| track.y) - self.scroll;
+            if !band_visible(top, row_layout.height, rect) {
+                continue;
+            }
             let Some(Block::WidgetRow(row)) = self.layout.source.get(bi) else {
                 continue;
             };
@@ -1095,8 +1117,10 @@ impl Component for Editor {
                         .filter(|(block, _)| *block == bi)
                         .map(|(_, drag)| drag),
                 },
+                &mut paint_cache,
             );
         }
+        drop(paint_cache);
 
         self.draw_selection(layer, rect, x, content);
         let (spans, blocks) = self.selection_bars();
@@ -1724,6 +1748,12 @@ impl Editor {
     }
 }
 
+/// Whether a band `height` tall starting at screen `top` shows in `view`.
+/// What the page paints is only what this admits.
+pub fn band_visible(top: f32, height: f32, view: Rect) -> bool {
+    top <= view.bottom() && top + height >= view.y
+}
+
 /// The scroll offset that brings the y-band `[band_top, band_bottom)` inside
 /// `[view_top, view_bottom)` without moving further than it must — a band
 /// already in view leaves the scroll untouched. Pure, so the "stuck at the
@@ -1784,6 +1814,16 @@ fn only_blanks_between(source: &[Block], previous: FlatRange, next: FlatRange) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_bands_touching_the_view_are_visible() {
+        let view = Rect::new(0.0, 100.0, 700.0, 500.0);
+        assert!(band_visible(150.0, 240.0, view));
+        assert!(band_visible(-100.0, 240.0, view), "cut by the top edge");
+        assert!(band_visible(590.0, 240.0, view), "cut by the bottom edge");
+        assert!(!band_visible(-200.0, 240.0, view), "scrolled past");
+        assert!(!band_visible(700.0, 240.0, view), "not reached yet");
+    }
 
     #[test]
     fn page_origin_centers_the_capped_measure_without_changing_narrow_insets() {
