@@ -3,6 +3,13 @@ name = "typewritter"
 version = "0.1.0"
 edition = "2024"
 
+# Vendored plotters (crates/plotters) is a `git subtree` of
+# plotters-rs/plotters, edited in place. Its upstream root Cargo.toml is
+# removed so it doesn't form a nested workspace; pull upstream with
+# `git subtree pull --prefix=crates/plotters plotters-upstream master --squash`.
+[workspace]
+members = [".", "crates/plotters/plotters", "crates/plotters/plotters-backend"]
+
 [dependencies]
 # Vendored Atomos platform (src/renderer, src/input.rs, src/frame.rs,
 # src/animation.rs) — see docs/atomos/. Versions track Atomos; wgpu is
@@ -19,6 +26,7 @@ fuzzy-matcher = "0.3.7"
 image = { version = "0.25", default-features = false, features = ["png"] }
 lyon = "1.0.19"
 lyon_extra = "1.1"
+plotters = { path = "crates/plotters/plotters", default-features = false, features = ["line_series"] }
 pollster = "0.4"
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "pollster"] }
 serde = { version = "1.0.229", features = ["derive"] }
