@@ -347,9 +347,11 @@ In `components/editor.rs`:
   read of one expression for plotting (`document::math_eval`, through
   exmex): it never changes the tree, stores nothing, and binds no symbol
   across a note. Plain letters are free variables; only symbols resolved
-  as functions or constants carry a meaning. Notation without a numeric
-  reading yet (big operators, accents, undefined functions) is reported,
-  never guessed.
+  as functions or constants carry a meaning. Leibniz fractions
+  differentiate (symbolically through exmex, numerically around an
+  integral) and `∫ … dx` integrates numerically; notation without a
+  numeric reading yet (sums, products, limits, accents, undefined
+  functions) is reported, never guessed.
 - No LaTeX import/export (SPEC §13.2).
 - No repair workflow for raw nodes (§6.3).
 - No matrix/cases/decorations until the slot machinery is proven — they
