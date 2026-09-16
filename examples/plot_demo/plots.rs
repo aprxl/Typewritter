@@ -130,7 +130,7 @@ impl Plot {
             Plot::TypedMath => Frame {
                 x_desc: Some("x"),
                 y_desc: Some("y"),
-                ..Frame::ticked("Typed math · exmex")
+                ..Frame::ticked("Typed math · derivatives · integrals")
             },
             Plot::Waves => Frame {
                 x_desc: Some("t"),
@@ -326,22 +326,24 @@ fn segment<T: ToString>(value: &SegmentValue<T>) -> String {
 }
 
 /// Curves typed in Typewritter's math notation, read by `math_eval` and
-/// sampled here. The last entry has no numeric reading, and says so.
+/// sampled here: one function, its derivatives (symbolic, through exmex)
+/// and its integral (numeric), a pole, and one line with no numeric
+/// reading yet, which says so.
 fn typed_math<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
 where
     DB::ErrorType: 'static,
 {
-    const SIN: &str = "sym{function|sin|plain}{sin}";
-    const PI: &str = "sym{constant|pi|plain}{π}";
     const RANGE: f64 = 4.0;
     const SAMPLES: usize = 800;
+    const F: &str = "(x^3/4-x)";
     // (notation, legend label, colour)
     let curves = [
-        ("y=x^3/4-x".to_owned(), "y = x³/4 − x", INDIGO_400),
-        (format!("y=2{SIN}({PI}x/2)"), "y = 2 sin(πx/2)", TEAL_600),
-        ("y=1/x".to_owned(), "y = 1/x", DEEPORANGE_400),
-        ("y=sqrt{x+3}-1".to_owned(), "y = √(x+3) − 1", PINK_400),
-        ("y=int{0}{x}t".to_owned(), "y = ∫₀ˣ t", GREY_500),
+        (format!("y={F}"), "f(x) = x³/4 − x", INDIGO_400),
+        (format!("y=d/{{dx}}{F}"), "d/dx f", TEAL_600),
+        (format!("y={{d^2}}/{{dx^2}}{F}"), "d²/dx² f", AMBER_700),
+        ("y=int{0}{x}(t^3/4-t)dt".to_owned(), "∫₀ˣ f(t) dt", PINK_400),
+        ("y=1/x".to_owned(), "1/x", DEEPORANGE_400),
+        ("y=sum{n=1}{5}x^n".to_owned(), "Σ xⁿ", GREY_500),
     ];
 
     let mut chart = ChartBuilder::on(area).build_cartesian_2d(-RANGE..RANGE, -RANGE..RANGE)?;
