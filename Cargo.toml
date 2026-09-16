@@ -49,6 +49,9 @@ tree-sitter-java = "0.23.5"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-go = "0.25.0"
 serde_json = "1.0.151"
+# Evaluates math trees for plotting (src/document/math_eval.rs). `partial`
+# is exmex's symbolic differentiation, which derivative plots build on.
+exmex = { version = "0.21", features = ["partial"] }
 
 # The plot demo (`examples/plot_demo`) exercises most of plotters. Features
 # requested here reach only examples and tests, so the app itself keeps the

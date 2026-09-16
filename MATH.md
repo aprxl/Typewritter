@@ -2,7 +2,7 @@
 
 Structural math editing, in the spirit of corca.app: an AST-driven input
 system where every structure is a node with typed-into slots, autocompletion
-is the default typing experience, and nothing is ever evaluated. This
+is the default typing experience, and editing never evaluates. This
 document records the design decisions and the build plan; SPEC.md §6, §9,
 §11 and §14 are the requirements it answers to.
 
@@ -343,7 +343,13 @@ In `components/editor.rs`:
 
 ## 8. What is deliberately not built
 
-- No evaluation, units, symbol bindings, plots (SPEC §6.4).
+- No units or symbol bindings (SPEC §6.4). Evaluation exists only as a
+  read of one expression for plotting (`document::math_eval`, through
+  exmex): it never changes the tree, stores nothing, and binds no symbol
+  across a note. Plain letters are free variables; only symbols resolved
+  as functions or constants carry a meaning. Notation without a numeric
+  reading yet (big operators, accents, undefined functions) is reported,
+  never guessed.
 - No LaTeX import/export (SPEC §13.2).
 - No repair workflow for raw nodes (§6.3).
 - No matrix/cases/decorations until the slot machinery is proven — they

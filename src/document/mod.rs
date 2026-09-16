@@ -13,6 +13,7 @@ pub mod layout;
 pub mod markdown;
 pub mod math;
 pub mod math_conversion;
+pub mod math_eval;
 pub mod math_layout;
 pub mod math_notation;
 pub mod math_paint;
