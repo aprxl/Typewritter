@@ -1,0 +1,7 @@
+/target
+.*.sw*
+**/target
+.vscode/*
+Cargo.lock
+.idea
+plotters/*.svg
