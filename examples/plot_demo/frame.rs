@@ -133,34 +133,22 @@ pub fn draw(layer: &Layer, cell: Rect, inside: Rect, frame: &Frame, ticks: &Tick
             label,
         );
     }
-    for tick in visible(&ticks.y, inside.height, scale) {
-        let y = inside.y + tick.at as f32 / scale;
-        if on_straight_edge(y - inside.y, inside.height) {
-            mark(layer, (inside.x - MARK, y - 0.5), (MARK, 1.0));
-        }
-        text(
-            layer,
-            &tick.label,
-            (inside.x - MARK - MARK_GAP, y),
-            HorizontalAlign::Right,
-            VerticalAlign::Center,
-            label,
-        );
-    }
-    for tick in visible(&ticks.y2, inside.height, scale) {
-        let y = inside.y + tick.at as f32 / scale;
-        if on_straight_edge(y - inside.y, inside.height) {
-            mark(layer, (inside.right(), y - 0.5), (MARK, 1.0));
-        }
-        text(
-            layer,
-            &tick.label,
-            (inside.right() + MARK + MARK_GAP, y),
-            HorizontalAlign::Left,
-            VerticalAlign::Center,
-            label,
-        );
-    }
+    side(
+        layer,
+        &ticks.y,
+        inside,
+        (inside.x - MARK, inside.x - MARK - MARK_GAP),
+        HorizontalAlign::Right,
+        label,
+    );
+    side(
+        layer,
+        &ticks.y2,
+        inside,
+        (inside.right(), inside.right() + MARK + MARK_GAP),
+        HorizontalAlign::Left,
+        label,
+    );
 
     // Axis names are horizontal, just outside the container at the far end
     // of their axis, lined up with its edges.
@@ -198,6 +186,40 @@ pub fn draw(layer: &Layer, cell: Rect, inside: Rect, frame: &Frame, ticks: &Tick
             HorizontalAlign::Right,
             VerticalAlign::Top,
             label,
+        );
+    }
+}
+
+/// Marks and labels down one vertical edge; `at` is the mark's left and
+/// the labels' anchor. A label closer to the last one drawn than a line
+/// of text is left out, as along the x axis.
+fn side(
+    layer: &Layer,
+    ticks: &[Tick],
+    inside: Rect,
+    (mark_x, label_x): (f32, f32),
+    align: HorizontalAlign,
+    parameters: FontParameters,
+) {
+    let scale = layer.scale_factor();
+    let (_, line) = layer.get_text_size("0", &theme::sans(), &parameters);
+    let mut last: Option<f32> = None;
+    for tick in visible(ticks, inside.height, scale) {
+        let y = inside.y + tick.at as f32 / scale;
+        if on_straight_edge(y - inside.y, inside.height) {
+            mark(layer, (mark_x, y - 0.5), (MARK, 1.0));
+        }
+        if last.is_some_and(|last| (y - last).abs() < line + LABEL_GAP / 2.0) {
+            continue;
+        }
+        last = Some(y);
+        text(
+            layer,
+            &tick.label,
+            (label_x, y),
+            align,
+            VerticalAlign::Center,
+            parameters,
         );
     }
 }

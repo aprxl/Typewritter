@@ -18,11 +18,13 @@ use plotters::style::full_palette::{
     PURPLE_400, TEAL_400, TEAL_600,
 };
 use plotters::style::text_anchor::{HPos, Pos, VPos};
+use typewritter::document::{math_eval::Curve, math_notation};
 
 pub type Outcome<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plot {
+    TypedMath,
     Waves,
     Scatter,
     Histogram,
@@ -89,7 +91,8 @@ pub struct Ticks {
 }
 
 impl Plot {
-    pub const ALL: [Plot; 12] = [
+    pub const ALL: [Plot; 13] = [
+        Plot::TypedMath,
         Plot::Waves,
         Plot::Scatter,
         Plot::Histogram,
@@ -106,6 +109,7 @@ impl Plot {
 
     pub fn slug(self) -> &'static str {
         match self {
+            Plot::TypedMath => "typed-math",
             Plot::Waves => "waves",
             Plot::Scatter => "scatter",
             Plot::Histogram => "histogram",
@@ -123,6 +127,11 @@ impl Plot {
 
     pub fn frame(self) -> Frame {
         match self {
+            Plot::TypedMath => Frame {
+                x_desc: Some("x"),
+                y_desc: Some("y"),
+                ..Frame::ticked("Typed math · exmex")
+            },
             Plot::Waves => Frame {
                 x_desc: Some("t"),
                 y_desc: Some("amplitude"),
@@ -171,6 +180,7 @@ impl Plot {
     {
         area.fill(&style.palette.surface)?;
         match self {
+            Plot::TypedMath => typed_math(area, style),
             Plot::Waves => waves(area, style),
             Plot::Scatter => scatter(area, style),
             Plot::Histogram => histogram(area, style),
@@ -313,6 +323,94 @@ fn segment<T: ToString>(value: &SegmentValue<T>) -> String {
         SegmentValue::Exact(v) | SegmentValue::CenterOf(v) => v.to_string(),
         SegmentValue::Last => String::new(),
     }
+}
+
+/// Curves typed in Typewritter's math notation, read by `math_eval` and
+/// sampled here. The last entry has no numeric reading, and says so.
+fn typed_math<DB: DrawingBackend>(area: &DrawingArea<DB, Shift>, s: Style) -> Outcome<Ticks>
+where
+    DB::ErrorType: 'static,
+{
+    const SIN: &str = "sym{function|sin|plain}{sin}";
+    const PI: &str = "sym{constant|pi|plain}{π}";
+    const RANGE: f64 = 4.0;
+    const SAMPLES: usize = 800;
+    // (notation, legend label, colour)
+    let curves = [
+        ("y=x^3/4-x".to_owned(), "y = x³/4 − x", INDIGO_400),
+        (format!("y=2{SIN}({PI}x/2)"), "y = 2 sin(πx/2)", TEAL_600),
+        ("y=1/x".to_owned(), "y = 1/x", DEEPORANGE_400),
+        ("y=sqrt{x+3}-1".to_owned(), "y = √(x+3) − 1", PINK_400),
+        ("y=int{0}{x}t".to_owned(), "y = ∫₀ˣ t", GREY_500),
+    ];
+
+    let mut chart = ChartBuilder::on(area).build_cartesian_2d(-RANGE..RANGE, -RANGE..RANGE)?;
+    chart
+        .configure_mesh()
+        .disable_axes()
+        .x_labels(9)
+        .y_labels(9)
+        .light_line_style(TRANSPARENT)
+        .bold_line_style(s.palette.grid)
+        .draw()?;
+    // The axes through the origin, a step darker than the grid.
+    chart.draw_series([
+        PathElement::new([(-RANGE, 0.0), (RANGE, 0.0)], s.palette.border),
+        PathElement::new([(0.0, -RANGE), (0.0, RANGE)], s.palette.border),
+    ])?;
+
+    let mut problems = Vec::new();
+    for (notation, label, color) in &curves {
+        let curve = match Curve::parse(&math_notation::parse(notation)) {
+            Ok(curve) => curve,
+            Err(error) => {
+                problems.push(format!("{label}: {error}"));
+                continue;
+            }
+        };
+        // Sampled evenly; a run breaks where the curve is undefined or leaves
+        // the view by a wide margin, so 1/x does not join across its pole.
+        let mut runs: Vec<Vec<(f64, f64)>> = vec![Vec::new()];
+        for i in 0..=SAMPLES {
+            let x = -RANGE + 2.0 * RANGE * i as f64 / SAMPLES as f64;
+            let y = curve.eval(x);
+            let run = runs.last_mut().expect("runs starts non-empty");
+            if y.is_finite() && y.abs() <= RANGE * 4.0 {
+                run.push((x, y));
+            } else if !run.is_empty() {
+                runs.push(Vec::new());
+            }
+        }
+        let color = *color;
+        let mut first = true;
+        for run in runs.into_iter().filter(|run| run.len() > 1) {
+            let series = chart.draw_series(LineSeries::new(run, s.line(color, 2.0)))?;
+            if std::mem::take(&mut first) {
+                series.label(*label).legend(move |(x, y)| {
+                    PathElement::new([(x, y), (x + 14, y)], s.line(color, 2.0))
+                });
+            }
+        }
+    }
+    s.legend(&mut chart, SeriesLabelPosition::UpperLeft)?;
+    for (line, problem) in problems.iter().enumerate() {
+        let (_, height) = area.dim_in_pixel();
+        area.draw(&Text::new(
+            problem.clone(),
+            (
+                s.px(8.0) as i32,
+                height as i32 - s.px(8.0 + 14.0 * (problems.len() - line) as f64) as i32,
+            ),
+            s.font(10.0).color(&s.palette.dim),
+        ))?;
+    }
+
+    let spec = chart.as_coord_spec();
+    Ok(Ticks {
+        x: x_ticks(spec, 9, number),
+        y: y_ticks(spec, 9, number),
+        ..Ticks::default()
+    })
 }
 
 /// Line series, dashed and dotted variants, π tick labels, a legend.

@@ -420,24 +420,58 @@ fn export(view: View) -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(dir)
 }
 
-/// The plot cells below the header, `COLUMNS` across.
+/// The plot cells below the header, `COLUMNS` across. Plots are packed in
+/// order into the first free place their span fits, row by row.
 fn grid(width: f32, height: f32) -> Vec<Rect> {
-    let rows = Plot::ALL.len().div_ceil(COLUMNS);
+    let mut taken: Vec<[bool; COLUMNS]> = Vec::new();
+    let mut places = Vec::new();
+    for plot in Plot::ALL {
+        let (span_x, span_y) = span(plot);
+        let fits = |taken: &Vec<[bool; COLUMNS]>, column: usize, row: usize| {
+            column + span_x <= COLUMNS
+                && (row..row + span_y).all(|r| {
+                    (column..column + span_x).all(|c| !taken.get(r).is_some_and(|cells| cells[c]))
+                })
+        };
+        let (column, row) = (0..)
+            .flat_map(|row| (0..COLUMNS).map(move |column| (column, row)))
+            .find(|&(column, row)| fits(&taken, column, row))
+            .expect("an empty row always fits");
+        while taken.len() < row + span_y {
+            taken.push([false; COLUMNS]);
+        }
+        for cells in &mut taken[row..row + span_y] {
+            cells[column..column + span_x].fill(true);
+        }
+        places.push((column, row, span_x, span_y));
+    }
+
+    let rows = taken.len();
     let cell_width =
         ((width - 2.0 * PADDING - GAP * (COLUMNS - 1) as f32) / COLUMNS as f32).max(1.0);
     let cell_height =
         ((height - HEADER - PADDING - GAP * (rows - 1) as f32) / rows as f32).max(1.0);
-    (0..Plot::ALL.len())
-        .map(|index| {
-            let (column, row) = ((index % COLUMNS) as f32, (index / COLUMNS) as f32);
+    places
+        .into_iter()
+        .map(|(column, row, span_x, span_y)| {
+            let (column, row) = (column as f32, row as f32);
+            let (span_x, span_y) = (span_x as f32, span_y as f32);
             Rect::new(
                 (PADDING + column * (cell_width + GAP)).round(),
                 (HEADER + row * (cell_height + GAP)).round(),
-                cell_width.floor(),
-                cell_height.floor(),
+                (span_x * cell_width + (span_x - 1.0) * GAP).floor(),
+                (span_y * cell_height + (span_y - 1.0) * GAP).floor(),
             )
         })
         .collect()
+}
+
+/// How many grid cells a plot covers, across and down.
+fn span(plot: Plot) -> (usize, usize) {
+    match plot {
+        Plot::TypedMath => (2, 2),
+        _ => (1, 1),
+    }
 }
 
 fn millis(duration: Duration) -> String {
