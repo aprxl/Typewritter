@@ -17,6 +17,7 @@ use typewritter::theme;
 use crate::plots::{Frame, Tick, Ticks};
 
 pub const RADIUS: f32 = 10.0;
+const BORDER: f32 = 1.0;
 const TITLE: f32 = 13.0;
 const LABEL: f32 = 10.5;
 const TITLE_ROW: f32 = 24.0;
@@ -62,12 +63,18 @@ pub fn container(cell: Rect, frame: &Frame) -> Rect {
 }
 
 /// Readies the data layer: clipped to the container's rounded shape.
+///
+/// The border is stroked centred on the container's edge, so half of it
+/// lies inside. The clip stops at the stroke's centre line — inset by half
+/// the border, with a concentric radius — so the data's anti-aliased rim is
+/// always under the stroke and never shows past a corner.
 pub fn clip(layer: &Layer, inside: Rect) {
+    let half = BORDER / 2.0;
     layer
         .set_clip_shape(Some(ClipShape::Rectangle {
-            top_left: inside.position(),
-            size: inside.size(),
-            rounding: Rounding::uniform(RADIUS),
+            top_left: (inside.x + half, inside.y + half),
+            size: (inside.width - BORDER, inside.height - BORDER),
+            rounding: Rounding::uniform(RADIUS - half),
         }))
         .expect("a rectangle clip never fails to parse");
 }
@@ -79,7 +86,7 @@ pub fn draw(layer: &Layer, cell: Rect, inside: Rect, frame: &Frame, ticks: &Tick
     // Titles and labels never reach into a neighbouring plot.
     layer.set_clip_rect(Some((cell.position(), cell.size())));
     let mut pen: &Layer = layer;
-    canvas::rounded_outline(&mut pen, inside, RADIUS, 1.0, theme::border());
+    canvas::rounded_outline(&mut pen, inside, RADIUS, BORDER, theme::border());
 
     let mut title = FontParameters::new(TITLE);
     title.weight = TITLE * 0.018;
@@ -98,7 +105,9 @@ pub fn draw(layer: &Layer, cell: Rect, inside: Rect, frame: &Frame, ticks: &Tick
         inside.bottom() + MARK + MARK_GAP
     };
     // A label that would touch the one before it is left out; its mark
-    // stays, so the rhythm of the axis still reads.
+    // stays, so the rhythm of the axis still reads. Near a corner it is the
+    // other way round: the edge curves away from a mark there, so only the
+    // label is drawn.
     let mut previous_right = f32::NEG_INFINITY;
     for tick in visible(&ticks.x, inside.width, scale) {
         let x = inside.x + tick.at as f32 / scale;
@@ -107,7 +116,9 @@ pub fn draw(layer: &Layer, cell: Rect, inside: Rect, frame: &Frame, ticks: &Tick
         } else {
             (inside.bottom(), VerticalAlign::Top)
         };
-        mark(layer, (x - 0.5, mark_y), (1.0, MARK));
+        if on_straight_edge(x - inside.x, inside.width) {
+            mark(layer, (x - 0.5, mark_y), (1.0, MARK));
+        }
         let (width, _) = layer.get_text_size(&tick.label, &theme::sans(), &label);
         if x - width / 2.0 < previous_right + LABEL_GAP {
             continue;
@@ -124,7 +135,9 @@ pub fn draw(layer: &Layer, cell: Rect, inside: Rect, frame: &Frame, ticks: &Tick
     }
     for tick in visible(&ticks.y, inside.height, scale) {
         let y = inside.y + tick.at as f32 / scale;
-        mark(layer, (inside.x - MARK, y - 0.5), (MARK, 1.0));
+        if on_straight_edge(y - inside.y, inside.height) {
+            mark(layer, (inside.x - MARK, y - 0.5), (MARK, 1.0));
+        }
         text(
             layer,
             &tick.label,
@@ -136,7 +149,9 @@ pub fn draw(layer: &Layer, cell: Rect, inside: Rect, frame: &Frame, ticks: &Tick
     }
     for tick in visible(&ticks.y2, inside.height, scale) {
         let y = inside.y + tick.at as f32 / scale;
-        mark(layer, (inside.right(), y - 0.5), (MARK, 1.0));
+        if on_straight_edge(y - inside.y, inside.height) {
+            mark(layer, (inside.right(), y - 0.5), (MARK, 1.0));
+        }
         text(
             layer,
             &tick.label,
@@ -193,6 +208,12 @@ fn visible(ticks: &[Tick], length: f32, scale: f32) -> impl Iterator<Item = &Tic
         let at = tick.at as f32 / scale;
         (-0.5..=length + 0.5).contains(&at)
     })
+}
+
+/// Whether `at`, along an edge `length` long, is off the corners' curves —
+/// where a mark would meet the border rather than float beside it.
+fn on_straight_edge(at: f32, length: f32) -> bool {
+    (RADIUS..=length - RADIUS).contains(&at)
 }
 
 fn mark(layer: &Layer, at: (f32, f32), size: (f32, f32)) {
