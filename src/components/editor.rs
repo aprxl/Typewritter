@@ -1084,6 +1084,7 @@ impl Component for Editor {
                 row,
                 row_layout,
                 widget_paint::Interaction {
+                    editable: true,
                     active_slot,
                     hover: self
                         .widget_hover

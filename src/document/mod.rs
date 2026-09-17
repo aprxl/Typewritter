@@ -2673,8 +2673,9 @@ impl Document {
         changed
     }
 
-    /// Removes the placement covering `slot`. Removing the final placement
-    /// removes the row anchor too, returning the caret to adjacent Markdown.
+    /// Removes the placement covering `slot`. The row remains as a structural
+    /// anchor even after its final card is gone, so it can accept a new widget
+    /// without rebuilding the surrounding document flow.
     pub fn remove_widget_at(&mut self, block: usize, slot: usize) -> bool {
         if !matches!(self.focus, Focus::Body) {
             return false;
@@ -2686,20 +2687,15 @@ impl Document {
         if !removed {
             return false;
         }
-        if self.body[block]
+        let next_slot = self.body[block]
             .widget_row_ref()
-            .is_some_and(widget::WidgetRow::is_empty)
-        {
-            if self.body.len() == 1 {
-                self.body[0] = empty_block();
-                self.set_caret(0, 0, 0);
-            } else {
-                self.body.remove(block);
-                self.set_caret(block.min(self.body.len() - 1), 0, 0);
-            }
-        } else {
-            self.set_caret(block, slot.min(widget::TRACKS - 1), 0);
-        }
+            .and_then(|row| {
+                row.placement_at(slot)
+                    .or_else(|| row.placements.last())
+                    .map(|placement| placement.slot)
+            })
+            .unwrap_or(0);
+        self.set_caret(block, next_slot, 0);
         self.dirty = true;
         self.enforce();
         true
@@ -2836,6 +2832,7 @@ impl Document {
         if !self.in_widget_row() {
             return false;
         }
+        let slot = self.caret.inline;
         let target = if up {
             self.caret.block.checked_sub(1)
         } else {
@@ -2844,8 +2841,15 @@ impl Document {
         let Some(block) = target else {
             return true;
         };
-        let offset = if up { self.block_len(block) } else { 0 };
-        self.set_caret(block, 0, offset);
+        let widget = self.scope()[block].is_widget();
+        let offset = if widget {
+            0
+        } else if up {
+            self.block_len(block)
+        } else {
+            0
+        };
+        self.set_caret(block, if widget { slot } else { 0 }, offset);
         true
     }
 
@@ -4979,7 +4983,6 @@ mod tests {
                 continue;
             }
             if block.is_widget() {
-                assert!(!block.widget_row_ref().unwrap().placements.is_empty());
                 continue;
             }
             assert!(!block.inlines().is_empty());
@@ -5027,9 +5030,20 @@ mod tests {
             widget::Widget::Clarity(widget) if widget.value == Some(widget::ClarityLevel::Review)
         ));
         assert!(d.remove_widget_at(0, 1));
+        assert_eq!(
+            d.body()[0]
+                .widget_row_ref()
+                .unwrap()
+                .placements
+                .iter()
+                .map(|placement| placement.slot)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
         assert!(d.remove_widget_at(0, 0));
-        assert!(d.remove_widget_at(0, 2));
-        assert!(matches!(d.body(), [Block::Paragraph(_)]));
+        assert!(d.remove_widget_at(0, 0));
+        assert!(matches!(d.body(), [Block::WidgetRow(row)] if row.is_empty()));
+        assert_eq!((d.caret.block, d.caret.inline), (0, 0));
         assert_invariants(&d);
     }
 
@@ -5080,6 +5094,24 @@ mod tests {
         d.set_caret(1, 3, 0);
         assert!(d.move_widget_vertical(false));
         assert_eq!((d.caret.block, d.caret.offset), (2, 0));
+        assert_invariants(&d);
+    }
+
+    #[test]
+    fn vertical_widget_navigation_keeps_its_track_between_rows() {
+        let mut d = doc();
+        *d.body_mut() = vec![
+            Block::WidgetRow(widget::WidgetRow::new(widget::Widget::Empty)),
+            Block::WidgetRow(widget::WidgetRow::new(widget::Widget::Clarity(
+                widget::ClarityWidget::default(),
+            ))),
+        ];
+
+        d.set_caret(0, 3, 0);
+        assert!(d.move_widget_vertical(false));
+        assert_eq!((d.caret.block, d.caret.inline), (1, 3));
+        assert!(d.move_widget_vertical(true));
+        assert_eq!((d.caret.block, d.caret.inline), (0, 3));
         assert_invariants(&d);
     }
 

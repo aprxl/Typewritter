@@ -819,6 +819,9 @@ impl Shell {
         let Some((block, placement)) = layout.widget_at(local_x, local_y) else {
             return false;
         };
+        if layout.widget_close_at(local_x, local_y).is_some() {
+            return false;
+        }
         let Some(card) = layout
             .widget_rows
             .get(block)
@@ -1146,6 +1149,13 @@ impl Shell {
                 .and_then(|row| row.placements.get(placement))
                 .map(|placement| placement.slot)
         };
+        if let Some((block, placement)) = layout.widget_close_at(local_x, local_y)
+            && let Some(slot) = slot_for(block, placement)
+        {
+            self.goal_x = None;
+            self.docs.borrow_mut().remove_widget_at(block, slot);
+            return true;
+        }
         if let Some((block, placement, day)) = layout.widget_day_at(local_x, local_y)
             && let Some(slot) = slot_for(block, placement)
         {
@@ -1580,27 +1590,31 @@ impl Shell {
             return;
         }
 
-        // Bare / opens the slash menu — before the docs borrow so we can
-        // call refresh_slash_menu (which needs &mut self) without a conflict.
-        let text = input.text();
-        if text == "/" {
-            self.insert_shortcuts.reset();
-            let anchor = self.compute_slash_anchor();
-            // An in-flight fade-out of THIS menu is superseded: it is back.
-            if matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })) {
-                self.menu_dismiss = None;
-                self.menu_dismiss_clock = 0.0;
+        // A widget row has its own four-track cursor, not an invisible line
+        // of Markdown. Insert-mode text and structural shortcuts therefore
+        // do nothing while it is selected; Tab and the arrows above navigate
+        // it, and Escape below still returns to Normal mode.
+        if !self.docs.borrow().in_widget_row() {
+            // Bare / opens the slash menu — before the docs borrow so we can
+            // call refresh_slash_menu (which needs &mut self) without a conflict.
+            let text = input.text();
+            if text == "/" {
+                self.insert_shortcuts.reset();
+                let anchor = self.compute_slash_anchor();
+                // An in-flight fade-out of THIS menu is superseded: it is back.
+                if matches!(self.menu_dismiss, Some(MenuDismiss::Slash { .. })) {
+                    self.menu_dismiss = None;
+                    self.menu_dismiss_clock = 0.0;
+                }
+                self.slash_menu = Some(SlashMenuState {
+                    query: String::new(),
+                    selected: 0,
+                    anchor,
+                });
+                self.popup_reveal.restart();
+                self.refresh_slash_menu();
+                return;
             }
-            self.slash_menu = Some(SlashMenuState {
-                query: String::new(),
-                selected: 0,
-                anchor,
-            });
-            self.popup_reveal.restart();
-            self.refresh_slash_menu();
-            return;
-        }
-        {
             for c in input.text().chars() {
                 // `$` is math entry (SPEC §12.1: the one-key alias for the
                 // highest-frequency gesture in the app). A second `$` before
@@ -1832,7 +1846,7 @@ impl Shell {
                 self.docs.borrow_mut().widget_move_vertical(false);
                 true
             }
-            'x' => {
+            'd' | 'x' => {
                 let target = {
                     let docs = self.docs.borrow();
                     let Some(tab) = docs.active() else {

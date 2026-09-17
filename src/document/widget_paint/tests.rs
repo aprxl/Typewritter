@@ -58,6 +58,7 @@ fn active_and_hovered_cards_never_paint_in_the_markdown_lane() {
             for state in [
                 Interaction::default(),
                 Interaction {
+                    editable: true,
                     active_slot: Some(0),
                     hover: Some(Hit::Day(0, 31)),
                     hover_amount: 1.0,

@@ -2103,10 +2103,16 @@ fn flat_to_pos(block: &Block, flat: usize) -> (usize, usize) {
 }
 
 impl DocLayout {
-    fn widget_caret(&self, block: usize, slot: usize) -> Caret {
+    fn widget_caret(&self, block: usize, x: f32) -> Caret {
+        let slot = self
+            .widget_rows
+            .get(block)
+            .and_then(Option::as_ref)
+            .and_then(|row| row.tracks.iter().position(|track| x < track.right()))
+            .unwrap_or(super::widget::TRACKS - 1);
         Caret {
             block,
-            inline: slot.min(super::widget::TRACKS - 1),
+            inline: slot,
             offset: 0,
             style: Style::PLAIN,
         }
@@ -2212,6 +2218,18 @@ impl DocLayout {
                     .position(|track| track.contains((x, y)))
                     .map(|slot| (block, slot))
             })
+    }
+
+    /// The card close button at a point. Its rectangle is part of the layout
+    /// snapshot, so painting and pointer routing cannot drift apart.
+    pub fn widget_close_at(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+        let (block, placement) = self.widget_at(x, y)?;
+        let row = self.widget_rows.get(block)?.as_ref()?;
+        row.cards
+            .get(placement)?
+            .close
+            .contains((x, y))
+            .then_some((block, placement))
     }
 
     /// Whether a point is in a free track lane already occupied by flowing
@@ -3267,7 +3285,7 @@ impl DocLayout {
             return if self.tables.get(previous).is_some_and(Option::is_some) {
                 Some(self.hit(goal_x, target.y + target.height * 0.5, measure))
             } else if self.source[previous].is_widget() {
-                Some(self.widget_caret(previous, caret.inline))
+                Some(self.widget_caret(previous, goal_x))
             } else {
                 let last_line = target.lines.len() - 1;
                 Some(caret_for_click(
@@ -3306,7 +3324,7 @@ impl DocLayout {
             return Some(self.hit(goal_x, target.y + target.height * 0.5, measure));
         }
         if self.source[prev].is_widget() {
-            return Some(self.widget_caret(prev, caret.inline));
+            return Some(self.widget_caret(prev, goal_x));
         }
         let last_line = self.blocks[prev].lines.len() - 1;
         Some(caret_for_click(
@@ -3346,7 +3364,7 @@ impl DocLayout {
             return if self.tables.get(next).is_some_and(Option::is_some) {
                 Some(self.hit(goal_x, target.y + target.height * 0.5, measure))
             } else if self.source[next].is_widget() {
-                Some(self.widget_caret(next, caret.inline))
+                Some(self.widget_caret(next, goal_x))
             } else {
                 Some(caret_for_click(
                     &self.source,
@@ -3381,7 +3399,7 @@ impl DocLayout {
             return Some(self.hit(goal_x, target.y + target.height * 0.5, measure));
         }
         if self.source[next].is_widget() {
-            return Some(self.widget_caret(next, caret.inline));
+            return Some(self.widget_caret(next, goal_x));
         }
         Some(caret_for_click(
             &self.source,
@@ -3946,6 +3964,18 @@ mod tests {
             .line_down(table_caret, 0.0, &fake_measure)
             .expect("table moves into the widget row");
         assert_eq!((widget_caret.block, widget_caret.inline), (1, 0));
+        let third_track = laid.widget_rows[1].as_ref().unwrap().tracks[2];
+        let aligned_widget_caret = laid
+            .line_down(
+                table_caret,
+                third_track.x + third_track.width * 0.5,
+                &fake_measure,
+            )
+            .expect("table keeps its horizontal goal entering a widget row");
+        assert_eq!(
+            (aligned_widget_caret.block, aligned_widget_caret.inline),
+            (1, 2)
+        );
         let table_caret = laid
             .line_up(widget_caret, 0.0, &fake_measure)
             .expect("widget moves back into the table");

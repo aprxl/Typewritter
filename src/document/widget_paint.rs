@@ -14,6 +14,9 @@ use crate::theme::{self, TextStyle};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Interaction {
+    /// Editor-only affordances such as card close buttons. Export painting
+    /// uses the default interaction and must remain document-only.
+    pub editable: bool,
     pub active_slot: Option<usize>,
     pub hover: Option<Hit>,
     pub hover_amount: f32,
@@ -151,6 +154,15 @@ pub fn row(
                 if hot { state.hover_amount } else { 0.0 },
             ),
         }
+        if state.editable {
+            close_button(
+                canvas,
+                card.close,
+                scale,
+                active,
+                state.amount(Hit::Close(card.placement)),
+            );
+        }
         if active || hot || dragging.is_some() {
             let label = if let Some(drag) = dragging {
                 if drag.target.is_some() {
@@ -203,6 +215,46 @@ pub fn row(
         );
         canvas::rounded_outline(canvas, rect, radius, 1.5 * scale, theme::accent());
     }
+}
+
+fn close_button(canvas: &mut dyn Canvas, rect: Rect, scale: f32, active: bool, hot: f32) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let center = (rect.x + rect.width * 0.5, rect.y + rect.height * 0.5);
+    canvas.draw_circle(
+        center,
+        rect.width.min(rect.height) * 0.5,
+        theme::mix(
+            theme::alt(),
+            theme::selection(),
+            if active { 0.35 } else { hot * 0.72 },
+        ),
+    );
+    let arm = (4.0 * scale).min(rect.width.min(rect.height) * 0.28);
+    let color = if active {
+        theme::accent()
+    } else {
+        theme::dim()
+    };
+    canvas::polyline(
+        canvas,
+        &[
+            (center.0 - arm, center.1 - arm),
+            (center.0 + arm, center.1 + arm),
+        ],
+        color.clone(),
+        1.2 * scale,
+    );
+    canvas::polyline(
+        canvas,
+        &[
+            (center.0 - arm, center.1 + arm),
+            (center.0 + arm, center.1 - arm),
+        ],
+        color,
+        1.2 * scale,
+    );
 }
 
 /// Fit labels to their own rectangle; the document layer cannot scissor

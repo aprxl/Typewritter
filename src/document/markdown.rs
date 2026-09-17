@@ -1534,6 +1534,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_widget_rows_round_trip_as_structural_rows() {
+        let text = "<!-- typewritter-widgets:v1 [] -->\n";
+        let document = parse(Path::new("widgets.md"), text);
+        assert!(matches!(document.body(), [Block::WidgetRow(row)] if row.is_empty()));
+        assert_eq!(serialize(&document), text);
+    }
+
+    #[test]
     fn malformed_widget_markers_remain_literal_markdown() {
         let text = "<!-- typewritter-widgets:v2 [{\"slot\":1,\"type\":\"empty\"}] -->\n";
         let document = parse(Path::new("widgets.md"), text);

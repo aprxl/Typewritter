@@ -8,6 +8,9 @@ pub const WIDGET_EMPTY_HEIGHT: f32 = 112.0;
 pub const WIDGET_CALENDAR_HEIGHT: f32 = 240.0;
 pub const WIDGET_RADIUS: f32 = 14.0;
 pub const WIDGET_PAD: f32 = 12.0;
+pub const WIDGET_CLOSE_SIZE: f32 = 18.0;
+pub const WIDGET_CLOSE_INSET: f32 = 6.0;
+pub const WIDGET_CLOSE_GAP: f32 = 5.0;
 pub const WIDGET_CALENDAR_CONTROL: f32 = 24.0;
 pub const WIDGET_CALENDAR_CONTROL_GAP: f32 = 4.0;
 
@@ -31,6 +34,7 @@ pub struct WidgetCardLayout {
     pub heading: Rect,
     pub weekdays: Rect,
     pub footer: Rect,
+    pub close: Rect,
     pub previous: Option<Rect>,
     pub next: Option<Rect>,
 }
@@ -54,6 +58,7 @@ pub struct WidgetRowLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Card(usize),
+    Close(usize),
     Day(usize, u8),
     Previous(usize),
     Next(usize),
@@ -63,9 +68,11 @@ pub enum Hit {
 impl Hit {
     pub fn placement(self) -> Option<usize> {
         match self {
-            Self::Card(index) | Self::Day(index, _) | Self::Previous(index) | Self::Next(index) => {
-                Some(index)
-            }
+            Self::Card(index)
+            | Self::Close(index)
+            | Self::Day(index, _)
+            | Self::Previous(index)
+            | Self::Next(index) => Some(index),
             Self::Add(_) => None,
         }
     }
@@ -84,6 +91,9 @@ impl WidgetRowLayout {
         for card in &self.cards {
             if !card.rect.contains(point) {
                 continue;
+            }
+            if card.close.contains(point) {
+                return Some(Hit::Close(card.placement));
             }
             if card.previous.is_some_and(|rect| rect.contains(point)) {
                 return Some(Hit::Previous(card.placement));
@@ -183,19 +193,31 @@ pub fn widget_layout(
                 track_width * placement.span as f32 + gap * (placement.span - 1) as f32;
             let rect = Rect::new(left, y, card_width, widget_height(&placement.widget, scale));
             let inner = rect.inset(WIDGET_PAD * scale);
+            let close_size = (WIDGET_CLOSE_SIZE * scale).min(rect.width).min(rect.height);
+            let close_inset = WIDGET_CLOSE_INSET * scale;
+            let close = Rect::new(
+                (rect.right() - close_size - close_inset).max(rect.x),
+                (rect.y + close_inset).min(rect.bottom() - close_size),
+                close_size,
+                close_size,
+            );
             // Narrow cards give navigation a separate row. Optional headings
             // never collapse this band into the selectable day cells.
             let stacked = inner.width < 128.0 * scale;
-            let control = (WIDGET_CALENDAR_CONTROL * scale).min(inner.width * 0.4);
             let control_gap = WIDGET_CALENDAR_CONTROL_GAP * scale;
+            let controls_right = close.x - WIDGET_CLOSE_GAP * scale;
+            let control = (WIDGET_CALENDAR_CONTROL * scale)
+                .min(((controls_right - inner.x - control_gap) * 0.5).max(0.0));
             let controls_y = inner.y + if stacked { 42.0 * scale } else { 2.0 * scale };
+            let next_x = (controls_right - control).max(inner.x);
+            let previous_x = (next_x - control - control_gap).max(inner.x);
             let heading = Rect::new(
                 inner.x,
                 inner.y,
                 if stacked {
-                    inner.width
+                    (close.x - WIDGET_CLOSE_GAP * scale - inner.x).max(0.0)
                 } else {
-                    inner.width - 2.0 * control - control_gap - 6.0 * scale
+                    (previous_x - inner.x - 6.0 * scale).max(0.0)
                 },
                 40.0 * scale,
             );
@@ -239,15 +261,13 @@ pub fn widget_layout(
                 super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => Vec::new(),
             };
             let (previous, next) = match &placement.widget {
-                super::widget::Widget::Calendar(_) => {
-                    let next_x = (inner.right() - control).max(inner.x);
-                    let previous_x = (next_x - control - control_gap).max(inner.x);
-                    (
-                        Some(Rect::new(previous_x, controls_y, control, control)),
-                        Some(Rect::new(next_x, controls_y, control, control)),
-                    )
-                }
-                super::widget::Widget::Empty | super::widget::Widget::Clarity(_) => (None, None),
+                super::widget::Widget::Calendar(_) if control > 0.0 => (
+                    Some(Rect::new(previous_x, controls_y, control, control)),
+                    Some(Rect::new(next_x, controls_y, control, control)),
+                ),
+                super::widget::Widget::Calendar(_)
+                | super::widget::Widget::Empty
+                | super::widget::Widget::Clarity(_) => (None, None),
             };
             WidgetCardLayout {
                 placement: placement_index,
@@ -258,6 +278,7 @@ pub fn widget_layout(
                 heading,
                 weekdays,
                 footer,
+                close,
                 previous,
                 next,
             }
@@ -360,11 +381,17 @@ mod tests {
                             let card = &layout.cards[0];
                             let previous = card.previous.unwrap();
                             let next = card.next.unwrap();
-                            assert!(contains(card.rect, previous) && contains(card.rect, next));
+                            assert!(
+                                contains(card.rect, card.close)
+                                    && contains(card.rect, previous)
+                                    && contains(card.rect, next)
+                            );
+                            assert!(!overlaps(card.close, previous) && !overlaps(card.close, next));
                             assert!(!overlaps(previous, next));
                             assert!(
                                 !overlaps(card.heading, previous) && !overlaps(card.heading, next)
                             );
+                            assert_eq!(layout.hit(center(card.close)), Some(Hit::Close(0)));
                             assert_eq!(layout.hit(center(previous)), Some(Hit::Previous(0)));
                             assert_eq!(layout.hit(center(next)), Some(Hit::Next(0)));
                             assert_eq!(card.days.len(), calendar.days() as usize);

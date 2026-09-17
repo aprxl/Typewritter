@@ -97,7 +97,20 @@ impl WidgetRow {
         let index = self.placements.iter().position(|placement| {
             placement.slot <= slot && slot < placement.slot + placement.span
         })?;
-        Some(self.placements.remove(index))
+        let removed = self.placements.remove(index);
+        self.pack_left();
+        Some(removed)
+    }
+
+    /// Close the gaps left by a removal. Widgets keep their spans and their
+    /// left-to-right order, but no longer leave an empty track between cards.
+    fn pack_left(&mut self) {
+        self.normalize();
+        let mut slot = 0;
+        for placement in &mut self.placements {
+            placement.slot = slot;
+            slot += placement.span;
+        }
     }
 
     /// Moves the placement covering `from` to a free horizontal track. A
@@ -347,9 +360,6 @@ pub fn parse_payload(payload: &str) -> Option<WidgetRow> {
         .ok()?
         .as_array()?
         .clone();
-    if values.is_empty() {
-        return None;
-    }
     let mut placements = Vec::with_capacity(values.len());
     for value in values {
         placements.push(parse_placement(&value)?);
@@ -459,6 +469,32 @@ mod tests {
             parse_payload(r#"[{"slot":1,"type":"empty"},{"slot":1,"type":"empty"}]"#).is_none()
         );
         assert!(parse_payload(r#"[{"slot":1,"type":"unknown"}]"#).is_none());
+    }
+
+    #[test]
+    fn removing_a_widget_packs_the_remaining_cards_left() {
+        let mut row = WidgetRow {
+            placements: vec![
+                WidgetPlacement {
+                    slot: 0,
+                    span: 1,
+                    widget: Widget::Empty,
+                },
+                WidgetPlacement {
+                    slot: 2,
+                    span: 2,
+                    widget: Widget::Clarity(ClarityWidget::default()),
+                },
+            ],
+        };
+
+        assert!(row.remove_at(0).is_some());
+        assert_eq!(row.placements[0].slot, 0);
+        assert_eq!(row.placements[0].span, 2);
+
+        assert!(row.remove_at(0).is_some());
+        assert!(row.is_empty());
+        assert_eq!(parse_payload(&serialize_payload(&row)), Some(row));
     }
 
     #[test]
