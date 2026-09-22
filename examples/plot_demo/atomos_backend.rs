@@ -406,8 +406,10 @@ fn line_height_per_em(font: &Font) -> f32 {
 }
 
 pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
-    rgb.chunks_exact(3)
-        .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 0xFF])
+    rgb.as_chunks::<3>()
+        .0
+        .iter()
+        .flat_map(|&[r, g, b]| [r, g, b, 0xFF])
         .collect()
 }
 
