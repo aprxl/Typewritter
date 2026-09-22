@@ -912,6 +912,43 @@ fn capture_operand(list: &mut MathList, index: usize) -> (usize, MathList) {
     (start, list.drain(start..index).collect())
 }
 
+/// One typed character, the way every expression takes typing — a note's
+/// and a graph's alike: a bracket opens or closes a group, `/` builds a
+/// fraction, `^` and `_` open scripts, a space turns a trigger word
+/// (`sqrt`, `int`) into its structure, and anything else is a symbol.
+///
+/// `name_word` runs first whenever `c` ends a word — anything but a letter,
+/// a digit or `_`, which makes the letters before it an indexed name — for
+/// a surface that names words as they are finished rather than through a
+/// completion menu. It returns whether it changed the tree; a space it
+/// consumed is not typed.
+pub fn type_char(
+    root: &mut MathList,
+    cursor: &mut MathCursor,
+    c: char,
+    name_word: impl FnOnce(&mut MathList, &mut MathCursor) -> bool,
+) {
+    clamp(root, cursor);
+    let named = !c.is_alphanumeric() && c != '_' && name_word(root, cursor);
+    match c {
+        ' ' if named => {}
+        ' ' => {
+            if !insert_word(root, cursor) {
+                insert_char(root, cursor, ' ');
+            }
+        }
+        '/' => insert_fraction(root, cursor),
+        '^' => insert_script(root, cursor, Slot::Sup),
+        '_' => insert_script(root, cursor, Slot::Sub),
+        c if PAIRS.iter().any(|&(open, close)| open == c || close == c) => {
+            if !close_group(root, cursor, c) && !insert_group(root, cursor, c) {
+                insert_char(root, cursor, c);
+            }
+        }
+        c => insert_char(root, cursor, c),
+    }
+}
+
 /// The `/` trigger wraps the preceding operand in a fraction and enters its
 /// empty denominator, or its numerator when no operand was present.
 pub fn insert_fraction(root: &mut MathList, cursor: &mut MathCursor) {
@@ -2572,5 +2609,74 @@ mod tests {
         let cursor = at_path(&[(0, Slot::Den), (0, Slot::Den)], 0);
 
         assert_eq!(path_names(&cursor), vec!["denom", "denom"]);
+    }
+
+    fn typed(text: &str, name_word: &dyn Fn(&mut MathList, &mut MathCursor) -> bool) -> MathList {
+        let mut list = MathList::new();
+        let mut cursor = at(0);
+        for c in text.chars() {
+            type_char(&mut list, &mut cursor, c, name_word);
+        }
+        list
+    }
+
+    #[test]
+    fn typing_builds_structure_from_its_triggers() {
+        let none = |_: &mut MathList, _: &mut MathCursor| false;
+        assert_eq!(typed("1/2", &none), vec![frac(sym("1"), sym("2"))]);
+        assert_eq!(
+            typed("x^2", &none),
+            vec![script(sym("x"), Some(sym("2")), None)]
+        );
+        assert_eq!(
+            typed("(x)y", &none),
+            vec![group('(', ')', sym("x")), MathNode::Sym('y')]
+        );
+        // A closer with no group of its own is a symbol.
+        assert_eq!(typed("(]", &none), vec![group('(', ')', sym("]"))]);
+        assert_eq!(typed("sqrt x", &none), vec![sqrt(sym("x"))]);
+        assert_eq!(typed("a b", &none), sym("a b"));
+    }
+
+    #[test]
+    fn a_surface_names_a_word_when_it_is_finished() {
+        // Names `e` as a constant whenever it is the word before the cursor.
+        let name_e = |list: &mut MathList, cursor: &mut MathCursor| {
+            let index = cursor.index;
+            let named = cursor.path.is_empty()
+                && index > 0
+                && list[index - 1] == MathNode::Sym('e')
+                && (index == 1
+                    || !matches!(list[index - 2], MathNode::Sym(c) if c.is_alphabetic()));
+            if named {
+                list[index - 1] = resolved("e", SymbolRole::Constant, "plain", sym("e"));
+            }
+            named
+        };
+        let e = || resolved("e", SymbolRole::Constant, "plain", sym("e"));
+        // A space that names a word is taken by it.
+        assert_eq!(typed("e ", &name_e), vec![e()]);
+        assert_eq!(
+            typed("e^x", &name_e),
+            vec![script(vec![e()], Some(sym("x")), None)]
+        );
+        assert_eq!(typed("e(x)", &name_e), vec![e(), group('(', ')', sym("x"))]);
+        assert_eq!(
+            typed("2e+1", &name_e),
+            vec![
+                MathNode::Sym('2'),
+                e(),
+                MathNode::Sym('+'),
+                MathNode::Sym('1')
+            ]
+        );
+        // Letters, digits and an index continue the word.
+        assert_eq!(typed("ex", &name_e), sym("ex"));
+        assert_eq!(
+            typed("e_1", &name_e),
+            vec![script(sym("e"), None, Some(sym("1")))]
+        );
+        // A space that names nothing is typed, or builds a trigger word.
+        assert_eq!(typed("sqrt x", &name_e), vec![sqrt(sym("x"))]);
     }
 }

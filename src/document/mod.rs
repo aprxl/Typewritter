@@ -4423,53 +4423,14 @@ impl Document {
         }
     }
 
-    pub fn math_insert_fraction(&mut self) {
+    /// One typed character into the focused expression; see
+    /// [`math::type_char`]. A note names words through its completion menu,
+    /// so nothing is named as it is typed.
+    pub fn math_type(&mut self, c: char) {
         if let Some((list, cursor)) = self.focused_math() {
-            math::insert_fraction(list, cursor);
+            math::type_char(list, cursor, c, |_, _| false);
             self.dirty = true;
         }
-    }
-
-    pub fn math_insert_script(&mut self, which: math::Slot) {
-        if let Some((list, cursor)) = self.focused_math() {
-            math::insert_script(list, cursor, which);
-            self.dirty = true;
-        }
-    }
-
-    /// Opens a bracket group. `false` when `c` is not an opener, so the
-    /// caller can type it literally instead.
-    pub fn math_open_group(&mut self, c: char) -> bool {
-        let opened = self
-            .focused_math()
-            .is_some_and(|(list, cursor)| math::insert_group(list, cursor, c));
-        if opened {
-            self.dirty = true;
-        }
-        opened
-    }
-
-    /// Steps out of the group `c` closes, if the cursor is in one.
-    pub fn math_close_group(&mut self, c: char) -> bool {
-        let closed = self
-            .focused_math()
-            .is_some_and(|(list, cursor)| math::close_group(list, cursor, c));
-        if closed {
-            self.dirty = true;
-        }
-        closed
-    }
-
-    /// A space was typed: turns a trigger word before the cursor into its
-    /// structure. `false` means the space is an ordinary space.
-    pub fn math_insert_word(&mut self) -> bool {
-        let inserted = self
-            .focused_math()
-            .is_some_and(|(list, cursor)| math::insert_word(list, cursor));
-        if inserted {
-            self.dirty = true;
-        }
-        inserted
     }
 
     /// The focused expression and cursor, read-only, for the shell's
@@ -6372,9 +6333,9 @@ mod tests {
     fn math_ops_route_into_the_focused_atom() {
         let mut d = doc();
         d.insert_inline_math();
-        d.math_insert_char('1');
-        d.math_insert_fraction();
-        d.math_insert_char('2');
+        for c in "1/2".chars() {
+            d.math_type(c);
+        }
         assert_eq!(
             d.body()[0].inlines()[0],
             Inline::Math(vec![math::MathNode::Frac {
@@ -6392,7 +6353,7 @@ mod tests {
         let mut d = doc();
         d.insert_inline_math();
 
-        assert!(d.math_open_group('('));
+        d.math_type('(');
         assert_eq!(
             d.body()[0].inlines()[0],
             Inline::Math(vec![math::MathNode::Group {
@@ -6401,18 +6362,26 @@ mod tests {
                 body: Vec::new(),
             }])
         );
-        assert!(!d.math_close_group(']'));
+        // `]` closes no `(`: it is typed inside the group as a symbol.
+        d.math_type(']');
+        assert_eq!(
+            d.body()[0].inlines()[0],
+            Inline::Math(vec![math::MathNode::Group {
+                open: '(',
+                close: ')',
+                body: vec![math::MathNode::Sym(']')],
+            }])
+        );
     }
 
     #[test]
     fn a_space_after_a_trigger_word_builds_its_structure() {
         let mut d = doc();
         d.insert_inline_math();
-        for c in ['s', 'q', 'r', 't'] {
-            d.math_insert_char(c);
+        for c in "sqrt ".chars() {
+            d.math_type(c);
         }
 
-        assert!(d.math_insert_word());
         assert_eq!(
             d.body()[0].inlines()[0],
             Inline::Math(vec![math::MathNode::Sqrt { body: Vec::new() }])

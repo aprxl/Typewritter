@@ -1067,39 +1067,13 @@ impl Tabs {
     }
 
     pub fn math_type(&mut self, c: char) {
-        self.edit(|doc| doc.math_insert_char(c));
+        self.edit(|doc| doc.math_type(c));
     }
 
     pub fn math_discard_if_empty(&mut self) -> bool {
         let mut discarded = false;
         self.edit(|doc| discarded = doc.math_discard_if_empty());
         discarded
-    }
-
-    pub fn math_fraction(&mut self) {
-        self.edit(Document::math_insert_fraction);
-    }
-
-    pub fn math_script(&mut self, which: math::Slot) {
-        self.edit(|doc| doc.math_insert_script(which));
-    }
-
-    pub fn math_open_group(&mut self, c: char) -> bool {
-        let mut opened = false;
-        self.edit(|doc| opened = doc.math_open_group(c));
-        opened
-    }
-
-    pub fn math_close_group(&mut self, c: char) -> bool {
-        let mut closed = false;
-        self.edit(|doc| closed = doc.math_close_group(c));
-        closed
-    }
-
-    pub fn math_insert_word(&mut self) -> bool {
-        let mut inserted = false;
-        self.edit(|doc| inserted = doc.math_insert_word());
-        inserted
     }
 
     pub fn math_conversion_query(&self) -> Option<math_conversion::Query> {

@@ -23,7 +23,7 @@ use crate::components::{
 };
 use crate::config::Config;
 use crate::document::layout::{ContextHit, DocLayout, RangeKind, TableResize};
-use crate::document::math::{self, AccentKind, BigOp, MathNode, NodeAddress, Slot, SymbolRole};
+use crate::document::math::{self, AccentKind, BigOp, MathNode, NodeAddress, SymbolRole};
 use crate::document::math_style::{self, HighlightShape, MathHue};
 use crate::document::math_symbols;
 use crate::document::{
@@ -884,6 +884,7 @@ impl Shell {
     }
 
     fn close_graph_card(&mut self) {
+        self.finish_graph_word();
         self.end_graph_card_session();
         self.refresh_graph_card();
     }
@@ -923,15 +924,32 @@ impl Shell {
         let Some(focus) = self.graph_card.as_ref().map(|state| state.focus) else {
             return;
         };
+        let in_expression = focus == GraphTarget::Expression;
+        // As in a note, Escape first leaves the structure the caret is in;
+        // at the top level it puts the card away.
         if input.is_key_pressed(KeyCode::Escape) {
-            self.close_graph_card();
+            if !(in_expression && self.graph_math(math::pop_level)) {
+                self.close_graph_card();
+            }
             return;
         }
+        // Inside a structure Tab walks its slots, as in a note — the last
+        // stop is the structure's exit — and at the top level it moves on
+        // to the next control.
         if input.is_key_typed(KeyCode::Tab) {
-            if let Some(state) = self.graph_card.as_mut() {
-                state.focus = graph_card::step_focus(focus, !input.shift());
+            let forward = !input.shift();
+            let walked = in_expression
+                && self.graph_math(|list, cursor| {
+                    !cursor.path.is_empty()
+                        && if forward {
+                            math::slot_next(list, cursor)
+                        } else {
+                            math::slot_prev(list, cursor)
+                        }
+                });
+            if !walked {
+                self.focus_graph_card(graph_card::step_focus(focus, forward));
             }
-            self.refresh_graph_card();
             return;
         }
         if input.is_key_typed(KeyCode::Enter) && focus.takes_text() {
@@ -961,12 +979,8 @@ impl Shell {
         let card = graph_card::card_anchored(viewport, anchor);
         match graph_card::hit_at(card, point) {
             Some(target) => {
-                if let Some(state) = self.graph_card.as_mut() {
-                    state.focus = target;
-                }
-                if target.takes_text() {
-                    self.refresh_graph_card();
-                } else {
+                self.focus_graph_card(target);
+                if !target.takes_text() {
                     self.activate_graph_card(target);
                 }
             }
@@ -975,38 +989,58 @@ impl Shell {
         }
     }
 
-    /// Structural math input into the graph's expression — the keys a note
-    /// expression takes, minus the ones that leave it.
+    /// Moves focus to `target`, naming the word the expression ends in
+    /// when focus leaves it.
+    fn focus_graph_card(&mut self, target: GraphTarget) {
+        if target != GraphTarget::Expression {
+            self.finish_graph_word();
+        }
+        if let Some(state) = self.graph_card.as_mut() {
+            state.focus = target;
+        }
+        self.refresh_graph_card();
+    }
+
+    /// Names the word before the expression's caret, while the expression
+    /// has focus: `2pi` left behind is 2π, as `2pi ` would have been.
+    fn finish_graph_word(&mut self) {
+        if self
+            .graph_card
+            .as_ref()
+            .is_some_and(|state| state.focus == GraphTarget::Expression)
+        {
+            self.edit_graph(|graph, state| {
+                resolve_graph_word(&mut graph.expression, &mut state.cursor);
+            });
+        }
+    }
+
+    /// Moves the caret in the card's expression; whether it moved.
+    fn graph_math(
+        &mut self,
+        step: impl FnOnce(&math::MathList, &mut math::MathCursor) -> bool,
+    ) -> bool {
+        let mut moved = false;
+        self.edit_graph(|graph, state| {
+            math::clamp(&graph.expression, &mut state.cursor);
+            moved = step(&graph.expression, &mut state.cursor);
+        });
+        moved
+    }
+
+    /// Typing into the graph's expression: a note's own
+    /// ([`math::type_char`]), except that a word naming a function or
+    /// constant the graph can evaluate is named as soon as it is finished —
+    /// the card has no completion menu to name it through.
     fn graph_expression_keys(&mut self, input: &Input) {
         for c in input.text().chars().filter(|c| !c.is_control()) {
             self.edit_graph(|graph, state| {
-                let list = &mut graph.expression;
-                let cursor = &mut state.cursor;
-                math::clamp(list, cursor);
-                match c {
-                    c if math::PAIRS
-                        .iter()
-                        .any(|&(open, close)| open == c || close == c) =>
-                    {
-                        // `sin(` names the function before opening its
-                        // argument, as `sin ` does.
-                        resolve_graph_word(list, cursor);
-                        if !math::close_group(list, cursor, c)
-                            && !math::insert_group(list, cursor, c)
-                        {
-                            math::insert_char(list, cursor, c);
-                        }
-                    }
-                    ' ' => {
-                        if !math::insert_word(list, cursor) {
-                            resolve_graph_word(list, cursor);
-                        }
-                    }
-                    '/' => math::insert_fraction(list, cursor),
-                    '^' => math::insert_script(list, cursor, Slot::Sup),
-                    '_' => math::insert_script(list, cursor, Slot::Sub),
-                    c => math::insert_char(list, cursor, c),
-                }
+                math::type_char(
+                    &mut graph.expression,
+                    &mut state.cursor,
+                    c,
+                    resolve_graph_word,
+                );
             });
         }
         let key = |code| input.is_key_typed(code);
@@ -1022,16 +1056,11 @@ impl Shell {
                 let _ = math::delete_forward(&mut graph.expression, &mut state.cursor);
             });
         }
-        if key(KeyCode::ArrowLeft) || key(KeyCode::ArrowRight) {
-            let right = key(KeyCode::ArrowRight);
-            self.edit_graph(|graph, state| {
-                math::clamp(&graph.expression, &mut state.cursor);
-                if right {
-                    math::move_right(&graph.expression, &mut state.cursor);
-                } else {
-                    math::move_left(&graph.expression, &mut state.cursor);
-                }
-            });
+        if key(KeyCode::ArrowLeft) {
+            self.graph_math(math::move_left);
+        }
+        if key(KeyCode::ArrowRight) {
+            self.graph_math(math::move_right);
         }
     }
 
@@ -2059,33 +2088,6 @@ impl Shell {
                     self.docs.borrow_mut().math_exit_after();
                 }
             }
-            c if math::PAIRS
-                .iter()
-                .any(|&(open, close)| open == c || close == c) =>
-            {
-                let closed = {
-                    let mut docs = self.docs.borrow_mut();
-                    docs.math_close_group(c)
-                };
-                if !closed {
-                    let opened = {
-                        let mut docs = self.docs.borrow_mut();
-                        docs.math_open_group(c)
-                    };
-                    if !opened {
-                        self.docs.borrow_mut().math_type(c);
-                    }
-                }
-            }
-            ' ' => {
-                let inserted = self.docs.borrow_mut().math_insert_word();
-                if !inserted {
-                    self.docs.borrow_mut().math_type(c);
-                }
-            }
-            '/' => self.docs.borrow_mut().math_fraction(),
-            '^' => self.docs.borrow_mut().math_script(Slot::Sup),
-            '_' => self.docs.borrow_mut().math_script(Slot::Sub),
             _ => self.docs.borrow_mut().math_type(c),
         }
     }
