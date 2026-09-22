@@ -442,8 +442,8 @@ fn inside(
 
 /// The curve sampled across the x range, cut exactly where it leaves the
 /// y range so nothing is drawn outside, and broken where it is undefined or
-/// jumps by far more than the range between two samples — a pole, not a
-/// steep stretch to join.
+/// not continuous between two samples — a pole or a step, not a steep
+/// stretch to join.
 fn clipped_runs(
     curve: &Curve,
     x_range: GraphRange,
@@ -452,7 +452,7 @@ fn clipped_runs(
 ) -> Vec<Vec<(f64, f64)>> {
     let (bottom, top) = (y_range.min(), y_range.max());
     let within = |y: f64| (bottom..=top).contains(&y);
-    let jump = 4.0 * (top - bottom);
+    let visible = (top - bottom) / 20.0;
     let mut runs = Vec::new();
     let mut run = Vec::new();
     let mut previous: Option<(f64, f64)> = None;
@@ -461,7 +461,11 @@ fn clipped_runs(
         let y = curve.eval(x);
         let current = y.is_finite().then_some((x, y));
         match (previous, current) {
-            (Some((px, py)), Some((x, y))) if (y - py).abs() <= jump => {
+            // Both beyond the same edge: nothing between them is drawn,
+            // whatever the curve does there.
+            (Some((_, py)), Some((_, y)))
+                if (py > top && y > top) || (py < bottom && y < bottom) => {}
+            (Some((px, py)), Some((x, y))) if joins(curve, (px, py), (x, y), visible) => {
                 // Where the segment meets a bound.
                 let crossing = |bound: f64| (px + (x - px) * (bound - py) / (y - py), bound);
                 match (within(py), within(y)) {
@@ -490,6 +494,32 @@ fn clipped_runs(
     }
     finish(&mut run, &mut runs);
     runs
+}
+
+/// Whether the curve is continuous between two samples, as far as a plot
+/// can tell. Only a jump big enough to see is examined: the step is halved
+/// towards the bigger half of the jump, which shrinks it on a continuous
+/// curve however steep, while across a pole or a step it stays.
+fn joins(curve: &Curve, from: (f64, f64), to: (f64, f64), visible: f64) -> bool {
+    const HALVINGS: usize = 8;
+    let jump = (to.1 - from.1).abs();
+    if jump <= visible {
+        return true;
+    }
+    let ((mut x0, mut y0), (mut x1, mut y1)) = (from, to);
+    for _ in 0..HALVINGS {
+        let xm = (x0 + x1) / 2.0;
+        let ym = curve.eval(xm);
+        if !ym.is_finite() {
+            return false;
+        }
+        if (ym - y0).abs() > (y1 - ym).abs() {
+            (x1, y1) = (xm, ym);
+        } else {
+            (x0, y0) = (xm, ym);
+        }
+    }
+    (y1 - y0).abs() < jump / 2.0
 }
 
 /// Ends `run`, keeping it when it has a line to draw.
@@ -654,6 +684,38 @@ mod tests {
                 assert!(run.iter().all(|(t, _)| *t < 0.0) || run.iter().all(|(t, _)| *t > 0.0));
             }
         }
+    }
+
+    #[test]
+    fn a_wide_value_range_still_breaks_at_every_pole() {
+        let x = GraphWidget::DEFAULT_X;
+        let y = GraphRange::new(-100.0, 100.0).unwrap();
+        let tan = curve("sym{function|tan|plain}{tan}x");
+        let poles: Vec<f64> = (-2..=1)
+            .map(|k| std::f64::consts::FRAC_PI_2 + k as f64 * std::f64::consts::PI)
+            .collect();
+        for samples in [400, 401, 1200] {
+            let runs = clipped_runs(&tan, x, y, samples);
+            // Four poles in [−5, 5] leave five branches.
+            assert_eq!(runs.len(), 5, "{samples} samples");
+            for run in &runs {
+                for pole in &poles {
+                    assert!(
+                        run.iter().all(|(t, _)| t < pole) || run.iter().all(|(t, _)| t > pole),
+                        "a run crosses the pole at {pole}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_steep_continuous_stretch_is_joined() {
+        let (x, y) = (GraphWidget::DEFAULT_X, GraphWidget::DEFAULT_Y);
+        // Crosses the whole value range between two samples, continuously.
+        let steep = curve("(3x)^9");
+        assert_eq!(clipped_runs(&steep, x, y, 40).len(), 1);
+        assert_eq!(clipped_runs(&curve("sqrt{x}"), x, y, 400).len(), 1);
     }
 
     #[test]
