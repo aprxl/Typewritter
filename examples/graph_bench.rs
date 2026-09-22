@@ -117,6 +117,12 @@ fn main() {
     case("one small graph", &[row(wave, 2)], 20);
     case("one large graph", &[row(wave, 3)], 20);
     case("one integral graph", &[row(integral, 2)], 5);
+    case(
+        "derivative of an integral",
+        &[row("d/{dx}int{0}{x}t^4dt", 2)],
+        5,
+    );
+    case("nested integral", &[row("int{0}{x}int{0}{t}sdsdt", 2)], 5);
     let many: Vec<_> = (0..20).map(|_| row(wave, 2)).collect();
     case("twenty graphs, all painted", &many, 10);
     // What the page paints: only the rows `editor::band_visible` admits.

@@ -19,8 +19,10 @@
 //!   integral, in which the limits may use the curve's variable; without,
 //!   it is the antiderivative that is zero at 0. exmex does not integrate,
 //!   so each integral stands in the exmex text as a placeholder variable
-//!   whose value is computed by adaptive Simpson quadrature per evaluation.
+//!   whose value is computed by adaptive Simpson quadrature, extending the
+//!   integral's previous value where it can.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
@@ -182,24 +184,79 @@ struct Integral {
     /// `None` is the antiderivative, taken from 0 to the value the
     /// surrounding scope gives `var`.
     limits: Option<(Expr, Expr)>,
+    /// The integrand's free variables other than `var`: what it depends on
+    /// besides the point it is sampled at.
+    outer: Vec<String>,
+    /// The last value taken, which the next one can extend.
+    last: RefCell<Option<Taken>>,
+}
+
+/// One evaluated integral: ∫ from `from` to `to`, with the integrand's
+/// outer variables bound to `outer`.
+#[derive(Debug)]
+struct Taken {
+    outer: Vec<f64>,
+    from: f64,
+    to: f64,
+    value: f64,
 }
 
 impl Integral {
+    fn new(var: String, integrand: Expr, limits: Option<(Expr, Expr)>) -> Self {
+        let mut outer = BTreeSet::new();
+        integrand.free(&mut outer);
+        outer.remove(&var);
+        Self {
+            var,
+            integrand,
+            limits,
+            outer: outer.into_iter().collect(),
+            last: RefCell::new(None),
+        }
+    }
+
+    /// A plot samples an integral at point after nearby point, so when the
+    /// integrand and the lower limit are what they were last time, only the
+    /// stretch between the last upper limit and this one is integrated —
+    /// ∫ₐᵇ = ∫ₐᶜ + ∫ᶜᵇ. A sweep then costs about one integral over its
+    /// range rather than one per sample, and a numeric derivative's two
+    /// nearby values differ by a small integral instead of by two large
+    /// ones.
     fn eval<'a>(&'a self, scope: &mut Scope<'a>) -> f64 {
         let (from, to) = match &self.limits {
             Some((lower, upper)) => (lower.eval(scope), upper.eval(scope)),
             None => (0.0, lookup(scope, &self.var)),
         };
-        integrate(
-            |t| {
-                scope.push((self.var.as_str(), t));
-                let value = self.integrand.eval(scope);
-                scope.pop();
-                value
-            },
+        let outer: Vec<f64> = self.outer.iter().map(|name| lookup(scope, name)).collect();
+        let (start, base) = self
+            .last
+            .borrow()
+            .as_ref()
+            .filter(|last| {
+                last.from == from
+                    && last.outer == outer
+                    && last.value.is_finite()
+                    && (to - last.to).abs() < (to - from).abs()
+            })
+            .map_or((from, 0.0), |last| (last.to, last.value));
+        let value = base
+            + integrate(
+                |t| {
+                    scope.push((self.var.as_str(), t));
+                    let value = self.integrand.eval(scope);
+                    scope.pop();
+                    value
+                },
+                start,
+                to,
+            );
+        *self.last.borrow_mut() = Some(Taken {
+            outer,
             from,
             to,
-        )
+            value,
+        });
+        value
     }
 
     fn free(&self, out: &mut BTreeSet<String>) {
@@ -263,6 +320,11 @@ impl Derivative {
 /// evaluations so a curve that never settles still returns in bounded
 /// time. Reversed limits give the negated integral; any non-finite sample
 /// makes the result non-finite.
+///
+/// The tolerance is relative to ∫|f| as the first panels estimate it:
+/// the precision a float can hold scales with the integrand, so a fixed
+/// tolerance is out of reach for a large one and refinement would spend
+/// the whole budget chasing rounding error.
 fn integrate(mut f: impl FnMut(f64) -> f64, from: f64, to: f64) -> f64 {
     const PANELS: usize = 8;
     const TOLERANCE: f64 = 1e-12;
@@ -275,25 +337,35 @@ fn integrate(mut f: impl FnMut(f64) -> f64, from: f64, to: f64) -> f64 {
         return 0.0;
     }
     let width = (to - from) / PANELS as f64;
+    let panels: Vec<([f64; 2], [f64; 3])> = (0..PANELS)
+        .map(|panel| {
+            let a = from + width * panel as f64;
+            let b = if panel + 1 == PANELS { to } else { a + width };
+            let m = (a + b) / 2.0;
+            ([a, b], [f(a), f(m), f(b)])
+        })
+        .collect();
+    let magnitude: f64 = panels
+        .iter()
+        .map(|&([a, b], [fa, fm, fb])| simpson(a, b, fa.abs(), fm.abs(), fb.abs()).abs())
+        .sum();
+    let tolerance = TOLERANCE * magnitude / PANELS as f64;
     let mut budget = BUDGET;
-    let mut total = 0.0;
-    for panel in 0..PANELS {
-        let a = from + width * panel as f64;
-        let b = if panel + 1 == PANELS { to } else { a + width };
-        let m = (a + b) / 2.0;
-        let (fa, fm, fb) = (f(a), f(m), f(b));
-        let whole = simpson(a, b, fa, fm, fb);
-        total += refine(
-            &mut f,
-            [a, b],
-            [fa, fm, fb],
-            whole,
-            TOLERANCE / PANELS as f64,
-            DEPTH,
-            &mut budget,
-        );
-    }
-    total
+    panels
+        .into_iter()
+        .map(|([a, b], [fa, fm, fb])| {
+            let whole = simpson(a, b, fa, fm, fb);
+            refine(
+                &mut f,
+                [a, b],
+                [fa, fm, fb],
+                whole,
+                tolerance,
+                DEPTH,
+                &mut budget,
+            )
+        })
+        .sum()
 }
 
 fn simpson(a: f64, b: f64, fa: f64, fm: f64, fb: f64) -> f64 {
@@ -647,11 +719,9 @@ impl Translator {
                 ));
             }
         };
-        let placeholder = self.placeholder(Source::Integral(Rc::new(Integral {
-            var,
-            integrand,
-            limits,
-        })));
+        let placeholder = self.placeholder(Source::Integral(Rc::new(Integral::new(
+            var, integrand, limits,
+        ))));
         Ok((Piece::Operand(placeholder), at + 2))
     }
 
@@ -1028,6 +1098,60 @@ mod tests {
         assert_eq!(primitive.input.as_deref(), Some("x"));
         assert!(near(primitive.eval(2.0), 2.0, 1e-9));
         assert!(near(primitive.eval(-4.0), 8.0, 1e-9));
+    }
+
+    #[test]
+    fn an_integral_is_the_same_whatever_was_evaluated_before() {
+        let area = curve(&format!("y=int{{0}}{{x}}{COS}(t^2)dt"));
+        let points = [3.0, -1.0, 0.25, 2.9, 3.1, -4.0, 0.0, 1.7];
+        for x in points {
+            let fresh = curve(&format!("y=int{{0}}{{x}}{COS}(t^2)dt")).eval(x);
+            assert!(near(area.eval(x), fresh, 1e-10), "at {x}");
+        }
+        // A sweep, as a plot samples it.
+        for step in 0..=400 {
+            let x = -5.0 + step as f64 * 0.025;
+            let fresh = curve(&format!("y=int{{0}}{{x}}{COS}(t^2)dt")).eval(x);
+            assert!(near(area.eval(x), fresh, 1e-10), "at {x}");
+        }
+    }
+
+    #[test]
+    fn an_integral_follows_its_integrands_other_variables() {
+        // ∫₀¹ x·t dt = x/2: the value taken at x = 2 is no start for x = 3.
+        let scaled = curve("y=int{0}{1}xtdt");
+        assert!(near(scaled.eval(2.0), 1.0, 1e-12));
+        assert!(near(scaled.eval(3.0), 1.5, 1e-12));
+        assert!(near(scaled.eval(2.0), 1.0, 1e-12));
+    }
+
+    #[test]
+    fn large_integrands_converge_well_within_the_budget() {
+        for (f, from, to, exact) in [
+            (
+                (|t: f64| t.powi(4)) as fn(f64) -> f64,
+                0.0,
+                5.0,
+                5.0f64.powi(5) / 5.0,
+            ),
+            (f64::exp, 0.0, 30.0, 30.0f64.exp() - 1.0),
+            (|t: f64| 1e9 * t.sin(), 0.0, 3.0, 1e9 * (1.0 - 3.0f64.cos())),
+        ] {
+            let mut calls = 0;
+            let value = integrate(
+                |t| {
+                    calls += 1;
+                    f(t)
+                },
+                from,
+                to,
+            );
+            assert!(
+                ((value - exact) / exact).abs() < 1e-10,
+                "{value} vs {exact}"
+            );
+            assert!(calls < 5_000, "{calls} evaluations for {exact}");
+        }
     }
 
     #[test]
