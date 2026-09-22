@@ -4,8 +4,10 @@
 //! (`frame.rs`), in the current theme. The same plot code runs through two
 //! in-app paths, switched with Tab:
 //!
-//! - **Vector** — `AtomosBackend` turns every plotters primitive into an
-//!   Atomos draw call (paths, rectangles, polygons, Atomos-shaped text).
+//! - **Vector** — the app's own `CanvasBackend` (`typewritter::plot`),
+//!   the one graph widgets draw through, turns every plotters primitive
+//!   into a canvas call. What a canvas cannot draw — the Mandelbrot plot's
+//!   bitmap — is refused there, as it would be in a note.
 //! - **Bitmap** — plotters' `BitMapBackend` rasterizes into an RGB buffer
 //!   at the window's physical resolution, uploaded as one Atomos image.
 //!
@@ -16,7 +18,6 @@
 //!
 //! `cargo run --example plot_demo`
 
-mod atomos_backend;
 mod frame;
 mod plots;
 
@@ -24,13 +25,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use atomos_backend::AtomosBackend;
 use plots::{Palette, Plot, Style, Ticks, View};
 use plotters::prelude::{BitMapBackend, IntoDrawingArea, RGBColor, SVGBackend};
+use plotters_backend::FontStyle;
 use typewritter::layout::Rect;
+use typewritter::plot::{CanvasBackend, SUBPIXELS};
 use typewritter::renderer::{
-    Alignment, Color, FontParameters, HorizontalAlign, Layer, LayerInvalidation, Pixels, Renderer,
-    Rounding, VerticalAlign,
+    Alignment, Color, Font, FontParameters, HorizontalAlign, Layer, LayerInvalidation, Pixels,
+    Renderer, Rounding, VerticalAlign,
 };
 use typewritter::theme::{self, Theme};
 use winit::{
@@ -58,7 +60,7 @@ enum Path {
 impl Path {
     fn describe(self) -> &'static str {
         match self {
-            Path::Vector => "Vector — AtomosBackend → Atomos paths, shapes and text",
+            Path::Vector => "Vector — CanvasBackend → canvas paths, shapes and text",
             Path::Bitmap => "Bitmap — BitMapBackend → RGB buffer → one Atomos image per plot",
         }
     }
@@ -325,19 +327,23 @@ fn paint_plot(
     view: View,
 ) -> plots::Outcome<Ticks> {
     let scale = layer.scale_factor();
-    let style = Style {
-        scale: f64::from(scale),
-        palette: palette(),
-    };
     match path {
         Path::Vector => {
-            let backend = AtomosBackend::new(layer.clone(), rect.position(), rect.size());
-            let area = backend.into_drawing_area();
+            let style = Style {
+                scale: f64::from(SUBPIXELS),
+                palette: palette(),
+            };
+            let mut canvas = layer;
+            let area = CanvasBackend::new(&mut canvas, rect).into_drawing_area();
             let ticks = plot.draw(&area, style, view)?;
             area.present()?;
             Ok(ticks)
         }
         Path::Bitmap => {
+            let style = Style {
+                scale: f64::from(scale),
+                palette: palette(),
+            };
             let width = (rect.width * scale).round() as u32;
             let height = (rect.height * scale).round() as u32;
             if width == 0 || height == 0 {
@@ -352,7 +358,7 @@ fn paint_plot(
                 ticks
             };
             layer.draw_image(
-                Pixels::new(width, height, atomos_backend::rgb_to_rgba(&rgb)),
+                Pixels::new(width, height, rgb_to_rgba(&rgb)),
                 rect.position(),
                 rect.size(),
                 Color::rgb(0xFF, 0xFF, 0xFF),
@@ -484,6 +490,32 @@ fn main() -> Result<(), winit::error::EventLoopError> {
     } else {
         Theme::LIGHT
     });
-    atomos_backend::register_fonts();
+    register_fonts();
     EventLoop::new()?.run_app(&mut Demo::default())
+}
+
+/// Registers the app's embedded fonts under the family names plotters asks
+/// for, so its own rasterizer (bitmap and SVG) sets the faces the app does.
+fn register_fonts() {
+    for (family, font) in [
+        ("sans-serif", theme::sans()),
+        ("serif", theme::sans()),
+        ("monospace", theme::mono()),
+    ] {
+        let Font::Bytes(bytes) = font else {
+            unreachable!("theme fonts are embedded");
+        };
+        for style in [FontStyle::Normal, FontStyle::Bold] {
+            plotters::style::register_font(family, style, bytes)
+                .unwrap_or_else(|_| panic!("{family} is not a valid font"));
+        }
+    }
+}
+
+fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
+    rgb.as_chunks::<3>()
+        .0
+        .iter()
+        .flat_map(|&[r, g, b]| [r, g, b, 0xFF])
+        .collect()
 }

@@ -57,7 +57,7 @@ exmex = { version = "0.21", features = ["partial"] }
 # The plot demo (`examples/plot_demo`) exercises most of plotters. Features
 # requested here reach only examples and tests, so the app itself keeps the
 # lean set above. `ab_glyph` rasterizes plotters' own text (the bitmap path
-# and rotated labels) from our embedded fonts, with no system font
+# and the PNG export) from our embedded fonts, with no system font
 # libraries. `evcxr_bitmap`
 # (bitmaps embedded in SVGs) is left out: upstream's `plotters-svg`
 # `bitmap_encoder` does not compile against image 0.25.
