@@ -821,10 +821,19 @@ impl Shell {
         if self.table_lines.is_some() {
             self.close_table_lines();
         }
+        // Everything the card changes is one undo step. A session already
+        // grouping edits — Insert mode — keeps its own boundary.
+        let transaction = {
+            let mut docs = self.docs.borrow_mut();
+            let fresh = !docs.in_transaction();
+            docs.begin_transaction();
+            fresh
+        };
         self.graph_card = Some(GraphCardState {
             block,
             placement,
             anchor,
+            transaction,
             focus: GraphTarget::Expression,
             cursor: math::MathCursor {
                 path: Vec::new(),
@@ -868,15 +877,26 @@ impl Shell {
         });
         // A graph that is gone — deleted, undone — takes its card with it.
         if card.is_none() {
-            self.graph_card = None;
+            self.end_graph_card_session();
         }
         self.regions[self.graph_card_region]
             .set_component(Box::new(card.unwrap_or_else(GraphCard::closed)));
     }
 
     fn close_graph_card(&mut self) {
-        self.graph_card = None;
+        self.end_graph_card_session();
         self.refresh_graph_card();
+    }
+
+    /// Forgets the card's state and closes the undo step it opened.
+    fn end_graph_card_session(&mut self) {
+        if self
+            .graph_card
+            .take()
+            .is_some_and(|state| state.transaction)
+        {
+            self.docs.borrow_mut().end_transaction();
+        }
     }
 
     /// Applies `change` to the card's graph and writes it back as one edit.

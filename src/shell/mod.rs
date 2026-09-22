@@ -450,6 +450,9 @@ struct GraphCardState {
     block: usize,
     placement: usize,
     anchor: (f32, f32),
+    /// Whether the card opened the undo transaction its edits group into,
+    /// and so closes it.
+    transaction: bool,
     focus: crate::components::graph_card::GraphTarget,
     cursor: MathCursor,
     /// `XMin, XMax, YMin, YMax`, as typed.

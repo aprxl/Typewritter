@@ -380,6 +380,11 @@ impl Tabs {
         }
     }
 
+    /// Whether edits are currently being grouped into one snapshot.
+    pub fn in_transaction(&self) -> bool {
+        self.transaction.is_some()
+    }
+
     /// Group edits spanning multiple input frames into one snapshot.
     pub fn begin_transaction(&mut self) {
         if self.transaction.is_none() {
@@ -2068,6 +2073,38 @@ mod tests {
         assert_eq!(tabs.active().unwrap().document.block_text(0), "abcde");
         tabs.undo();
         assert_eq!(tabs.active().unwrap().document.block_text(0), "abc");
+    }
+
+    #[test]
+    fn a_graph_edited_across_frames_in_a_transaction_undoes_in_one_step() {
+        let path = temp_file("graph-card", "");
+        let mut tabs = Tabs::new();
+        tabs.open_full(&path);
+        let graph = widget::GraphWidget::default();
+        assert!(tabs.insert_widget(widget::Widget::Graph(graph.clone())));
+        let before = tabs.active().unwrap().document.body().to_vec();
+        assert!(!tabs.in_transaction());
+        tabs.begin_transaction();
+        assert!(tabs.in_transaction());
+        // What a card session does over several frames: type the curve,
+        // then flip the grid.
+        for (notation, grid) in [
+            ("x", true),
+            ("x^2", true),
+            ("x^2+1", true),
+            ("x^2+1", false),
+        ] {
+            let edited = widget::GraphWidget {
+                expression: crate::document::math_notation::parse(notation),
+                grid,
+                ..graph.clone()
+            };
+            assert!(tabs.set_widget_graph(0, 0, edited));
+        }
+        tabs.end_transaction();
+        assert!(!tabs.in_transaction());
+        tabs.undo();
+        assert_eq!(tabs.active().unwrap().document.body(), before.as_slice());
     }
 
     #[test]
