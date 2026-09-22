@@ -417,23 +417,23 @@ fn inside(
     }
 
     let spec = chart.as_coord_spec();
-    let x_ticks = spec
-        .x_spec()
-        .key_points(BoldPoints(X_TICKS))
-        .into_iter()
-        .map(|value| Tick {
+    let x_values = spec.x_spec().key_points(BoldPoints(X_TICKS));
+    let x_ticks = x_values
+        .iter()
+        .zip(labels(&x_values))
+        .map(|(&value, label)| Tick {
             at: spec.translate(&(value, y.min())).0 as f32 / SUBPIXELS,
-            label: number(value),
+            label,
             width: 0.0,
         })
         .collect();
-    let y_ticks = spec
-        .y_spec()
-        .key_points(BoldPoints(Y_TICKS))
-        .into_iter()
-        .map(|value| Tick {
+    let y_values = spec.y_spec().key_points(BoldPoints(Y_TICKS));
+    let y_ticks = y_values
+        .iter()
+        .zip(labels(&y_values))
+        .map(|(&value, label)| Tick {
             at: spec.translate(&(x.min(), value)).1 as f32 / SUBPIXELS,
-            label: number(value),
+            label,
             width: 0.0,
         })
         .collect();
@@ -574,14 +574,43 @@ fn frame(
     }
 }
 
-/// A tick value without float noise, and with a real minus sign.
-fn number(value: f64) -> String {
-    let rounded = (value * 1000.0).round() / 1000.0 + 0.0;
-    let text = format!("{rounded}");
-    match text.strip_prefix('-') {
-        Some(magnitude) => format!("−{magnitude}"),
-        None => text,
-    }
+/// Tick values as labels: to the decimals their spacing needs, so float
+/// noise never shows and a narrow range's ticks stay distinct, then with
+/// trailing zeros dropped and a real minus sign.
+fn labels(values: &[f64]) -> Vec<String> {
+    const MOST_DECIMALS: i32 = 12;
+    let spacing = values
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).abs())
+        .fold(f64::INFINITY, f64::min);
+    // One tick has no spacing; its own value says how precise it is.
+    let spacing = if spacing.is_finite() {
+        spacing
+    } else {
+        values.first().map_or(0.0, |value| value.abs())
+    };
+    let decimals = (0..=MOST_DECIMALS)
+        .find(|&decimals| {
+            let scaled = spacing * 10f64.powi(decimals);
+            (scaled - scaled.round()).abs() <= 1e-6 * scaled.max(1.0)
+        })
+        .unwrap_or(MOST_DECIMALS) as usize;
+    values
+        .iter()
+        .map(|value| {
+            let text = format!("{value:.decimals$}");
+            let text = if text.contains('.') {
+                text.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                &text
+            };
+            match text.strip_prefix('-') {
+                Some("0") => "0".to_owned(),
+                Some(magnitude) => format!("−{magnitude}"),
+                None => text.to_owned(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -718,8 +747,19 @@ mod tests {
 
     #[test]
     fn tick_labels_use_a_minus_sign() {
-        assert_eq!(number(-2.0), "−2");
-        assert_eq!(number(0.5), "0.5");
-        assert_eq!(number(-0.0), "0");
+        assert_eq!(labels(&[-2.0, -1.0, 0.0]), ["−2", "−1", "0"]);
+        assert_eq!(labels(&[-0.0]), ["0"]);
+        assert_eq!(labels(&[0.5]), ["0.5"]);
+    }
+
+    #[test]
+    fn tick_labels_carry_the_decimals_their_spacing_needs() {
+        assert_eq!(labels(&[0.0, 0.5, 1.0, 1.5]), ["0", "0.5", "1", "1.5"]);
+        // A narrow range keeps its ticks apart.
+        assert_eq!(labels(&[0.0, 0.0002, 0.0004]), ["0", "0.0002", "0.0004"]);
+        assert_eq!(labels(&[-0.25, 0.0, 0.25]), ["−0.25", "0", "0.25"]);
+        // Float noise from stepping does not show.
+        assert_eq!(labels(&[0.1 + 0.2, 0.4 + 0.2]), ["0.3", "0.6"]);
+        assert_eq!(labels(&[1e6, 2e6]), ["1000000", "2000000"]);
     }
 }
